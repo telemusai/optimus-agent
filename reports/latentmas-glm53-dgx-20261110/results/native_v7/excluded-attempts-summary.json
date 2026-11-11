@@ -1,0 +1,93 @@
+{
+  "schema": "latents.bench.native_exclusions_summary.v1",
+  "condition": "occ3_agent_native_v7",
+  "summary_kind": "metadata_only_existing_attempts_no_inference_or_scoring",
+  "sources": [
+    {
+      "source_id": "blocked_artifact_audit",
+      "source_file": "/tmp/latentmas-blocked-artifact-audit.md",
+      "source_sha256": "eb3427f5f6226cfa567577a8eab62b7f92eb99c8a1be4cccbf85e00f7390d763",
+      "scope": "Read-only audit of existing artifacts, 2026-11-11; sections F3-F5. No question, solution, gold or model-answer content copied."
+    },
+    {
+      "source_id": "arc_easy12_outcome",
+      "source_file": "/tmp/latentmas-one-item-control/20261111t134256z-arc_easy-12/batch-outcome.json",
+      "source_sha256": "c1a59063f695a26c2e1a4f7d58131e5c5231d63085c8291a441e322283cf7c26"
+    },
+    {
+      "source_id": "arc_easy12_failure_metadata",
+      "source_file": "/tmp/latentmas-one-item-control/20261111t134256z-arc_easy-12/failure-metadata.txt",
+      "source_sha256": "868262240af023af67694e456b6009f3034a9e74f04282be14b67fdc6c14da13",
+      "scope": "Selected status/error fields only; source is not copied wholesale."
+    }
+  ],
+  "excluded_attempts": [
+    {
+      "task": "mbppplus",
+      "idx": 9,
+      "run_root": "/home/nvidia/occ3-deploy/native-v7-batch-mbppplus-r6-20261111t130500z",
+      "source_id": "blocked_artifact_audit",
+      "audit_section": "F3",
+      "driver_terminal_status": "failed_uncertain",
+      "driver_reason": "file_owner_type_or_bound",
+      "scorer_error_code": "input_file_type_or_size",
+      "runner_reported_status": "complete",
+      "events_size_bytes": 446003659,
+      "read_limit_bytes": 402653184,
+      "score_eligible": false,
+      "correct": null,
+      "audit_note": "The journal exceeds the driver and scorer read bound. Later terminal, bookkeeping, wire, cleanup and standby gates were not completed; runner self-report is not verified completion."
+    },
+    {
+      "task": "mbppplus",
+      "idx": 9,
+      "run_root": "/home/nvidia/occ3-deploy/native-v7-batch-mbppplus-r9-20261111t131248z",
+      "source_id": "blocked_artifact_audit",
+      "audit_section": "F4",
+      "driver_terminal_status": "failed_uncertain",
+      "driver_reason": "item_exit_or_work_cleanup_bound",
+      "runner_reason": "role_generation_failed_or_truncated",
+      "observed_source_error_code": "occ3_source_busy",
+      "runner_cleanup_confirmed": true,
+      "score_eligible": false,
+      "correct": null,
+      "audit_note": "Source capture refused before admission; no scored answer. The audit identifies capture_inflight while unrelated decode work was active; client identity was not established."
+    },
+    {
+      "task": "humanevalplus",
+      "idx": 9,
+      "run_root": "/home/nvidia/occ3-deploy/native-v7-batch-humanevalplus-r9-20261111t090000z",
+      "source_id": "blocked_artifact_audit",
+      "audit_section": "F5",
+      "driver_terminal_status": "failed_uncertain",
+      "driver_reason": "item_exit_or_work_cleanup_bound",
+      "runner_reason": "worker_log_changed",
+      "runner_cleanup_confirmed": false,
+      "score_eligible": false,
+      "correct": null,
+      "audit_note": "Worker-log stability guard stopped role setup. The audit found an unchanged inode and intact prefix with appended activation lines. This attempt remains excluded; no guard was bypassed or run resumed."
+    },
+    {
+      "task": "arc_easy",
+      "idx": 12,
+      "run_root": "/home/nvidia/occ3-deploy/native-v7-batch-arc-easy-b-20261111t134256z",
+      "source_ids": [
+        "arc_easy12_outcome",
+        "arc_easy12_failure_metadata"
+      ],
+      "driver_terminal_status": "failed_uncertain",
+      "driver_reason": "item_exit_or_work_cleanup_bound",
+      "runner_reason": "role_generation_failed_or_truncated",
+      "runner_cleanup_confirmed": true,
+      "observed_source_error_code": "occ3_completed_binding_count",
+      "score_eligible": false,
+      "correct": null,
+      "audit_note": "No scored answer. Source capture/provenance did not complete. Cleanup was acknowledged in runner metadata, but the follow-up provenance and cleanup safety audit remains incomplete because remote access failed."
+    }
+  ],
+  "publication_limits": [
+    "This is not an exhaustive attempt ledger. All listed attempts remain excluded from eligible correctness denominators; none is relabeled as a scored incorrect answer.",
+    "Full HumanEval+ and MBPP+ public scorer and sandbox artifacts were unavailable locally during this update. code-sandbox-recovered-summary.json records only historical tool-result aggregates, with full source validation and per-item coverage pending. Queue metadata is not substitute scoring evidence.",
+    "Configured DGX SSH access was blocked. No alternate route, credential, guard bypass, replay, new inference or new scorer run was used for this report update."
+  ]
+}

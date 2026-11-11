@@ -1,0 +1,181 @@
+{
+  "schema": "latents.bench.native_continuation_summary.v1",
+  "task": "arc_easy",
+  "condition": "occ3_agent_native_v7",
+  "summary_kind": "safe_aggregate_of_existing_public_scores_not_a_new_scorer_run",
+  "combined_scorer_run": false,
+  "projection_denominator": 20,
+  "budget_matched_to_baseline": false,
+  "common_source_contract": {
+    "manifest_sha256": "5775c480ad9cad8fb5f791c1eb4304a2fec8a7a49efd4ff768ad5e1d059a52a8",
+    "paired_cohort_sha256": "75a7932962e6b06538772d3979c8641f987ec556898937826a1cfaef9d428c08",
+    "scorer_sha256": "e613c39f29852d3bf6e58ef970a259f71474c8546e561e0d16548815c5644330",
+    "upstream_utils_sha256": "abc15e391ba5b323929a709d2a4e7ed36f0083f24eeb965274912c322a1f3bfe",
+    "scoring_rule": "unchanged_raw_final_upstream_extract_then_normalize_compare_exact_manifest_gold",
+    "approved_source_artifact_sha256": {
+      "controller_sha256": "c044b9c5b626b18dad734d2eb6c4d7367a256ab9a9c52c9216e6a1741cd96a9f",
+      "profile_sha256": "6223dbcee285b3f9e6a52d1b0c624b7def1be86f712102cb6ae61df2efd36d32",
+      "projection_sha256": "9d5962690ddc3bb2071d252544fa37140e643a7637a25d5bbf6cc272dc94fd49",
+      "runner_sha256": "f60087e48577f6b29f576cd362d04b4547d76a3160d01247ea759cbf5d487536"
+    },
+    "generation_parameters": "effective_config_in_source_artifacts_not_assumed_4096_matched"
+  },
+  "prior_a_cohort": {
+    "published_source_file": "results/native_v7/score-public-arc_easy-a-cohort.json",
+    "source_sha256": "ccc204fdf1749878b5695f00b565c1765f464b54cf05d18cd86e6754bd3d661d",
+    "eligible_indices": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9
+    ],
+    "score_eligible": 10,
+    "strict_correct": 10
+  },
+  "individual_score_sources": [
+    {
+      "source_file": "/tmp/latentmas-arc-easy-item10-20261111t133221z-score-public.json",
+      "source_sha256": "4261cd75143d8952f0d4e0f5695874dabaab4232942dad7f60b9e0828ba633a3",
+      "source_schema": "occ3.native.score_summary.v1",
+      "created_unix_ns": 1794404224063365115,
+      "denominator": 20,
+      "explicit_attempt_count": 1,
+      "score_eligible": 1,
+      "strict_correct": 1,
+      "incomplete_or_ineligible": 19,
+      "strict_accuracy_all20": 0.05,
+      "eligible_row": {
+        "idx": 10,
+        "run_id": "008d505beb54465ea6c16517cf1dc5f2",
+        "status": "complete",
+        "correct": true,
+        "score_eligible": true,
+        "transport_valid": true,
+        "cleanup_confirmed": true,
+        "cleanup_issue_count": 0,
+        "format_valid": true,
+        "truncated": false,
+        "error_code": null,
+        "question_sha256": "2d5b7837817650cbd5f5bcdbfe66692f13c44d4725b9f0b462c8b222fbf0ea44",
+        "raw_final_sha256": "d5fdfc0a4f76e1b9eafd884764281a14ee6085bdc76dddf3792bde71f9a9c727",
+        "artifact_sha256": {
+          "cleanup.json": "2207ef50f5f452ab7e461a6541f821033a53605cce32c16efeb699dbce98fdfe",
+          "context-bookkeeping.json": "0ed946e142c68e297ef0874842f914d742c31d5a20a0fc5873bddcfdf424d721",
+          "events.jsonl": "6ee7d981b48fd0385ed7e709ef98a16bfc24bd1ae1bfebd2c696a425e0d06e9a",
+          "item.json": "52a0672cbe6c8ea8e51228c34def817e152d1c9b96247f5e0a96dd5091f9f248",
+          "outcome.json": "77a4836254a11c7308fd5c7991cddbd57b56e28e8a63beeb90e699c0487e847e"
+        },
+        "measured_times": {
+          "cleanup_seconds": 0.144450275,
+          "daemon_connection_seconds": null,
+          "item_wall_seconds_including_setup": 142.53441947,
+          "native_work_seconds": 135.160457555,
+          "setup_seconds": 7.371101666
+        },
+        "usage_coverage": "terminal_transcripts",
+        "provider_usage": {
+          "semantics": "provider_reported_counters_not_estimates",
+          "record_count": 26,
+          "all_fields_complete": true,
+          "input_tokens": 105114,
+          "output_tokens": 11641,
+          "total_tokens": 116755
+        }
+      },
+      "published_source_file": "results/native_v7/score-public-arc_easy-item10.json"
+    },
+    {
+      "source_file": "/tmp/latentmas-one-item-control/20261111t133924z-arc_easy-11/score-public.json",
+      "source_sha256": "45da6275b897fe435b143d8f333dd0e15812c37db0ab91e301e201f86bc0cf8c",
+      "source_schema": "occ3.native.score_summary.v1",
+      "created_unix_ns": 1794404551228751248,
+      "denominator": 20,
+      "explicit_attempt_count": 1,
+      "score_eligible": 1,
+      "strict_correct": 1,
+      "incomplete_or_ineligible": 19,
+      "strict_accuracy_all20": 0.05,
+      "eligible_row": {
+        "idx": 11,
+        "run_id": "8f5678648215457caa427e19f92d7687",
+        "status": "complete",
+        "correct": true,
+        "score_eligible": true,
+        "transport_valid": true,
+        "cleanup_confirmed": true,
+        "cleanup_issue_count": 0,
+        "format_valid": true,
+        "truncated": false,
+        "error_code": null,
+        "question_sha256": "6c59045a0a84774f8777740fd5cf1810b1f9c33be32528ce42a62349f0e9b0a1",
+        "raw_final_sha256": "2f88da7667a2fead5ad59e4e4f2782e97a8a3f08b614519e1d99b77addfcb83e",
+        "artifact_sha256": {
+          "cleanup.json": "2207ef50f5f452ab7e461a6541f821033a53605cce32c16efeb699dbce98fdfe",
+          "context-bookkeeping.json": "c6d41897deed90bebb1ddc84ca916894088b177c6c6f91164ea1004483115749",
+          "events.jsonl": "243a5cca75fdd220542bf9bb52f4d2637fc16ff95556a4173598b931a8ff7e42",
+          "item.json": "33081d23f754df286bd03633c2abe186c6c6b5591906ab2bb28c8c8b1e023c32",
+          "outcome.json": "e0737601360d4b4a38e148ee8358b5a2c30fcba2b28f33bb650e7b49274bbd5c"
+        },
+        "measured_times": {
+          "cleanup_seconds": 0.12015705,
+          "daemon_connection_seconds": null,
+          "item_wall_seconds_including_setup": 127.650522473,
+          "native_work_seconds": 120.25199607,
+          "setup_seconds": 7.395963311
+        },
+        "usage_coverage": "terminal_transcripts",
+        "provider_usage": {
+          "semantics": "provider_reported_counters_not_estimates",
+          "record_count": 26,
+          "all_fields_complete": true,
+          "input_tokens": 93655,
+          "output_tokens": 5701,
+          "total_tokens": 99356
+        }
+      },
+      "published_source_file": "results/native_v7/score-public-arc_easy-item11.json"
+    }
+  ],
+  "cumulative_arithmetic": {
+    "eligible_indices": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11
+    ],
+    "eligible_items": 12,
+    "correct": 12,
+    "accuracy_among_eligible": 1.0,
+    "unscored_projection_indices": [
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19
+    ],
+    "note": "Disjoint union of the a-cohort (0-9) and separately scored items 10 and 11. Not a combined scorer run or a completed 20-item evaluation."
+  },
+  "limitations": [
+    "Each individual public score has denominator=20, score_eligible=1 and strict_correct=1. Its strict_accuracy_all20=0.05 is a projection count, not accuracy on 20 evaluated items.",
+    "Only already scored source rows are aggregated; no model inference, answer extraction, rescoring or answer repair was performed for this summary.",
+    "ARC-Easy item 12 remains excluded. Its provenance and cleanup safety audit was incomplete when remote access failed.",
+    "Native v7 is a smaller paired-subset track with different execution contracts and budgets; these results do not establish channel-only gains, efficiency or speedup."
+  ]
+}

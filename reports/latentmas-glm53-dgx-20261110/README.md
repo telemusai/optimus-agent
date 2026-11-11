@@ -4,10 +4,10 @@ These are interim results from running the LatentMAS evaluation suite
 ([Gen-Verse/LatentMAS](https://github.com/Gen-Verse/LatentMAS) at `9a9e4d3`) against
 GLM-5.3. The API conditions use the upstream prompts and scoring. The OCC-3
 condition adapts the role prompts and includes the answer recoveries below. The model is served by SGLang with the OCC-3
-bridge. The suite adds an Optimus OCC-3 native-handoff condition. The run was paused at
-2026-11-10 09:29 UTC so that PR #279 could be deployed. Reruns on the updated stack will
-be added to this directory. All numbers are measured. Untested items are listed under
-NOT-RUN. The post-update smoke failed; see [smoke-validation.md](smoke-validation.md).
+bridge. The suite adds an Optimus OCC-3 native-handoff condition. The initial run was paused at
+2026-11-10 09:29 UTC so that PR #279 could be deployed. Later runs on the updated
+stack are documented below. All scores are measured; untested items and pending
+verification are listed separately. The post-update smoke failed; see [smoke-validation.md](smoke-validation.md).
 It is diagnostic evidence, not an additional benchmark sample.
 
 Update: GPQA baseline is now complete (73/198). The separate 38-item continuation
@@ -122,15 +122,38 @@ docker container (no network, read-only, uid 65534). One sample per item.
 - "Truncated" is the share of items in which at least one model call stopped
   at the 4096-token cap; HumanEval+ sequential truncation is visible in its
   29.3% rate and its mean latency.
-- HumanEval+ hierarchical is above its baseline Wilson interval overlap:
-  +4.3 points, McNemar p=0.143 (not significant at 5%). MBPP+ hierarchical is
+- HumanEval+ hierarchical is +4.3 points above baseline, but the Wilson
+  intervals overlap and McNemar p=0.143 (not significant at 5%). MBPP+ hierarchical is
   +5.3 points above its 80.2% baseline and above the baseline's 75.8-83.9%
   Wilson interval; McNemar b=6, c=26, p=0.000535 (significant at 5%).
 - Raw model outputs are not committed (11 MB per file); per-item correctness,
   token and latency rows plus source sha256 values are in
   `results/*_safe.json`, and aggregate metrics in `results/*_summary.json`.
-- ARC-Easy hierarchical and all ARC-Challenge conditions (restarted runner
-  finishing them) are NOT-RUN and excluded from the tables.
+
+#### Native OCC-3 code-task aggregates (limited historical evidence)
+
+Recovered tool-result aggregates report the following existing sandbox scores
+on 2026-11-11. This update did not run inference or rescore answers.
+
+| Task | Sandbox correct / reported eligible | Accuracy among eligible | Observation time (UTC) |
+|---|---:|---:|---|
+| HumanEval+ | 8/9 | 88.9% | 12:22:55 |
+| MBPP+ | 8/9 | 88.9% | 13:12:41 |
+
+Each aggregate has a 20-item projection denominator but only nine reported
+eligible items. Neither is a completed 20-item evaluation. The full public
+scorer and sandbox artifacts could not be retrieved after configured DGX SSH
+access failed. Full source validation and per-item membership therefore remain
+pending. These recovered counts do not independently verify transport or
+cleanup gates, and support no per-item comparisons, token or latency claims.
+Safe aggregate evidence and its limits are recorded in
+`results/native_v7/code-sandbox-recovered-summary.json`.
+
+Native v7 is a separate, smaller paired-subset track, not the full HTTP sweep.
+Execution contracts and budgets differ, so these results cannot establish a
+channel-only gain, efficiency or speedup. Four-call HTTP TextMAS is also not
+budget matched to the one-call baseline. Failed and excluded native attempts
+remain listed below and do not count as scored answers.
 
 ### ARC-Easy (interim, 300 items)
 
@@ -159,8 +182,22 @@ exact extractor) gives **10/10 correct**. Paired on items 0-9: baseline 10/10
 all role records). Safe rows and summary:
 `results/glm53_arc_easy_native_occ3_v7_safe.json` /
 `results/glm53_arc_easy_native_occ3_v7_summary.json`; public scorer report in
-`results/native_v7/score-public-arc_easy-a-cohort.json`. The b-cohort
-(items 10-19) is outstanding; n=10 intervals are wide (Wilson 95% CI 72.2-100%).
+`results/native_v7/score-public-arc_easy-a-cohort.json`. The a-cohort interval
+is wide (n=10, Wilson 95% CI 72.2-100%).
+
+Continuation items 10 and 11 were each independently scored correct, with
+transport, cleanup and format gates valid. Together with the a-cohort, this is
+**12/12 correct among eligible items 0-11**, by arithmetic across disjoint
+source scores, not a combined scorer run. Each single-item public report uses
+`denominator=20`, `score_eligible=1`, `strict_correct=1`; its `1/20` projection
+count is not accuracy on 20 evaluated items. Source hashes, safe item metadata
+and the cumulative arithmetic are in
+`results/glm53_arc_easy_native_occ3_v7_continuation_summary.json`. The individual
+public scorer reports are also preserved in
+`results/native_v7/score-public-arc_easy-item10.json` and
+`results/native_v7/score-public-arc_easy-item11.json`.
+Items 12-19 remain unscored here; item 12 was attempted and excluded, with its
+follow-up provenance and cleanup safety audit incomplete after SSH access failed.
 
 ### ARC-Challenge (interim, 300 items)
 
@@ -372,7 +409,8 @@ Provider totals are 97,628 prompt and 389,509 completion tokens. Missing cache
 and nested reasoning details remain unknown. Driver wall time is 368.978 seconds,
 separate from the overlapping request-latency sum and not isolated GPU time.
 This is ordinary HTTP inference, not native OCC-3 or a clinical reliability claim.
-The separate sequential TextMAS condition is complete below; hierarchical is not run.
+The separate sequential and hierarchical TextMAS conditions are both complete;
+see their sections in this report.
 See [MEDQA_BASELINE.md](MEDQA_BASELINE.md) for cohort/source bindings, accounting,
 metric limits and sanitized metadata.
 
@@ -405,7 +443,7 @@ bindings, strict scoring, accounting and sanitized evidence.
    makes four capped calls. So the AIME differences between TextMAS and the baseline are
    confounded with the total token budget. A separately labelled rerun at a higher cap
    has not been run.
-2. The OCC-3 condition differs from the API conditions in more than the channel:
+2. The historical OCC-3 condition differs from the API conditions in more than the channel:
    - its output budget is 131,072 tokens per call instead of 4096;
    - it uses Optimus provider sampling defaults;
    - its children have the Optimus system prompt and tools.
@@ -416,8 +454,9 @@ bindings, strict scoring, accounting and sanitized evidence.
    run is unverified. Full-agent observation tools can expose parent transcripts
    and files; the later smoke reported access to a parent transcript containing
    scoring context. This does not prove historical answer leakage.
-3. OCC-3 rows do not record token counts. Their wall time includes fixed waits.
-4. Five OCC-3 items needed answer recovery, recorded in each row's `scoring_note`:
+3. Historical OCC-3 rows do not record token counts. Their wall time includes
+   fixed waits. Native v7 token accounting, where verified, is separate.
+4. Five historical OCC-3 items needed answer recovery, recorded in each row's `scoring_note`:
    - item 2 used a comma-aware parse of `$70,000` (the verbatim LatentMAS extractor reads
      only the digits before the comma);
    - item 3: the judger answered in an OCC/2-encoded message;
@@ -448,18 +487,37 @@ bindings, strict scoring, accounting and sanitized evidence.
    Per-item scoring fields remain. Numeric predictions are replaced by
    `"prediction_kind": "non_letter"`.
 
-## NOT-RUN
+## Excluded native v7 attempts
+
+These selected failed attempts remain outside eligible correctness denominators.
+They are not scored incorrect answers, and this is not an exhaustive attempt ledger.
+
+| Task / item | Attempt | Recorded failure | Scoring status |
+|---|---|---|---|
+| MBPP+ / 9 | r6-20261111t130500z | `file_owner_type_or_bound`; scorer `input_file_type_or_size` | Journal exceeds the 384 MiB read bound; runner self-report of completion does not verify the later gates |
+| MBPP+ / 9 | r9-20261111t131248z | `occ3_source_busy` | Source capture refused before admission; no scored answer |
+| HumanEval+ / 9 | r9-20261111t090000z | `worker_log_changed` | Role setup stopped; cleanup unconfirmed; no scored answer |
+| ARC-Easy / 12 | b-20261111t134256z | `occ3_completed_binding_count` | No scored answer; runner reported cleanup, but follow-up provenance and cleanup safety audit remains incomplete |
+
+Safe metadata and source bindings are in
+`results/native_v7/excluded-attempts-summary.json`. No guard was bypassed,
+failed attempt replayed or new scorer run performed for this report update.
+
+## NOT-RUN and pending verification
 
 - The `latent_mas` condition, because it needs model internals; this also
   applies to the native OCC-3 track. Manifests are listed in `MANIFESTS.json`.
 - Native OCC-3 GSM8K item 1 (setup failure in its original batch, never
   retried), and a completed rerun of items 0-13 on the PR #279 stack. The later
   item-0 smoke failed and remains separate from these denominators.
-- Native OCC-3 ARC-Easy and ARC-Challenge b-cohorts (items 10-19) - not run yet.
-- Native OCC-3 HumanEval+ items 0 (format-metadata failure) and 9 (capture race,
-  four consecutive batch failures, parked pending a fence fix); MBPP+ items
-  3-19 (item 3 retry in flight at publication). Correctness of the completed
-  code-task native items awaits the separate sandbox scoring join.
+- Native OCC-3 ARC-Easy items 12-19 and ARC-Challenge items 10-19 have no
+  completed scored results in this update. ARC-Easy item 12 was attempted and
+  excluded, not unstarted; items 10 and 11 are scored above.
+- Native OCC-3 HumanEval+ and MBPP+ 20-item projections remain incomplete.
+  Historical sandbox aggregates record 8/9 each, but full source validation
+  and exact per-item coverage remain pending. The recovered aggregate evidence
+  alone does not establish which nine indices are eligible. Item-9 failed
+  attempts remain excluded as recorded above.
 - AIME and GPQA at a higher token cap.
 - Token accounting for the historical OCC-3 API rows. The native v7 cohort
   does carry provider-reported token sums per item (see the safe rows), but the
@@ -474,14 +532,17 @@ bindings, strict scoring, accounting and sanitized evidence.
 | `results/glm53_gsm8k_occ3_clean.jsonl` | OCC-3 rows: hop states, receipt ids, native/total hops, wall time, scoring notes |
 | `results/glm53_gsm8k_native_occ3_v7_safe.json` | Native OCC-3 v7 cohort: per-item correct/truncated/tokens/latency rows (19 eligible items), source sha pins |
 | `results/glm53_gsm8k_native_occ3_v7_summary.json` | Native OCC-3 v7 cohort summary: 17/19 (89.5%), CI, McNemar vs paired baseline, latency and token aggregates |
-| `results/native_v7/score-public-*.json` | Pinned-scorer public reports per native cohort (item 0, batch items 2-18, item 19 v7, ARC-Easy a-cohort, ARC-Challenge a-cohort): counts, hashes, usage; no predictions |
+| `results/native_v7/score-public-*.json` | Pinned-scorer public reports per native cohort (item 0, batch items 2-18, item 19 v7, ARC-Easy a-cohort and items 10/11, ARC-Challenge a-cohort): counts, hashes, usage; no predictions |
 | `results/glm53_arc_easy_native_occ3_v7_safe.json` + `_summary.json` | Native OCC-3 v7 ARC-Easy a-cohort (items 0-9): 10/10 correct, paired McNemar vs baseline/TextMAS, latency and token aggregates |
 | `results/glm53_arc_challenge_native_occ3_v7_safe.json` + `_summary.json` | Native OCC-3 v7 ARC-Challenge a-cohort (items 0-9): 10/10 correct, paired McNemar vs baseline/TextMAS, latency and token aggregates |
+| `results/glm53_arc_easy_native_occ3_v7_continuation_summary.json` | Individually scored items 10 and 11; source-bound arithmetic total 12/12 on items 0-11, not a combined scorer run |
+| `results/native_v7/code-sandbox-recovered-summary.json` | Historical tool-result aggregates: HumanEval+ and MBPP+ 8/9 each; full source validation and per-item coverage pending |
+| `results/native_v7/excluded-attempts-summary.json` | Selected failed attempts and source-bound safe metadata; not scored answers or an exhaustive ledger |
 | `harness/runner.py`, `harness/bench_lib.py` | Resumable runner and OpenAI-compatible client adapter for the LatentMAS prompts |
 | `harness/occ3_lib.py`, `harness/occ3_v3_prompts.py` | Historical OCC-3 helpers/prompts, retained unchanged; not a validated team recipe |
 | `smoke-validation.md`, `server-smoke-excerpt.txt` | Post-update smoke failure and bounded server-log evidence |
 | `results/glm53_gsm8k_occ3_v6.jsonl` | Original diagnostic-only item-0 smoke row; its `native_hops` field counts admission, not proven completion |
-| `harness/sandbox-img/Dockerfile` | Code-task sandbox image (not used by any completed task yet) |
+| `harness/sandbox-img/Dockerfile` | Offline code-task sandbox image used by the completed HTTP code-task sweep |
 | `MANIFESTS.json` | Item manifest SHA-256 values, sources, counts and sampled indices |
 | `GPQA_COMPLETION.md` | Completed GPQA baseline aggregate and segmented continuation provenance |
 | `results/gpqa_baseline_160_197_safe.json` | Continuation index, truncation, usage and timing only; no answer content |
