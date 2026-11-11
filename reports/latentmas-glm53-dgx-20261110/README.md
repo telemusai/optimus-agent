@@ -26,10 +26,12 @@ on completed items** with item 19 never started; see
 [GSM8K_OCC3_NATIVE_V7.md](GSM8K_OCC3_NATIVE_V7.md).
 Four calls per item versus one baseline call are not budget matched.
 A code-task sweep on the same server started 2026-11-11 with the
-`runner.py` harness: HumanEval+ (n=164) is complete for all three conditions
-and MBPP+ (n=378) for baseline and TextMAS sequential; MBPP+ hierarchical and
-both ARC splits are still running and are listed under NOT-RUN. See the
-Code-task sweep section below. A second item-19 retry attempt under the v7
+`runner.py` harness: HumanEval+ (n=164) and MBPP+ (n=378) are complete for all
+three conditions (MBPP+ TextMAS hierarchical 323/378, 85.45%). ARC-Easy baseline
+and TextMAS sequential are complete (285/300, 95.0% and 290/300, 96.67%);
+ARC-Easy hierarchical and all ARC-Challenge conditions remain in flight on a
+restarted runner and are listed under NOT-RUN. See the Code-task sweep and
+ARC-Easy sections below. A second item-19 retry attempt under the v7
 protocol ran 2026-11-11 and ended `failed_uncertain` without a score; see
 [GSM8K_OCC3_NATIVE_V7.md](GSM8K_OCC3_NATIVE_V7.md).
 
@@ -106,17 +108,33 @@ docker container (no network, read-only, uid 65534). One sample per item.
 | HumanEval+ | TextMAS hierarchical | 149/164 | 90.9% | 85.5-94.4% | b=5, c=12, p=0.143 | 10.4% | 3,813 | 25.8 s |
 | MBPP+ | baseline | 303/378 | 80.2% | 75.8-83.9% | - | 8.5% | 1,162 | 8.4 s |
 | MBPP+ | TextMAS sequential | 303/378 | 80.2% | 75.8-83.9% | b=13, c=13, p=1.0 | 25.7% | 6,415 | 48.8 s |
+| MBPP+ | TextMAS hierarchical | 323/378 | 85.4% | 81.5-88.6% | b=6, c=26, p=0.000535 | 9.5% | 3,295 | 21.4 s |
 
 - "Truncated" is the share of items in which at least one model call stopped
   at the 4096-token cap; HumanEval+ sequential truncation is visible in its
   29.3% rate and its mean latency.
-- HumanEval+ hierarchical is the only condition so far above its baseline
-  Wilson interval overlap: +4.3 points, McNemar p=0.143 (not significant at 5%).
+- HumanEval+ hierarchical is above its baseline Wilson interval overlap:
+  +4.3 points, McNemar p=0.143 (not significant at 5%). MBPP+ hierarchical is
+  +5.3 points above its 80.2% baseline and above the baseline's 75.8-83.9%
+  Wilson interval; McNemar b=6, c=26, p=0.000535 (significant at 5%).
 - Raw model outputs are not committed (11 MB per file); per-item correctness,
   token and latency rows plus source sha256 values are in
   `results/*_safe.json`, and aggregate metrics in `results/*_summary.json`.
-- MBPP+ hierarchical (80/378 at the 05:56 UTC snapshot) and ARC-Easy /
-  ARC-Challenge (not started) are NOT-RUN and excluded from the table.
+- ARC-Easy hierarchical and all ARC-Challenge conditions (restarted runner
+  finishing them) are NOT-RUN and excluded from the tables.
+
+### ARC-Easy (interim, 300 items)
+
+From the same 2026-11-11 `runner.py` sweep on the same GLM-5.3 SGLang endpoint,
+run on the ARC-Easy test split. One sample per item, upstream LatentMAS prompts
+and scoring; gold answers are letters. ARC-Easy TextMAS hierarchical and all
+ARC-Challenge conditions are NOT-RUN (restarted runner finishing them) and
+excluded.
+
+| Task | Condition | Correct | Accuracy | 95% CI | McNemar vs baseline | Truncated | Completion tokens/item | Mean latency |
+|---|---|---|---|---|---|---|---|---|
+| ARC-Easy | baseline | 285/300 | 95.0% | 91.9-96.9% | - | 0.7% | 392 | 2.8 s |
+| ARC-Easy | TextMAS sequential | 290/300 | 96.7% | 94.0-98.2% | b=6, c=11, p=0.332 | 2.0% | 3,834 | 31.3 s |
 
 ### GSM8K (first 20 test items)
 
@@ -329,9 +347,11 @@ bindings, strict scoring, accounting and sanitized evidence.
 ## NOT-RUN
 
 - The `latent_mas` condition, because it needs model internals.
-- HumanEval+, MBPP+, ARC-Easy, ARC-Challenge and GSM8K-300 have no published result
-  here. MedQA baseline and TextMAS sequential are complete above; its hierarchical
-  condition is not run. Manifests are listed in `MANIFESTS.json`.
+- ARC-Challenge and GSM8K-300 have no published result here. HumanEval+, MBPP+
+  and ARC-Easy interim results are in the sections above; ARC-Easy hierarchical
+  is in flight on a restarted runner. MedQA baseline and TextMAS sequential are
+  complete above; its hierarchical condition is not run. Manifests are listed in
+  `MANIFESTS.json`.
 - OCC-3 items 14-19, and a completed rerun of items 0-13 on the PR #279 stack.
   The later item-0 smoke failed and remains separate from these denominators.
 - AIME and GPQA at a higher token cap.
