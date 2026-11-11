@@ -98,17 +98,15 @@ in the [agent-message guide](../skills/agent-message/SKILL.md) and
 
 ## Reading the lights
 
-The bottom status row has separate **OCC3.1** and **OCC3.2** configuration lights,
-even with no subagents. OCC3.1 shows `off`, `seq` or `hier`; an enabled mode has a
-steady filled light. OCC3.2 shows `off`, `on` or `blocked`. These labels are also
-summarized in the agents-box header when space permits. Their mode/enabled states
-are configuration, not a success claim. Latent enabled but not active is not
-equivalent to a working connector. The existing native delivery pulse still
+The bottom status row shows delivery lights only: `TXT`, `OCC1`, `OCC2` and
+`OCC3.2`. Each fills and brightens while its channel is in use; the **OCC3.2**
+light blinks only while native latent transport is actively delivering, and it
 requires a validated completed-use receipt. A model's text claiming a handoff,
 a selected mode, a visible tool or a queued request cannot produce that proof.
+Mode configuration (OCC3.1 off/sequential/hierarchical, OCC3.2 on/off) is not
+shown in the status row; use `/occ` or `/occ 3.2` to inspect it.
 
-Missing metadata on an older host means unavailable, not enabled. TXT, OCC1 and
-OCC2 delivery indicators keep their existing meaning.
+Missing metadata on an older host means unavailable, not enabled.
 
 ## Host compatibility
 

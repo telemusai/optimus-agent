@@ -5,43 +5,7 @@ use std::time::{Duration, Instant};
 
 use crate::core::occ::activity::{CommunicationActivity, CommunicationKind, MAX_ACTIVITY_MESSAGES};
 use crate::modes::daemon::daemon_session_list::SessionSummary;
-use crate::modes::agent_connection::types::Occ3Modes;
-use crate::modes::interactive::components::subagent_summary_line::{linkage_row_for_roster_summary, RightStatus, RosterParent};
-use crate::modes::interactive::theme::theme::theme;
-
-/// Configuration is a steady snapshot, not a message or completed-use receipt.
-pub(super) fn mode_status(modes: Option<&Occ3Modes>) -> RightStatus {
-    use crate::core::occ::textmas::TextMasMode;
-    let (textmas, textmas_marker, textmas_color) = match modes.map(|modes| modes.textmas_mode) {
-        Some(TextMasMode::Off) => ("off", "○", "muted"),
-        Some(TextMasMode::Sequential) => ("seq", "●", "success"),
-        Some(TextMasMode::Hierarchical) => ("hier", "●", "success"),
-        None => ("unavailable", "-", "muted"),
-    };
-    let (latent, latent_marker, latent_color) = match modes {
-        Some(modes) if !modes.latent_enabled => ("off", "○", "muted"),
-        Some(modes) if modes.latent_active && modes.latent_available => ("on", "●", "success"),
-        Some(_) => ("blocked", "!", "warning"),
-        None => ("unavailable", "-", "muted"),
-    };
-    let pair = |compact: bool| {
-        let label = |name: &str, value: &str, marker: &str, color: &str| {
-            let text = if compact {
-                format!("{name} {}", if value == "unavailable" { "n/a" } else { value })
-            } else {
-                format!("{marker} {name} {value}")
-            };
-            theme().fg(color, &text)
-        };
-        format!("{}  {}", label("OCC3.1", textmas, textmas_marker, textmas_color),
-            label("OCC3.2", latent, latent_marker, latent_color))
-    };
-    RightStatus {
-        full: format!("{} {}", theme().fg("muted", "CONFIG"), pair(false)),
-        compact: format!("{} {}", theme().fg("muted", "CFG"), pair(true)),
-        minimal: pair(true),
-    }
-}
+use crate::modes::interactive::components::subagent_summary_line::{linkage_row_for_roster_summary, RosterParent};
 
 pub(super) const PULSE: Duration = Duration::from_millis(1400);
 const QUEUE_FLASH: Duration = Duration::from_millis(500);

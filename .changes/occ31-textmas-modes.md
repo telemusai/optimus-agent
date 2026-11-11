@@ -1,6 +1,5 @@
 - Added OCC3.1 TextMAS for any model supported by Optimus, with per-chat off, sequential and hierarchical modes, tool-free preparation stages and the normal parent Judger/executor.
 - Added `/occ 3 off|sequential|hierarchical` and `/occ 3.1` controls; latent communication now uses `/occ 3.2 on|off`.
-- Changed status indicators to distinguish OCC3.1 TextMAS configuration from OCC3.2 latent configuration and validated completed-use activity.
-- Fixed the bottom status row to keep both OCC3.1 and OCC3.2 configuration lights visible, including chats with no subagents.
+- Changed the bottom status row to show delivery lights only: the OCC3.2 light blinks while native latent transport is actively delivering, and steady configuration labels no longer render in the bar.
 - Fixed independent OCC preferences so changing OCC-2 does not erase the latent preference.
 - Added capability-gated host-owned TextMAS controls, offline workflow and compatibility tests, and updated mode and migration guides.

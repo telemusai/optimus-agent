@@ -51,13 +51,19 @@ pub fn resolve(session_file: &str) -> Result<Resolution, String> {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.to_string()),
         }
+        // An unreadable or replaced session file must degrade to the default
+        // mode, not fail the turn: OCC3.1 is opt-in and fail-open here.
         let reader = match File::open(&file) {
             Ok(reader) => reader,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Resolution::default()),
-            Err(error) => return Err(error.to_string()),
+            Err(_) => return Ok(Resolution::default()),
         };
         let mut header = Vec::new();
-        BufReader::new(reader.take(65537)).read_until(b'\n', &mut header).map_err(|error| error.to_string())?;
+        match BufReader::new(reader.take(65537)).read_until(b'\n', &mut header) {
+            // An unreadable session file (replaced by a directory, EACCES) must
+            // degrade to the default mode, not fail the turn: OCC3.1 is opt-in.
+            Err(_) => return Ok(Resolution::default()),
+            Ok(_) => {}
+        }
         if header.len() > 65536 { return Err("OCC3.1 session header is too large".into()); }
         let header: serde_json::Value = serde_json::from_slice(&header).map_err(|error| error.to_string())?;
         if header["rlmDepth"].as_u64().unwrap_or(0) == 0 { return Ok(Resolution::default()); }

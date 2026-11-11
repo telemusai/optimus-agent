@@ -157,7 +157,6 @@ pub struct SubagentSummaryLine {
     openable: bool,
     always_visible: bool,
     right_status: Option<RightStatus>,
-    mode_status: Option<RightStatus>,
     communication_status: Option<String>,
     get_location_label: Box<dyn Fn() -> Option<String>>,
     get_context_label: Box<dyn Fn() -> Option<String>>,
@@ -179,7 +178,6 @@ impl SubagentSummaryLine {
             openable: false,
             always_visible: false,
             right_status: None,
-            mode_status: None,
             communication_status: None,
             get_location_label,
             get_context_label,
@@ -196,11 +194,6 @@ impl SubagentSummaryLine {
 
     pub fn set_right_status(&mut self, status: Option<RightStatus>) {
         self.right_status = status;
-    }
-
-    /// Steady mode configuration stays separate from delivery pulses.
-    pub fn set_mode_status(&mut self, status: Option<RightStatus>) {
-        self.mode_status = status;
     }
 
     pub fn set_communication_status(&mut self, status: Option<String>) {
@@ -319,15 +312,7 @@ impl Component for SubagentSummaryLine {
             "subagents".to_string()
         };
         let label = theme().fg("accent", &format!("\u{1b}[1m{title}\u{1b}[22m"));
-        let mode_in_title = self.mode_status.as_ref().and_then(|status| {
-            [&status.full, &status.compact, &status.minimal].into_iter()
-                .find(|text| visible_width(&label) + visible_width(text) + 8 <= safe_width as usize)
-        });
-        let top = if let Some(status) = mode_in_title {
-            let fill = (safe_width as usize).saturating_sub(visible_width(&label) + visible_width(status) + 8);
-            format!("{}{label} {} {status} {}", theme().fg("border", "╭─ "),
-                theme().fg("border", &"─".repeat(fill)), theme().fg("border", "─╮"))
-        } else { truncate_to_width(
+        let top = truncate_to_width(
             &format!(
                 "{}{}{}",
                 theme().fg("border", "\u{256d}\u{2500} "),
@@ -347,7 +332,7 @@ impl Component for SubagentSummaryLine {
             safe_width,
             "\u{2026}",
             false,
-        ) };
+        );
         let mut counts = format!(
             "{}{}{}{}{}",
             theme().fg(
@@ -370,12 +355,6 @@ impl Component for SubagentSummaryLine {
         }
         let available = (inner - 2.0).max(0.0) as usize;
         let right_min = self.right_status.as_ref().map(|status| visible_width(&status.minimal) + 2).unwrap_or(0);
-        let communication_below = self.communication_status.as_ref().is_some_and(|status| {
-            visible_width(&counts) + 3 + visible_width(status) + right_min > available
-        });
-        if !communication_below {
-            if let Some(status) = &self.communication_status { counts.push_str(&format!("   {status}")); }
-        }
         let open_hint = if self.is_selectable() {
             if self.focused {
                 format!(
@@ -388,6 +367,15 @@ impl Component for SubagentSummaryLine {
             }
         } else {
             String::new()
+        };
+        // The open hint shares the counts row, so it participates in the
+        // inline fit: an unfittable hint must never be ellipsized away.
+        let communication_below = self.communication_status.as_ref().is_some_and(|status| {
+            visible_width(&counts) + 3 + visible_width(status) + right_min
+                + visible_width(&open_hint) > available
+        });
+        if !communication_below {
+            if let Some(status) = &self.communication_status { counts.push_str(&format!("   {status}")); }
         };
         let gap = (inner - 2.0 - visible_width(&counts) as f64 - visible_width(&open_hint) as f64)
             .max(1.0);
@@ -440,13 +428,6 @@ impl Component for SubagentSummaryLine {
             if let Some(status) = &self.communication_status {
                 lines.push(self.render_status_row(status, inner as usize));
             }
-        }
-        // Keep configuration visible beside the delivery row, not only in the title.
-        if let Some(status) = &self.mode_status {
-            let status = [&status.full, &status.compact, &status.minimal].into_iter()
-                .find(|text| visible_width(text) <= inner as usize)
-                .map(String::as_str).unwrap_or("CFG /occ");
-            lines.push(self.render_status_row(status, inner as usize));
         }
         lines.push(theme().fg(
             "border",
@@ -596,19 +577,16 @@ mod tests {
         }
     }
 
+    /// The tray shows delivery lights only: no steady configuration row and
+    /// no mode labels in the title. Configuration lives in /occ panels.
     #[test]
-    fn mode_pair_survives_title_and_extra_row_boundaries_without_displacing_metrics() {
+    fn tray_never_renders_a_steady_configuration_row() {
         crate::modes::interactive::theme::theme::init_theme(Some("dark"), false);
         for width in 2..=200usize {
             for focused in [false, true] {
                 let mut line = SubagentSummaryLine::default();
                 line.set_always_visible(true);
                 line.set_focused(focused);
-                line.set_mode_status(Some(RightStatus {
-                    full: "CONFIG ● OCC3.1 hier  ! OCC3.2 blocked".into(),
-                    compact: "CFG OCC3.1 hier  OCC3.2 blocked".into(),
-                    minimal: "OCC3.1 hier  OCC3.2 blocked".into(),
-                }));
                 line.set_right_status(Some(RightStatus {
                     full: "Jev C+A · 12 req".into(), compact: "Jev 12r".into(), minimal: "Jev".into(),
                 }));
@@ -616,13 +594,9 @@ mod tests {
                 let rows = line.render(width as f64);
                 assert!(rows.iter().all(|row| visible_width(row) <= width), "{width}: {rows:?}");
                 let text = pi_tui::utils::strip_ansi(&rows.join("\n"));
-                if width >= 29 {
-                    let footer = pi_tui::utils::strip_ansi(&rows[rows.len() - 2]);
-                    assert!(footer.contains("OCC3.1 hier") && footer.contains("OCC3.2 blocked"),
-                        "{width}: missing bottom-row modes: {text}");
-                }
+                assert!(!text.contains("CONFIG") && !text.contains("CFG") && !text.contains("OCC3.1"),
+                    "{width}: configuration leaked into the tray: {text}");
                 if width >= 80 {
-                    assert!(rows[0].contains("CONFIG"), "{width}: {text}");
                     assert!(text.contains("STREAM TPS ~50.0  CTX HEALTH GREEN 100"), "{width}: {text}");
                 }
             }

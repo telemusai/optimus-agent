@@ -1,4 +1,6 @@
-//! Offline snapshot-to-render proof for steady modes versus receipt-backed pulses.
+//! Offline snapshot-to-render proof: the tray shows delivery lights only.
+//! Steady mode configuration (OCC3.1/OCC3.2 enablement) never renders in the
+//! bar; the OCC3.2 light blinks only on a completed native-use receipt.
 use super::*;
 use crate::core::agent_messages::{
     create_agent_session_message, stamp_occ3_delivery_record, AgentSessionMessageEndpoint,
@@ -45,7 +47,7 @@ fn roster() -> Arc<Roster> {
             active_session_id: Some(format!("active-{id}")),
             runtime_kind: Some(if id == "child" { "subagent" } else { "top-level" }.into()),
             parent_session_id: (id == "child").then(|| "parent".into()),
-            extra: [("communicationActivity".into(), json!({"generation":"g","deliveries":[]}))]
+            extra: [("communicationActivity".into(), json!({"generation":"g","deliveries":[]})) ]
                 .into_iter().collect(),
             ..Default::default()
         }).unwrap()
@@ -55,7 +57,7 @@ fn roster() -> Arc<Roster> {
 
 fn deliver(roster: &Roster, id: &str, marker: Option<&Occ3DeliveryDetails>) {
     let mut record = create_agent_session_message(&AgentSessionMessagePayload {
-        id: id.into(), message: "OCC3.1 complete; OCC3.2 latent_native completed".into(),
+        id: id.into(), message: "body claim only".into(),
         from: Some(AgentSessionMessageSender { session_id: Some("parent".into()), ..Default::default() }),
         target: AgentSessionMessageEndpoint { session_id: "child".into(), ..Default::default() },
         ..Default::default()
@@ -74,70 +76,52 @@ fn capture(name: &str, rows: &[String]) {
     }
 }
 
+/// Whatever the OCC3.1/OCC3.2 configuration is, the tray never shows it:
+/// no CONFIG row, no mode labels in the title, no extra rows. Configuration
+/// belongs to /occ panels; the tray owns delivery lights only.
 #[test]
-fn occ3_mode_bar_projects_all_modes_without_providers_or_activity() {
+fn occ3_mode_bar_never_renders_configuration() {
     for style in ["prime", "neon"] {
         let h = super::super::ui_tests::FrameHarness::new("mode-fixture");
         crate::modes::interactive::theme::theme::init_theme(Some(style), false);
         let mut bar = Bar::new(h.mode.clone());
+        *bar.roster.lock().unwrap() = Some(roster());
         {
             let mut jev = bar.jev.lock().unwrap();
-            jev.select("mode-fixture".into());
+            jev.select("parent".into());
             jev.status = Some(RightStatus {
                 full: "Jev C+A · 12 req · 1.2k in/45 out".into(),
                 compact: "Jev 12r".into(), minimal: "Jev".into(),
             });
         }
-        for (name, mode, textmas, latent) in [
-            ("absent", None, "unavailable", "unavailable"),
-            ("off", Some(modes(TextMasMode::Off, false, false, false)), "off", "off"),
-            ("disabled", Some(modes(TextMasMode::Off, false, true, true)), "off", "off"),
-            ("seq", Some(modes(TextMasMode::Sequential, false, false, false)), "seq", "off"),
-            ("hier-blocked", Some(modes(TextMasMode::Hierarchical, true, false, false)), "hier", "blocked"),
-            ("not-active", Some(modes(TextMasMode::Sequential, true, false, true)), "seq", "blocked"),
-            ("unavailable", Some(modes(TextMasMode::Sequential, true, true, false)), "seq", "blocked"),
-            ("on", Some(modes(TextMasMode::Sequential, true, true, true)), "seq", "on"),
+        for (name, mode) in [
+            ("absent", None),
+            ("off", Some(modes(TextMasMode::Off, false, false, false))),
+            ("seq", Some(modes(TextMasMode::Sequential, false, false, false))),
+            ("hier-blocked", Some(modes(TextMasMode::Hierarchical, true, false, false))),
+            ("on", Some(modes(TextMasMode::Sequential, true, true, true))),
         ] {
-            h.mode.borrow_mut().apply_connection_state_snapshot(snapshot("mode-fixture", mode));
+            h.mode.borrow_mut().apply_connection_state_snapshot(snapshot("parent", mode));
             for focused in [false, true] {
                 bar.line.set_focused(focused);
                 for width in [0, 1, 2, 8, 20, 30, 40, 80, 110, 160] {
                     let rows = bar.render(width as f64);
                     assert!(rows.iter().all(|row| visible_width(row) <= width), "{style}/{name}/{width}: {rows:?}");
                     let text = strip_ansi(&rows.join("\n"));
-                    if width >= 30 {
-                        let footer = strip_ansi(&rows[rows.len() - 2]);
-                        assert!(footer.contains("OCC3.1") && footer.contains("OCC3.2"),
-                            "{style}/{name}/{width}: missing bottom-row modes: {text}");
-                    }
-                    if width == 20 {
-                        assert!(text.contains("CFG /occ"), "{text}");
-                    }
+                    assert!(!text.contains("CONFIG") && !text.contains("CFG")
+                        && !text.contains("OCC3.1") && !text.contains("OCC3.2 on")
+                        && !text.contains("OCC3.2 off") && !text.contains("OCC3.2 blocked"),
+                        "{style}/{name}/{width}: configuration leaked into the tray: {text}");
                     if width >= 80 {
-                        assert!(text.contains("CONFIG"));
-                        assert!(text.contains(&format!("OCC3.1 {textmas}")), "{text}");
-                        assert!(text.contains(&format!("OCC3.2 {latent}")), "{text}");
+                        assert!(text.contains("OCC3.2"), "{style}/{name}/{width}: delivery light missing: {text}");
+                        assert!(text.contains("○ TXT  ○ OCC1  ○ OCC2  ○ OCC3.2"), "{style}/{name}/{width}: {text}");
                         assert!(text.contains("STREAM TPS —  CTX HEALTH GREEN 100"), "{text}");
-                        assert!(text.contains("Jev"), "{text}");
-                        assert_eq!(rows.len(), if width >= 160 { 4 } else { 5 },
-                            "configuration needs a bottom row even when the title fits");
-                        let footer = &rows[rows.len() - 2];
-                        assert!(footer.contains(&format!("OCC3.1 {textmas}")), "{style}/{width}: {footer}");
-                        assert!(footer.contains(&format!("OCC3.2 {latent}")), "{style}/{width}: {footer}");
-                        if textmas == "seq" || textmas == "hier" {
-                            assert!(footer.contains(&theme().fg("success", &format!("● OCC3.1 {textmas}"))));
-                        } else if textmas == "off" {
-                            assert!(footer.contains(&theme().fg("muted", "○ OCC3.1 off")));
-                        } else {
-                            assert!(footer.contains(&theme().fg("muted", "- OCC3.1 unavailable")));
-                        }
-                        if latent == "blocked" {
-                            assert!(footer.contains(&theme().fg("warning", "! OCC3.2 blocked")));
-                        }
-                        if !focused { capture(&format!("{style}-{name}-{width}"), &rows); }
+                        if width >= 110 { assert!(text.contains("Jev"), "{text}"); }
+                        let title = strip_ansi(&rows[0]);
+                        assert!(!title.contains("OCC3.1") && !title.contains("OCC3.2"),
+                            "{style}/{name}/{width}: title carries modes: {title}");
                     }
-                    assert!(bar.pulse_deadline.is_none(), "config is not an animation trigger");
-                    assert!(!bar.communication.indicators(Instant::now()).contains('●'));
+                    if !focused { capture(&format!("{style}-{name}-{width}"), &rows); }
                 }
             }
         }
@@ -145,25 +129,29 @@ fn occ3_mode_bar_projects_all_modes_without_providers_or_activity() {
 }
 
 #[test]
-fn occ3_mode_bar_refresh_and_session_change_never_keep_old_modes() {
+fn occ3_mode_bar_refresh_and_session_change_stay_configuration_free() {
     let h = super::super::ui_tests::FrameHarness::new("mode-refresh");
     let mut bar = Bar::new(h.mode.clone());
-    for (session, mode, expected) in [
-        ("old", Some(modes(TextMasMode::Sequential, true, true, true)), ["OCC3.1 seq", "OCC3.2 on"]),
-        ("old", Some(modes(TextMasMode::Hierarchical, true, false, false)), ["OCC3.1 hier", "OCC3.2 blocked"]),
-        ("old", None, ["OCC3.1 unavailable", "OCC3.2 unavailable"]),
-        ("new", Some(modes(TextMasMode::Off, false, false, false)), ["OCC3.1 off", "OCC3.2 off"]),
+    for (session, mode) in [
+        ("old", Some(modes(TextMasMode::Sequential, true, true, true))),
+        ("old", Some(modes(TextMasMode::Hierarchical, true, false, false))),
+        ("old", None),
+        ("new", Some(modes(TextMasMode::Off, false, false, false))),
     ] {
         h.mode.borrow_mut().apply_connection_state_snapshot(snapshot(session, mode));
         let rows = bar.render(110.0);
-        let text = strip_ansi(&rows[rows.len() - 2]);
-        assert!(expected.iter().all(|label| text.contains(label)), "bottom row: {text}");
+        let text = strip_ansi(&rows.join("\n"));
+        assert!(!text.contains("CONFIG") && !text.contains("OCC3.1"), "bottom row: {text}");
+        assert!(text.contains("OCC3.2"), "delivery light lost: {text}");
         assert!(bar.pulse_deadline.is_none());
     }
 }
 
+/// The OCC3.2 light blinks on a completed native-use receipt only: never on
+/// enablement, queueing, or a receipt-less native claim. Config states and
+/// queue badges never light the delivery slots.
 #[test]
-fn occ3_mode_bar_completed_receipt_is_independent_of_config_and_queue() {
+fn occ3_mode_bar_uses_delivery_pulses_only() {
     for (name, mode) in [
         ("old-daemon", None),
         ("off", Some(modes(TextMasMode::Off, false, false, false))),
@@ -195,7 +183,6 @@ fn occ3_mode_bar_completed_receipt_is_independent_of_config_and_queue() {
         let rendered = received.join("\n");
         assert!(rendered.contains("\x1b[1;38;5;39m● OCC3.2\x1b[22;39m"), "{rendered}");
         assert!(!strip_ansi(&rendered).contains("QUEUED"));
-        assert!(!bar.communication.indicators(Instant::now()).contains("OCC3.1"));
         let deadline = bar.pulse_deadline.unwrap();
         bar.render(160.0);
         assert_eq!(bar.pulse_deadline, Some(deadline), "same receipt must not extend its pulse");
@@ -218,20 +205,22 @@ fn occ3_mode_bar_body_claims_only_pulse_txt() {
     let rows = bar.render(160.0);
     let delivery = strip_ansi(&bar.communication.indicators(Instant::now()));
     assert_eq!(delivery, "● TXT  ○ OCC1  ○ OCC2  ○ OCC3.2");
-    assert!(strip_ansi(&rows.join("\n")).contains("OCC3.1 seq"));
-    assert!(strip_ansi(&rows.join("\n")).contains("OCC3.2 on"));
+    let text = strip_ansi(&rows.join("\n"));
+    assert!(!text.contains("OCC3.1"), "configuration leaked: {text}");
 }
 
 #[test]
-fn occ3_mode_bar_fullscreen_paint_preserves_modes_tps_context_and_draft() {
+fn occ3_mode_bar_fullscreen_paint_preserves_delivery_tps_context_and_draft() {
     for style in ["prime", "neon"] {
         let h = super::super::ui_tests::FrameHarness::new("mode-fullscreen");
         crate::modes::interactive::theme::theme::init_theme(Some(style), false);
-        h.mode.borrow_mut().apply_connection_state_snapshot(snapshot("mode-fullscreen", Some(
+        h.mode.borrow_mut().apply_connection_state_snapshot(snapshot("parent", Some(
             modes(TextMasMode::Sequential, true, false, false),
         )));
         h.editor.borrow_mut().editor_mut().set_text("preserve this draft");
-        let bar = Rc::new(RefCell::new(Bar::new(h.mode.clone())));
+        let mut plain_bar = Bar::new(h.mode.clone());
+        *plain_bar.roster.lock().unwrap() = Some(roster());
+        let bar = Rc::new(RefCell::new(plain_bar));
         h.transcript.borrow_mut().subagents = Some(bar);
         h.ui.borrow_mut().exit_fullscreen(pi_tui::tui::ExitFullscreenOptions {
             flush: false, leave_alt_screen: false,
@@ -245,17 +234,16 @@ fn occ3_mode_bar_fullscreen_paint_preserves_modes_tps_context_and_draft() {
                 let frame = h.paint();
                 assert!(frame.iter().all(|row| visible_width(row) <= width), "{style}/{width}/{height}: {frame:?}");
                 let text = frame.join("\n");
-                for label in ["OCC3.1 seq", "OCC3.2 blocked", "STREAM TPS", "CTX", "preserve this draft"] {
+                let plain = strip_ansi(&text);
+                assert!(!plain.contains("CONFIG") && !plain.contains("OCC3.1"),
+                    "{style}/{width}/{height}: configuration leaked: {plain}");
+                for label in ["STREAM TPS", "CTX", "preserve this draft"] {
                     assert!(text.contains(label), "{style}/{width}/{height} missing {label}: {text}");
                 }
                 if width >= 80 {
-                    assert!(text.contains("CONFIG") && text.contains("CTX HEALTH"), "{text}");
+                    assert!(text.contains("○ TXT  ○ OCC1  ○ OCC2  ○ OCC3.2"),
+                        "{style}/{width}/{height} missing delivery lights: {text}");
                 }
-                let delivery_row = frame.iter().rposition(|row| row.contains("STREAM TPS")).unwrap();
-                let config_row = frame.iter().rposition(|row| row.contains("OCC3.1 seq")).unwrap();
-                assert!(config_row > delivery_row,
-                    "{style}/{width}/{height}: OCC3.1 must be below delivery/metrics, not only in the title: {text}");
-                assert!(frame[config_row].contains("OCC3.2 blocked"));
                 capture(&format!("fullscreen-{style}-{width}-{height}"), &frame);
             }
         }
