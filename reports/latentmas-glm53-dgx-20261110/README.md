@@ -44,6 +44,50 @@ item-19 retry attempts are recorded in
 attempt, the v7 retry completed item 19 (correct) and the full native cohort
 is pinned-scorer verified at 17/19.
 
+## Results at a glance
+
+Correct items / scored items, as of 2026-11-11. The three HTTP conditions ran
+the full item sets. Native OCC-3 v7 ran only partial subsets of the first 20
+items, so its column is not comparable with the full-set columns.
+
+| Benchmark | Single-agent baseline | TextMAS sequential | TextMAS hierarchical | Native OCC-3 v7 (partial) |
+|---|---:|---:|---:|---:|
+| AIME 2024 | 11/30 | 16/30 | 18/30 | not run |
+| AIME 2025 | 10/30 | 11/30 | 13/30 | not run |
+| GSM8K | 280/300 | 277/300 | 286/300 | 17/19 |
+| GPQA-Diamond | 73/198 | 103/198 | 10/198 | not run |
+| MedQA | 174/300 | 268/300 | 109/300 | not run |
+| HumanEval+ | 142/164 | 143/164 | 149/164 | 8/9 (aggregate; verification pending) |
+| MBPP+ | 303/378 | 303/378 | 323/378 | 8/9 (aggregate; verification pending) |
+| ARC-Easy | 285/300 | 290/300 | 200/300 | 12/12 |
+| ARC-Challenge | 286/300 | 297/300 | 215/300 | 10/10 |
+
+Native OCC-3 v7 progress against the first 20 items of each task:
+
+| Benchmark | Planned | Scored | Correct | Not yet scored |
+|---|---:|---:|---:|---|
+| GSM8K | 20 | 19 | 17 | 1 (item 1) |
+| ARC-Easy | 20 | 12 | 12 | 8 (items 12-19) |
+| ARC-Challenge | 20 | 10 | 10 | 10 (items 10-19) |
+| HumanEval+ | 20 | 9 | 8 | 11 (indices not established) |
+| MBPP+ | 20 | 9 | 8 | 11 (indices not established) |
+| Total | 100 | 59 | - | 41 |
+
+- All 27 HTTP runs are complete. TextMAS makes four 4096-token calls per item
+  against one baseline call, so it is not budget matched.
+- Native OCC-3 v7 is the Optimus native-handoff track, not the upstream
+  `latent_mas` method, which was not run. Its execution contract and budgets
+  differ from the HTTP conditions, so it cannot establish a channel-only gain,
+  efficiency or speedup.
+- GSM8K native on the same 19 items: native 17, baseline 18, TextMAS
+  sequential 18 (exact McNemar p=1.0).
+- ARC-Easy 12/12 is arithmetic across disjoint score reports, not a combined
+  scorer run. The HumanEval+ and MBPP+ native counts are recovered historical
+  aggregates; full source validation and per-item coverage are pending.
+- The historical OCC-3 GSM8K run (13/14 adjudicated, items 0-13) is a separate
+  condition; see the GSM8K first-20 section.
+- Intervals and McNemar tests for each task are in the sections below.
+
 ## Setup
 
 This table describes the historical runs. The GPQA continuation records its

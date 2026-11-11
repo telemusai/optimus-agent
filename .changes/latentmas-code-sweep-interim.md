@@ -43,6 +43,8 @@
 - Added safe exclusion metadata for HumanEval+ item 9, MBPP+ item 9 attempts
   and ARC-Easy item 12. Failed attempts do not count as scored answers; the
   ARC-Easy item-12 provenance and cleanup safety audit remains incomplete.
+- Added a results-at-a-glance table for all nine benchmarks and a native
+  OCC-3 v7 progress table: 59 of 100 planned first-20 items scored.
 - Fixed stale NOT-RUN and sandbox prose to match completed HTTP conditions
   and the limited native evidence. Four-call TextMAS remains separate from
   the one-call baseline; execution budgets are not matched.
