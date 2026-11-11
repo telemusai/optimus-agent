@@ -453,7 +453,7 @@ def _log_poison(runtime, site, code, *, op="none", phase="none"):
             return
         sites = {"consensus", "preflight", "control", "private_kv_fence", "abort_fence", "bootstrap"}
         operations = {"health", "status", "publication_status", "enroll_session", "reserve_capture",
-                      "reserve_consume", "publish", "bind_output", "release_lease", "retire", "none"}
+                      "reserve_consume", "publish", "bind_output", "release_lease", "retire", "finish_consume", "none"}
         from .turn_diagnostics import _FAILURE_CODES
         logger.error("occ3-bridge: runtime poisoned (site=%s code=%s op=%s phase=%s)",
                      site if site in sites else "unknown", code if code in _FAILURE_CODES else "unknown",
@@ -730,7 +730,7 @@ class WorkerRuntime:
         old = self.commands.get(command_id)
         if old is not None:
             require(old[0] == fingerprint, "replay")
-            if op != "retire":
+            if op != "retire" and not (op == "finish_consume" and not old[1]["ok"]):
                 return old[1]
         require(op in ("health", "status", "publication_status") or old is not None
                 or len(self.commands) < self.profile.max_records * 16, "quota")
@@ -772,6 +772,16 @@ class WorkerRuntime:
                           else self.registry.get(payload["source_handle"], allow_retired=True))
                 require(record.descriptor.principal_digest == payload["principal_digest"], "identity")
                 result = record.snapshot()
+            elif op == "finish_consume":
+                require(set(payload) == {"attempt_id", "principal_digest"})
+                result = self.registry.finish_consume(payload["attempt_id"], payload["principal_digest"])
+                record = self.registry.source_for_attempt(payload["attempt_id"])
+                if record.retire_requested:
+                    # result owns a terminal snapshot; subsequent retirement
+                    # cannot invalidate the evidence returned to the frontend.
+                    _release_content_state(record)
+                    self.fence()
+                    self.registry.retire(handle=record.handle)
             elif op == "bind_output":
                 require(set(payload) == {"attempt_id", "principal_digest", "binding"})
                 record = self.registry.source_for_attempt(payload["attempt_id"])
@@ -792,6 +802,10 @@ class WorkerRuntime:
                     require(record.descriptor.principal_digest == payload["principal_digest"], "identity")
                     if "source_session_id" in payload:
                         require(record.descriptor.source_session_id == payload["source_session_id"], "identity")
+                    # Keep admitted-consumer state until its frontend proof
+                    # read, not merely until GPU work or terminal commit ends.
+                    require(not self.registry.defer_client_retire(record), "busy",
+                            detail="latent_registry.retire.consumer_pending")
                     _release_content_state(record)
                 elif handle is not None and self.registry.tombstone(handle) is not None:
                     # Pruned terminal record: same owner checks as a live one.
