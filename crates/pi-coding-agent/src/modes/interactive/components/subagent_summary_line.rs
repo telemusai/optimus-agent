@@ -198,7 +198,7 @@ impl SubagentSummaryLine {
         self.right_status = status;
     }
 
-    /// Steady mode configuration belongs in the title, separate from delivery pulses.
+    /// Steady mode configuration stays separate from delivery pulses.
     pub fn set_mode_status(&mut self, status: Option<RightStatus>) {
         self.mode_status = status;
     }
@@ -436,18 +436,17 @@ impl Component for SubagentSummaryLine {
             theme().fg("border", "\u{2502}"),
             theme().fg("border", "\u{2502}")
         ));
-        if mode_in_title.is_none() {
-            if let Some(status) = &self.mode_status {
-                let status = [&status.full, &status.compact, &status.minimal].into_iter()
-                    .find(|text| visible_width(text) <= inner as usize)
-                    .map(String::as_str).unwrap_or("CFG /occ");
-                lines.push(self.render_status_row(status, inner as usize));
-            }
-        }
         if communication_below {
             if let Some(status) = &self.communication_status {
                 lines.push(self.render_status_row(status, inner as usize));
             }
+        }
+        // Keep configuration visible beside the delivery row, not only in the title.
+        if let Some(status) = &self.mode_status {
+            let status = [&status.full, &status.compact, &status.minimal].into_iter()
+                .find(|text| visible_width(text) <= inner as usize)
+                .map(String::as_str).unwrap_or("CFG /occ");
+            lines.push(self.render_status_row(status, inner as usize));
         }
         lines.push(theme().fg(
             "border",
@@ -618,7 +617,9 @@ mod tests {
                 assert!(rows.iter().all(|row| visible_width(row) <= width), "{width}: {rows:?}");
                 let text = pi_tui::utils::strip_ansi(&rows.join("\n"));
                 if width >= 29 {
-                    assert!(text.contains("OCC3.1 hier") && text.contains("OCC3.2 blocked"), "{width}: {text}");
+                    let footer = pi_tui::utils::strip_ansi(&rows[rows.len() - 2]);
+                    assert!(footer.contains("OCC3.1 hier") && footer.contains("OCC3.2 blocked"),
+                        "{width}: missing bottom-row modes: {text}");
                 }
                 if width >= 80 {
                     assert!(rows[0].contains("CONFIG"), "{width}: {text}");

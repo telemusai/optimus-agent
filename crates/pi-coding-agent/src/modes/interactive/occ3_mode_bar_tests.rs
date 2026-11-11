@@ -77,8 +77,8 @@ fn capture(name: &str, rows: &[String]) {
 #[test]
 fn occ3_mode_bar_projects_all_modes_without_providers_or_activity() {
     for style in ["prime", "neon"] {
-        crate::modes::interactive::theme::theme::init_theme(Some(style), false);
         let h = super::super::ui_tests::FrameHarness::new("mode-fixture");
+        crate::modes::interactive::theme::theme::init_theme(Some(style), false);
         let mut bar = Bar::new(h.mode.clone());
         {
             let mut jev = bar.jev.lock().unwrap();
@@ -106,7 +106,9 @@ fn occ3_mode_bar_projects_all_modes_without_providers_or_activity() {
                     assert!(rows.iter().all(|row| visible_width(row) <= width), "{style}/{name}/{width}: {rows:?}");
                     let text = strip_ansi(&rows.join("\n"));
                     if width >= 30 {
-                        assert!(text.contains("OCC3.1") && text.contains("OCC3.2"), "{style}/{name}/{width}: {text}");
+                        let footer = strip_ansi(&rows[rows.len() - 2]);
+                        assert!(footer.contains("OCC3.1") && footer.contains("OCC3.2"),
+                            "{style}/{name}/{width}: missing bottom-row modes: {text}");
                     }
                     if width == 20 {
                         assert!(text.contains("CFG /occ"), "{text}");
@@ -117,13 +119,20 @@ fn occ3_mode_bar_projects_all_modes_without_providers_or_activity() {
                         assert!(text.contains(&format!("OCC3.2 {latent}")), "{text}");
                         assert!(text.contains("STREAM TPS —  CTX HEALTH GREEN 100"), "{text}");
                         assert!(text.contains("Jev"), "{text}");
-                        assert_eq!(rows.len(), if width >= 160 { 3 } else { 4 },
-                            "configuration reuses the title, not another normal-width row");
+                        assert_eq!(rows.len(), if width >= 160 { 4 } else { 5 },
+                            "configuration needs a bottom row even when the title fits");
+                        let footer = &rows[rows.len() - 2];
+                        assert!(footer.contains(&format!("OCC3.1 {textmas}")), "{style}/{width}: {footer}");
+                        assert!(footer.contains(&format!("OCC3.2 {latent}")), "{style}/{width}: {footer}");
                         if textmas == "seq" || textmas == "hier" {
-                            assert!(rows[0].contains(&theme().fg("success", &format!("● OCC3.1 {textmas}"))));
+                            assert!(footer.contains(&theme().fg("success", &format!("● OCC3.1 {textmas}"))));
+                        } else if textmas == "off" {
+                            assert!(footer.contains(&theme().fg("muted", "○ OCC3.1 off")));
+                        } else {
+                            assert!(footer.contains(&theme().fg("muted", "- OCC3.1 unavailable")));
                         }
                         if latent == "blocked" {
-                            assert!(rows[0].contains(&theme().fg("warning", "! OCC3.2 blocked")));
+                            assert!(footer.contains(&theme().fg("warning", "! OCC3.2 blocked")));
                         }
                         if !focused { capture(&format!("{style}-{name}-{width}"), &rows); }
                     }
@@ -146,8 +155,9 @@ fn occ3_mode_bar_refresh_and_session_change_never_keep_old_modes() {
         ("new", Some(modes(TextMasMode::Off, false, false, false)), ["OCC3.1 off", "OCC3.2 off"]),
     ] {
         h.mode.borrow_mut().apply_connection_state_snapshot(snapshot(session, mode));
-        let text = strip_ansi(&bar.render(110.0).join("\n"));
-        assert!(expected.iter().all(|label| text.contains(label)), "{text}");
+        let rows = bar.render(110.0);
+        let text = strip_ansi(&rows[rows.len() - 2]);
+        assert!(expected.iter().all(|label| text.contains(label)), "bottom row: {text}");
         assert!(bar.pulse_deadline.is_none());
     }
 }
@@ -227,17 +237,27 @@ fn occ3_mode_bar_fullscreen_paint_preserves_modes_tps_context_and_draft() {
             flush: false, leave_alt_screen: false,
         });
         super::super::native_settings::fullscreen(true, &h.mode, &h.editor, &h.ui, &h.transcript);
-        for width in [80, 110, 160] {
-            h.width.set(width);
-            h.height.set(32);
-            h.ui.borrow_mut().request_render_forced();
-            let frame = h.paint();
-            assert!(frame.iter().all(|row| visible_width(row) <= width), "{style}/{width}: {frame:?}");
-            let text = frame.join("\n");
-            for label in ["CONFIG", "OCC3.1 seq", "OCC3.2 blocked", "STREAM TPS", "CTX HEALTH", "preserve this draft"] {
-                assert!(text.contains(label), "{style}/{width} missing {label}: {text}");
+        for width in [40, 80, 110, 160] {
+            for height in [18, 24, 32] {
+                h.width.set(width);
+                h.height.set(height);
+                h.ui.borrow_mut().request_render_forced();
+                let frame = h.paint();
+                assert!(frame.iter().all(|row| visible_width(row) <= width), "{style}/{width}/{height}: {frame:?}");
+                let text = frame.join("\n");
+                for label in ["OCC3.1 seq", "OCC3.2 blocked", "STREAM TPS", "CTX", "preserve this draft"] {
+                    assert!(text.contains(label), "{style}/{width}/{height} missing {label}: {text}");
+                }
+                if width >= 80 {
+                    assert!(text.contains("CONFIG") && text.contains("CTX HEALTH"), "{text}");
+                }
+                let delivery_row = frame.iter().rposition(|row| row.contains("STREAM TPS")).unwrap();
+                let config_row = frame.iter().rposition(|row| row.contains("OCC3.1 seq")).unwrap();
+                assert!(config_row > delivery_row,
+                    "{style}/{width}/{height}: OCC3.1 must be below delivery/metrics, not only in the title: {text}");
+                assert!(frame[config_row].contains("OCC3.2 blocked"));
+                capture(&format!("fullscreen-{style}-{width}-{height}"), &frame);
             }
-            capture(&format!("fullscreen-{style}-{width}"), &frame);
         }
     }
 }

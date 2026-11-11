@@ -98,9 +98,12 @@ in the [agent-message guide](../skills/agent-message/SKILL.md) and
 
 ## Reading the lights
 
-The status bar has separate **OCC3.1** and **OCC3.2** labels. Their mode/enabled
-states are configuration, not a success claim. Latent enabled but not active is
-not equivalent to a working connector. The existing native delivery pulse still
+The bottom status row has separate **OCC3.1** and **OCC3.2** configuration lights,
+even with no subagents. OCC3.1 shows `off`, `seq` or `hier`; an enabled mode has a
+steady filled light. OCC3.2 shows `off`, `on` or `blocked`. These labels are also
+summarized in the agents-box header when space permits. Their mode/enabled states
+are configuration, not a success claim. Latent enabled but not active is not
+equivalent to a working connector. The existing native delivery pulse still
 requires a validated completed-use receipt. A model's text claiming a handoff,
 a selected mode, a visible tool or a queued request cannot produce that proof.
 
