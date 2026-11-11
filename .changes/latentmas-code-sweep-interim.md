@@ -25,10 +25,18 @@ Added:
     in-flight concurrency across conditions.
   - MedQA TextMAS hierarchical completing the 27/27 TextMAS matrix: 109/300
     (36.33%), McNemar vs baseline b=103, c=38, p=4.1e-08; the hierarchical
-    letter-choice collapse now spans GPQA, ARC-Easy, ARC-Challenge and MedQA.  - GSM8K native OCC-3 v7 cohort completed and pinned-scorer verified: 17/19
+    letter-choice collapse now spans GPQA, ARC-Easy, ARC-Challenge and MedQA.
+  - GSM8K native OCC-3 v7 cohort completed and pinned-scorer verified: 17/19
     eligible items correct (89.5%), exact McNemar p=1.0 vs the paired baseline
     on the same items; item 19 completed by the v7 retry after the 0.1.45
     daemon upgrade; safe rows, summary and per-cohort public score reports
     published. The interim 16/17 transcript-join figure is superseded by the
     pinned-scorer 15/17 batch number (item 2 is a documented formatting loss).
+  - Native OCC-3 v7 ARC-Easy and ARC-Challenge a-cohorts (items 0-9 each)
+    completed and pinned-scorer verified: 10/10 correct on both tasks, all
+    transport/cleanup/format gates valid; paired McNemar on items 0-9 vs
+    baseline and TextMAS sequential shows no discordant items (ARC-Challenge
+    sequential 9/10, b=0, c=1, p=1.0); TextMAS hierarchical trails at 6/10 and
+    7/10. Safe rows, summaries and public scorer reports published; b-cohorts
+    (items 10-19) outstanding.
 

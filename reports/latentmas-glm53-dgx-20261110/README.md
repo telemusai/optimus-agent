@@ -148,6 +148,20 @@ ARC-Easy hierarchical drops far below baseline (significant), consistent with
 the GPQA hierarchical result: the hierarchical prompt routing degrades
 letter-choice answering.
 
+The native OCC-3 v7 a-cohort (first 10 items of the paired first-20 projection,
+three serial batches on the 0.1.45 daemon after capture-race retries) completed
+10/10 items with transport, cleanup and format gates valid on every item; the
+pinned offline scorer (`score_native_arc_easy_v1.py`, `native_extract_arc.py`
+exact extractor) gives **10/10 correct**. Paired on items 0-9: baseline 10/10
+(McNemar b=0, c=0), TextMAS sequential 10/10 (b=0, c=0), TextMAS hierarchical
+6/10 (b=0, c=4, p=0.125). Mean item wall 171.6 s including setup (serial);
+~105.3k prompt + ~11.9k completion tokens per item (provider-reported sums over
+all role records). Safe rows and summary:
+`results/glm53_arc_easy_native_occ3_v7_safe.json` /
+`results/glm53_arc_easy_native_occ3_v7_summary.json`; public scorer report in
+`results/native_v7/score-public-arc_easy-a-cohort.json`. The b-cohort
+(items 10-19) is outstanding; n=10 intervals are wide (Wilson 95% CI 72.2-100%).
+
 ### ARC-Challenge (interim, 300 items)
 
 Same sweep and contract as ARC-Easy. ARC-Challenge sequential is the only
@@ -160,6 +174,17 @@ letter-choice hierarchical pattern.
 | ARC-Challenge | baseline | 286/300 | 95.3% | 92.3-97.2% | - | 0.0% | 405 | 3.0 s |
 | ARC-Challenge | TextMAS sequential | 297/300 | 99.0% | 97.1-99.7% | b=2, c=13, p=0.00739 | 4.3% | 4,065 | 36.1 s |
 | ARC-Challenge | TextMAS hierarchical | 215/300 | 71.7% | 66.3-76.5% | b=78, c=7, p=2.8e-16 | 0.0% | 1,081 | 18.8 s |
+
+The native OCC-3 v7 a-cohort (items 0-9 of the paired first-20 projection, two
+serial batches) likewise completed 10/10 items with all gates valid; the pinned
+offline scorer gives **10/10 correct**. Paired on items 0-9: baseline 10/10
+(McNemar b=0, c=0), TextMAS sequential 9/10 (b=0, c=1, p=1.0), TextMAS
+hierarchical 7/10 (b=0, c=3, p=0.25). Mean item wall 170.5 s including setup;
+~107.0k prompt + ~12.6k completion tokens per item. Safe rows and summary:
+`results/glm53_arc_challenge_native_occ3_v7_safe.json` /
+`results/glm53_arc_challenge_native_occ3_v7_summary.json`; public scorer report
+in `results/native_v7/score-public-arc_challenge-a-cohort.json`. B-cohort
+outstanding; n=10 intervals wide (72.2-100%).
 
 ### GSM8K (full 300-item run)
 
@@ -430,6 +455,11 @@ bindings, strict scoring, accounting and sanitized evidence.
 - Native OCC-3 GSM8K item 1 (setup failure in its original batch, never
   retried), and a completed rerun of items 0-13 on the PR #279 stack. The later
   item-0 smoke failed and remains separate from these denominators.
+- Native OCC-3 ARC-Easy and ARC-Challenge b-cohorts (items 10-19) - not run yet.
+- Native OCC-3 HumanEval+ items 0 (format-metadata failure) and 9 (capture race,
+  four consecutive batch failures, parked pending a fence fix); MBPP+ items
+  3-19 (item 3 retry in flight at publication). Correctness of the completed
+  code-task native items awaits the separate sandbox scoring join.
 - AIME and GPQA at a higher token cap.
 - Token accounting for the historical OCC-3 API rows. The native v7 cohort
   does carry provider-reported token sums per item (see the safe rows), but the
@@ -444,7 +474,9 @@ bindings, strict scoring, accounting and sanitized evidence.
 | `results/glm53_gsm8k_occ3_clean.jsonl` | OCC-3 rows: hop states, receipt ids, native/total hops, wall time, scoring notes |
 | `results/glm53_gsm8k_native_occ3_v7_safe.json` | Native OCC-3 v7 cohort: per-item correct/truncated/tokens/latency rows (19 eligible items), source sha pins |
 | `results/glm53_gsm8k_native_occ3_v7_summary.json` | Native OCC-3 v7 cohort summary: 17/19 (89.5%), CI, McNemar vs paired baseline, latency and token aggregates |
-| `results/native_v7/score-public-*.json` | Pinned-scorer public reports per native cohort (item 0, batch items 2-18, item 19 v7): counts, hashes, usage; no predictions |
+| `results/native_v7/score-public-*.json` | Pinned-scorer public reports per native cohort (item 0, batch items 2-18, item 19 v7, ARC-Easy a-cohort, ARC-Challenge a-cohort): counts, hashes, usage; no predictions |
+| `results/glm53_arc_easy_native_occ3_v7_safe.json` + `_summary.json` | Native OCC-3 v7 ARC-Easy a-cohort (items 0-9): 10/10 correct, paired McNemar vs baseline/TextMAS, latency and token aggregates |
+| `results/glm53_arc_challenge_native_occ3_v7_safe.json` + `_summary.json` | Native OCC-3 v7 ARC-Challenge a-cohort (items 0-9): 10/10 correct, paired McNemar vs baseline/TextMAS, latency and token aggregates |
 | `harness/runner.py`, `harness/bench_lib.py` | Resumable runner and OpenAI-compatible client adapter for the LatentMAS prompts |
 | `harness/occ3_lib.py`, `harness/occ3_v3_prompts.py` | Historical OCC-3 helpers/prompts, retained unchanged; not a validated team recipe |
 | `smoke-validation.md`, `server-smoke-excerpt.txt` | Post-update smoke failure and bounded server-log evidence |
