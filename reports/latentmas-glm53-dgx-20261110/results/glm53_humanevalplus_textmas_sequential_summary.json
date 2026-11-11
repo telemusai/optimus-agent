@@ -1,0 +1,22 @@
+{
+  "task": "humanevalplus",
+  "condition": "text_mas_sequential",
+  "n": 164,
+  "correct": 143,
+  "accuracy": 0.8719512195121951,
+  "ci_lo": 0.8121738693536251,
+  "ci_hi": 0.9147019468921684,
+  "mcnemar_b": 5,
+  "mcnemar_c": 6,
+  "mcnemar_p": 1.0,
+  "wall_s": 859.6,
+  "mean_latency_s": 51.23,
+  "median_latency_s": 49.085,
+  "p95_latency_s": 83.398,
+  "prompt_per_item": 5187.670731707317,
+  "completion_per_item": 6889.84756097561,
+  "reasoning_per_item": 4512.219512195122,
+  "truncation_rate": 0.2926829268292683,
+  "invalid_answer_rate": 0.08536585365853659,
+  "tasks_per_s": 0.1908
+}

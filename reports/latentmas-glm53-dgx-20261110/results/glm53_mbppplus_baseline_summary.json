@@ -1,0 +1,22 @@
+{
+  "task": "mbppplus",
+  "condition": "baseline",
+  "n": 378,
+  "correct": 303,
+  "accuracy": 0.8015873015873016,
+  "ci_lo": 0.7584368625582965,
+  "ci_hi": 0.838669372068837,
+  "mcnemar_b": null,
+  "mcnemar_c": null,
+  "mcnemar_p": null,
+  "wall_s": 426.4,
+  "mean_latency_s": 8.41,
+  "median_latency_s": 7.461,
+  "p95_latency_s": 19.53,
+  "prompt_per_item": 235.64021164021165,
+  "completion_per_item": 1161.989417989418,
+  "reasoning_per_item": 1017.7936507936508,
+  "truncation_rate": 0.08465608465608465,
+  "invalid_answer_rate": 0.08465608465608465,
+  "tasks_per_s": 0.8865
+}
