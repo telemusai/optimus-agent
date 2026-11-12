@@ -109,7 +109,7 @@
     {
       "path": "managers/scheduler.py",
       "before_sha256": "b61df5b750adc748a99ceb381b8494c199fb3f704d793da5a0217bd6bbb606c4",
-      "after_sha256": "de8bb8dfc9bd12e6a729619da380613669ba6fc17537836a3fbee7993549caae",
+      "after_sha256": "cd0aa2050c0f9aff2949f20841c4cced593aaa391400b225b482e2989eb8a5dc",
       "replacements": [
         {
           "before": "    OpenSessionReqInput,\n",
@@ -270,6 +270,26 @@
         {
           "before": "            self.token_to_kv_pool_allocator.clear()\n",
           "after": "            self.token_to_kv_pool_allocator.clear()\n            # The allocator reset reclaims every quarantined page.\n            self.occ3_quarantined_tokens = 0\n            self._occ3_quarantine_error_logged = False\n"
+        },
+        {
+          "before": "                    code = \"occ3_busy_batch\" if getattr(error, \"code\", None) == \"quota\" else \"occ3_admission_failed\"\n                    self._occ3_reject_received(recv_req, code)\n                    return\n",
+          "after": "                    code = \"occ3_busy_batch\" if getattr(error, \"code\", None) == \"quota\" else \"occ3_admission_failed\"\n                    from occ3_sglang.latent_worker import capture_hold_park\n\n                    # A capture declined only for in-flight work is parked\n                    # as a reservation: nothing was mutated and nothing is\n                    # sent until the reservation resolves.\n                    if capture_hold_park(self, recv_req, error):\n                        return\n                    self._occ3_reject_received(recv_req, code)\n                    return\n"
+        },
+        {
+          "before": "            return (None, True) if running else (pending[0].rid, False)\n        return None, False\n",
+          "after": "            return (None, True) if running else (pending[0].rid, False)\n        # A parked capture reservation holds new ordinary prefills; running\n        # rows keep decoding and OCC-3 rows keep the rules above.\n        return None, getattr(self, \"occ3_capture_hold\", None) is not None\n"
+        },
+        {
+          "before": "            if now >= deadline:\n                aborts.append(AbortReq(rid=req.rid, abort_message=\"occ3_admission_timeout\"))\n\n",
+          "after": "            if now >= deadline:\n                aborts.append(AbortReq(rid=req.rid, abort_message=\"occ3_admission_timeout\"))\n        # Only this rank reads a clock for a parked capture reservation. The\n        # signal resolves it on every rank in the same iteration, as soon as\n        # the in-flight rows are gone or the drain window is over.\n        occ3_hold = getattr(self, \"occ3_capture_hold\", None)\n        if occ3_hold is not None and (\n            now >= occ3_hold.due_at or all(r.finished() for r in running)\n        ):\n            aborts.append(AbortReq(rid=occ3_hold.rid, abort_message=occ3_hold.signal))\n\n"
+        },
+        {
+          "before": "    def abort_request(self, recv_req: AbortReq):\n        self._occ3_abort_attached(recv_req)\n",
+          "after": "    def abort_request(self, recv_req: AbortReq):\n        occ3_message = getattr(recv_req, \"abort_message\", None)\n        if getattr(self, \"occ3_capture_hold\", None) is not None or (\n            isinstance(occ3_message, str) and occ3_message.startswith(\"occ3_capture_hold_\")\n        ):\n            from occ3_sglang.latent_worker import capture_hold_abort\n\n            # The resolve signal of a capture reservation is not an abort.\n            if capture_hold_abort(self, recv_req):\n                return\n        self._occ3_abort_attached(recv_req)\n"
+        },
+        {
+          "before": "    def _pause_engine(self) -> Tuple[List[Req], int]:\n        raise NotImplementedError()\n",
+          "after": "    def _occ3_capture_hold_retract(self) -> List[Req]:\n        \"\"\"Retract every in-flight row through the stock pause path and put\n        the retracted rows at the queue front. The caller has checked that\n        each row is a plain row and that the queue has room.\"\"\"\n        rows = set(self.collect_inflight_reqs())\n        if self.chunked_req is not None:\n            rows.add(self.chunked_req)\n        self.pause_generation(PauseGenerationReqInput(mode=\"retract\"))\n        self.continue_generation(ContinueGenerationReqInput(torch_empty_cache=False))\n        moved = [r for r in self.waiting_queue if r in rows]\n        self.waiting_queue[:] = moved + [r for r in self.waiting_queue if r not in rows]\n        return moved\n\n    def _pause_engine(self) -> Tuple[List[Req], int]:\n        raise NotImplementedError()\n"
         }
       ]
     },

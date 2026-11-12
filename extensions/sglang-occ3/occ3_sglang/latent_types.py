@@ -670,3 +670,73 @@ def validate_control_payload(value, *, result=False):
     require(type(value["result"]) is dict and type(value["error"]) is str)
     require((value["ok"] and not value["error"]) or (not value["ok"] and not value["result"]))
     return value
+
+
+# Capture reservation knobs. The frontend installer and the scheduler ranks read
+# the same per-boot environment. A ValueError carries the fixed decline code.
+# The ranks compare their values before a capture is parked; a difference only
+# declines. No capture is parked when a queue limit (max_queued_requests), a
+# request timeout sweep (SGLANG_REQ_WAITING_TIMEOUT, SGLANG_REQ_RUNNING_TIMEOUT)
+# or receive skipping (scheduler_recv_interval above 1) is configured: a held
+# request could be rejected or expire there, and a skipped receive drops the
+# signal that ends the hold. That capture gets the busy decline at once and the
+# frontend sends it again.
+CAPTURE_BUSY_WAIT_MAX_SECONDS = 10.0
+CAPTURE_BUSY_WAIT_DEFAULT_SECONDS = 10.0
+CAPTURE_DRAIN_DEFAULT_SECONDS = 2.0
+CAPTURE_PREEMPT_MODES = ("off", "retract")
+CAPTURE_PREEMPT_DEFAULT = "off"
+
+
+def _knob_seconds(raw, high, code):
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        raise ValueError(code) from None
+    if not (math.isfinite(value) and 0.0 <= value <= high):
+        raise ValueError(code)
+    return value
+
+
+def capture_busy_wait_seconds(raw):
+    """OCC3_CAPTURE_BUSY_WAIT_SECONDS. 0 disables the busy waits and the reservation."""
+    if raw is None:
+        return CAPTURE_BUSY_WAIT_DEFAULT_SECONDS
+    return _knob_seconds(raw, CAPTURE_BUSY_WAIT_MAX_SECONDS, "capture_busy_wait_seconds_invalid")
+
+
+def capture_drain_seconds(raw, window):
+    """OCC3_CAPTURE_DRAIN_SECONDS: the time one parked capture gives running
+    requests to finish while new ordinary prefills wait. The scheduler ends the
+    hold in its next iteration after that time. Never longer than the busy
+    window."""
+    if raw is None:
+        return min(CAPTURE_DRAIN_DEFAULT_SECONDS, window)
+    return _knob_seconds(raw, window, "capture_drain_seconds_invalid")
+
+
+def capture_preempt_mode(raw):
+    """OCC3_CAPTURE_PREEMPT: "off" (drain only) or "retract" (operator opt-in:
+    plain rows still running after the drain are retracted and resume later. A
+    session row, or a row that cannot resume from the same output position, is
+    never retracted; the capture is then declined as with "off")."""
+    if raw is None:
+        return CAPTURE_PREEMPT_DEFAULT
+    if raw not in CAPTURE_PREEMPT_MODES:
+        raise ValueError("capture_preempt_invalid")
+    return raw
+
+
+@dataclass(frozen=True)
+class CaptureHoldSettings:
+    window: float
+    drain: float
+    preempt: str
+
+
+def capture_hold_settings(environ=None):
+    environ = os.environ if environ is None else environ
+    window = capture_busy_wait_seconds(environ.get("OCC3_CAPTURE_BUSY_WAIT_SECONDS"))
+    return CaptureHoldSettings(
+        window, capture_drain_seconds(environ.get("OCC3_CAPTURE_DRAIN_SECONDS"), window),
+        capture_preempt_mode(environ.get("OCC3_CAPTURE_PREEMPT")))

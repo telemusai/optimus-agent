@@ -8,7 +8,7 @@ import time
 import uuid
 from dataclasses import asdict
 
-from .attachment_contract import (AttachmentError, BackendReadiness, CaptureWorkerDescriptor,
+from .attachment_contract import (ActiveSlotBusy, AttachmentError, BackendReadiness, CaptureWorkerDescriptor,
                                   ConsumeWorkerDescriptor, Reservation, SourceEnrollment,
                                   SPAN_POLICIES_V2, digest)
 from .span_policy import resolve_runtime_markers
@@ -387,8 +387,12 @@ class LatentBackend:
             # exist, so this is the same retryable contract as the
             # scheduler busy-batch refusal: a distinct 503 with Retry-After
             # instead of a terminal 409 that strands the sender. The local
-            # entry is marked retired so it is pruned.
+            # entry is marked retired so it is pruned. Only "busy" (the
+            # active slot, latent_registry.reserve_capture) clears by waiting
+            # and is typed so the frontend may re-enroll; quota stays generic.
             self.attempts[attempt_id]["retired"] = True
+            if error.code == "busy":
+                raise ActiveSlotBusy() from None
             raise AttachmentError("scheduler_busy", 503) from None
         return enrollment
 

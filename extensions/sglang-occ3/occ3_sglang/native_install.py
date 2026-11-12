@@ -61,6 +61,48 @@ def _max_turn_seconds_from_env():
     return value
 
 
+_CAPTURE_KNOB_CODES = frozenset({
+    "capture_busy_wait_seconds_invalid", "capture_drain_seconds_invalid", "capture_preempt_invalid"})
+
+
+def _capture_hold_settings_from_env():
+    """Read the per-boot source-capture busy-wait knobs. Trusted bootstrap only.
+
+    Parsed by latent_types.capture_hold_settings, the reader the scheduler
+    ranks use, so the frontend accounts for the reservation the ranks apply.
+    - OCC3_CAPTURE_BUSY_WAIT_SECONDS: absent -> 10 s; range [0, 10], the window
+      the client resend headroom covers. 0 disables both capture busy waits
+      and the scheduler capture reservation.
+    - OCC3_CAPTURE_DRAIN_SECONDS: absent -> 2 s, capped by the window; range
+      [0, window]. Time a parked capture gives running ordinary requests to
+      finish before it is admitted or declined.
+    - OCC3_CAPTURE_PREEMPT: absent -> "off", an expired drain declines.
+      "retract" is an operator opt-in: plain rows that still run after the
+      drain are retracted and resume after the capture turn. A session row,
+      or a row that cannot resume from the same output position, is never
+      retracted; the capture is then declined as with "off".
+    The scheduler does not use the reservation when a queue limit
+    (max_queued_requests), a request timeout sweep
+    (SGLANG_REQ_WAITING_TIMEOUT or SGLANG_REQ_RUNNING_TIMEOUT) or receive
+    skipping (scheduler_recv_interval above 1) is configured.
+    Such a capture gets the busy refusal at once and the busy wait sends the
+    same request again.
+    An unparseable or out-of-range value -> InstallationError with the fixed
+    code of that knob, so a mistyped value never serves a default. The knobs
+    are read for every installation. An explicit buffer profile must state
+    the same window and drain, or the installation is refused with
+    capture_profile_mismatch.
+    """
+    from .latent_types import capture_hold_settings
+    try:
+        return capture_hold_settings()
+    except ValueError as error:
+        code = str(error)
+        if code not in _CAPTURE_KNOB_CODES:
+            raise
+        raise InstallationError(code) from None
+
+
 @dataclass(repr=False)
 class _BrokerGate:
     authority: object
@@ -971,12 +1013,28 @@ async def install_native_runtime(app, tokenizer_manager, *, experimental_opt_in=
             raise InstallationError("control_client_occupied")
         _check_route_conflicts(app)
         from .chat_adapter import BufferProfile
-        # Only the default profile takes the per-boot turn window; a trusted
-        # caller's explicit profile passes through untouched.
-        profile = (BufferProfile(max_turn_seconds=_max_turn_seconds_from_env())
-                   if buffer_profile is None else buffer_profile)
+        # Only the default profile takes the per-boot turn window and capture
+        # busy-wait knobs; a trusted caller's explicit profile passes through
+        # untouched. The scheduler ranks apply the capture knobs of the
+        # environment in both cases, so the knobs are always validated here.
+        # The preempt mode is only validated; only the ranks use it.
+        if buffer_profile is None:
+            max_turn = _max_turn_seconds_from_env()
+            hold = _capture_hold_settings_from_env()
+            profile = BufferProfile(max_turn_seconds=max_turn,
+                                    capture_busy_wait_seconds=hold.window,
+                                    capture_drain_seconds=hold.drain)
+        else:
+            hold = _capture_hold_settings_from_env()
+            profile = buffer_profile
         if type(profile) is not BufferProfile or profile.max_buffer_bytes > 4194304:
             raise InstallationError("unsupported_buffer_profile")
+        # An explicit profile must state the window and drain the ranks apply.
+        # A frontend with a shorter drain would time out a parked capture, and
+        # a 0 window would not disable the scheduler reservation.
+        if ((profile.capture_busy_wait_seconds, profile.capture_drain_seconds)
+                != (hold.window, hold.drain)):
+            raise InstallationError("capture_profile_mismatch")
         snapshot = _snapshot_precommit(app, tokenizer_manager, key)
         components = await _construct_components(app, tokenizer_manager, key, profile)
         startup_state.mark_backend_constructed()

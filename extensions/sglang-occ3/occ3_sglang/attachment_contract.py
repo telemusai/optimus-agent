@@ -56,6 +56,17 @@ class AttachmentError(ValueError):
         super().__init__(self.code)
 
 
+class ActiveSlotBusy(AttachmentError):
+    """scheduler_busy 503 for the registry active-slot decline only.
+
+    Raised before any registry mutation; unlike capacity quota it clears once
+    another OCC-3 turn releases its slot, so the frontend may wait for it.
+    """
+
+    def __init__(self):
+        super().__init__("scheduler_busy", 503)
+
+
 def identifier(value: Any) -> str:
     if not isinstance(value, str) or not _IDENTIFIER.fullmatch(value):
         raise AttachmentError("invalid_attachment", 400)

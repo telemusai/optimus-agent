@@ -334,6 +334,35 @@ def test_not_selected_prepare_stays_disabled_with_code(machine, monkeypatch):
     assert current.stage == "prepare" and current.experimental_selected is False
 
 
+@pytest.mark.parametrize("code", ["capture_busy_wait_seconds_invalid", "capture_drain_seconds_invalid",
+                                  "capture_preempt_invalid", "capture_profile_mismatch",
+                                  "max_turn_seconds_invalid"])
+def test_window_knob_decline_codes_are_surfaced(machine, code):
+    machine.record_declined(code, stage="install", attempt="0123abcd", rollback_completed=True)
+    current = machine.current()
+    assert current.state.value == "DECLINED" and current.code == code and current.stage == "install"
+
+
+async def test_explicit_profile_mismatch_status_shows_the_fixed_code(phase, monkeypatch):
+    """The real installer refuses an explicit default profile (drain 0) in a
+    default environment (drain 2), and the status route shows the code."""
+    from occ3_sglang.chat_adapter import BufferProfile
+    for name in ("OCC3_CAPTURE_BUSY_WAIT_SECONDS", "OCC3_CAPTURE_DRAIN_SECONDS", "OCC3_CAPTURE_PREEMPT"):
+        monkeypatch.delenv(name, raising=False)
+    f = phase
+    receipt = await install.install_native_runtime(f.app, f.tm, experimental_opt_in=True,
+                                                   buffer_profile=BufferProfile())
+    assert not receipt.installed and receipt.code == "capture_profile_mismatch"
+    async with AsyncClient(transport=ASGITransport(app=f.app), base_url="http://fixture") as client:
+        payload = (await client.get("/occ3/v1/status", headers=AUTH)).json()
+        assert set(payload) == STATUS_KEYS
+        assert payload["state"] == "DECLINED" and payload["code"] == "capture_profile_mismatch"
+        assert payload["stage"] == "install" and payload["preflight_reached"] is True
+        assert payload["backend_constructed"] is False and payload["rollback_completed"] is True
+        caps = (await client.get("/occ3/v1/capabilities", headers=AUTH)).json()
+        assert caps["supported"] is False and caps["native"]["installed"] is False
+
+
 async def test_cancelled_installer_supersedes_to_native_startup_aborted(serve_flow, machine, monkeypatch):
     f = serve_flow
 

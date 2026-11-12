@@ -170,6 +170,7 @@ class TestScheduler(PinnedCase):
             calls.append("all-rank-admission")
             raise RuntimeError("one rank missing")
         worker.admit_request = incomplete
+        worker.capture_hold_park = lambda *args: False
         fn = self.sources.function("managers/scheduler.py", "handle_generate_request", "Scheduler",
             get_disagg=lambda: NS(disaggregation_bootstrap_port=1234),
             BeamCoordinator=NS(request_beam_width=lambda req: 1), Req=lambda *a, **kw: NS(), array=array)
@@ -188,6 +189,7 @@ class TestScheduler(PinnedCase):
     def test_busy_admission_decline_keeps_its_own_retryable_code(self):
         import ast as _ast
         worker = types.ModuleType("occ3_sglang.latent_worker")
+        worker.capture_hold_park = lambda *args: False
         codes = []
 
         class QuotaDecline(RuntimeError):
@@ -230,6 +232,46 @@ class TestScheduler(PinnedCase):
         # request may wait at most this long before the queue-bound sweep.
         self.assertIn("min(occ3_descriptor.deadline, time.monotonic() + 5.0)",
                       self.sources.text["managers/scheduler.py"])
+
+    def test_parked_capture_returns_before_any_refusal_or_queue_entry(self):
+        import ast as _ast
+        worker = types.ModuleType("occ3_sglang.latent_worker")
+        calls, verdict = [], [True]
+
+        class QuotaDecline(RuntimeError):
+            code = "quota"
+
+        error = QuotaDecline("rank-uniform busy decline")
+
+        def busy(*args):
+            raise error
+
+        def park(scheduler, recv_req, raised):
+            calls.append(("park", scheduler is state, recv_req is req, raised is error))
+            return verdict[0]
+
+        worker.admit_request, worker.capture_hold_park = busy, park
+        fn = self.sources.function("managers/scheduler.py", "handle_generate_request", "Scheduler",
+            get_disagg=lambda: NS(disaggregation_bootstrap_port=1234),
+            BeamCoordinator=NS(request_beam_width=lambda req: 1), Req=lambda *a, **kw: NS(), array=array)
+        node = self.sources.node("managers/scheduler.py", "handle_generate_request", "Scheduler")
+        names = {n.attr for n in _ast.walk(node) if isinstance(n, _ast.Attribute)
+                 and isinstance(n.value, _ast.Name) and n.value.id == "recv_req"}
+        req = NS(**{name: None for name in names})
+        req.occ3_worker_descriptor = descriptor(); req.rid = "native-rid"
+        state = NS(_occ3_validate_received=lambda r: descriptor(), enable_session_radix_cache=False,
+                   metrics_reporter=NS(enable_metrics=False), tokenizer=object(),
+                   model_config=NS(hf_eos_token_id=[2], vocab_size=100),
+                   disaggregation_mode="none", dllm_config=None,
+                   _occ3_reject_received=lambda r, code=None: calls.append(("reject", r is req, code)),
+                   _add_request_to_queue=lambda *a, **kw: calls.append("queued"))
+        with patch.dict("sys.modules", {worker.__name__: worker}): fn(state, req)
+        # Parked: the raw request is kept by the worker and nothing is sent.
+        self.assertEqual(calls, [("park", True, True, True)])
+        verdict[0] = False
+        calls.clear()
+        with patch.dict("sys.modules", {worker.__name__: worker}): fn(state, req)
+        self.assertEqual(calls, [("park", True, True, True), ("reject", True, "occ3_busy_batch")])
 
     def test_abort_reason_threads_the_sweep_code_and_keeps_user_cancels(self):
         matches = self.sources.function("managers/scheduler.py", "_occ3_abort_matches", "Scheduler")
