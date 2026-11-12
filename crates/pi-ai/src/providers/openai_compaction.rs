@@ -36,6 +36,15 @@ impl CompactionRequestError {
 			retry_after_ms,
 		}
 	}
+
+	pub(crate) fn transport(message: impl Into<String>) -> Self {
+		Self {
+			message: message.into(),
+			name: "TypeError",
+			status: 0,
+			retry_after_ms: None,
+		}
+	}
 }
 
 impl std::fmt::Display for CompactionRequestError {
@@ -238,7 +247,7 @@ pub async fn request_openai_compaction(
 		},
 		None => send.await,
 	};
-	let response = response.map_err(|error| CompactionRequestError::new(error.to_string(), 0, None))?;
+	let response = response.map_err(|error| CompactionRequestError::transport(error.to_string()))?;
 
 	if let Some(on_response) = options.and_then(|options| options.simple.stream.on_response.clone()) {
 		on_response(
@@ -292,11 +301,23 @@ pub async fn request_openai_compaction(
 		}
 
 		let payload: Value = match decode {
-			Some(decode) => decode(response).await?,
-			None => response
-				.json::<Value>()
-				.await
-				.map_err(|error| CompactionRequestError::new(error.to_string(), 0, None))?,
+			Some(decode) => match decode(response).await {
+				Ok(payload) => payload,
+				Err(mut error) => {
+					if error.retry_after_ms.is_none() {
+						error.retry_after_ms = retry_after_ms;
+					}
+					return Err(error);
+				}
+			},
+			None => {
+				let body = response
+					.bytes()
+					.await
+					.map_err(|error| CompactionRequestError::transport(error.to_string()))?;
+				serde_json::from_slice(&body)
+					.map_err(|error| CompactionRequestError::new(error.to_string(), 0, None))?
+			}
 		};
 		Ok(Some(payload))
 	};
@@ -471,6 +492,7 @@ mod tests {
 	use super::*;
 	use crate::types::{InputModality, ModelCost, NativeCompactionCapability};
 	use crate::utils::hash::short_hash;
+	use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 	fn model() -> Model {
 		Model {
@@ -647,6 +669,58 @@ mod tests {
 		)
 		.await;
 		assert!(result.is_err());
+	}
+
+	async fn response_server(response: Vec<u8>) -> (String, tokio::task::JoinHandle<()>) {
+		let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+		let address = listener.local_addr().unwrap();
+		let server = tokio::spawn(async move {
+			let (mut socket, _) = listener.accept().await.unwrap();
+			let mut request = [0u8; 4096];
+			socket.read(&mut request).await.unwrap();
+			socket.write_all(&response).await.unwrap();
+		});
+		(format!("http://{address}/responses/compact"), server)
+	}
+
+	#[tokio::test]
+	async fn body_transport_and_malformed_json_have_distinct_error_classes() {
+		for (body, expected_name) in [
+			(
+				b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 1000\r\nConnection: close\r\n\r\n{\"output\":[]".as_slice(),
+				"TypeError",
+			),
+			(
+				b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 8\r\nConnection: close\r\n\r\nnot-json".as_slice(),
+				"CompactionRequestError",
+			),
+		] {
+			let (url, server) = response_server(body.to_vec()).await;
+			let error = request_openai_compaction(&model(), &url, &IndexMap::new(), Map::new(), None, None)
+				.await
+				.unwrap_err();
+			server.await.unwrap();
+			assert_eq!(error.name, expected_name);
+			assert_eq!(error.status, 0);
+		}
+	}
+
+	#[tokio::test]
+	async fn decoder_retry_after_uses_header_only_when_decoder_has_no_value() {
+		for (decoder_retry, expected) in [(None, 1250.0), (Some(25.0), 25.0)] {
+			let response = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nRetry-After-Ms: 1250\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}".to_vec();
+			let (url, server) = response_server(response).await;
+			let decode: CompactionDecode = Arc::new(move |_response| {
+				Box::pin(async move { Err(CompactionRequestError::new("decoder failed", 418, decoder_retry)) })
+			});
+			let error = request_openai_compaction(&model(), &url, &IndexMap::new(), Map::new(), None, Some(decode))
+				.await
+				.unwrap_err();
+			server.await.unwrap();
+			assert_eq!(error.status, 418);
+			assert_eq!(error.retry_after_ms, Some(expected));
+			assert_eq!(error.message, "decoder failed");
+		}
 	}
 
 	#[test]

@@ -540,12 +540,25 @@ pub async fn compact_openai_codex_responses(
         .unwrap_or(None)
 }
 
-/// [`compact_openai_codex_responses`] with the TypeScript `throw` turned into `Err`.
-pub async fn try_compact_openai_codex_responses(
+fn codex_compaction_request_error(error: CodexThrown) -> CompactionRequestError {
+    if error.name == "Error" {
+        let mut result = CompactionRequestError::transport(error.message);
+        result.retry_after_ms = error.retry_after_ms;
+        result
+    } else {
+        CompactionRequestError::new(
+            error.message,
+            error.status.unwrap_or(0),
+            error.retry_after_ms,
+        )
+    }
+}
+
+pub(crate) async fn try_compact_openai_codex_responses_typed(
     model: &Model,
     context: &Context,
     options: Option<&CompactionOptions>,
-) -> Result<Option<ProviderCompactionResult>, String> {
+) -> Result<Option<ProviderCompactionResult>, CompactionRequestError> {
     if !supports_openai_compaction(model) {
         return Ok(None);
     }
@@ -553,12 +566,17 @@ pub async fn try_compact_openai_codex_responses(
         .and_then(|options| options.simple.stream.api_key.clone())
         .or_else(|| get_env_api_key(&model.provider));
     let Some(api_key) = api_key else {
-        return Err(format!("No API key for provider: {}", model.provider));
+        return Err(CompactionRequestError::new(
+            format!("No API key for provider: {}", model.provider),
+            0,
+            None,
+        ));
     };
     let headers = build_sse_headers(
         model.headers.as_ref(),
         options.and_then(|options| options.simple.stream.headers.as_ref()),
-        &extract_account_id(&api_key).map_err(|error| error.message)?,
+        &extract_account_id(&api_key)
+            .map_err(|error| CompactionRequestError::new(error.message, 0, None))?,
         &api_key,
         options.and_then(|options| options.simple.stream.session_id.as_deref()),
     );
@@ -591,7 +609,8 @@ pub async fn try_compact_openai_codex_responses(
         text_verbosity: None,
         on_output_item_done: None,
     };
-    let body = build_request_body(model, &compaction_context, Some(&typed))?;
+    let body = build_request_body(model, &compaction_context, Some(&typed))
+        .map_err(|error| CompactionRequestError::new(error, 0, None))?;
     let input: Vec<Value> = body
         .get("input")
         .and_then(Value::as_array)
@@ -618,9 +637,7 @@ pub async fn try_compact_openai_codex_responses(
                 while let Some(event) = events.next().await {
                     let event = match event {
                         Ok(event) => event,
-                        Err(error) => {
-                            return Err(CompactionRequestError::new(error.message, 0, None));
-                        }
+                        Err(error) => return Err(codex_compaction_request_error(error)),
                     };
                     let event_type = event.get("type").and_then(Value::as_str).unwrap_or_default().to_string();
                     observe_event(&observation_options, &event);
@@ -722,8 +739,7 @@ pub async fn try_compact_openai_codex_responses(
         options,
         Some(decode),
     )
-    .await
-    .map_err(|error| error.message)?;
+    .await?;
     let mut result = result;
     if let Some(result) = result.as_mut() {
         if let Some(usage) = result.usage.as_mut() {
@@ -734,6 +750,17 @@ pub async fn try_compact_openai_codex_responses(
         }
     }
     Ok(result)
+}
+
+/// [`compact_openai_codex_responses`] with the TypeScript `throw` turned into `Err`.
+pub async fn try_compact_openai_codex_responses(
+    model: &Model,
+    context: &Context,
+    options: Option<&CompactionOptions>,
+) -> Result<Option<ProviderCompactionResult>, String> {
+    try_compact_openai_codex_responses_typed(model, context, options)
+        .await
+        .map_err(|error| error.message)
 }
 
 // ---------------------------------------------------------------------------
@@ -2899,6 +2926,47 @@ mod tests {
         assert!(events.next().await.unwrap().is_err());
         assert!(events.next().await.is_none());
         server.await.unwrap();
+    }
+
+    #[test]
+    fn codex_compaction_distinguishes_transport_from_protocol_errors() {
+        let transport = codex_compaction_request_error(CodexThrown::error("connection reset"));
+        assert_eq!(transport.name, "TypeError");
+        let protocol = codex_compaction_request_error(CodexThrown::protocol_error("bad frame", None));
+        assert_eq!(protocol.name, "CompactionRequestError");
+        let rate_limit = codex_compaction_request_error(CodexThrown::api_error(
+            "limited", None, Some(429), Some(25.0), None,
+        ));
+        assert_eq!(rate_limit.name, "CompactionRequestError");
+        assert_eq!(rate_limit.status, 429);
+        assert_eq!(rate_limit.retry_after_ms, Some(25.0));
+    }
+
+    #[tokio::test]
+    async fn codex_compaction_decoder_error_inherits_retry_after_without_sleeping() {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 4096];
+            socket.read(&mut request).await.unwrap();
+            let frame = "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"rate_limit_exceeded\"}}}\n\n";
+            socket.write_all(format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nRetry-After-Ms: 1250\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                frame.len(), frame,
+            ).as_bytes()).await.unwrap();
+        });
+        let mut model = model();
+        model.base_url = format!("http://{address}");
+        let mut options = CompactionOptions::default();
+        options.simple.stream.api_key = Some(token("retry-after-test"));
+        let error = try_compact_openai_codex_responses_typed(&model, &context(), Some(&options))
+            .await
+            .unwrap_err();
+        server.await.unwrap();
+        assert_eq!(error.status, 429);
+        assert_eq!(error.retry_after_ms, Some(1250.0));
+        assert_eq!(error.name, "CompactionRequestError");
     }
 
     static WEB_SOCKET_TEST_LOCK: Mutex<()> = Mutex::new(());

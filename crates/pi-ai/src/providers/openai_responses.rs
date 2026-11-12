@@ -16,6 +16,7 @@ use crate::providers::github_copilot_headers::{
 };
 use crate::providers::openai_compaction::{
     request_openai_compaction, supports_openai_compaction, validated_native_compaction_endpoint,
+    CompactionRequestError,
 };
 use crate::providers::openai_responses_shared::{
     convert_responses_messages, convert_responses_tools, process_responses_stream, ConvertResponsesMessagesOptions,
@@ -143,12 +144,11 @@ pub async fn compact_openai_responses(
         .unwrap_or(None)
 }
 
-/// [`compact_openai_responses`] with the TypeScript `throw` turned into `Err`.
-pub async fn try_compact_openai_responses(
+pub(crate) async fn try_compact_openai_responses_typed(
     model: &Model,
     context: &Context,
     options: Option<&CompactionOptions>,
-) -> Result<Option<ProviderCompactionResult>, String> {
+) -> Result<Option<ProviderCompactionResult>, CompactionRequestError> {
     if !supports_openai_compaction(model) {
         return Ok(None);
     }
@@ -162,7 +162,11 @@ pub async fn try_compact_openai_responses(
         .and_then(|options| options.simple.stream.api_key.clone())
         .or_else(|| get_env_api_key(&model.provider));
     let Some(api_key) = api_key else {
-        return Err(format!("No API key for provider: {}", model.provider));
+        return Err(CompactionRequestError::new(
+            format!("No API key for provider: {}", model.provider),
+            0,
+            None,
+        ));
     };
     let mut headers: IndexMap<String, String> = model.headers.clone().unwrap_or_default();
     if let Some(options_headers) = options.and_then(|options| options.simple.stream.headers.clone()) {
@@ -198,7 +202,8 @@ pub async fn try_compact_openai_responses(
             Some(&ConvertResponsesMessagesOptions {
                 include_system_prompt: Some(false),
             }),
-        )?),
+        )
+        .map_err(|error| CompactionRequestError::new(error, 0, None))?),
     );
     body.insert("instructions".to_string(), Value::String(instructions));
     if let Some(session_id) = options.and_then(|options| options.simple.stream.session_id.clone()) {
@@ -214,9 +219,7 @@ pub async fn try_compact_openai_responses(
         None => {}
     }
 
-    let mut result = request_openai_compaction(model, &url, &headers, body, options, None)
-        .await
-        .map_err(|error| error.to_string())?;
+    let mut result = request_openai_compaction(model, &url, &headers, body, options, None).await?;
     if let Some(result) = result.as_mut() {
         if let Some(usage) = result.usage.as_mut() {
             let service_tier = options
@@ -226,6 +229,17 @@ pub async fn try_compact_openai_responses(
         }
     }
     Ok(result)
+}
+
+/// [`compact_openai_responses`] with the TypeScript `throw` turned into `Err`.
+pub async fn try_compact_openai_responses(
+    model: &Model,
+    context: &Context,
+    options: Option<&CompactionOptions>,
+) -> Result<Option<ProviderCompactionResult>, String> {
+    try_compact_openai_responses_typed(model, context, options)
+        .await
+        .map_err(|error| error.message)
 }
 
 /// `resolveCacheRetention(cacheRetention?)`.
