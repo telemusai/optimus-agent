@@ -8,7 +8,7 @@
 use indexmap::IndexMap;
 use pi_agent_core::agent::{Agent, AgentOptions, PromptInput};
 use pi_agent_core::types::{AgentMessage, AgentState, ThinkingLevel};
-use pi_ai::source_capture::{canonical_json_bytes, sha256, SourceCaptureProfile};
+use pi_ai::source_capture::{canonical_json_bytes, sha256, SourceCaptureIntent, SourceCaptureProfile};
 use pi_ai::types::{Model, API_OPENAI_COMPLETIONS};
 use pi_coding_agent::core::agent_messages::{
     create_agent_session_message_delivery, stamp_occ3_delivery_record, AgentSessionMessageEndpoint,
@@ -170,8 +170,15 @@ async fn serve(records: Arc<Mutex<FixtureRecords>>) -> (String, tokio::task::Joi
                             // row and the stop row (both CONTROL), the single tool-call
                             // row and its argument rows, no THINKING row, no CONTENT row
                             // and the "none" reasoning terminator.
-                            let mut receipt = json!({"schema":"occ3.source.v2","intent_digest":sha256(&canonical_json_bytes(intent).unwrap()),"source_handle":"private-source-handle","native_rid":"native-source-rid","response_id":"native-source-rid","capture_commit_id":"synthetic-capture-commit",
+                            // Only the typed intent canonicalizer admits the bounded decimal
+                            // label anchor; the generic publication encoding stays integer-only.
+                            let typed_intent: SourceCaptureIntent = serde_json::from_value(intent.clone()).unwrap();
+                            typed_intent.validate(now()).unwrap();
+                            let mut receipt = json!({"schema":"occ3.source.v2","intent_digest":typed_intent.digest().unwrap(),"source_handle":"private-source-handle","native_rid":"native-source-rid","response_id":"native-source-rid","capture_commit_id":"synthetic-capture-commit",
                                 "accepted_span_start":0,"accepted_span_end":6,"retained_count":6,"predictor_position_offset":-1,"representation":"final_layer_prenorm_predictor","layer_index":3,"hidden_dim":8,"dtype":"bfloat16","layout_digest":"b".repeat(64),"ready_ranks":8,"expected_ranks":8,"accepted_sequence_digest":"d".repeat(64),"output_sha256":sha256(output.as_bytes()),"expires_at_epoch":intent["expires_at_epoch"],"byte_count":96});
+                            if let Some(alpha) = typed_intent.label_anchor_alpha {
+                                receipt["label_anchor_alpha"] = json!(alpha);
+                            }
                             let span = json!({"span_schema":"occ3.span.v1","span_policy":intent["span_policy"],
                                 "span_marker_profile":"glm45_glm47_xml_kv.v1","span_marker_schema":"occ3.span.markers.v1",
                                 "span_reasoning_terminator":"none","span_turn_end_attested":true,

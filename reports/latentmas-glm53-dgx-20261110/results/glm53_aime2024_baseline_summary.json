@@ -1,0 +1,22 @@
+{
+  "task": "aime2024",
+  "condition": "baseline",
+  "n": 30,
+  "correct": 11,
+  "accuracy": 0.36666666666666664,
+  "ci_lo": 0.21873702204017678,
+  "ci_hi": 0.5448675356639506,
+  "mcnemar_b": null,
+  "mcnemar_c": null,
+  "mcnemar_p": null,
+  "wall_s": 65.9,
+  "mean_latency_s": 23.984,
+  "median_latency_s": 29.281,
+  "p95_latency_s": 32.616,
+  "prompt_per_item": 183.56666666666666,
+  "completion_per_item": 3167.1666666666665,
+  "reasoning_per_item": 2986.4666666666667,
+  "truncation_rate": 0.6333333333333333,
+  "invalid_answer_rate": 0.6333333333333333,
+  "tasks_per_s": 0.4553
+}

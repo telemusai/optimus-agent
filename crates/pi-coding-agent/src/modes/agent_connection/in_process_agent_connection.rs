@@ -409,6 +409,32 @@ impl AgentConnection for InProcessAgentConnection {
             crate::core::occ::session_settings::set_preferences(session_file, occ2_enabled)
         })
     }
+    fn set_occ32_enabled(&self, enabled: bool) -> BoxFuture<Result<Value, String>> {
+        let session_file = self.runtime_host.snapshot_source().session.session_file;
+        Box::pin(async move {
+            crate::core::occ::session_settings::set_latent_preferences(
+                session_file.as_deref().ok_or("This chat has no saved session identity")?, enabled)
+        })
+    }
+
+    fn supports_occ31_textmas(&self) -> bool { true }
+
+    fn get_occ31_preferences(&self) -> BoxFuture<Result<Value, String>> {
+        let session_file = self.runtime_host.snapshot_source().session.session_file;
+        Box::pin(async move {
+            crate::core::occ::textmas_settings::preferences(
+                session_file.as_deref().ok_or("This chat has no saved session identity")?)
+        })
+    }
+
+    fn set_occ31_mode(&self, mode: crate::core::occ::textmas::TextMasMode) -> BoxFuture<Result<Value, String>> {
+        let session_file = self.runtime_host.snapshot_source().session.session_file;
+        Box::pin(async move {
+            crate::core::occ::textmas_settings::set_mode(
+                session_file.as_deref().ok_or("This chat has no saved session identity")?, mode)
+        })
+    }
+
     fn supports_occ_queue_resolution(&self) -> bool { true }
     fn resolve_occ_queue_entry(&self, queue_id: &str, reemit: bool) -> BoxFuture<Result<Value, String>> {
         let runtime_host = self.runtime_host.clone();

@@ -330,7 +330,7 @@ pub fn plan_reap(daemons: &[DaemonInfo], force: bool) -> Vec<ReapAction> {
                 if !force || daemon.pid.is_none() {
                     return ReapAction::Skip {
                         daemon: daemon.clone(),
-                        reason: "unreachable; use \"prime-agent shutdown --force\" to stop it".to_string(),
+                        reason: "unreachable; use \"optimus-agent shutdown --force\" to stop it".to_string(),
                     };
                 }
                 let pid = daemon.pid.unwrap();
@@ -486,7 +486,7 @@ pub async fn run_shutdown_all(json: bool, force: bool, io: &DaemonPsIo<'_>) -> R
                 .map(|daemon| {
                     serde_json::json!({
                         "socketPath": daemon.socket_path,
-                        "reason": "confirmation required; use \"prime-agent shutdown --force --json\"",
+                        "reason": "confirmation required; use \"optimus-agent shutdown --force --json\"",
                     })
                 })
                 .collect();
@@ -495,7 +495,7 @@ pub async fn run_shutdown_all(json: bool, force: bool, io: &DaemonPsIo<'_>) -> R
         }
         "tty-error" => {
             return Err(
-                "Shutdown requires confirmation in an interactive terminal. Use \"prime-agent shutdown --force\"."
+                "Shutdown requires confirmation in an interactive terminal. Use \"optimus-agent shutdown --force\"."
                     .to_string(),
             );
         }
@@ -2306,7 +2306,7 @@ u_str  LISTEN 0      4096   /tmp/foreign.sock 1 * 0 users:((\"other-app\",pid=2,
         let infos = vec![daemon("/x", DaemonStatus::Unreachable, false, None)];
         match &plan_reap(&infos, false)[0] {
             ReapAction::Skip { reason, .. } => {
-                assert_eq!(reason, "unreachable; use \"prime-agent shutdown --force\" to stop it")
+                assert_eq!(reason, "unreachable; use \"optimus-agent shutdown --force\" to stop it")
             }
             other => panic!("unexpected action: {:?}", other),
         }

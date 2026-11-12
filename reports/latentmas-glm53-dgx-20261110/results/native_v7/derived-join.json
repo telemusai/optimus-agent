@@ -1,0 +1,182 @@
+{
+ "task": "gsm8k_first20",
+ "condition": "occ3_agent_native_v7",
+ "batch": "native-v7-batch-20261110t175110z",
+ "items_attempted": [
+  2,
+  3,
+  4,
+  5,
+  6,
+  7,
+  8,
+  9,
+  10,
+  11,
+  12,
+  13,
+  14,
+  15,
+  16,
+  17,
+  18
+ ],
+ "scored_items": 17,
+ "correct": 16,
+ "join_method": "last FINAL_ANSWER numeric from judger transcript in item.json, normalized against manifest gold",
+ "rows": [
+  {
+   "idx": 2,
+   "pred": "70000",
+   "gold": "70000",
+   "correct": true,
+   "transport_valid": true,
+   "status": "complete",
+   "duration_s": 259.7
+  },
+  {
+   "idx": 3,
+   "pred": "540",
+   "gold": "540",
+   "correct": true,
+   "transport_valid": true,
+   "status": "complete",
+   "duration_s": 116.5
+  },
+  {
+   "idx": 4,
+   "pred": "20",
+   "gold": "20",
+   "correct": true,
+   "transport_valid": true,
+   "status": "complete",
+   "duration_s": 162.4
+  },
+  {
+   "idx": 5,
+   "pred": "64",
+   "gold": "64",
+   "correct": true,
+   "transport_valid": true,
+   "status": "complete",
+   "duration_s": 118.7
+  },
+  {
+   "idx": 6,
+   "pred": "260",
+   "gold": "260",
+   "correct": true,
+   "transport_valid": true,
+   "status": "complete",
+   "duration_s": 102.9
+  },
+  {
+   "idx": 7,
+   "pred": "160",
+   "gold": "160",
+   "correct": true,
+   "transport_valid": true,
+   "status": "complete",
+   "duration_s": 178.8
+  },
+  {
+   "idx": 8,
+   "pred": "45",
+   "gold": "45",
+   "correct": true,
+   "transport_valid": true,
+   "status": "complete",
+   "duration_s": 264.5
+  },
+  {
+   "idx": 9,
+   "pred": "460",
+   "gold": "460",
+   "correct": true,
+   "transport_valid": true,
+   "status": "complete",
+   "duration_s": 155.2
+  },
+  {
+   "idx": 10,
+   "pred": "366",
+   "gold": "366",
+   "correct": true,
+   "transport_valid": true,
+   "status": "complete",
+   "duration_s": 183.6
+  },
+  {
+   "idx": 11,
+   "pred": "694",
+   "gold": "694",
+   "correct": true,
+   "transport_valid": true,
+   "status": "complete",
+   "duration_s": 193.9
+  },
+  {
+   "idx": 12,
+   "pred": "12",
+   "gold": "13",
+   "correct": false,
+   "transport_valid": true,
+   "status": "complete",
+   "duration_s": 106.4
+  },
+  {
+   "idx": 13,
+   "pred": "18",
+   "gold": "18",
+   "correct": true,
+   "transport_valid": true,
+   "status": "complete",
+   "duration_s": 171.7
+  },
+  {
+   "idx": 14,
+   "pred": "60",
+   "gold": "60",
+   "correct": true,
+   "transport_valid": true,
+   "status": "complete",
+   "duration_s": 187.5
+  },
+  {
+   "idx": 15,
+   "pred": "125",
+   "gold": "125",
+   "correct": true,
+   "transport_valid": true,
+   "status": "complete",
+   "duration_s": 238.5
+  },
+  {
+   "idx": 16,
+   "pred": "230",
+   "gold": "230",
+   "correct": true,
+   "transport_valid": true,
+   "status": "complete",
+   "duration_s": 252.5
+  },
+  {
+   "idx": 17,
+   "pred": "57500",
+   "gold": "57500",
+   "correct": true,
+   "transport_valid": true,
+   "status": "complete",
+   "duration_s": 130.6
+  },
+  {
+   "idx": 18,
+   "pred": "7",
+   "gold": "7",
+   "correct": true,
+   "transport_valid": true,
+   "status": "complete",
+   "duration_s": 108.7
+  }
+ ]
+}

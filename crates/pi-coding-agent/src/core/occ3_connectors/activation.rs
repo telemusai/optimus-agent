@@ -230,6 +230,50 @@ impl Occ3ActivationRequest {
     }
 }
 
+/// Whether `model` declares an enabled `occ3` block: the model-level half
+/// of the activation gate. Ordinary models (no block, or a disabled one)
+/// return false.
+pub fn model_declares_occ3(model: &Model) -> bool {
+    model.occ3.as_ref().is_some_and(|occ3| occ3.enabled)
+}
+
+/// The settings keys a policy decline needs, named exactly. Value-free, so
+/// it is safe for logs, status panels and warnings.
+pub const OCC3_POLICY_REMEDY: &str = "set agentCommunication.occ3Enabled and agentCommunication.occ3Experimental to true in settings.json";
+
+/// The daemon log line for a decline that happens before the configuration
+/// gate runs - the policy is off, or the activation credentials do not
+/// resolve - or `None` when the decline stays silent.
+///
+/// Sessions on ordinary models keep the off-by-default contract: no log
+/// line. A model that declares an enabled `occ3` block was configured for
+/// native handoff, so its decline is named. Without the line, the missing
+/// `occ3_handoff` tool was the only symptom of a missing opt-in.
+pub fn early_decline_log_line(
+    model: &Model,
+    decline: Occ3Decline,
+    session_id: &str,
+) -> Option<String> {
+    if !model_declares_occ3(model) {
+        return None;
+    }
+    let detail = match decline {
+        Occ3Decline::DisabledByPolicy | Occ3Decline::ExperimentalAckRequired => {
+            format!(
+                "the model declares an enabled occ3 block but the opt-in is off, so no occ3_handoff tool is installed; {OCC3_POLICY_REMEDY}"
+            )
+        }
+        Occ3Decline::ConnectorUnavailable => {
+            "the activation credentials for the model's provider did not resolve, so no occ3_handoff tool is installed".to_string()
+        }
+        other => other.message().to_string(),
+    };
+    Some(format!(
+        "occ3 activation declined reason={} session={session_id} detail=\"{detail}\"",
+        decline.as_str(),
+    ))
+}
+
 /// The configuration-only gate: no network. Returns the connector config a
 /// live handshake would need, or the named decline.
 pub fn configured_connector(
@@ -1080,6 +1124,48 @@ mod tests {
         assert_eq!(config.endpoint.as_str(), "http://127.0.0.1:30001/");
         assert!(config.api_key.is_none());
         assert!(config.control_headers.is_none());
+    }
+
+    #[test]
+    fn early_declines_are_logged_only_for_models_that_declare_occ3() {
+        // Ordinary models keep the off-by-default contract: no log line.
+        assert_eq!(
+            early_decline_log_line(&model_with(None), Occ3Decline::DisabledByPolicy, "s-1"),
+            None
+        );
+        let mut disabled = capability();
+        disabled.enabled = false;
+        assert!(!model_declares_occ3(&model_with(Some(disabled.clone()))));
+        assert_eq!(
+            early_decline_log_line(
+                &model_with(Some(disabled)),
+                Occ3Decline::DisabledByPolicy,
+                "s-1"
+            ),
+            None
+        );
+        // A model configured for native handoff names the policy decline and
+        // the exact settings keys, so the missing tool is never the only
+        // symptom.
+        let configured = model_with(Some(capability()));
+        assert!(model_declares_occ3(&configured));
+        let line = early_decline_log_line(&configured, Occ3Decline::DisabledByPolicy, "s-1")
+            .expect("a configured model logs its policy decline");
+        assert!(line.starts_with("occ3 activation declined reason=disabled_by_policy session=s-1 "));
+        assert!(line.contains("agentCommunication.occ3Enabled"));
+        assert!(line.contains("agentCommunication.occ3Experimental"));
+        assert!(line.contains("no occ3_handoff tool is installed"));
+        let line = early_decline_log_line(&configured, Occ3Decline::ExperimentalAckRequired, "s-2")
+            .expect("the acknowledgement decline is logged too");
+        assert!(line.starts_with("occ3 activation declined reason=experimental_ack_required session=s-2 "));
+        assert!(line.contains("agentCommunication.occ3Experimental"));
+        // An unresolvable credential is named, never silent.
+        let line = early_decline_log_line(&configured, Occ3Decline::ConnectorUnavailable, "s-3")
+            .expect("a credential decline is logged");
+        assert!(line.starts_with("occ3 activation declined reason=connector_unavailable session=s-3 "));
+        assert!(line.contains("credentials"));
+        // The line is value-free: no endpoint from the model block leaks.
+        assert!(!line.contains("127.0.0.1"));
     }
 
     #[test]

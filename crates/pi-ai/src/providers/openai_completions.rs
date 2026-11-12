@@ -1471,9 +1471,10 @@ const OCC3_SOURCE_BUSY_DEFAULT_DELAY_SECS: u64 = 5;
 /// Time a resent source capture may still need after its delay to be
 /// admitted and send its first event. Matches the server's published
 /// worst-case pre-first-event bound (`x-optimus-occ3-admission-window`,
-/// 7 s control + 8 s first event). A resend is attempted only if the delay
-/// plus this headroom fits the lease, so it never expires in flight.
-const OCC3_SOURCE_BUSY_RESEND_HEADROOM_SECS: u64 = 15;
+/// 7 s control + 10 s capture busy wait + 8 s first event). A resend is
+/// attempted only if the delay plus this headroom fits the lease, so it
+/// never expires in flight.
+const OCC3_SOURCE_BUSY_RESEND_HEADROOM_SECS: u64 = 25;
 
 /// Whether a bounded 503 error code is an admission-busy refusal for the
 /// given request shape (`source` = armed source capture, else attached

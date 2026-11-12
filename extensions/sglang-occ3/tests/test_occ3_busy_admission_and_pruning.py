@@ -7,7 +7,7 @@ import pytest
 
 from occ3_sglang import latent_backend as lb
 from occ3_sglang import latent_worker as w
-from occ3_sglang.attachment_contract import AttachmentError, CaptureIntent, canonical
+from occ3_sglang.attachment_contract import ActiveSlotBusy, AttachmentError, CaptureIntent, canonical
 from occ3_sglang.latent_registry import LatentRegistry
 from occ3_sglang.latent_types import LatentError, SessionEnrollment, control_request
 from test_latent_types import capture, profile
@@ -115,6 +115,46 @@ async def test_backend_maps_registry_busy_to_scheduler_busy_503(code):
         await b.enroll_source(_intent(p), _identity(p), "attempt-1", "rid-1", time.monotonic() + 30)
     assert (caught.value.code, caught.value.status) == ("scheduler_busy", 503)
     assert b.attempts["attempt-1"]["retired"] is True
+    # Only the active-slot decline is typed as waitable; quota fails fast.
+    assert isinstance(caught.value, ActiveSlotBusy) is (code == "busy")
+
+
+class _SequencedClient(_Client):
+    """reserve_capture declines with the queued codes, then succeeds."""
+    def __init__(self, errors):
+        super().__init__()
+        self.errors, self.commands = list(errors), []
+
+    async def call(self, operation, payload, command_id=None):
+        if operation == "reserve_capture":
+            self.commands.append((command_id, payload["descriptor"]["reservation_id"],
+                                  payload["source_handle"]))
+            if self.errors:
+                self.calls.append(operation)
+                raise LatentError(self.errors.pop(0))
+        return await super().call(operation, payload, command_id)
+
+
+@pytest.mark.asyncio
+async def test_backend_reenrolls_same_attempt_after_active_slot_busy():
+    """The frontend busy wait re-enrolls with the SAME attempt and native rid.
+    The busy decline left no registry state and retired the local entry, so
+    the retry passes the attempt slot and reaches the worker under a fresh
+    reservation id and command id (the worker command cache would otherwise
+    replay the cached busy reply)."""
+    b = _backend(None)
+    b.client = _SequencedClient(["busy", "busy"])
+    p = b.profile
+    for _ in range(2):
+        with pytest.raises(ActiveSlotBusy):
+            await b.enroll_source(_intent(p), _identity(p), "attempt-1", "rid-1", time.monotonic() + 30)
+    enrollment = await b.enroll_source(_intent(p), _identity(p), "attempt-1", "rid-1", time.monotonic() + 30)
+    assert enrollment.attempt_id == "attempt-1" and enrollment.native_rid == "rid-1"
+    assert not b.attempts["attempt-1"].get("retired")
+    commands = b.client.commands
+    assert len(commands) == 3 and len({c for c, _, _ in commands}) == 3
+    assert len({r for _, r, _ in commands}) == 3 and len({h for _, _, h in commands}) == 3
+    assert all(command == "reserve-" + reservation for command, reservation, _ in commands)
 
 
 @pytest.mark.asyncio

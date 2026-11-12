@@ -42,6 +42,9 @@ class StateRecord:
     admitted_capture: bool = False
     admitted_consume: bool = False
     inflight: int = 0
+    # Client cleanup must wait for both terminal commit and the proof read.
+    retire_requested: bool = False
+    consumer_proof_read: bool = False
     # Agreed-epoch time the record became terminal (retired/expired); the
     # prune grace is measured from here.
     terminal_at: float | None = None
@@ -278,6 +281,37 @@ class LatentRegistry:
                 require(record.output_binding == binding, "replay")
             record.output_binding = dict(binding)
             return record.snapshot()
+
+    def defer_client_retire(self, record):
+        """Hold admitted-consumer state through its terminal proof read.
+
+        GPU events alone do not cover scheduler commit or frontend proof
+        reads. Abort cleanup still retires directly after its own fence.
+        """
+        with self.lock:
+            if (record.revoked or not record.admitted_consume
+                    or record.consumer is None or record.consumer_proof_read):
+                return False
+            record.retire_requested = True
+            return True
+
+    def finish_consume(self, attempt_id, principal_digest):
+        """Snapshot terminal evidence before releasing the receiver's hold.
+
+        Only the exact consumer attempt may acknowledge the proof read.
+        The worker may then honor a deferred retire using this copied
+        snapshot as its reply, without exposing revoked state as evidence.
+        """
+        with self.lock:
+            record = self.source_for_attempt(attempt_id)
+            consumer = record.consumer
+            require(consumer is not None and consumer.attempt_id == attempt_id
+                    and consumer.principal_digest == principal_digest, "identity")
+            require(record.admitted_consume and record.state == "terminal"
+                    and not record.revoked, "not_ready")
+            snapshot = record.snapshot()
+            record.consumer_proof_read = True
+            return snapshot
 
     @admission_probe("retire", registry=True)
     def retire(self, attempt_id=None, handle=None):

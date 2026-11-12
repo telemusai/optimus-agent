@@ -658,8 +658,8 @@ impl Occ3NativeSession {
             let preference = crate::core::occ::session_settings::resolve(file)?;
             // With no chat override the already-verified global opt-in applies.
             // Explicit chat/ancestor preferences are read on each native action.
-            if preference.source_session_id.is_some() && !preference.occ3_enabled {
-                return Err("OCC-3 is disabled for this chat; use /occ 3 on with a supported model".into());
+            if preference.occ3_source_session_id.is_some() && !preference.occ3_enabled {
+                return Err("OCC3.2 is disabled for this chat; use /occ 3.2 on with a supported model".into());
             }
         }
         Ok(())
@@ -4029,11 +4029,11 @@ mod tests {
         let queue_path = sender_queue_path(file.to_str().unwrap());
         std::fs::remove_file(&queue_path).unwrap();
         std::fs::create_dir(&queue_path).unwrap();
-        assert!(session.check_native_allowed().unwrap_err().contains("/occ 3 on"));
+        assert!(session.check_native_allowed().unwrap_err().contains("/occ 3.2 on"));
         let error = (session.source_hooks().resolve)(hook_request()).await.unwrap_err().to_string();
         assert!(queue_path.is_dir(), "queue persist must have failed");
         assert!(error.contains("disabled for this chat"), "{error}");
-        assert!(error.contains("/occ 3 on"), "{error}");
+        assert!(error.contains("/occ 3.2 on"), "{error}");
         let entries = session.sender_queue_snapshot().unwrap().0;
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].state, Occ3SenderQueueState::Pending);

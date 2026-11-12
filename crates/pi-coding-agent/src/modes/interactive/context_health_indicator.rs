@@ -124,7 +124,7 @@ pub(super) fn status_line(
             return text;
         }
     }
-    compact
+    pi_tui::utils::truncate_to_width(&compact, available as f64, "…", false)
 }
 
 #[cfg(test)]
@@ -239,7 +239,7 @@ mod tests {
 
     #[test]
     fn queue_badge_drops_before_delivery_slots_at_width_boundary() {
-        let communication = "○ TXT  ○ OCC1  ○ OCC2  ● OCC3";
+        let communication = "○ TXT  ○ OCC1  ○ OCC2  ○ OCC3.1  ● OCC3.2";
         let throughput = "STREAM TPS ~50.0";
         let input = input(100.0);
         let expected = format!("{communication}  {throughput}  {}", Indicator::from_input(&input).label(true));
@@ -247,7 +247,7 @@ mod tests {
         let rendered = status_line(communication, "● QUEUED 2", throughput, &input, width);
         assert_eq!(rendered, expected);
         assert!(!rendered.contains("QUEUED"));
-        assert!(rendered.contains("● OCC3"));
+        assert!(rendered.contains("● OCC3.2"));
         assert_eq!(visible_width(&rendered), width);
         let full = format!("{communication}  {throughput}  {}", Indicator::from_input(&input).label(false));
         let compact_with_badge = format!("{communication}  ● QUEUED 2  {throughput}  {}", Indicator::from_input(&input).label(true));

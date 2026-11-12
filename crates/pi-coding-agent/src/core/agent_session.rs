@@ -23,6 +23,8 @@
 
 #[path = "agent_session/agent_handle.rs"]
 mod agent_handle;
+#[path = "agent_session/textmas.rs"]
+mod textmas;
 #[path = "agent_session/occ3_state.rs"]
 pub mod occ3_state;
 #[path = "agent_session/occ3_sender_queue.rs"]
@@ -2677,6 +2679,7 @@ mod rlm_model_resolution_tests;
 pub struct AgentSession {
     pub agent: Arc<dyn AgentHandle>,
     native_occ3: Mutex<Option<Arc<occ3_state::Occ3NativeSession>>>,
+    textmas: Mutex<textmas::TextMasState>,
     pub session_manager: Arc<Mutex<SessionManager>>,
     pub settings_manager: Arc<Mutex<crate::core::settings_manager::SettingsManager>>,
 
@@ -3088,6 +3091,7 @@ impl AgentSession {
         let session = Arc::new(AgentSession {
             agent: config.agent.clone(),
             native_occ3: Mutex::new(None),
+            textmas: Mutex::new(textmas::TextMasState::default()),
             session_manager: config.session_manager.clone(),
             settings_manager: config.settings_manager.clone(),
             service_tier_preference: Mutex::new(service_tier_preference),
@@ -4230,13 +4234,14 @@ async fn sender_queue_idle_tick(
                     crate::core::jev_bridge::before_request_assessment(
                         &session_id,
                         request_index,
-                        signal,
+                        signal.clone(),
                     )
                     .await;
                     // Consume CURRENT gates on every provider request, including
                     // Compare/no-roster/preparation-refusal early returns. The
                     // renderer removes only its exact owned projection.
                     session.refresh_request_system_prompt();
+                    session.prepare_textmas(signal).await.map_err(anyhow::Error::msg)?;
                     Ok(())
                 })
             },
@@ -7763,6 +7768,7 @@ async fn sender_queue_idle_tick(
 
     /// `_createRetryPromiseForAgentEnd`.
     fn create_retry_promise_for_agent_end(&self, event: &AgentEvent) {
+        if self.textmas_failure().is_some() { return; }
         let messages = match event {
             AgentEvent::AgentEnd { messages } => messages,
             _ => return,
@@ -8052,6 +8058,12 @@ async fn sender_queue_idle_tick(
         }
 
         if let AgentEvent::AgentEnd { messages } = &event {
+            if self.textmas_failure().is_some() {
+                // Preparation failure is terminal: no auth retry, compaction replay, or ordinary fallback.
+                *self.last_assistant_message.lock().unwrap() = None;
+                self.resolve_retry();
+                return;
+            }
             if self.has_failed_dispatch_persistence() {
                 for message in messages {
                     if let AgentMessage::Message(Message::Assistant(assistant)) = message {
@@ -12461,6 +12473,7 @@ async fn sender_queue_idle_tick(
                 return Err(error);
             }
         };
+        let _textmas_turn = textmas::TurnGuard::new(self);
         let prompt_result = self
             .run_session_action_commit(
                 &turns,
@@ -12499,7 +12512,12 @@ async fn sender_queue_idle_tick(
         if !self.has_cancelled_dispatch_capture() {
             self.await_agent_event_queue().await;
         }
-        if let Some(error) = self.settled_turn_delivery_error(&turns) {
+        let delivery_error = self.settled_turn_delivery_error(&turns);
+        if let Some(error) = self.textmas_failure() {
+            self.settle_aborted_textmas_inputs(epoch, &error)?;
+            return Err(delivery_error.unwrap_or(error));
+        }
+        if let Some(error) = delivery_error {
             return Err(error);
         }
         let primary_messages: Vec<AgentMessage> = turns
@@ -12692,6 +12710,7 @@ async fn sender_queue_idle_tick(
         }
         self.ensure_skill_hint_listener();
         self.refresh_request_system_prompt();
+        self.arm_textmas(&turns)?;
         let suppress = turns
             .iter()
             .any(|action| action.suppress_autonomous_continuation.unwrap_or(false));
@@ -14191,6 +14210,7 @@ async fn sender_queue_idle_tick(
         model: Model,
         options: ModelSelectOptions,
     ) -> Result<(), String> {
+        self.cancel_textmas_for_model_change(&model);
         if let Some(state)=self.experimental_native_occ3() { state.close().await?; }
         let previous = self.agent.state().model;
         let thinking_level = self.get_thinking_level_for_model_switch(None);

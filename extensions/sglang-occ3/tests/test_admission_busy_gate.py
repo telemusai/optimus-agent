@@ -287,10 +287,11 @@ def test_refusal_detail_sanitizes_arbitrary_keys_and_nested_values():
 
 def test_published_bounds_match_profile_and_manifest_window():
     """Retry-After stays advisory; the window header states the accurate
-    end-to-end pre-first-event maximum (control + first-event), and the
-    first-event bound must strictly cover the patched scheduler's armed
-    admission window so a healthy scheduler's sweep abort always arrives
-    inside the adapter's bound."""
+    end-to-end pre-first-event maximum (control + capture busy wait +
+    first-event, worst case for a source capture), and the first-event bound
+    must strictly cover the patched scheduler's armed admission window so a
+    healthy scheduler's sweep abort always arrives inside the adapter's
+    bound."""
     from occ3_sglang import chat_adapter
     assert chat_adapter.ADMISSION_BUSY_RETRY_AFTER_SECONDS == 5
     manifest = _json.loads((_Path(__file__).resolve().parents[1]
@@ -300,10 +301,11 @@ def test_published_bounds_match_profile_and_manifest_window():
     assert ("time.monotonic() + %d.0"
             % chat_adapter.ADMISSION_BUSY_RETRY_AFTER_SECONDS) in after
     # The scheduler window (5 s) is covered by the first-event bound, and the
-    # published header is the sum of the two profile bounds.
+    # published header is the sum of the three profile bounds.
     profile = harness_profile()
     assert profile.admission_first_event_seconds > 5.0
-    assert profile.admission_control_seconds + profile.admission_first_event_seconds == 15.0
+    assert (profile.admission_control_seconds + profile.capture_busy_wait_seconds
+            + profile.admission_first_event_seconds) == 25.0
 
 
 def harness_profile():
@@ -355,9 +357,10 @@ async def test_admission_family_first_output_is_public_503(harness, message, pub
     assert response.status_code == 503
     assert _json.loads(response.body)["error"]["message"] == public
     assert response.headers.get("retry-after") == "5"
-    # Accurate end-to-end admission maximum: control bound (7.0) +
-    # first-event bound (8.0); the manifest's 5 s scheduler window sits
-    # inside the first-event bound.
+    # Accurate end-to-end admission maximum for this harness: control
+    # bound (7.0) + first-event bound (8.0); the harness disables the
+    # capture busy wait (0.0), and the manifest's 5 s scheduler window
+    # sits inside the first-event bound.
     assert response.headers.get("x-optimus-occ3-admission-window") == "15.0"
 
 

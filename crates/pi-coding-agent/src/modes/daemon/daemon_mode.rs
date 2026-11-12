@@ -714,7 +714,7 @@ pub struct DaemonHistoryRange {
 }
 
 /// `DAEMON_COMMAND_TYPES` (ported verbatim from daemon-mode.ts).
-pub const DAEMON_COMMAND_TYPES: [&str; 106] = [
+pub const DAEMON_COMMAND_TYPES: [&str; 109] = [
     "ack_result",
     "list",
     "list_saved_sessions",
@@ -822,6 +822,9 @@ pub const DAEMON_COMMAND_TYPES: [&str; 106] = [
     // capability-gated; an old daemon answers "Unknown daemon command".
     "occ_get_preferences",
     "occ_set_preferences",
+    "occ31_get_preferences",
+    "occ31_set_mode",
+    "occ32_set_enabled",
     // Manual OCC-3 queue resolution (schema revision 46): optional and
     // capability-gated; an old daemon answers "Unknown daemon command".
     "occ_resolve_queue_entry",
@@ -5924,6 +5927,32 @@ impl AgentDaemon {
                     "occ_set_preferences",
                     Some(value),
                 )))
+            }
+            "occ32_set_enabled" => {
+                let enabled = body.get("enabled").and_then(Value::as_bool)
+                    .ok_or_else(|| "enabled must be a boolean".to_string())?;
+                let state = self.get_session_state(active_session_id)?;
+                let session_file = self.session_of(&state).session_file()
+                    .ok_or_else(|| "This chat has no saved session identity".to_string())?;
+                let value = crate::core::occ::session_settings::set_latent_preferences(&session_file, enabled)?;
+                Ok(Some(DaemonResponse::success(id, "occ32_set_enabled", Some(value))))
+            }
+            "occ31_get_preferences" => {
+                let state = self.get_session_state(active_session_id)?;
+                let session_file = self.session_of(&state).session_file()
+                    .ok_or_else(|| "This chat has no saved session identity".to_string())?;
+                let value = crate::core::occ::textmas_settings::preferences(&session_file)?;
+                Ok(Some(DaemonResponse::success(id, "occ31_get_preferences", Some(value))))
+            }
+            "occ31_set_mode" => {
+                let mode: crate::core::occ::textmas::TextMasMode = serde_json::from_value(
+                    body.get("mode").cloned().unwrap_or(Value::Null)
+                ).map_err(|_| "mode must be off, sequential, or hierarchical".to_string())?;
+                let state = self.get_session_state(active_session_id)?;
+                let session_file = self.session_of(&state).session_file()
+                    .ok_or_else(|| "This chat has no saved session identity".to_string())?;
+                let value = crate::core::occ::textmas_settings::set_mode(&session_file, mode)?;
+                Ok(Some(DaemonResponse::success(id, "occ31_set_mode", Some(value))))
             }
             // Manual resolution (schema 46): cancel or explicitly confirmed
             // re-emit of ONE uncertain entry on the attached session's own
@@ -16853,18 +16882,41 @@ impl AgentDaemon {
             }
             None => (false, false, None),
         };
-        // Off by default: no network, no log line, no behaviour change.
+        // Off by default: no network and no behaviour change. Ordinary models
+        // also get no log line; a model that declares an enabled `occ3` block
+        // logs the named decline, because the missing `occ3_handoff` tool is
+        // otherwise the only symptom of the missing opt-in.
         if !enabled && !experimental {
+            if let Some(line) = activation::early_decline_log_line(
+                &model,
+                Occ3Decline::DisabledByPolicy,
+                &session.session_id(),
+            ) {
+                self.log(&line);
+            }
             return Err(Occ3Decline::DisabledByPolicy);
         }
         // The control plane is keyed to the provider the session runs on, so
         // activation uses the credential this session resolves for its own
         // requests; nothing comes from `models.json`. An unresolvable
-        // credential is a named decline before any network.
-        let (api_key, control_headers) = agent_session
+        // credential is a named decline before any network, logged on the
+        // same terms as the policy decline above.
+        let (api_key, control_headers) = match agent_session
             .occ3_activation_credentials(&model)
             .await
-            .map_err(|_| Occ3Decline::ConnectorUnavailable)?;
+        {
+            Ok(credentials) => credentials,
+            Err(_) => {
+                if let Some(line) = activation::early_decline_log_line(
+                    &model,
+                    Occ3Decline::ConnectorUnavailable,
+                    &session.session_id(),
+                ) {
+                    self.log(&line);
+                }
+                return Err(Occ3Decline::ConnectorUnavailable);
+            }
+        };
         let request = Occ3ActivationRequest::new(&model, enabled, experimental)
             .with_endpoint_override(endpoint)
             .with_credentials(api_key, control_headers);

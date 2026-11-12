@@ -21,7 +21,7 @@ def _env_int(name: str, default: int) -> int:
 
 
 def _agent_dir() -> Path:
-    """Resolve the Prime Agent config dir the same way the runtime does."""
+    """Resolve the Optimus config dir the same way the runtime does."""
     raw = (
         os.environ.get("PRIME_AGENT_CODING_AGENT_DIR")
         or os.environ.get("PI_CODING_AGENT_DIR")

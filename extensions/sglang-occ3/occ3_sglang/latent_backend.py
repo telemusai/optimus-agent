@@ -8,7 +8,7 @@ import time
 import uuid
 from dataclasses import asdict
 
-from .attachment_contract import (AttachmentError, BackendReadiness, CaptureWorkerDescriptor,
+from .attachment_contract import (ActiveSlotBusy, AttachmentError, BackendReadiness, CaptureWorkerDescriptor,
                                   ConsumeWorkerDescriptor, Reservation, SourceEnrollment,
                                   SPAN_POLICIES_V2, digest)
 from .span_policy import resolve_runtime_markers
@@ -309,7 +309,11 @@ class LatentBackend:
         state = self.attempts.get(reservation.attempt_id)
         require(state is not None and state["reservation"] == reservation and completion.native_rid == reservation.native_rid, "identity")
         d = state["descriptor"]
-        record = await self.client.call("status", {"attempt_id": d.attempt_id, "principal_digest": d.principal_digest})
+        # Atomically read terminal evidence and release the worker's proof
+        # hold; a deferred source retire may reclaim only after that read.
+        record = await self.client.call("finish_consume", {
+            "attempt_id": d.attempt_id, "principal_digest": d.principal_digest},
+            command_id="finish-" + d.reservation_id)
         require(record["state"] == "terminal" and not record["revoked"], "not_ready")
         t = record["terminal"]
         require(t["native_rid"] == d.native_rid and record["source"]["capture_commit_id"] == d.source_capture_commit_id, "identity")
@@ -383,8 +387,12 @@ class LatentBackend:
             # exist, so this is the same retryable contract as the
             # scheduler busy-batch refusal: a distinct 503 with Retry-After
             # instead of a terminal 409 that strands the sender. The local
-            # entry is marked retired so it is pruned.
+            # entry is marked retired so it is pruned. Only "busy" (the
+            # active slot, latent_registry.reserve_capture) clears by waiting
+            # and is typed so the frontend may re-enroll; quota stays generic.
             self.attempts[attempt_id]["retired"] = True
+            if error.code == "busy":
+                raise ActiveSlotBusy() from None
             raise AttachmentError("scheduler_busy", 503) from None
         return enrollment
 

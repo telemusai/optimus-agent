@@ -426,8 +426,8 @@ fn canonical_builtin_slash_commands() -> Vec<BuiltinSlashCommand> {
     );
     push(
         "occ",
-        "Agent communication: OCC-1 fallback, adaptive OCC-2, experimental OCC-3 preference".into(),
-        Some("[status|1|2 on|2 off|3 on|3 off]"),
+        "OCC-1/OCC-2 messaging, any-model OCC3.1 TextMAS, native OCC3.2 preference".into(),
+        Some("[status|1|2 on|2 off|3 off|3 sequential|3 hierarchical|3.1|3.2 on|3.2 off]"),
         Some(true),
     );
     push("quit", format!("Quit {APP_NAME}"), None, None);

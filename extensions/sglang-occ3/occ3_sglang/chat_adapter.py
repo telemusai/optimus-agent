@@ -1,6 +1,8 @@
 """Opt-in native chat format hooks. No plugin registration or GPU backend here.
 
-The original converter, native generator and chat renderer each run once.
+The original converter and chat renderer each run once. The native generator
+runs once, except that a source capture declined busy before admission is
+re-sent as the same request inside the bounded capture busy-wait window.
 Only a trusted backend can bind worker state or return completed-use evidence.
 """
 from __future__ import annotations
@@ -21,7 +23,7 @@ from typing import Any, Awaitable, Callable, Protocol
 from starlette.responses import JSONResponse, Response, StreamingResponse
 
 from .attachment_contract import (
-    AttachmentError, AuthenticatedContext, BackendReadiness, CaptureIntent,
+    ActiveSlotBusy, AttachmentError, AuthenticatedContext, BackendReadiness, CaptureIntent,
     CaptureWorkerDescriptor, ConsumeWorkerDescriptor, InferenceAttachment, MAX_RECEIPT_BYTES, RECEIPT_HEADER,
     SOURCE_RECEIPT_HEADER, SourceEnrollment, Reservation, SPAN_POLICIES_V2, TERMINAL_ACK_HEADER, TERMINAL_MODE,
     DEFERRED_RECEIPT_HEADER, DEFERRED_RECEIPT_MODE, KEEPALIVE_REQUEST_HEADER, KEEPALIVE_REQUEST_MODE,
@@ -33,7 +35,8 @@ from .prefix_layout import (LAYOUT_PREPEND, PREFIX_MARKER, PrefixLayout, resolve
 from .span_markers import resolve_user_role_id
 from . import metrics as _metrics
 from .turn_diagnostics import TurnDiagnostics, log_failure, log_retention
-from .latent_types import admission_probe
+from .latent_types import (CAPTURE_BUSY_WAIT_DEFAULT_SECONDS, CAPTURE_BUSY_WAIT_MAX_SECONDS,
+                           admission_probe)
 from .use_receipts import (
     NativeCompletion, NativeOutputAudit, TerminalOutputAudit, TerminalUseEvidence,
     receipt_bytes, terminal_envelope, terminal_event_bytes,
@@ -82,12 +85,19 @@ def _inner_error_detail(response, limit):
 _REFUSAL_CODE = re.compile(r"occ3_[a-z][a-z_]{0,62}\Z")
 
 #: The published admission maximum is the END-TO-END pre-first-event bound:
-#: control-plane bound plus dispatch-relative first-event bound (see
+#: control-plane bound plus the dispatch-relative first-event bound (see
 #: BufferProfile.admission_control_seconds and admission_first_event_seconds;
 #: the scheduler's own 5 s armed window sits inside the first-event bound).
-#: Deliberately distinct from the Retry-After advice below. The fail-closed
-#: settle can add at most BufferProfile.cleanup_seconds before the client
-#: sees the bounded 503.
+#: A source capture adds BufferProfile.capture_busy_wait_seconds: one shared
+#: window, anchored at the first registry active-slot decline or else at the
+#: initial dispatch, covers both busy waits (re-enroll and same-request
+#: re-dispatch). BufferProfile.capture_drain_seconds is taken out of that
+#: window, not added to it: the scheduler may park a capture that long before
+#: it admits or declines it, so every source dispatch gets the first-event
+#: bound plus the drain, and a re-enroll or re-dispatch must start in the
+#: first (window - drain) seconds. Deliberately distinct from the Retry-After
+#: advice below. The fail-closed settle can add at most
+#: BufferProfile.cleanup_seconds before the client sees the bounded 503.
 
 #: Advisory retry timing, in seconds, attached as Retry-After on the
 #: admission-unavailability 503 family. Advice only: it tells a sender how
@@ -98,6 +108,12 @@ ADMISSION_BUSY_RETRY_AFTER_SECONDS = 5
 #: Response header that publishes the admission maximum (above) alongside the
 #: advisory Retry-After on admission-unavailability refusals.
 ADMISSION_WINDOW_HEADER = "x-optimus-occ3-admission-window"
+
+#: CAPTURE_BUSY_WAIT_MAX_SECONDS (latent_types, shared with the scheduler
+#: ranks) is the upper bound of BufferProfile.capture_busy_wait_seconds. The
+#: Rust client's source resend headroom (OCC3_SOURCE_BUSY_RESEND_HEADROOM_SECS,
+#: 25 s) is the default control + this + first-event bound; a longer window
+#: would outrun it.
 
 #: Scheduler refusal codes that are admission unavailability, mapped to their
 #: distinct public (code, status) shapes. These are retryable with a fresh
@@ -361,10 +377,43 @@ class BufferProfile:
     #: window plus the sweep tick, tokenizer and stream plumbing margin.
     #: Never applied after the first event: generation keeps the turn
     #: deadline. Worst-case pre-first-event wall clock is therefore
-    #: admission_control_seconds + admission_first_event_seconds (plus at
-    #: most cleanup_seconds of fail-closed settle before the client sees
-    #: the bounded 503).
+    #: admission_control_seconds + admission_first_event_seconds, plus
+    #: capture_busy_wait_seconds for a source capture (plus at most
+    #: cleanup_seconds of fail-closed settle before the client sees the
+    #: bounded 503).
     admission_first_event_seconds: float = 8.0
+    #: Sleep before each same-request busy re-dispatch of a source capture.
+    #: Must be positive: a zero cadence would re-send without any pause.
+    capture_busy_retry_interval: float = 1.0
+    #: Absolute source-capture busy-wait window, shared by the registry
+    #: active-slot wait and the scheduler busy re-dispatch. It is anchored
+    #: at the first registry busy decline, or else at the initial dispatch;
+    #: every re-enroll and re-dispatch must start within it, less
+    #: capture_drain_seconds. 0 disables both waits and the scheduler capture
+    #: reservation. At most CAPTURE_BUSY_WAIT_MAX_SECONDS (the client's
+    #: resend headroom assumes it). Operators set it with
+    #: OCC3_CAPTURE_BUSY_WAIT_SECONDS (native_install).
+    capture_busy_wait_seconds: float = CAPTURE_BUSY_WAIT_DEFAULT_SECONDS
+    #: Share of the busy-wait window given to the scheduler capture
+    #: reservation: a capture declined only for in-flight ordinary work is
+    #: parked for at most this long while running requests finish, then
+    #: admitted or declined. A source dispatch therefore gets
+    #: admission_first_event_seconds plus this value, and the window for
+    #: starts shrinks by the same amount, so the end-to-end bound does not
+    #: move. Between 0 and capture_busy_wait_seconds, so a 0 window forces
+    #: 0. The default 0 accounts for no reservation; the installer sets the
+    #: per-boot value from OCC3_CAPTURE_DRAIN_SECONDS (default 2 s, capped by
+    #: the window). An explicit profile given to the installer must state the
+    #: window and drain of the environment, because the scheduler ranks apply
+    #: those. OCC3_CAPTURE_PREEMPT (default "off"; "retract" is an operator
+    #: opt-in) only selects what the scheduler does with rows that outlast
+    #: the drain, so no frontend bound depends on it.
+    capture_drain_seconds: float = 0.0
+
+    @property
+    def capture_busy_start_seconds(self):
+        """Busy-wait window left for re-enroll and re-dispatch starts."""
+        return self.capture_busy_wait_seconds - self.capture_drain_seconds
 
     def __post_init__(self):
         integer_fields = (self.max_buffer_bytes, self.max_active, self.total_working_bytes,
@@ -383,6 +432,13 @@ class BufferProfile:
             self.disconnect_interval, self.deadline_margin_seconds, self.keepalive_seconds,
             self.admission_control_seconds, self.admission_first_event_seconds,
         )):
+            raise ValueError("invalid buffer profile")
+        if (not math.isfinite(self.capture_busy_retry_interval)
+                or self.capture_busy_retry_interval <= 0
+                or not math.isfinite(self.capture_busy_wait_seconds)
+                or not 0 <= self.capture_busy_wait_seconds <= CAPTURE_BUSY_WAIT_MAX_SECONDS
+                or not math.isfinite(self.capture_drain_seconds)
+                or not 0 <= self.capture_drain_seconds <= self.capture_busy_wait_seconds):
             raise ValueError("invalid buffer profile")
 
 
@@ -529,6 +585,10 @@ class _Context:
     # (never reserve/prepare success: the request may still sit unqueued).
     admission_control_deadline: float = 0.0
     first_event_deadline: float = 0.0
+    # Source capture only: the shared busy-wait window end for starts (first
+    # registry busy decline or initial dispatch + capture_busy_start_seconds),
+    # the latest instant a re-enroll or same-request re-dispatch may start.
+    capture_busy_deadline: float = 0.0
     native_started: bool = False
     diagnostics: Any = None
 
@@ -609,7 +669,7 @@ class ChatAttachmentAdapter:
             self._active -= 1
             ctx.charged = False
 
-    def _error(self, error):
+    def _error(self, error, source=False):
         headers = {"cache-control": "no-store"}
         if error.status == 503 and error.code in _ADMISSION_PUBLIC_CODES:
             # Advisory retry timing, plus the published admission maximum.
@@ -618,10 +678,12 @@ class ChatAttachmentAdapter:
             # the window header states the accurate end-to-end bound within
             # which a request either produces its first native event or is
             # refused as admission unavailability (control bound + first-event
-            # bound; fail-closed settle can add at most cleanup_seconds).
+            # bound, plus the busy-wait window for a source capture;
+            # fail-closed settle can add at most cleanup_seconds).
             headers["retry-after"] = str(ADMISSION_BUSY_RETRY_AFTER_SECONDS)
             headers[ADMISSION_WINDOW_HEADER] = str(
                 self.profile.admission_control_seconds
+                + (self.profile.capture_busy_wait_seconds if source else 0.0)
                 + self.profile.admission_first_event_seconds)
         return JSONResponse({"error": {"message": error.code,
                             "type": "occ3_attachment_error", "code": error.status}},
@@ -740,7 +802,7 @@ class ChatAttachmentAdapter:
                 logger.error("occ3-bridge: native turn ended before any response "
                              "(reason=%s status=%s dispatched=%s)",
                              error.code, error.status, ctx.dispatched)
-            return self._error(error)
+            return self._error(error, source=type(attachment) is CaptureIntent)
         except asyncio.CancelledError:
             if ctx is not None and ctx.diagnostics is not None:
                 ctx.diagnostics.fail("cancelled", 499)
@@ -818,17 +880,23 @@ class ChatAttachmentAdapter:
         if source:
             ctx.native_rid = uuid.uuid4().hex
             self._fence(ctx)
-            try:
-                enrollment = await self._bounded_admission(
-                    self.backend.enroll_source(
-                        ctx.attachment, identity, ctx.attempt_id, ctx.native_rid, ctx.deadline), ctx)
-            except AttachmentError as error:
-                if (error.code, error.status) == ("scheduler_busy", 503):
-                    # The registry declined "busy" before any mutation
-                    # (latent_backend.enroll_source); nothing was dispatched.
-                    ctx.registry_busy = True
-                    ctx.busy_refusal = "scheduler_busy"
-                raise
+            while True:
+                try:
+                    enrollment = await self._bounded_admission(
+                        self.backend.enroll_source(
+                            ctx.attachment, identity, ctx.attempt_id, ctx.native_rid, ctx.deadline), ctx)
+                    break
+                except AttachmentError as error:
+                    if (error.code, error.status) != ("scheduler_busy", 503):
+                        raise
+                    # The registry declined "busy" or quota before any
+                    # mutation (latent_backend.enroll_source); nothing was
+                    # dispatched. Only the active-slot decline may wait.
+                    if not (isinstance(error, ActiveSlotBusy)
+                            and await self._registry_busy_wait(ctx)):
+                        ctx.registry_busy = True
+                        ctx.busy_refusal = "scheduler_busy"
+                        raise
             if ctx.cancel_requested:
                 raise AttachmentError("client_disconnected", 499)
             validate_source_enrollment(ctx.attachment, identity, ctx.attempt_id, ctx.native_rid, enrollment)
@@ -1007,6 +1075,115 @@ class ChatAttachmentAdapter:
         ctx.retired = ctx.retire_confirmed = True
         return True
 
+    def _capture_busy_redispatch_at(self, ctx, obj, expected, delay):
+        """Monotonic start of a same-request capture re-dispatch, or None.
+
+        Called only after a source capture's first and only native output
+        was a pre-admission busy decline. Both busy codes decline before
+        any mutation: the request never entered the scheduler and the
+        worker record keeps its reserved, never-admitted state, so the same
+        native request can be sent again. Every bound is checked at the
+        planned start (now + delay): the shared absolute busy window, the
+        turn and descriptor deadlines still fitting the reserved generation,
+        the attachment TTL, a live client, and an unchanged request identity
+        (the bound descriptor object and exactly the state the pinned
+        dispatch preamble produces, see _dispatched_state). None keeps the
+        historical bounded refusal.
+        """
+        at = self.monotonic() + delay
+        required = ctx.reservation.required_seconds
+        if (expected is None
+                or not self._capture_wait_fits(ctx, at, delay)
+                or required + self.profile.deadline_margin_seconds > ctx.deadline - at
+                or ctx.descriptor.deadline < at + required
+                or getattr(obj, "occ3_worker_descriptor", None) is not ctx.descriptor
+                or {k: v for k, v in vars(obj).items() if k != "occ3_worker_descriptor"} != expected):
+            return None
+        return at
+
+    def _capture_wait_fits(self, ctx, at, delay):
+        """Bounds shared by both capture busy waits at a planned start."""
+        return not (ctx.cancel_requested
+                    or at > ctx.capture_busy_deadline
+                    or ctx.deadline - at <= self.profile.deadline_margin_seconds
+                    or self.epoch() + delay >= ctx.attachment.expires_at_epoch)
+
+    @staticmethod
+    def _dispatched_state(tm, obj, protected, descriptor):
+        """Request state after the pinned dispatch preamble, or None.
+
+        The pinned TokenizerManager.generate_request (SGLang 0.5.21) first
+        runs obj.normalize_batch_and_arguments() and then
+        _set_default_priority(obj), which add is_single, batch_size and
+        parallel_sample_num and fill None defaults. Both are replayed on a
+        copy of the pre-dispatch snapshot, so a re-dispatch tolerates exactly
+        that delta; any other change to the request blocks it. Both steps
+        are idempotent, so the re-sent request normalizes to the same state.
+        """
+        normalize = getattr(type(obj), "normalize_batch_and_arguments", None)
+        if normalize is None:
+            return protected
+        try:
+            clone = copy.copy(obj)
+            clone.__dict__.clear()
+            clone.__dict__.update(copy.deepcopy(protected))
+            clone.occ3_worker_descriptor = descriptor
+            normalize(clone)
+            priority = getattr(tm, "_set_default_priority", None)
+            if callable(priority):
+                priority(clone)
+        except Exception:
+            return None
+        if clone.occ3_worker_descriptor is not descriptor:
+            return None
+        return {k: v for k, v in vars(clone).items() if k != "occ3_worker_descriptor"}
+
+    async def _registry_busy_wait(self, ctx):
+        """Wait one cadence before re-enrolling after an active-slot decline.
+
+        The registry declines "busy" before any mutation, so the same
+        attempt and native rid can enroll again (a fresh reservation id; the
+        frontend entry was retired and is pruned). The first busy decline
+        anchors the shared busy window that a later scheduler re-dispatch
+        also draws on. The control-plane deadline moves by exactly the time
+        spent waiting, never more than the window less the drain that the
+        later dispatch adds to its first-event bound, so the published
+        pre-first-event maximum still holds. False keeps the historical
+        refusal.
+        """
+        declined_at = self.monotonic()
+        if declined_at >= ctx.admission_control_deadline:
+            raise AttachmentError("admission_timeout", 503)
+        if not ctx.capture_busy_deadline:
+            ctx.capture_busy_deadline = declined_at + self.profile.capture_busy_start_seconds
+        interval = self.profile.capture_busy_retry_interval
+        if not self._capture_wait_fits(ctx, declined_at + interval, interval):
+            return False
+        control_deadline = ctx.admission_control_deadline
+        # Publish the planned extension before yielding, so the guard cannot
+        # expire the old control deadline during an allowed wait.
+        ctx.admission_control_deadline = control_deadline + interval
+        try:
+            await asyncio.sleep(interval)
+        finally:
+            ctx.admission_control_deadline = control_deadline
+        if ctx.cancel_requested:
+            raise AttachmentError("client_disconnected", 499)
+        resumed_at = self.monotonic()
+        if not self._capture_wait_fits(ctx, resumed_at, 0.0):
+            return False
+        ctx.admission_control_deadline += resumed_at - declined_at
+        _metrics.inc("capture_registry_busy_retry")
+        return True
+
+    @staticmethod
+    def _admission_refusal(ctx, code):
+        """The bounded public refusal for an admission-family scheduler code."""
+        public, status = _ADMISSION_REFUSALS[code]
+        if code in _PRE_ADMISSION_BUSY:
+            ctx.busy_refusal = public
+        return AttachmentError(public, status)
+
     async def _generate(self, original, tm, obj, request, ctx):
         try:
             if ctx.native is not obj or ctx.tm is not tm or ctx.generation_calls:
@@ -1147,70 +1324,133 @@ class ChatAttachmentAdapter:
             if self.epoch() >= ctx.attachment.expires_at_epoch:
                 raise AttachmentError("attachment_expired")
             ctx.dispatched = True  # Conservative: original may send before first yield.
-            ctx.inner = original(tm, obj, request)
-            # Dispatch moment: the first __anext__ submits to the scheduler.
-            # The first native event (any output, including an abort) must
-            # arrive within the profile's first-event bound - dispatch
-            # relative, because the patched scheduler's armed admission
-            # window starts at submission. Until that event, admission is
-            # NOT inferred from reserve/prepare success: the guard and the
-            # keepalive race cap their waits by this absolute deadline and
-            # fail closed with the retryable admission_timeout instead of
-            # holding a silent stream to the turn deadline.
-            ctx.first_event_deadline = self.monotonic() + self.profile.admission_first_event_seconds
-            emitted = False  # No native output has flowed yet.
-            async for output in ctx.inner:
-                ctx.diagnostics.inner_event()
-                if obj.rid != ctx.native_rid or not isinstance(output, dict):
-                    raise AttachmentError("native_completion_failed")
-                meta = output.get("meta_info", {})
-                if not isinstance(meta, dict) or meta.get("id") != ctx.native_rid:
-                    raise AttachmentError("native_completion_failed")
-                if ctx.native_terminal:
-                    raise AttachmentError("native_completion_failed")
-                reason = meta.get("finish_reason")
-                if reason is not None:
-                    if not isinstance(reason, dict) or reason.get("type") not in ("stop", "length"):
-                        # Scheduler-side refusals abort the request before prefill; the
-                        # ordinary stream delivers that as one abort output whose message
-                        # is a fixed occ3 refusal code. The public code stays generic;
-                        # the bounded code is recorded server-side so live refusals are
-                        # diagnosable offline. Other abort payloads are never logged.
-                        code = _refusal_code(reason)
-                        logger.error(
-                            "occ3-bridge: native turn aborted (refusal=%s status=%s detail=%s)",
-                            code,
-                            _refusal_status(reason),
-                            _refusal_detail(reason) if code == "unclassified" else "",
-                        )
-                        if code == "occ3_cancelled":
-                            # A genuine user/client abort of this request.
-                            # Distinct bounded code; the historical 409
-                            # status is preserved.
-                            raise AttachmentError("client_cancelled", 409)
-                        if code in _ADMISSION_REFUSALS and not emitted:
-                            # Admission unavailability reaching the stream as
-                            # the first and only output: nothing was
-                            # generated, so the bounded retryable shape is
-                            # honest - a distinct 503 with Retry-After for
-                            # the buffered contract, the same fixed code in
-                            # the keepalive SSE error event. Once content has
-                            # flowed, the same scheduler code is a mid-turn
-                            # deadline abort of admitted generation and keeps
-                            # the generic completion failure below.
-                            public, status = _ADMISSION_REFUSALS[code]
-                            if code in _PRE_ADMISSION_BUSY:
-                                ctx.busy_refusal = public
-                            raise AttachmentError(public, status)
+            dispatch_at = self.monotonic()
+            first_event = self.profile.admission_first_event_seconds
+            if source:
+                # The scheduler capture reservation may park this request for
+                # up to the drain before it admits or declines it, so every
+                # source dispatch gets the first-event bound plus the drain.
+                first_event += self.profile.capture_drain_seconds
+            if source and not ctx.capture_busy_deadline:
+                # Without an earlier registry busy wait, the INITIAL dispatch
+                # anchors the shared absolute capture busy-wait window: every
+                # same-request re-dispatch must start by this instant. Starts
+                # get the window less the drain, so no first-event bound ends
+                # later than this dispatch + capture_busy_wait_seconds +
+                # admission_first_event_seconds. After a registry wait the
+                # window keeps its earlier anchor (one budget for both waits,
+                # never two).
+                ctx.capture_busy_deadline = dispatch_at + self.profile.capture_busy_start_seconds
+            expected = None  # Request state the dispatch preamble may produce.
+            first_dispatch_at, retries = dispatch_at, 0
+            while True:
+                ctx.inner = original(tm, obj, request)
+                # Dispatch moment: the first __anext__ submits to the scheduler.
+                # The first native event (any output, including an abort) must
+                # arrive within the profile's first-event bound - dispatch
+                # relative, because the patched scheduler's armed admission
+                # window starts at submission. Until that event, admission is
+                # NOT inferred from reserve/prepare success: the guard and the
+                # keepalive race cap their waits by this absolute deadline and
+                # fail closed with the retryable admission_timeout instead of
+                # holding a silent stream to the turn deadline. A busy
+                # re-dispatch (below) arms the bound for its own submission.
+                ctx.first_event_deadline = dispatch_at + first_event
+                emitted = False  # No native output has flowed yet.
+                declined = None  # Busy code of a swallowed capture decline.
+                async for output in ctx.inner:
+                    ctx.diagnostics.inner_event()
+                    if declined is not None:
+                        # A swallowed busy decline already ended this stream;
+                        # any later output from it is a contract violation.
                         raise AttachmentError("native_completion_failed")
-                    ctx.native_terminal = True
-                # First native output observed: admission evidence. From
-                # here the admission bound no longer applies; generation
-                # keeps its own turn deadline.
-                ctx.native_started = True
-                yield output
-                emitted = True
-            ctx.exhausted = True
+                    if obj.rid != ctx.native_rid or not isinstance(output, dict):
+                        raise AttachmentError("native_completion_failed")
+                    meta = output.get("meta_info", {})
+                    if not isinstance(meta, dict) or meta.get("id") != ctx.native_rid:
+                        raise AttachmentError("native_completion_failed")
+                    if ctx.native_terminal:
+                        raise AttachmentError("native_completion_failed")
+                    reason = meta.get("finish_reason")
+                    if reason is not None:
+                        if not isinstance(reason, dict) or reason.get("type") not in ("stop", "length"):
+                            # Scheduler-side refusals abort the request before prefill; the
+                            # ordinary stream delivers that as one abort output whose message
+                            # is a fixed occ3 refusal code. The public code stays generic;
+                            # the bounded code is recorded server-side so live refusals are
+                            # diagnosable offline. Other abort payloads are never logged.
+                            code = _refusal_code(reason)
+                            logger.error(
+                                "occ3-bridge: native turn aborted (refusal=%s status=%s detail=%s)",
+                                code,
+                                _refusal_status(reason),
+                                _refusal_detail(reason) if code == "unclassified" else "",
+                            )
+                            if code == "occ3_cancelled":
+                                # A genuine user/client abort of this request.
+                                # Distinct bounded code; the historical 409
+                                # status is preserved.
+                                raise AttachmentError("client_cancelled", 409)
+                            if code in _ADMISSION_REFUSALS and not emitted:
+                                # Admission unavailability reaching the stream as
+                                # the first and only output: nothing was
+                                # generated, so the bounded retryable shape is
+                                # honest - a distinct 503 with Retry-After for
+                                # the buffered contract, the same fixed code in
+                                # the keepalive SSE error event. Once content has
+                                # flowed, the same scheduler code is a mid-turn
+                                # deadline abort of admitted generation and keeps
+                                # the generic completion failure below.
+                                if source and code in _PRE_ADMISSION_BUSY and expected is None:
+                                    expected = self._dispatched_state(tm, obj, protected, ctx.descriptor)
+                                if (source and code in _PRE_ADMISSION_BUSY
+                                        and self._capture_busy_redispatch_at(
+                                            ctx, obj, expected,
+                                            self.profile.capture_busy_retry_interval) is not None):
+                                    # A proven pre-admission busy decline of a
+                                    # capture that still fits a re-dispatch:
+                                    # never yielded and never recorded as a
+                                    # busy refusal. Drain this stream; a later
+                                    # output from it fails above.
+                                    declined = code
+                                    continue
+                                raise self._admission_refusal(ctx, code)
+                            raise AttachmentError("native_completion_failed")
+                        ctx.native_terminal = True
+                    # First native output observed: admission evidence. From
+                    # here the admission bound no longer applies; generation
+                    # keeps its own turn deadline.
+                    if retries and not emitted:
+                        logger.info("occ3-bridge: capture admitted after busy wait "
+                                    "(retries=%d waited_seconds=%.3f)",
+                                    retries, self.monotonic() - first_dispatch_at)
+                    ctx.native_started = True
+                    yield output
+                    emitted = True
+                if declined is None:
+                    ctx.exhausted = True
+                    return
+                # Bounded capture busy wait. The SAME native request (same
+                # object, rid, descriptor, enrollment and reservation; never a
+                # re-enroll) is re-sent after one positive cadence. The bounds
+                # are checked again now and at the re-dispatch itself; when
+                # they no longer fit, the proven decline surfaces exactly as
+                # without the wait. During the sleep the first-event bound
+                # covers the cadence plus the next dispatch window, so _guard
+                # and the keepalive race stay bounded by admission.
+                interval = self.profile.capture_busy_retry_interval
+                planned = self._capture_busy_redispatch_at(ctx, obj, expected, interval)
+                if planned is None:
+                    raise self._admission_refusal(ctx, declined)
+                ctx.first_event_deadline = planned + first_event
+                await asyncio.sleep(interval)
+                if ctx.cancel_requested:
+                    raise AttachmentError("client_disconnected", 499)
+                dispatch_at = self._capture_busy_redispatch_at(ctx, obj, expected, 0.0)
+                if dispatch_at is None:
+                    raise self._admission_refusal(ctx, declined)
+                _metrics.inc("capture_busy_retry")
+                retries += 1
         except asyncio.CancelledError:
             raise
         except AttachmentError:
@@ -2572,6 +2812,12 @@ class ChatAttachmentAdapter:
                     if now >= ctx.first_event_deadline:
                         raise AttachmentError("admission_timeout", 503)
                     remaining = min(remaining, ctx.first_event_deadline - now)
+                elif not ctx.dispatched and ctx.capture_busy_deadline:
+                    # Registry waits are outside _bounded_admission. Keep
+                    # their prospective control extension bounded as well.
+                    if now >= ctx.admission_control_deadline:
+                        raise AttachmentError("admission_timeout", 503)
+                    remaining = min(remaining, ctx.admission_control_deadline - now)
                 if remaining <= 0:
                     raise AttachmentError("deadline_exceeded", 504)
                 if await ctx.raw_request.is_disconnected():

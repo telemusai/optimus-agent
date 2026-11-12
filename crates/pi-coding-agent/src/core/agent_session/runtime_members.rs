@@ -3430,6 +3430,7 @@ impl AgentSession {
 
     /// `_isRetryableError(message)` (agent-session.ts:12000-12019).
     pub(super) fn is_retryable_error(&self, message: &AssistantMessage) -> bool {
+        if self.textmas_failure().is_some() { return false; }
         if message.stop_reason != STOP_REASON_ERROR || message.error_message.is_none() {
             return false;
         }
@@ -4508,6 +4509,14 @@ impl AgentSession {
                 total_cost += assistant.usage.cost.total;
             }
         }
+        let mut textmas = crate::core::occ::textmas::TextMasUsageLedger::default();
+        for record in entries.iter().filter_map(crate::core::occ::textmas::usage_record) { textmas.observe(record); }
+        let auxiliary = textmas.total();
+        total_input += auxiliary.input;
+        total_output += auxiliary.output;
+        total_cache_read += auxiliary.cache_read;
+        total_cache_write += auxiliary.cache_write;
+        total_cost += auxiliary.cost.total;
         SessionStats {
             session_file: self.session_file(),
             session_id: self.session_id(),
@@ -4524,6 +4533,7 @@ impl AgentSession {
                 total: total_input + total_output + total_cache_read + total_cache_write,
             },
             cost: total_cost,
+            textmas_usage: textmas.summary(),
             context_usage: self.get_context_usage().map(|usage| {
                 crate::core::session_stats::ContextUsage {
                     tokens: usage.tokens,

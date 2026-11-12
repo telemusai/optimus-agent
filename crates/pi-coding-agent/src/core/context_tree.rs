@@ -35,6 +35,9 @@ pub struct ContextTreeNode {
     pub model: Option<ContextTreeModel>,
     pub own_usage: Usage,
     pub total_usage: Usage,
+    /// This node's own auxiliary spend, already included above; unknown calls remain explicit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub textmas_usage: Option<crate::core::occ::textmas::TextMasUsageSummary>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_usage: Option<ContextUsage>,
     pub children: Vec<ContextTreeNode>,
@@ -82,6 +85,11 @@ pub enum ContextTreeEntry {
         target_id: String,
         child_usage: Usage,
     },
+    TextMasUsage {
+        id: String,
+        parent_id: Option<String>,
+        record: crate::core::occ::textmas::TextMasUsageRecord,
+    },
     Other {
         id: String,
         parent_id: Option<String>,
@@ -97,6 +105,7 @@ impl ContextTreeEntry {
             | ContextTreeEntry::Compaction { id, .. }
             | ContextTreeEntry::BranchSummary { id, .. }
             | ContextTreeEntry::ChildUsageAttributed { id, .. }
+            | ContextTreeEntry::TextMasUsage { id, .. }
             | ContextTreeEntry::Other { id, .. } => id,
         }
     }
@@ -108,6 +117,7 @@ impl ContextTreeEntry {
             | ContextTreeEntry::Compaction { parent_id, .. }
             | ContextTreeEntry::BranchSummary { parent_id, .. }
             | ContextTreeEntry::ChildUsageAttributed { parent_id, .. }
+            | ContextTreeEntry::TextMasUsage { parent_id, .. }
             | ContextTreeEntry::Other { parent_id, .. } => parent_id.as_deref(),
         }
     }
@@ -119,6 +129,7 @@ impl ContextTreeEntry {
             ContextTreeEntry::Compaction { .. } => "compaction",
             ContextTreeEntry::BranchSummary { .. } => "branch_summary",
             ContextTreeEntry::ChildUsageAttributed { .. } => "child_usage_attributed",
+            ContextTreeEntry::TextMasUsage { .. } => "custom",
             ContextTreeEntry::Other { entry_type, .. } => entry_type,
         }
     }
@@ -178,7 +189,9 @@ pub fn compute_own_and_total_usage(
 ) -> (Usage, Usage) {
     let mut total_usage = empty_usage();
     let mut branch_assistant_ids: BTreeSet<String> = BTreeSet::new();
+    let mut textmas = crate::core::occ::textmas::TextMasUsageLedger::default();
     for entry in branch {
+        if let ContextTreeEntry::TextMasUsage { record, .. } = entry { textmas.observe(record.clone()); }
         if let Some(assistant) = is_assistant_entry(entry) {
             branch_assistant_ids.insert(entry.id().to_string());
             add_assistant_usage(&mut total_usage, &assistant.usage);
@@ -196,6 +209,7 @@ pub fn compute_own_and_total_usage(
             }
         }
     }
+    add_assistant_usage(&mut total_usage, &textmas.total());
     let mut own_usage = clone_usage(&total_usage);
     for entry in all_entries {
         if let ContextTreeEntry::ChildUsageAttributed {
@@ -210,6 +224,15 @@ pub fn compute_own_and_total_usage(
         }
     }
     (own_usage, total_usage)
+}
+
+/// Explain this node's own auxiliary subtotal without including any descendant usage.
+pub fn textmas_usage_summary(branch: &[ContextTreeEntry]) -> Option<crate::core::occ::textmas::TextMasUsageSummary> {
+    let mut ledger = crate::core::occ::textmas::TextMasUsageLedger::default();
+    for entry in branch {
+        if let ContextTreeEntry::TextMasUsage { record, .. } = entry { ledger.observe(record.clone()); }
+    }
+    ledger.summary()
 }
 
 /// Current context utilization from persisted entries, mirroring
@@ -442,6 +465,7 @@ pub fn load_context_tree_child_from_disk(
         model,
         own_usage,
         total_usage,
+        textmas_usage: textmas_usage_summary(&branch),
         context_usage: compute_context_usage_from_entries(
             &all_entries,
             &branch,
@@ -508,6 +532,9 @@ pub fn context_tree_entry_from_json(value: &Value) -> Option<ContextTreeEntry> {
         .get("parentId")
         .and_then(Value::as_str)
         .map(str::to_string);
+    if let Some(record) = crate::core::occ::textmas::usage_record(object) {
+        return Some(ContextTreeEntry::TextMasUsage { id, parent_id, record });
+    }
     match entry_type {
         "message" => {
             let message = object.get("message")?;

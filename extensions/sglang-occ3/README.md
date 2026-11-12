@@ -204,6 +204,30 @@ or infer capacity from a short timeout estimate. Output-byte, context,
 GPU-memory, rank and deadline limits need independent verification. A
 failed or uncertain operation yields no verified lease or tool dispatch.
 
+### Capture retirement and receiver proof lifetime
+
+A client retire must not revoke state still owned by an admitted receiver.
+GPU work ending and the scheduler committing terminal metadata are not enough:
+the frontend must also read that metadata to validate the completed-use proof.
+An early retire returns `busy` and records a deferred cleanup request, including
+when the scheduler is terminal but the frontend has not read its proof yet.
+
+The private worker-control operation `finish_consume` validates the exact
+consumer attempt and principal, snapshots live terminal evidence, then releases
+the proof hold. If cleanup was deferred, it runs behind the existing stream
+fence and GPU-event/inflight guards before returning the copied snapshot.
+A repeated successful finish command returns the same snapshot, even after
+physical release. Failed finish requests do not fabricate proof. Scheduler
+abort cleanup and the original record-expiry limit remain unchanged.
+
+Deploy `latent_backend.py`, `latent_worker.py`, `latent_registry.py`, and
+`latent_types.py` together and regenerate the source attestation. The frontend
+now requires this internal worker operation; a mixed-version partial overlay
+fails closed. No daemon command, public receipt schema, model setting, or
+client binary change is required. CPU lifecycle tests are not CUDA/TP proof;
+validate a one-hop native smoke on the coordinated deployment before resuming
+a scored benchmark.
+
 ## Native-turn transport and diagnostics
 
 Guarded OCC-3 client requests offer `keepalive-v1` by default, for both

@@ -24,8 +24,8 @@ pub fn is_valid_thinking_level(level: &str) -> bool {
     THINKING_LEVELS.contains(&level)
 }
 
-/// `APP_NAME` from config.ts (`piConfig.name` in package.json).
-pub const APP_NAME: &str = "prime-agent";
+/// Installed CLI name used in model-selection guidance.
+pub const APP_NAME: &str = "optimus-agent";
 
 /// Default model IDs for each known provider, in declaration order.
 pub fn default_model_per_provider() -> &'static IndexMap<&'static str, &'static str> {
