@@ -1419,6 +1419,14 @@ mod e2e {
     /// window, compaction enabled, and a factory that answers agent turns and
     /// summary wire calls (distinguished by the `<conversation>` wrapper).
     async fn fixture(label: &str, rlm_depth: i64) -> E2eFixture {
+        fixture_with_checkpoint(label, rlm_depth, false).await
+    }
+
+    async fn fixture_with_checkpoint(
+        label: &str,
+        rlm_depth: i64,
+        with_checkpoint: bool,
+    ) -> E2eFixture {
         let root = tempfile::Builder::new()
             .prefix(&format!("compaction-recovery-{label}-"))
             .tempdir()
@@ -1445,6 +1453,47 @@ mod e2e {
             ..Default::default()
         }));
         let model = provider.get_model();
+        if with_checkpoint {
+            // Reuse the faux streams, replacing only this unique API's native
+            // compaction operation with a production-shaped checkpoint result.
+            let registered = pi_ai::api_registry::get_api_provider(&model.api)
+                .expect("faux API registration");
+            let compact: pi_ai::types::CompactFunction =
+                Arc::new(|model: &Model, _context: &Context, _options| {
+                    let checkpoint = pi_ai::compaction::ProviderCompactionCheckpoint {
+                        version: 1,
+                        provider: model.provider.clone(),
+                        api: model.api.clone(),
+                        model: model.id.clone(),
+                        base_url: model.base_url.clone(),
+                        endpoint: None,
+                        items: vec![json!({
+                            "type": "compaction",
+                            "encrypted_content": "recovery-checkpoint-Ω"
+                        })
+                        .as_object()
+                        .cloned()
+                        .expect("checkpoint item object")],
+                        estimated_tokens: 1.0,
+                    };
+                    Box::pin(async move {
+                        Some(pi_ai::compaction::ProviderCompactionResult {
+                            checkpoint,
+                            usage: None,
+                        })
+                    })
+                });
+            register_api_provider_simple(
+                ApiProviderSimple {
+                    api: model.api.clone(),
+                    stream: registered.stream,
+                    stream_simple: registered.stream_simple,
+                    compact: Some(compact),
+                    supports_compaction: Some(Arc::new(|_| true)),
+                },
+                Some(format!("recovery-checkpoint-{}", unique_tag())),
+            );
+        }
 
         let summary_requests: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let seen = Arc::clone(&summary_requests);
@@ -1800,5 +1849,311 @@ mod e2e {
         // The child identity survives restart.
         let header = reopened.get_header().unwrap();
         assert_eq!(header["rlmDepth"], Value::from(1));
+    }
+
+    fn append_restore_message(session: &Arc<AgentSession>, message: AgentMessage) {
+        session
+            .session_manager
+            .lock()
+            .unwrap()
+            .append_message(message.clone())
+            .expect("append restore fixture message");
+        session.agent.update_state(Box::new(move |state| {
+            state.messages.push(message);
+        }));
+    }
+
+    async fn seed_restore_phase(session: &Arc<AgentSession>, phase: &str) {
+        append_restore_message(
+            session,
+            user_message(&format!(
+                "TASK GOAL: ship the migration report before Friday. CONSTRAINT: never drop the payments ledger. Unicode café 東京 🦀 phase {phase}. Evidence reference: reports/résumé-Ω.json. {}",
+                "protected context with Unicode ångström Ω 東京. ".repeat(30)
+            )),
+        );
+        session
+            .send_custom_message(
+                CustomMessage {
+                    role: "custom".into(),
+                    custom_type: "agent_message".into(),
+                    content: CustomMessageContent::Text(format!(
+                        "Protected {phase} reviewer evidence: artifacts/résumé-Ω.json"
+                    )),
+                    display: true,
+                    details: Some(json!({
+                        "id": format!("agentmsg-pr4-{phase}-Ω"),
+                        "fromName": format!("reviewer-{phase}-Ω")
+                    })),
+                    timestamp: 1_000,
+                },
+                Some(false),
+                None,
+            )
+            .await
+            .expect("append protected restore evidence");
+
+        let call_id = format!("{phase}-call");
+        let orphan_id = format!("{phase}-orphan");
+        append_restore_message(
+            session,
+            AgentMessage::Message(Message::Assistant(AssistantMessage {
+                content: vec![
+                    ContentBlock::Text(TextContent::new(format!("Completed phase {phase}."))),
+                    tool_call(&call_id, "read_file", "src/résumé-Ω.rs"),
+                ],
+                stop_reason: "toolUse".into(),
+                ..Default::default()
+            })),
+        );
+        append_restore_message(
+            session,
+            tool_result(&call_id, "read_file", &format!("matched {phase} result Ω")),
+        );
+        append_restore_message(
+            session,
+            tool_result(&orphan_id, "read_file", &format!("orphan {phase} result 東京")),
+        );
+        append_restore_message(
+            session,
+            user_message(&format!(
+                "Retain the {phase} tail. {}",
+                "tail marker with Unicode déjà vu Ω. ".repeat(45)
+            )),
+        );
+    }
+
+    fn restore_reopen_snapshot(manager: &SessionManager) -> Value {
+        let branch = manager.get_branch(None);
+        let branch_values: Vec<Value> = branch
+            .iter()
+            .map(|entry| Value::Object(entry.clone()))
+            .collect();
+        let compactions: Vec<Value> = branch_values
+            .iter()
+            .filter(|entry| entry.get("type").and_then(Value::as_str) == Some("compaction"))
+            .cloned()
+            .collect();
+        let checkpoint_presence: Vec<bool> = compactions
+            .iter()
+            .map(|entry| {
+                entry
+                    .get("details")
+                    .and_then(|details| details.get("providerCheckpoint"))
+                    .is_some()
+            })
+            .collect();
+        let newest_compaction = compactions.last().cloned().unwrap_or(Value::Null);
+        let durable_messages = live_messages(&branch);
+        let live = manager.build_session_context_with_entry_ids(None);
+        let live_messages = serde_json::to_value(&live.messages).expect("serialize live messages");
+        let live_tool_call_ids: Vec<String> = live.messages.iter().flat_map(tool_call_ids).collect();
+        let live_tool_result_ids: Vec<String> =
+            live.messages.iter().flat_map(tool_result_ids).collect();
+        json!({
+            "header": manager.get_header(),
+            "branch": branch_values,
+            "compactions": compactions,
+            "checkpointPresence": checkpoint_presence,
+            "newestCompaction": newest_compaction,
+            "durableToolCallIds": durable_messages.iter().flat_map(tool_call_ids).collect::<Vec<_>>(),
+            "durableToolResultIds": durable_messages.iter().flat_map(tool_result_ids).collect::<Vec<_>>(),
+            "live": {
+                "messages": live_messages,
+                "toolCallIds": live_tool_call_ids,
+                "toolResultIds": live_tool_result_ids,
+                "entryIds": live.entry_ids
+            }
+        })
+    }
+
+    fn assert_restore_snapshot(snapshot: &Value, with_checkpoint: bool) {
+        let compactions = snapshot["compactions"].as_array().expect("two compactions");
+        assert_eq!(compactions.len(), 2);
+        assert_eq!(snapshot["newestCompaction"], compactions[1]);
+        assert_ne!(compactions[0]["id"], compactions[1]["id"]);
+        assert_eq!(snapshot["checkpointPresence"], json!([with_checkpoint, with_checkpoint]));
+        assert_eq!(
+            snapshot["branch"].as_array().and_then(|branch| branch.last())
+                .and_then(|entry| entry.get("type")).and_then(Value::as_str),
+            Some("message"),
+            "the newest compaction must not be the trailing leaf"
+        );
+        assert_eq!(snapshot["durableToolCallIds"], json!(["early-call", "late-call"]));
+        assert_eq!(
+            snapshot["durableToolResultIds"],
+            json!(["early-call", "early-orphan", "late-call", "late-orphan"])
+        );
+        assert_eq!(
+            snapshot["branch"].as_array().expect("durable branch").iter().filter(|entry| {
+                entry["type"] == "custom_message" && entry["customType"] == "agent_message"
+            }).count(),
+            2,
+            "both protected custom entries survive"
+        );
+        assert!(snapshot.to_string().contains("café 東京 🦀"), "Unicode evidence survives");
+    }
+
+    fn recovery_log_tail(path: &PathBuf) -> String {
+        let bytes = std::fs::read(path).unwrap_or_default();
+        String::from_utf8_lossy(&bytes[bytes.len().saturating_sub(16 * 1024)..]).into_owned()
+    }
+
+    fn run_restore_reopen_child(
+        case_root: &PathBuf,
+        session_file: &PathBuf,
+        variant: &str,
+    ) -> Value {
+        use std::process::{Command, Stdio};
+
+        let child_root = case_root.join(variant);
+        let child_temp = child_root.join("temp");
+        std::fs::create_dir_all(&child_temp).expect("create private child root");
+        let result_path = child_root.join("reopened.json");
+        let stdout_path = child_root.join("child.stdout.log");
+        let stderr_path = child_root.join("child.stderr.log");
+        let stdout = std::fs::File::create(&stdout_path).expect("create child stdout log");
+        let stderr = std::fs::File::create(&stderr_path).expect("create child stderr log");
+        let mut child = Command::new(std::env::current_exe().expect("current test executable"))
+            .current_dir(&child_root)
+            .args([
+                "--exact",
+                "e2e::restore_branch_projection_survives_fresh_process_reopen",
+                "--test-threads=1",
+                "--nocapture",
+            ])
+            .env_clear()
+            .env("SystemRoot", std::env::var("SystemRoot").unwrap_or_default())
+            .env("PATH", std::env::var("PATH").unwrap_or_default())
+            .env("HOME", &child_root)
+            .env("USERPROFILE", &child_root)
+            .env("TEMP", &child_temp)
+            .env("TMP", &child_temp)
+            .env("TMPDIR", &child_temp)
+            .env("OPTIMUS_PARITY_STATE_ROOT", &child_root)
+            .env("OPTIMUS_PR4_RECOVERY_CHILD", "1")
+            .env("OPTIMUS_PR4_CHILD_SESSION", session_file)
+            .env("OPTIMUS_PR4_CHILD_RESULT", &result_path)
+            .env("OPTIMUS_PR4_CHILD_VARIANT", variant)
+            .env("OPTIMUS_PR4_PARENT_PID", std::process::id().to_string())
+            .stdout(Stdio::from(stdout))
+            .stderr(Stdio::from(stderr))
+            .spawn()
+            .expect("spawn fresh recovery child");
+
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            if let Some(status) = child.try_wait().expect("poll recovery child") {
+                assert!(
+                    status.success(),
+                    "fresh recovery child failed ({status}); logs: {}\n{}\nstdout:\n{}\nstderr:\n{}",
+                    stdout_path.display(), stderr_path.display(),
+                    recovery_log_tail(&stdout_path), recovery_log_tail(&stderr_path)
+                );
+                break;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!(
+                    "fresh recovery child timed out; killed and reaped; logs: {}\n{}\nstdout:\n{}\nstderr:\n{}",
+                    stdout_path.display(), stderr_path.display(),
+                    recovery_log_tail(&stdout_path), recovery_log_tail(&stderr_path)
+                );
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+
+        let artifact: Value = serde_json::from_str(
+            &std::fs::read_to_string(&result_path).expect("fresh child must write its result"),
+        )
+        .expect("complete fresh-child JSON result");
+        assert_eq!(artifact["schemaVersion"], json!(1));
+        assert_eq!(artifact["variant"], json!(variant));
+        assert_eq!(artifact["reopened"], Value::Bool(true));
+        assert_eq!(artifact["sessionFile"], json!(session_file.to_string_lossy()));
+        assert_eq!(artifact["parentPid"].as_u64(), Some(std::process::id() as u64));
+        assert_ne!(
+            artifact["childPid"].as_u64(), Some(std::process::id() as u64),
+            "reopen proof must come from a different process"
+        );
+        artifact
+    }
+
+    /// The parent executes both real restore tails. A fresh child only reopens
+    /// the resulting JSONL; it does not execute the edited restore blocks.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restore_branch_projection_survives_fresh_process_reopen() {
+        if std::env::var("OPTIMUS_PR4_RECOVERY_CHILD").unwrap_or_default() == "1" {
+            let session_file = PathBuf::from(
+                std::env::var_os("OPTIMUS_PR4_CHILD_SESSION").expect("child session path"),
+            );
+            let result_path = PathBuf::from(
+                std::env::var_os("OPTIMUS_PR4_CHILD_RESULT").expect("child result path"),
+            );
+            let variant = std::env::var("OPTIMUS_PR4_CHILD_VARIANT").expect("child variant");
+            let with_checkpoint = match variant.as_str() {
+                "ordinary" => false,
+                "checkpoint" => true,
+                other => panic!("unexpected child variant {other}"),
+            };
+            let parent_pid = std::env::var("OPTIMUS_PR4_PARENT_PID")
+                .expect("parent pid").parse::<u32>().expect("numeric parent pid");
+            let reopened = SessionManager::open(&session_file, None, None)
+                .expect("fresh child reopens production JSONL");
+            let snapshot = restore_reopen_snapshot(&reopened);
+            assert_restore_snapshot(&snapshot, with_checkpoint);
+            drop(reopened);
+            let artifact = json!({
+                "schemaVersion": 1,
+                "variant": variant,
+                "reopened": true,
+                "sessionFile": session_file.to_string_lossy(),
+                "parentPid": parent_pid,
+                "childPid": std::process::id(),
+                "snapshot": snapshot
+            });
+            std::fs::write(
+                &result_path,
+                serde_json::to_vec_pretty(&artifact).expect("serialize reopen result"),
+            )
+            .expect("write concrete fresh-child result");
+            return;
+        }
+
+        let process_root = case_dir("restore-fresh-process");
+        for (variant, with_checkpoint) in [("ordinary", false), ("checkpoint", true)] {
+            let fixture = fixture_with_checkpoint(variant, 0, with_checkpoint).await;
+            let session = Arc::clone(&fixture.session);
+            seed_restore_phase(&session, "early").await;
+            session.compact_with_options(Some("first bounded restore"), false)
+                .await.expect("first real compaction and restore");
+            seed_restore_phase(&session, "late").await;
+            session.compact_with_options(Some("second bounded restore"), false)
+                .await.expect("second real compaction and restore");
+            append_restore_message(
+                &session,
+                user_message(&format!("Trailing non-compaction after the newest {variant} summary Ω")),
+            );
+
+            let (session_file, expected, live_messages) = {
+                let mut manager = session.session_manager.lock().unwrap();
+                manager.flush_now().expect("flush both compactions");
+                let expected = restore_reopen_snapshot(&manager);
+                assert_restore_snapshot(&expected, with_checkpoint);
+                let live_messages = manager.build_session_context_with_entry_ids(None).messages;
+                (PathBuf::from(manager.get_session_file().expect("durable session file")), expected, live_messages)
+            };
+            assert_eq!(
+                live_messages, session.agent.messages(),
+                "the parent must preserve live context after both real restores"
+            );
+            session.dispose_async(Some(false)).await;
+
+            let actual = run_restore_reopen_child(&process_root, &session_file, variant);
+            assert_eq!(
+                actual["snapshot"], expected,
+                "fresh-process reopen must preserve the complete projection for {variant}"
+            );
+        }
     }
 }

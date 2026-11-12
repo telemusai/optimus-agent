@@ -1,0 +1,1 @@
+- Changed compaction restore to use borrowed branch walks for provider-checkpoint detection and newest-compaction lookup while preserving the existing lock and event boundaries.

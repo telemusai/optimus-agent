@@ -19222,26 +19222,34 @@ impl AgentSession {
                     // `restore_provider_context_for_model` replaces the live
                     // context a second time at the end of restore, so a
                     // concurrently started turn could be wiped from live state.
-                    let branch_has_provider_checkpoint = self
-                        .session_manager
-                        .lock()
-                        .unwrap()
-                        .get_branch(None)
-                        .iter()
-                        .any(|entry| {
-                            entry.get("type").and_then(Value::as_str) == Some("compaction")
-                                && has_provider_checkpoint(
+                    let branch_has_provider_checkpoint = {
+                        let session_manager = self.session_manager.lock().unwrap();
+                        let mut branch_has_provider_checkpoint = false;
+                        session_manager.visit_branch(None, |entry| {
+                            if !branch_has_provider_checkpoint
+                                && entry.get("type").and_then(Value::as_str) == Some("compaction")
+                            {
+                                branch_has_provider_checkpoint = has_provider_checkpoint(
                                     &entry.get("details").cloned().unwrap_or(Value::Null),
-                                )
+                                );
+                            }
                         });
+                        branch_has_provider_checkpoint
+                    };
                     if !branch_has_provider_checkpoint && release_input_after_swap {
                         self.release_compaction_input_admission();
                     }
                 }
                 // TS 8388-8397: the newest compaction entry is announced to extensions.
                 let saved_entry = {
-                    let branch = self.session_manager.lock().unwrap().get_branch(None);
-                    get_latest_compaction_entry(&branch)
+                    let session_manager = self.session_manager.lock().unwrap();
+                    let mut saved_entry: Option<SessionEntry> = None;
+                    session_manager.visit_branch(None, |entry| {
+                        if entry.get("type").and_then(Value::as_str) == Some("compaction") {
+                            saved_entry = Some(entry.clone());
+                        }
+                    });
+                    saved_entry
                 };
                 if let Some(saved_entry) = saved_entry {
                     if saved_entry.get("summary").and_then(Value::as_str)
