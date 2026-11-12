@@ -1359,10 +1359,12 @@ def _capture_hold_action(scheduler, hold, settings, rows):
         return "decline"
     # Only a plain row resumes from the same output position after the stock
     # retract path. An attached or eager row would be aborted by it, and a row
-    # with input embeddings would restart its output.
+    # with input embeddings would restart its output. A session row continues
+    # the history that its session holds; no evidence covers its resume.
     if any(getattr(row, "occ3_attached", False) or getattr(row, "occ3_force_eager", False)
            or getattr(row, "input_embeds", None) is not None
-           or getattr(row, "beam_group", None) is not None for row in rows):
+           or getattr(row, "beam_group", None) is not None
+           or getattr(row, "session", None) is not None for row in rows):
         return "decline"
     return "retract"
 

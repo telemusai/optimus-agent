@@ -77,8 +77,15 @@ def _capture_hold_settings_from_env():
       [0, window]. Time a parked capture gives running ordinary requests to
       finish before it is admitted or declined.
     - OCC3_CAPTURE_PREEMPT: absent -> "off", an expired drain declines.
-      "retract" is an operator opt-in: rows that still run after the drain
-      are retracted and resume after the capture turn.
+      "retract" is an operator opt-in: plain rows that still run after the
+      drain are retracted and resume after the capture turn. A session row,
+      or a row that cannot resume from the same output position, is never
+      retracted; the capture is then declined as with "off".
+    The scheduler does not use the reservation when a queue limit
+    (max_queued_requests) or a request timeout sweep
+    (SGLANG_REQ_WAITING_TIMEOUT or SGLANG_REQ_RUNNING_TIMEOUT) is configured.
+    Such a capture gets the busy refusal at once and the busy wait sends the
+    same request again.
     An unparseable or out-of-range value -> InstallationError with the fixed
     code of that knob, so a mistyped value never serves a default.
     """
