@@ -1308,17 +1308,33 @@ def capture_hold_park(scheduler, recv_req, error):
     return True
 
 
+def _capture_hold_sla_sweeps():
+    """True when a stock waiting or running timeout sweep is enabled. A row
+    retracted for a capture turn could then be aborted by that sweep."""
+    for name in ("SGLANG_REQ_WAITING_TIMEOUT", "SGLANG_REQ_RUNNING_TIMEOUT"):
+        raw = os.environ.get(name)
+        if raw is None:
+            continue
+        try:
+            if float(raw) > 0:
+                return True
+        except ValueError:
+            return True
+    return False
+
+
 def _capture_hold_action(scheduler, hold, settings, rows):
     """This rank's view of the resolution. The caller gathers it."""
-    if time.monotonic() >= hold.deadline:
+    if time.monotonic() >= hold.deadline or getattr(scheduler, "_engine_paused", False):
+        return "decline"
+    # The capture and every retracted row need a queue slot. A full queue
+    # would drop one of them after the one-shot record is spent.
+    limit = getattr(scheduler, "max_queued_requests", None)
+    if limit is not None and len(scheduler.waiting_queue) + len(rows) + 1 > limit:
         return "decline"
     if not rows:
         return "admit"
-    if (settings is None or settings.preempt != "retract"
-            or getattr(scheduler, "_engine_paused", False)):
-        return "decline"
-    limit = getattr(scheduler, "max_queued_requests", None)
-    if limit is not None and len(scheduler.waiting_queue) + len(rows) > limit:
+    if settings is None or settings.preempt != "retract" or _capture_hold_sla_sweeps():
         return "decline"
     # Only a plain row resumes from the same output position after the stock
     # retract path. An attached or eager row would be aborted by it, and a row
