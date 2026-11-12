@@ -334,6 +334,13 @@ def test_not_selected_prepare_stays_disabled_with_code(machine, monkeypatch):
     assert current.stage == "prepare" and current.experimental_selected is False
 
 
+@pytest.mark.parametrize("code", ["capture_busy_wait_seconds_invalid", "max_turn_seconds_invalid"])
+def test_window_knob_decline_codes_are_surfaced(machine, code):
+    machine.record_declined(code, stage="install", attempt="0123abcd", rollback_completed=True)
+    current = machine.current()
+    assert current.state.value == "DECLINED" and current.code == code and current.stage == "install"
+
+
 async def test_cancelled_installer_supersedes_to_native_startup_aborted(serve_flow, machine, monkeypatch):
     f = serve_flow
 

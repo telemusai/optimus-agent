@@ -52,7 +52,8 @@ _ATTEMPT = re.compile(r"[0-9a-f]{8}\Z")
 # Every code the receipts, InstallationError raises and serve-abort paths can
 # emit today. Anything else is dropped rather than surfaced (fail-closed).
 _FIXED_CODES = frozenset({
-    "backend_not_ready", "control_client_occupied", "descriptor_overlay_unavailable",
+    "backend_not_ready", "capture_busy_wait_seconds_invalid", "control_client_occupied",
+    "descriptor_overlay_unavailable",
     "explicit_experimental_opt_in_required", "experimental_startup_not_selected",
     "experimental_startup_prepared", "experimental_startup_refused",
     "factory_cleanup_unconfirmed", "hook_install_unverified",
@@ -60,6 +61,7 @@ _FIXED_CODES = frozenset({
     "installation_busy", "installation_cancelled", "installation_cleanup_unconfirmed",
     "installation_owner_mismatch", "installation_ownership_changed",
     "installation_unavailable", "installed_experimental_not_live_validated",
+    "max_turn_seconds_invalid",
     "native_route_conflict", "native_router_unverified", "native_startup_aborted",
     "native_startup_cleanup_unconfirmed", "original_api_key_required",
     "original_auth_mismatch", "original_auth_registration_required",

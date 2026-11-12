@@ -1,6 +1,8 @@
 """Opt-in native chat format hooks. No plugin registration or GPU backend here.
 
-The original converter, native generator and chat renderer each run once.
+The original converter and chat renderer each run once. The native generator
+runs once, except that a source capture declined busy before admission is
+re-sent as the same request inside the bounded capture busy-wait window.
 Only a trusted backend can bind worker state or return completed-use evidence.
 """
 from __future__ import annotations
@@ -1304,6 +1306,7 @@ class ChatAttachmentAdapter:
                 # budget for both waits, never two).
                 ctx.capture_busy_deadline = dispatch_at + self.profile.capture_busy_wait_seconds
             expected = None  # Request state the dispatch preamble may produce.
+            first_dispatch_at, retries = dispatch_at, 0
             while True:
                 ctx.inner = original(tm, obj, request)
                 # Dispatch moment: the first __anext__ submits to the scheduler.
@@ -1381,6 +1384,10 @@ class ChatAttachmentAdapter:
                     # First native output observed: admission evidence. From
                     # here the admission bound no longer applies; generation
                     # keeps its own turn deadline.
+                    if retries and not emitted:
+                        logger.info("occ3-bridge: capture admitted after busy wait "
+                                    "(retries=%d waited_seconds=%.3f)",
+                                    retries, self.monotonic() - first_dispatch_at)
                     ctx.native_started = True
                     yield output
                     emitted = True
@@ -1407,6 +1414,7 @@ class ChatAttachmentAdapter:
                 if dispatch_at is None:
                     raise self._admission_refusal(ctx, declined)
                 _metrics.inc("capture_busy_retry")
+                retries += 1
         except asyncio.CancelledError:
             raise
         except AttachmentError:

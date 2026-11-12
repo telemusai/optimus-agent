@@ -471,6 +471,25 @@ async def test_capture_busy_window_exhausts_and_unfences_only_after_retire(sourc
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("declines", [0, 2])
+async def test_capture_busy_rescue_is_logged_once(source_harness, caplog, declines):
+    import logging
+    import re
+    h = source_harness
+    h.adapter.profile = replace(h.adapter.profile, capture_busy_wait_seconds=10,
+                                capture_busy_retry_interval=.01)
+    _aborting(h, ["occ3_busy_batch"] * declines)
+    with caplog.at_level(logging.INFO, logger="occ3_sglang.chat_adapter"):
+        response, _, _ = await source_call(h)
+    assert response.status_code == 200 and len(h.tm.calls) == declines + 1
+    admitted = [r.getMessage() for r in caplog.records if "admitted after busy wait" in r.getMessage()]
+    assert len(admitted) == (1 if declines else 0)
+    if declines:
+        assert re.fullmatch(r"occ3-bridge: capture admitted after busy wait "
+                            r"\(retries=2 waited_seconds=\d+\.\d{3}\)", admitted[0])
+
+
+@pytest.mark.asyncio
 async def test_capture_delayed_first_decline_does_not_restart_the_busy_window(source_harness):
     h = source_harness
     h.adapter.profile = replace(h.adapter.profile, capture_busy_wait_seconds=8,
