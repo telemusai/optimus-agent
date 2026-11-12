@@ -61,26 +61,35 @@ def _max_turn_seconds_from_env():
     return value
 
 
-def _capture_busy_wait_seconds_from_env():
-    """Read the per-boot source-capture busy-wait window. Trusted bootstrap only.
+_CAPTURE_KNOB_CODES = frozenset({
+    "capture_busy_wait_seconds_invalid", "capture_drain_seconds_invalid", "capture_preempt_invalid"})
 
-    OCC3_CAPTURE_BUSY_WAIT_SECONDS: absent -> the BufferProfile default (10 s);
-    0 disables both capture busy waits. Unparseable or outside
-    [0, CAPTURE_BUSY_WAIT_MAX_SECONDS] -> InstallationError, so a mistyped
-    value never serves the default or a window the client headroom does not
-    cover.
+
+def _capture_hold_settings_from_env():
+    """Read the per-boot source-capture busy-wait knobs. Trusted bootstrap only.
+
+    Parsed by latent_types.capture_hold_settings, the reader the scheduler
+    ranks use, so the frontend accounts for the reservation the ranks apply.
+    - OCC3_CAPTURE_BUSY_WAIT_SECONDS: absent -> 10 s; range [0, 10], the window
+      the client resend headroom covers. 0 disables both capture busy waits
+      and the scheduler capture reservation.
+    - OCC3_CAPTURE_DRAIN_SECONDS: absent -> 2 s, capped by the window; range
+      [0, window]. Time a parked capture gives running ordinary requests to
+      finish before it is admitted or declined.
+    - OCC3_CAPTURE_PREEMPT: absent -> "off", an expired drain declines.
+      "retract" is an operator opt-in: rows that still run after the drain
+      are retracted and resume after the capture turn.
+    An unparseable or out-of-range value -> InstallationError with the fixed
+    code of that knob, so a mistyped value never serves a default.
     """
-    from .chat_adapter import CAPTURE_BUSY_WAIT_MAX_SECONDS, BufferProfile
-    raw = os.environ.get("OCC3_CAPTURE_BUSY_WAIT_SECONDS")
-    if raw is None:
-        return BufferProfile.capture_busy_wait_seconds
+    from .latent_types import capture_hold_settings
     try:
-        value = float(raw)
-    except ValueError:
-        raise InstallationError("capture_busy_wait_seconds_invalid") from None
-    if not (math.isfinite(value) and 0.0 <= value <= CAPTURE_BUSY_WAIT_MAX_SECONDS):
-        raise InstallationError("capture_busy_wait_seconds_invalid") from None
-    return value
+        return capture_hold_settings()
+    except ValueError as error:
+        code = str(error)
+        if code not in _CAPTURE_KNOB_CODES:
+            raise
+        raise InstallationError(code) from None
 
 
 @dataclass(repr=False)
@@ -993,12 +1002,18 @@ async def install_native_runtime(app, tokenizer_manager, *, experimental_opt_in=
             raise InstallationError("control_client_occupied")
         _check_route_conflicts(app)
         from .chat_adapter import BufferProfile
-        # Only the default profile takes the per-boot turn and capture
-        # busy-wait windows; a trusted caller's explicit profile passes
-        # through untouched.
-        profile = (BufferProfile(max_turn_seconds=_max_turn_seconds_from_env(),
-                                 capture_busy_wait_seconds=_capture_busy_wait_seconds_from_env())
-                   if buffer_profile is None else buffer_profile)
+        # Only the default profile takes the per-boot turn window and capture
+        # busy-wait knobs; a trusted caller's explicit profile passes through
+        # untouched.
+        if buffer_profile is None:
+            max_turn = _max_turn_seconds_from_env()
+            # The preempt mode is validated here; only the scheduler ranks use it.
+            hold = _capture_hold_settings_from_env()
+            profile = BufferProfile(max_turn_seconds=max_turn,
+                                    capture_busy_wait_seconds=hold.window,
+                                    capture_drain_seconds=hold.drain)
+        else:
+            profile = buffer_profile
         if type(profile) is not BufferProfile or profile.max_buffer_bytes > 4194304:
             raise InstallationError("unsupported_buffer_profile")
         snapshot = _snapshot_precommit(app, tokenizer_manager, key)

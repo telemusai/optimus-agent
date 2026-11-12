@@ -35,7 +35,8 @@ from .prefix_layout import (LAYOUT_PREPEND, PREFIX_MARKER, PrefixLayout, resolve
 from .span_markers import resolve_user_role_id
 from . import metrics as _metrics
 from .turn_diagnostics import TurnDiagnostics, log_failure, log_retention
-from .latent_types import admission_probe
+from .latent_types import (CAPTURE_BUSY_WAIT_DEFAULT_SECONDS, CAPTURE_BUSY_WAIT_MAX_SECONDS,
+                           admission_probe)
 from .use_receipts import (
     NativeCompletion, NativeOutputAudit, TerminalOutputAudit, TerminalUseEvidence,
     receipt_bytes, terminal_envelope, terminal_event_bytes,
@@ -90,9 +91,13 @@ _REFUSAL_CODE = re.compile(r"occ3_[a-z][a-z_]{0,62}\Z")
 #: A source capture adds BufferProfile.capture_busy_wait_seconds: one shared
 #: window, anchored at the first registry active-slot decline or else at the
 #: initial dispatch, covers both busy waits (re-enroll and same-request
-#: re-dispatch). Deliberately distinct from the Retry-After advice below.
-#: The fail-closed settle can add at most BufferProfile.cleanup_seconds
-#: before the client sees the bounded 503.
+#: re-dispatch). BufferProfile.capture_drain_seconds is taken out of that
+#: window, not added to it: the scheduler may park a capture that long before
+#: it admits or declines it, so every source dispatch gets the first-event
+#: bound plus the drain, and a re-enroll or re-dispatch must start in the
+#: first (window - drain) seconds. Deliberately distinct from the Retry-After
+#: advice below. The fail-closed settle can add at most
+#: BufferProfile.cleanup_seconds before the client sees the bounded 503.
 
 #: Advisory retry timing, in seconds, attached as Retry-After on the
 #: admission-unavailability 503 family. Advice only: it tells a sender how
@@ -104,10 +109,11 @@ ADMISSION_BUSY_RETRY_AFTER_SECONDS = 5
 #: advisory Retry-After on admission-unavailability refusals.
 ADMISSION_WINDOW_HEADER = "x-optimus-occ3-admission-window"
 
-#: Upper bound of BufferProfile.capture_busy_wait_seconds. The Rust client's
-#: source resend headroom (OCC3_SOURCE_BUSY_RESEND_HEADROOM_SECS, 25 s) is the
-#: default control + this + first-event bound; a longer window would outrun it.
-CAPTURE_BUSY_WAIT_MAX_SECONDS = 10.0
+#: CAPTURE_BUSY_WAIT_MAX_SECONDS (latent_types, shared with the scheduler
+#: ranks) is the upper bound of BufferProfile.capture_busy_wait_seconds. The
+#: Rust client's source resend headroom (OCC3_SOURCE_BUSY_RESEND_HEADROOM_SECS,
+#: 25 s) is the default control + this + first-event bound; a longer window
+#: would outrun it.
 
 #: Scheduler refusal codes that are admission unavailability, mapped to their
 #: distinct public (code, status) shapes. These are retryable with a fresh
@@ -382,11 +388,30 @@ class BufferProfile:
     #: Absolute source-capture busy-wait window, shared by the registry
     #: active-slot wait and the scheduler busy re-dispatch. It is anchored
     #: at the first registry busy decline, or else at the initial dispatch;
-    #: every re-enroll and re-dispatch must start within it. 0 disables both
-    #: waits. At most CAPTURE_BUSY_WAIT_MAX_SECONDS (the client's resend
-    #: headroom assumes it). Operators set it with
+    #: every re-enroll and re-dispatch must start within it, less
+    #: capture_drain_seconds. 0 disables both waits and the scheduler capture
+    #: reservation. At most CAPTURE_BUSY_WAIT_MAX_SECONDS (the client's
+    #: resend headroom assumes it). Operators set it with
     #: OCC3_CAPTURE_BUSY_WAIT_SECONDS (native_install).
-    capture_busy_wait_seconds: float = 10.0
+    capture_busy_wait_seconds: float = CAPTURE_BUSY_WAIT_DEFAULT_SECONDS
+    #: Share of the busy-wait window given to the scheduler capture
+    #: reservation: a capture declined only for in-flight ordinary work is
+    #: parked for at most this long while running requests finish, then
+    #: admitted or declined. A source dispatch therefore gets
+    #: admission_first_event_seconds plus this value, and the window for
+    #: starts shrinks by the same amount, so the end-to-end bound does not
+    #: move. Between 0 and capture_busy_wait_seconds, so a 0 window forces
+    #: 0. The default 0 accounts for no reservation; the installer sets the
+    #: per-boot value from OCC3_CAPTURE_DRAIN_SECONDS (default 2 s, capped by
+    #: the window). OCC3_CAPTURE_PREEMPT (default "off"; "retract" is an
+    #: operator opt-in) only selects what the scheduler does with rows that
+    #: outlast the drain, so no frontend bound depends on it.
+    capture_drain_seconds: float = 0.0
+
+    @property
+    def capture_busy_start_seconds(self):
+        """Busy-wait window left for re-enroll and re-dispatch starts."""
+        return self.capture_busy_wait_seconds - self.capture_drain_seconds
 
     def __post_init__(self):
         integer_fields = (self.max_buffer_bytes, self.max_active, self.total_working_bytes,
@@ -409,7 +434,9 @@ class BufferProfile:
         if (not math.isfinite(self.capture_busy_retry_interval)
                 or self.capture_busy_retry_interval <= 0
                 or not math.isfinite(self.capture_busy_wait_seconds)
-                or not 0 <= self.capture_busy_wait_seconds <= CAPTURE_BUSY_WAIT_MAX_SECONDS):
+                or not 0 <= self.capture_busy_wait_seconds <= CAPTURE_BUSY_WAIT_MAX_SECONDS
+                or not math.isfinite(self.capture_drain_seconds)
+                or not 0 <= self.capture_drain_seconds <= self.capture_busy_wait_seconds):
             raise ValueError("invalid buffer profile")
 
 
@@ -556,9 +583,9 @@ class _Context:
     # (never reserve/prepare success: the request may still sit unqueued).
     admission_control_deadline: float = 0.0
     first_event_deadline: float = 0.0
-    # Source capture only: the shared busy-wait window end (first registry
-    # busy decline or initial dispatch + capture_busy_wait_seconds), the
-    # latest instant a re-enroll or same-request re-dispatch may start.
+    # Source capture only: the shared busy-wait window end for starts (first
+    # registry busy decline or initial dispatch + capture_busy_start_seconds),
+    # the latest instant a re-enroll or same-request re-dispatch may start.
     capture_busy_deadline: float = 0.0
     native_started: bool = False
     diagnostics: Any = None
@@ -1117,7 +1144,8 @@ class ChatAttachmentAdapter:
         frontend entry was retired and is pruned). The first busy decline
         anchors the shared busy window that a later scheduler re-dispatch
         also draws on. The control-plane deadline moves by exactly the time
-        spent waiting, never more than the window, so the published
+        spent waiting, never more than the window less the drain that the
+        later dispatch adds to its first-event bound, so the published
         pre-first-event maximum still holds. False keeps the historical
         refusal.
         """
@@ -1125,7 +1153,7 @@ class ChatAttachmentAdapter:
         if declined_at >= ctx.admission_control_deadline:
             raise AttachmentError("admission_timeout", 503)
         if not ctx.capture_busy_deadline:
-            ctx.capture_busy_deadline = declined_at + self.profile.capture_busy_wait_seconds
+            ctx.capture_busy_deadline = declined_at + self.profile.capture_busy_start_seconds
         interval = self.profile.capture_busy_retry_interval
         if not self._capture_wait_fits(ctx, declined_at + interval, interval):
             return False
@@ -1296,15 +1324,21 @@ class ChatAttachmentAdapter:
             ctx.dispatched = True  # Conservative: original may send before first yield.
             dispatch_at = self.monotonic()
             first_event = self.profile.admission_first_event_seconds
+            if source:
+                # The scheduler capture reservation may park this request for
+                # up to the drain before it admits or declines it, so every
+                # source dispatch gets the first-event bound plus the drain.
+                first_event += self.profile.capture_drain_seconds
             if source and not ctx.capture_busy_deadline:
                 # Without an earlier registry busy wait, the INITIAL dispatch
                 # anchors the shared absolute capture busy-wait window: every
-                # same-request re-dispatch must start by this instant, so no
-                # first-event bound ends later than this dispatch +
-                # capture_busy_wait_seconds + first-event bound. After a
-                # registry wait the window keeps its earlier anchor (one
-                # budget for both waits, never two).
-                ctx.capture_busy_deadline = dispatch_at + self.profile.capture_busy_wait_seconds
+                # same-request re-dispatch must start by this instant. Starts
+                # get the window less the drain, so no first-event bound ends
+                # later than this dispatch + capture_busy_wait_seconds +
+                # admission_first_event_seconds. After a registry wait the
+                # window keeps its earlier anchor (one budget for both waits,
+                # never two).
+                ctx.capture_busy_deadline = dispatch_at + self.profile.capture_busy_start_seconds
             expected = None  # Request state the dispatch preamble may produce.
             first_dispatch_at, retries = dispatch_at, 0
             while True:

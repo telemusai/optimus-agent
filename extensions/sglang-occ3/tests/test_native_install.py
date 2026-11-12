@@ -1295,11 +1295,165 @@ def test_capture_busy_wait_env_reader_valid(monkeypatch, raw, expected):
         monkeypatch.delenv("OCC3_CAPTURE_BUSY_WAIT_SECONDS", raising=False)
     else:
         monkeypatch.setenv("OCC3_CAPTURE_BUSY_WAIT_SECONDS", raw)
-    assert install._capture_busy_wait_seconds_from_env() == expected
+    assert install._capture_hold_settings_from_env().window == expected
 
 
 @pytest.mark.parametrize("raw", ["", "abc", "-1", "10.01", "60", "nan", "inf", "1e999"])
 def test_capture_busy_wait_env_reader_invalid(monkeypatch, raw):
     monkeypatch.setenv("OCC3_CAPTURE_BUSY_WAIT_SECONDS", raw)
     with pytest.raises(install.InstallationError, match="^capture_busy_wait_seconds_invalid$"):
-        install._capture_busy_wait_seconds_from_env()
+        install._capture_hold_settings_from_env()
+
+
+##############################
+# OCC3_CAPTURE_DRAIN_SECONDS and OCC3_CAPTURE_PREEMPT: per-boot capture reservation
+
+_CAPTURE_KNOBS = ("OCC3_CAPTURE_BUSY_WAIT_SECONDS", "OCC3_CAPTURE_DRAIN_SECONDS", "OCC3_CAPTURE_PREEMPT")
+
+
+def _capture_env(monkeypatch, window=None, drain=None, preempt=None):
+    for name, raw in zip(_CAPTURE_KNOBS, (window, drain, preempt)):
+        if raw is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, raw)
+
+
+_DRAIN_INVALID = [(None, raw) for raw in ("", "abc", "-1", "-0.001", "10.01", "nan", "inf", "1e999")] + [
+    ("4", "4.01"), ("0", "0.5")]
+_PREEMPT_INVALID = ["", "on", "OFF", "Retract", " off", "retract ", "true", "1"]
+
+
+@pytest.mark.parametrize("window,drain,preempt,expected", [
+    (None, None, None, (10.0, 2.0, "off")),
+    (None, "0", None, (10.0, 0.0, "off")),
+    (None, "3.5", None, (10.0, 3.5, "off")),
+    (None, "10", None, (10.0, 10.0, "off")),
+    ("4", None, None, (4.0, 2.0, "off")),
+    ("1.5", None, None, (1.5, 1.5, "off")),       # the default drain never outlasts the window
+    ("0", None, None, (0.0, 0.0, "off")),         # no window, no reservation, no drain
+    ("4", "4", None, (4.0, 4.0, "off")),
+    (None, None, "off", (10.0, 2.0, "off")),
+    (None, None, "retract", (10.0, 2.0, "retract")),
+])
+def test_capture_hold_env_reader_valid(monkeypatch, window, drain, preempt, expected):
+    _capture_env(monkeypatch, window, drain, preempt)
+    settings = install._capture_hold_settings_from_env()
+    assert (settings.window, settings.drain, settings.preempt) == expected
+
+
+@pytest.mark.parametrize("window,raw", _DRAIN_INVALID)
+def test_capture_drain_env_reader_invalid(monkeypatch, window, raw):
+    _capture_env(monkeypatch, window, raw)
+    with pytest.raises(install.InstallationError, match="^capture_drain_seconds_invalid$"):
+        install._capture_hold_settings_from_env()
+
+
+@pytest.mark.parametrize("raw", _PREEMPT_INVALID)
+def test_capture_preempt_env_reader_invalid(monkeypatch, raw):
+    _capture_env(monkeypatch, preempt=raw)
+    with pytest.raises(install.InstallationError, match="^capture_preempt_invalid$"):
+        install._capture_hold_settings_from_env()
+
+
+def test_capture_hold_env_reader_reports_the_first_invalid_knob(monkeypatch):
+    _capture_env(monkeypatch, "11", "abc", "on")
+    with pytest.raises(install.InstallationError, match="^capture_busy_wait_seconds_invalid$"):
+        install._capture_hold_settings_from_env()
+    _capture_env(monkeypatch, None, "abc", "on")
+    with pytest.raises(install.InstallationError, match="^capture_drain_seconds_invalid$"):
+        install._capture_hold_settings_from_env()
+
+
+def test_capture_hold_env_reader_matches_the_scheduler_rank_reader(monkeypatch):
+    """One parser for the frontend installer and the scheduler ranks."""
+    from occ3_sglang import latent_types
+    _capture_env(monkeypatch, "6", "1.5", "retract")
+    assert install._capture_hold_settings_from_env() == latent_types.capture_hold_settings()
+
+
+def test_capture_hold_env_reader_never_invents_a_decline_code(monkeypatch):
+    from occ3_sglang import latent_types, startup_state
+
+    def unknown():
+        raise ValueError("PRIVATE-UNLISTED-TEXT")
+
+    monkeypatch.setattr(latent_types, "capture_hold_settings", unknown)
+    with pytest.raises(ValueError):
+        install._capture_hold_settings_from_env()
+    assert install._CAPTURE_KNOB_CODES <= startup_state._FIXED_CODES
+
+
+async def test_capture_reservation_env_absent_installs_the_defaults(transaction_fixture, monkeypatch):
+    _capture_env(monkeypatch)
+    f = transaction_fixture
+    receipt = await install.install_native_runtime(f.app, f.tm, experimental_opt_in=True)
+    assert receipt.installed
+    profile = getattr(f.app, install._INSTALLED_ATTR).adapter.profile
+    assert (profile.capture_busy_wait_seconds, profile.capture_drain_seconds) == (10.0, 2.0)
+    assert profile.capture_busy_start_seconds == 8.0
+
+
+@pytest.mark.parametrize("window,drain,expected", [
+    (None, "0", (10.0, 0.0)), (None, "3.5", (10.0, 3.5)), (None, "10", (10.0, 10.0)),
+    ("4", None, (4.0, 2.0)), ("1.5", None, (1.5, 1.5)), ("0", None, (0.0, 0.0)), ("4", "4", (4.0, 4.0)),
+])
+async def test_capture_drain_env_reaches_installed_profile(
+        transaction_fixture, monkeypatch, window, drain, expected):
+    _capture_env(monkeypatch, window, drain)
+    f = transaction_fixture
+    receipt = await install.install_native_runtime(f.app, f.tm, experimental_opt_in=True)
+    assert receipt.installed
+    profile = getattr(f.app, install._INSTALLED_ATTR).adapter.profile
+    assert (profile.capture_busy_wait_seconds, profile.capture_drain_seconds) == expected
+
+
+@pytest.mark.parametrize("window,raw", _DRAIN_INVALID)
+async def test_capture_drain_env_invalid_declines_install_fail_closed(
+        transaction_fixture, monkeypatch, window, raw):
+    from occ3_sglang import startup_state
+    _capture_env(monkeypatch, window, raw)
+    f = transaction_fixture
+    receipt = await install.install_native_runtime(f.app, f.tm, experimental_opt_in=True)
+    assert not receipt.installed and receipt.code == "capture_drain_seconds_invalid"
+    assert getattr(f.app, install._INSTALLED_ATTR, None) is None
+    machine = startup_state.current()
+    assert machine.state.value == "DECLINED" and machine.code == "capture_drain_seconds_invalid"
+
+
+@pytest.mark.parametrize("raw", [None, "off", "retract"])
+async def test_capture_preempt_env_valid_installs_and_leaves_the_frontend_profile(
+        transaction_fixture, monkeypatch, raw):
+    """Preemption is a scheduler policy: off by default, retract an operator
+    opt-in. The frontend bounds are the same for both."""
+    _capture_env(monkeypatch, preempt=raw)
+    f = transaction_fixture
+    receipt = await install.install_native_runtime(f.app, f.tm, experimental_opt_in=True)
+    assert receipt.installed
+    profile = getattr(f.app, install._INSTALLED_ATTR).adapter.profile
+    assert (profile.capture_busy_wait_seconds, profile.capture_drain_seconds) == (10.0, 2.0)
+
+
+@pytest.mark.parametrize("raw", _PREEMPT_INVALID)
+async def test_capture_preempt_env_invalid_declines_install_fail_closed(
+        transaction_fixture, monkeypatch, raw):
+    from occ3_sglang import startup_state
+    _capture_env(monkeypatch, preempt=raw)
+    f = transaction_fixture
+    receipt = await install.install_native_runtime(f.app, f.tm, experimental_opt_in=True)
+    assert not receipt.installed and receipt.code == "capture_preempt_invalid"
+    assert getattr(f.app, install._INSTALLED_ATTR, None) is None
+    machine = startup_state.current()
+    assert machine.state.value == "DECLINED" and machine.code == "capture_preempt_invalid"
+
+
+async def test_capture_reservation_env_never_overrides_explicit_profile(transaction_fixture, monkeypatch):
+    _capture_env(monkeypatch, "6", "3", "retract")
+    from occ3_sglang.chat_adapter import BufferProfile
+    explicit = BufferProfile(capture_busy_wait_seconds=4, capture_drain_seconds=1)
+    f = transaction_fixture
+    receipt = await install.install_native_runtime(f.app, f.tm,
+        experimental_opt_in=True, buffer_profile=explicit)
+    assert receipt.installed
+    profile = getattr(f.app, install._INSTALLED_ATTR).adapter.profile
+    assert profile is explicit and profile.capture_drain_seconds == 1

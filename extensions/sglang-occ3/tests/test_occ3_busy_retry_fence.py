@@ -1365,3 +1365,218 @@ async def test_capture_busy_batch_keeps_the_fence_when_the_retire_fails(source_h
     assert len(calls) == 2                      # early retire, then the cleanup retry
     second, _, _ = await source_call(h)
     assert second.status_code == 409 and b"replay_forbidden" in second.body
+
+
+# ------------------------- scheduler capture reservation: drain accounting
+def _frozen_clock(h):
+    """Adapter clock that only moves when the test moves it, so every
+    deadline is an exact sum with no real-time drift."""
+    base, offset = time.monotonic(), [0.0]
+    h.adapter.monotonic = lambda: base + offset[0]
+    return base, offset
+
+
+def _recording_declines(h, offset=None, moves=()):
+    """Native generator that records (clock offset, busy start deadline,
+    first-event deadline) at each dispatch, optionally moves the clock, then
+    declines busy. Once ``moves`` is used up it runs a normal turn."""
+    seen, steps = [], list(moves)
+
+    async def generate(tm, obj, request=None):
+        tm.calls.append(obj)
+        ctx = request.state._optimus_occ3_chat_context
+        seen.append((offset[0] if offset else None, ctx.capture_busy_deadline, ctx.first_event_deadline))
+        if not steps:
+            yield {"text": "fixture", "meta_info": {"id": obj.rid, "finish_reason": {"type": "stop"}}}
+            return
+        move = steps.pop(0)
+        if move is not None:
+            offset[0] = move
+        yield _busy_output(obj)
+
+    type(h.tm).generate_request = h.wrap(generate, h.adapter.generate_around, h.HookType.AROUND)
+    return seen
+
+
+@pytest.mark.parametrize("window,drain", [(10, -.1), (10, 10.5), (10, float("nan")), (10, float("inf")),
+                                          (4, 4.5), (0, .5)])
+def test_capture_drain_profile_rejects_a_drain_outside_the_window(window, drain):
+    """A 0 window disables the reservation, so only a 0 drain fits it."""
+    from occ3_sglang.chat_adapter import BufferProfile
+    with pytest.raises(ValueError, match="invalid buffer profile"):
+        BufferProfile(capture_busy_wait_seconds=window, capture_drain_seconds=drain)
+
+
+@pytest.mark.parametrize("window,drain,start", [(10, 0, 10), (10, 2, 8), (4, 4, 0), (0, 0, 0)])
+def test_capture_drain_profile_moves_time_inside_the_published_window(window, drain, start):
+    from occ3_sglang.chat_adapter import BufferProfile, ChatAttachmentAdapter
+    assert BufferProfile().capture_drain_seconds == 0
+    profile = BufferProfile(capture_busy_wait_seconds=window, capture_drain_seconds=drain)
+    assert profile.capture_busy_start_seconds == start
+    adapter = ChatAttachmentAdapter(profile=profile)
+    error = AttachmentError("scheduler_busy", 503)
+    # Control 7 + window + first-event 8, whatever the drain.
+    assert adapter._error(error, source=True).headers["x-optimus-occ3-admission-window"] == str(15.0 + window)
+    assert adapter._error(error).headers["x-optimus-occ3-admission-window"] == "15.0"
+
+
+@pytest.mark.asyncio
+async def test_capture_drain_extends_each_dispatch_and_shrinks_the_start_window(source_harness):
+    """Every source dispatch gets the first-event bound plus the drain. Starts
+    get the window less the drain, so no first-event bound ends later than
+    the initial dispatch + window + first-event bound."""
+    h = source_harness
+    h.adapter.profile = replace(h.adapter.profile, capture_busy_wait_seconds=10,
+                                capture_drain_seconds=2, capture_busy_retry_interval=.01)
+    base, offset = _frozen_clock(h)
+    # The third decline comes 7.995 s in: a start one cadence later misses 8 s.
+    seen = _recording_declines(h, offset, moves=[5.0, 7.9, 7.995])
+    response, _, _ = await source_call(h)
+    assert response.status_code == 503 and b"scheduler_busy" in response.body
+    assert [at for at, _, _ in seen] == [0.0, 5.0, 7.9]
+    assert all(busy == base + 8 for _, busy, _ in seen)                  # window 10 - drain 2
+    assert [first for _, _, first in seen] == [(base + at) + 10.0 for at, _, _ in seen]   # 8 + drain 2
+    assert max(first for _, _, first in seen) <= base + 10 + 8.0
+    assert response.headers["x-optimus-occ3-admission-window"] == "25.0"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("drain,dispatches", [(0, 2), (4, 1)])
+async def test_capture_drain_refuses_a_redispatch_after_the_start_window(source_harness, drain, dispatches):
+    """A decline 7 s after the dispatch is inside the 10 s busy window. The
+    re-dispatch is allowed without a drain; a 4 s drain leaves a 6 s start
+    window, so the decline surfaces."""
+    h = source_harness
+    h.adapter.profile = replace(h.adapter.profile, capture_busy_wait_seconds=10,
+                                capture_drain_seconds=drain, capture_busy_retry_interval=.01)
+    _, offset = _frozen_clock(h)
+    _recording_declines(h, offset, moves=[7.0])
+    response, _, _ = await source_call(h)
+    assert len(h.tm.calls) == dispatches
+    if dispatches == 2:
+        assert response.status_code == 200
+    else:
+        assert response.status_code == 503 and b"scheduler_busy" in response.body
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("drain,status", [(0, 503), (1, 200)])
+async def test_capture_parked_for_the_drain_is_not_an_admission_timeout(source_harness, drain, status):
+    """A capture the scheduler parks stays silent past the bare first-event
+    bound. The drain keeps the frontend from failing it closed."""
+    h = source_harness
+    h.adapter.profile = replace(h.adapter.profile, capture_busy_wait_seconds=1,
+                                capture_drain_seconds=drain, admission_first_event_seconds=.05)
+
+    async def generate(tm, obj, request=None):
+        tm.calls.append(obj)
+        await asyncio.sleep(.2)
+        yield {"text": "fixture", "meta_info": {"id": obj.rid, "finish_reason": {"type": "stop"}}}
+
+    type(h.tm).generate_request = h.wrap(generate, h.adapter.generate_around, h.HookType.AROUND)
+    response, _, _ = await source_call(h)
+    assert response.status_code == status and len(h.tm.calls) == 1
+    if status == 503:
+        assert b"admission_timeout" in response.body
+
+
+@pytest.mark.asyncio
+async def test_receiver_dispatch_gets_no_capture_drain(harness):
+    h = harness
+    h.adapter.profile = replace(h.adapter.profile, capture_busy_wait_seconds=10, capture_drain_seconds=2)
+    base, _ = _frozen_clock(h)
+    seen = _recording_declines(h, moves=[None])
+    response = await consume_call(h)
+    assert response.status_code == 503 and b"scheduler_busy" in response.body
+    assert seen == [(None, 0.0, base + 8.0)]
+    assert response.headers["x-optimus-occ3-admission-window"] == "15.0"
+
+
+@pytest.mark.asyncio
+async def test_capture_drain_equal_to_the_window_leaves_no_frontend_wait(source_harness):
+    """The whole window belongs to the scheduler reservation: one dispatch
+    with the first-event bound plus the window, no re-dispatch and no
+    registry wait. Both declines surface and unfence as before."""
+    h = source_harness
+    h.adapter.profile = replace(h.adapter.profile, capture_busy_wait_seconds=10,
+                                capture_drain_seconds=10, capture_busy_retry_interval=.01)
+    proof = h.backend.release_unused_attempt = _Proof("unadmitted")
+    base, _ = _frozen_clock(h)
+    seen = _recording_declines(h, moves=[None])
+    first, _, _ = await source_call(h)
+    assert first.status_code == 503 and b"scheduler_busy" in first.body
+    assert seen == [(None, base, base + 18.0)]
+    assert first.headers["x-optimus-occ3-admission-window"] == "25.0"
+    assert len(h.tm.calls) == 1 and len(proof.calls) == 1
+    declines = _slot_busy(h, 1)
+    second, _, _ = await source_call(h)
+    assert second.status_code == 503 and b"scheduler_busy" in second.body
+    assert len(declines) == 1 and len(h.tm.calls) == 1
+    assert (await source_call(h))[0].status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_capture_registry_waits_stay_inside_the_start_window(source_harness, monkeypatch):
+    """Registry waits draw on the window less the drain, so the control
+    extension they earn plus the drain of the later dispatch stays inside
+    the published window."""
+    h = source_harness
+    window, drain = 1.0, .6
+    h.adapter.profile = replace(h.adapter.profile, capture_busy_wait_seconds=window,
+                                capture_drain_seconds=drain, capture_busy_retry_interval=.05,
+                                admission_control_seconds=.5)
+    _skewed_sleep(h, monkeypatch, overshoot=0)
+    declines = _slot_busy(h, 1000)
+    waits = _record_waits(h)
+    response, _, _ = await source_call(h)
+    assert response.status_code == 503 and b"scheduler_busy" in response.body
+    assert not h.tm.calls and h.adapter._active == 0
+    assert sum(after - before for before, after, _, _ in waits) <= window - drain + 1e-9
+    assert 3 <= len(declines) <= 8            # .4 s of starts at .05 s; about 20 without the drain
+
+
+@pytest.mark.asyncio
+async def test_capture_dispatch_after_registry_waits_keeps_the_published_bound(source_harness, monkeypatch):
+    h = source_harness
+    window, drain = 1.0, .6
+    h.adapter.profile = replace(h.adapter.profile, capture_busy_wait_seconds=window,
+                                capture_drain_seconds=drain, capture_busy_retry_interval=.05,
+                                admission_control_seconds=.5)
+    _skewed_sleep(h, monkeypatch, overshoot=0)
+    declines = _slot_busy(h, 4)
+    waits = _record_waits(h)
+    seen = _recording_declines(h, moves=[None] * 1000)
+    response, _, _ = await source_call(h)
+    assert response.status_code == 503 and b"scheduler_busy" in response.body
+    assert len(declines) == 4 and len(seen) >= 2
+    anchor = waits[0][3]                      # set at the first registry decline
+    assert all(busy == anchor for _, busy, _ in seen)
+    # Request start + control .5 + window 1 + first-event 8 is the published bound.
+    published = waits[0][0] + window + h.adapter.profile.admission_first_event_seconds
+    assert all(first <= published + 1e-9 for _, _, first in seen)
+    assert all(first <= anchor + drain + h.adapter.profile.admission_first_event_seconds + 1e-9
+               for _, _, first in seen)
+
+
+@pytest.mark.asyncio
+async def test_capture_drain_keepalive_stream_surfaces_the_decline_without_retry(source_harness):
+    from occ3_sglang.attachment_contract import KEEPALIVE_REQUEST_HEADER, KEEPALIVE_REQUEST_MODE
+    from test_chat_source_capture import source_raw
+    h = source_harness
+    h.adapter.profile = replace(h.adapter.profile, capture_busy_wait_seconds=.12,
+                                capture_drain_seconds=.12, capture_busy_retry_interval=.01,
+                                keepalive_seconds=.002)
+    _aborting(h, ["occ3_busy_batch"] * 1000)
+    raw, _ = source_raw()
+    raw.scope["headers"].append((KEEPALIVE_REQUEST_HEADER.encode(), KEEPALIVE_REQUEST_MODE.encode()))
+    response = await h.chat.handle_request(chat_request(), raw)
+    events = []
+
+    async def send(event):
+        events.append(event)
+
+    await asyncio.wait_for(response(raw.scope, raw.receive, send), 2)
+    body = b"".join(e.get("body", b"") for e in events)
+    frames = [line[6:] for line in body.splitlines() if line.startswith(b"data: ")]
+    assert len(frames) == 1 and json.loads(frames[0])["error"]["message"] == "scheduler_busy"
+    assert len(h.tm.calls) == 1 and h.adapter._active == 0
