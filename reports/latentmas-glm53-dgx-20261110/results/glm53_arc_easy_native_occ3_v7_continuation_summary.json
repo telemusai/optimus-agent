@@ -140,6 +140,414 @@
         }
       },
       "published_source_file": "results/native_v7/score-public-arc_easy-item11.json"
+    },
+    {
+      "source_file": "/tmp/latentmas-one-item-control/20261112t031218z-arc_easy-12/score-public.json",
+      "source_sha256": "0a4c5f03995c7a21fe8bea4df9fa0172a296c148fbcc0b548a43d5f7e4352197",
+      "source_schema": "occ3.native.score_summary.v1",
+      "created_unix_ns": 1794453257799372585,
+      "denominator": 20,
+      "explicit_attempt_count": 1,
+      "score_eligible": 1,
+      "strict_correct": 1,
+      "incomplete_or_ineligible": 19,
+      "strict_accuracy_all20": 0.05,
+      "eligible_row": {
+        "idx": 12,
+        "run_id": "6b929518e1af4641a92e74f7bac2767f",
+        "status": "complete",
+        "correct": true,
+        "score_eligible": true,
+        "transport_valid": true,
+        "cleanup_confirmed": true,
+        "cleanup_issue_count": 0,
+        "format_valid": true,
+        "truncated": false,
+        "error_code": null,
+        "question_sha256": "db723e062dde60061d742028186e2c85db1e864046f1843115f19c7fe0127afe",
+        "raw_final_sha256": "6808836b7731a64db409fc445f2f83fe0f4ec37c3163c96b6174de96221d09e4",
+        "artifact_sha256": {
+          "cleanup.json": "2207ef50f5f452ab7e461a6541f821033a53605cce32c16efeb699dbce98fdfe",
+          "context-bookkeeping.json": "9a14153e2ea12759af6941631f3623f62b29c3fb8536344d548cb46c82aa8346",
+          "events.jsonl": "62469d520060a9410e6aad67f8c4c25579f70b1763974b79fd8cdd28576f0d9c",
+          "item.json": "23cba549b019a73e6a30c8c565eab4906cfffcf192c53ee9e770c0f6d29f81eb",
+          "outcome.json": "1fb991056dcd5aff19723089fe415836210d35acd705d1a76db915d9af8856e7"
+        },
+        "measured_times": {
+          "cleanup_seconds": 0.117260236,
+          "daemon_connection_seconds": null,
+          "item_wall_seconds_including_setup": 103.15963197,
+          "native_work_seconds": 95.818936736,
+          "setup_seconds": 7.337808102
+        },
+        "usage_coverage": "terminal_transcripts",
+        "provider_usage": {
+          "semantics": "provider_reported_counters_not_estimates",
+          "record_count": 26,
+          "all_fields_complete": true,
+          "input_tokens": 95649,
+          "output_tokens": 6489,
+          "total_tokens": 102138
+        }
+      },
+      "published_source_file": "results/native_v7/score-public-arc_easy-item12.json"
+    },
+    {
+      "source_file": "/tmp/latentmas-one-item-control/20261112t031420z-arc_easy-13/score-public.json",
+      "source_sha256": "ee95bd115edea12141fcce311d61a420ec80081b8419299e1480f11a2aacef60",
+      "source_schema": "occ3.native.score_summary.v1",
+      "created_unix_ns": 1794453407960932533,
+      "denominator": 20,
+      "explicit_attempt_count": 1,
+      "score_eligible": 1,
+      "strict_correct": 1,
+      "incomplete_or_ineligible": 19,
+      "strict_accuracy_all20": 0.05,
+      "eligible_row": {
+        "idx": 13,
+        "run_id": "868964c99adf436ba74baa7c5a58423d",
+        "status": "complete",
+        "correct": true,
+        "score_eligible": true,
+        "transport_valid": true,
+        "cleanup_confirmed": true,
+        "cleanup_issue_count": 0,
+        "format_valid": true,
+        "truncated": false,
+        "error_code": null,
+        "question_sha256": "15ec6f1b961bfd8cfbfc7bbc2bb6ee53c74aa707ccea41e2e30d4a6df0dbe683",
+        "raw_final_sha256": "2969b49046e731380f8916aca8876787e44f0055cee9bd90141d92b78efa9c76",
+        "artifact_sha256": {
+          "cleanup.json": "2207ef50f5f452ab7e461a6541f821033a53605cce32c16efeb699dbce98fdfe",
+          "context-bookkeeping.json": "54d4d6b9435084f00613622cf6beb72e55a41fbc3e86035125c95468adb77b31",
+          "events.jsonl": "55e3fbeeed214c73f53418ec58d161a8cef2030480189f662eab2f8a4a2ffec1",
+          "item.json": "c452c66aadf9e99193f8be2827c4616cff408a20a48dc7f2e00c995864c33c64",
+          "outcome.json": "628df55fbee42ad3294cdec1c00215f9b8dc0e8023b3cc41994e7b0e69dbfef9"
+        },
+        "measured_times": {
+          "cleanup_seconds": 0.126237282,
+          "daemon_connection_seconds": null,
+          "item_wall_seconds_including_setup": 133.638415659,
+          "native_work_seconds": 126.68473133,
+          "setup_seconds": 6.951534211
+        },
+        "usage_coverage": "terminal_transcripts",
+        "provider_usage": {
+          "semantics": "provider_reported_counters_not_estimates",
+          "record_count": 26,
+          "all_fields_complete": true,
+          "input_tokens": 98394,
+          "output_tokens": 7862,
+          "total_tokens": 106256
+        }
+      },
+      "published_source_file": "results/native_v7/score-public-arc_easy-item13.json"
+    },
+    {
+      "source_file": "/tmp/latentmas-one-item-control/20261112t031650z-arc_easy-14/score-public.json",
+      "source_sha256": "8c1e78c8ab705f40cc7c6be69687d19a5cae13f7abae9e1c133726b26d6fd368",
+      "source_schema": "occ3.native.score_summary.v1",
+      "created_unix_ns": 1794453630218595260,
+      "denominator": 20,
+      "explicit_attempt_count": 1,
+      "score_eligible": 1,
+      "strict_correct": 1,
+      "incomplete_or_ineligible": 19,
+      "strict_accuracy_all20": 0.05,
+      "eligible_row": {
+        "idx": 14,
+        "run_id": "6e7cd5a64d264d14b4cb0f9fc7f7844b",
+        "status": "complete",
+        "correct": true,
+        "score_eligible": true,
+        "transport_valid": true,
+        "cleanup_confirmed": true,
+        "cleanup_issue_count": 0,
+        "format_valid": true,
+        "truncated": false,
+        "error_code": null,
+        "question_sha256": "efa77eb34cb25f38e7d59258d617fa0660f9355874425bbe4faebf2fd8b49685",
+        "raw_final_sha256": "5161006bb7a62a394c3cf892b67f4ef4f85e9e212e88fc62ede9eedadd17e9d6",
+        "artifact_sha256": {
+          "cleanup.json": "2207ef50f5f452ab7e461a6541f821033a53605cce32c16efeb699dbce98fdfe",
+          "context-bookkeeping.json": "29ba7784264a185ed8c3eb8c7ad4161acc0af649a91642b4b69de6b20ab50a31",
+          "events.jsonl": "0dcbfb60d2d659142a94b008f4d475d79be4a2e1a7608f42bfe0347431c0c36a",
+          "item.json": "f188a0c8991a6588a8987d4a5a148c883d9e43a3b4c453a27e1cc10a60025ed7",
+          "outcome.json": "626e18f7bf2fa860f3d275e9cc63305bc59a86d89bdacff4fb59be7cb21ba3ef"
+        },
+        "measured_times": {
+          "cleanup_seconds": 0.117330147,
+          "daemon_connection_seconds": null,
+          "item_wall_seconds_including_setup": 204.519193691,
+          "native_work_seconds": 196.721052407,
+          "setup_seconds": 7.795677205
+        },
+        "usage_coverage": "terminal_transcripts",
+        "provider_usage": {
+          "semantics": "provider_reported_counters_not_estimates",
+          "record_count": 26,
+          "all_fields_complete": true,
+          "input_tokens": 102045,
+          "output_tokens": 10537,
+          "total_tokens": 112582
+        }
+      },
+      "published_source_file": "results/native_v7/score-public-arc_easy-item14.json"
+    },
+    {
+      "source_file": "/tmp/latentmas-one-item-control/20261112t032032z-arc_easy-15/score-public.json",
+      "source_sha256": "9d3386364c6040c0c804119e20f4247c3e62602348e794019f879a21ea6789da",
+      "source_schema": "occ3.native.score_summary.v1",
+      "created_unix_ns": 1794453798227746945,
+      "denominator": 20,
+      "explicit_attempt_count": 1,
+      "score_eligible": 1,
+      "strict_correct": 1,
+      "incomplete_or_ineligible": 19,
+      "strict_accuracy_all20": 0.05,
+      "eligible_row": {
+        "idx": 15,
+        "run_id": "6be5efc3039a438a99fa05e4284310d7",
+        "status": "complete",
+        "correct": true,
+        "score_eligible": true,
+        "transport_valid": true,
+        "cleanup_confirmed": true,
+        "cleanup_issue_count": 0,
+        "format_valid": true,
+        "truncated": false,
+        "error_code": null,
+        "question_sha256": "18f167bc0b5aa6b57576282e24388728f49c7d4190c4d6dc0e03ccade2865e89",
+        "raw_final_sha256": "aea98a40c2504154b16b8120e20a8b693f2082f8dcdcc67df4c66c2c74d9625c",
+        "artifact_sha256": {
+          "cleanup.json": "2207ef50f5f452ab7e461a6541f821033a53605cce32c16efeb699dbce98fdfe",
+          "context-bookkeeping.json": "9ea387efc651ecc5d10ad799951b50851d6cebc16eaf671c4135d655548b7879",
+          "events.jsonl": "78b130e4d920d1b046f01e185b7ee0c20c8e0ec325390fe67cd0cf8b0512ee64",
+          "item.json": "edbfb5142228515132e37bfc82f579a9d8fb9bb1b4e08bd120c13075d521aed3",
+          "outcome.json": "f5081e58d972d69aa846c6700b7e712dfab6eab6b56fba6290b2f0b2cde5a4b6"
+        },
+        "measured_times": {
+          "cleanup_seconds": 0.186248653,
+          "daemon_connection_seconds": null,
+          "item_wall_seconds_including_setup": 149.826726515,
+          "native_work_seconds": 142.366685958,
+          "setup_seconds": 7.456623195
+        },
+        "usage_coverage": "terminal_transcripts",
+        "provider_usage": {
+          "semantics": "provider_reported_counters_not_estimates",
+          "record_count": 26,
+          "all_fields_complete": true,
+          "input_tokens": 108960,
+          "output_tokens": 13343,
+          "total_tokens": 122303
+        }
+      },
+      "published_source_file": "results/native_v7/score-public-arc_easy-item15.json"
+    },
+    {
+      "source_file": "/tmp/latentmas-one-item-control/20261112t032320z-arc_easy-16/score-public.json",
+      "source_sha256": "72938923c7ce23c51993a97c15d8efe40366959b6d5399ead1ba5c8bc75f3dc9",
+      "source_schema": "occ3.native.score_summary.v1",
+      "created_unix_ns": 1794453943905410998,
+      "denominator": 20,
+      "explicit_attempt_count": 1,
+      "score_eligible": 1,
+      "strict_correct": 1,
+      "incomplete_or_ineligible": 19,
+      "strict_accuracy_all20": 0.05,
+      "eligible_row": {
+        "idx": 16,
+        "run_id": "12a7afb7bc3a4c079b810840c8ae584a",
+        "status": "complete",
+        "correct": true,
+        "score_eligible": true,
+        "transport_valid": true,
+        "cleanup_confirmed": true,
+        "cleanup_issue_count": 0,
+        "format_valid": true,
+        "truncated": false,
+        "error_code": null,
+        "question_sha256": "a0d26f18662ba57a54a93b932f8ce517407c70095e692f525707dae85c2a84b4",
+        "raw_final_sha256": "7ee2bb70c2a71e947b1df5be0246521ff5b0e2d3e61229529cb9c8000fe688c0",
+        "artifact_sha256": {
+          "cleanup.json": "2207ef50f5f452ab7e461a6541f821033a53605cce32c16efeb699dbce98fdfe",
+          "context-bookkeeping.json": "f6e4943d56f8c2566ecda87e01f6b8ec715e69e6538bb874b8cb92b05df6373a",
+          "events.jsonl": "643079472cc725986dfc135b6439913f0f6d4511771e59fbc2ae4356244ade9b",
+          "item.json": "1a511f875fd41471b624ac3e7f24a287a44e29c37ca4daf807ffa4c26dcfdce4",
+          "outcome.json": "a362df357bc62145188b7e378534df391265246e53e7ead95ce3288d601c3618"
+        },
+        "measured_times": {
+          "cleanup_seconds": 0.135438178,
+          "daemon_connection_seconds": null,
+          "item_wall_seconds_including_setup": 126.576964697,
+          "native_work_seconds": 119.482551414,
+          "setup_seconds": 7.091259367
+        },
+        "usage_coverage": "terminal_transcripts",
+        "provider_usage": {
+          "semantics": "provider_reported_counters_not_estimates",
+          "record_count": 26,
+          "all_fields_complete": true,
+          "input_tokens": 97751,
+          "output_tokens": 7452,
+          "total_tokens": 105203
+        }
+      },
+      "published_source_file": "results/native_v7/score-public-arc_easy-item16.json"
+    },
+    {
+      "source_file": "/tmp/latentmas-one-item-control/20261112t032546z-arc_easy-17/score-public.json",
+      "source_sha256": "d48ce6dd69c91dfc2f1de5fc58b1e6bc63e2940ce848b1ff3946167eb32e82fe",
+      "source_schema": "occ3.native.score_summary.v1",
+      "created_unix_ns": 1794454106311349729,
+      "denominator": 20,
+      "explicit_attempt_count": 1,
+      "score_eligible": 1,
+      "strict_correct": 1,
+      "incomplete_or_ineligible": 19,
+      "strict_accuracy_all20": 0.05,
+      "eligible_row": {
+        "idx": 17,
+        "run_id": "0594cf6aafb14bcabe40886750fe24c3",
+        "status": "complete",
+        "correct": true,
+        "score_eligible": true,
+        "transport_valid": true,
+        "cleanup_confirmed": true,
+        "cleanup_issue_count": 0,
+        "format_valid": true,
+        "truncated": false,
+        "error_code": null,
+        "question_sha256": "df6013b5f7a2f37e2ba15fd8f1697c90fd5d0f36439eff3b82c9b05ced2ed446",
+        "raw_final_sha256": "a66986188ffab087e9f5e17aa3142676b382055af746d524c35fc34425adf09d",
+        "artifact_sha256": {
+          "cleanup.json": "2207ef50f5f452ab7e461a6541f821033a53605cce32c16efeb699dbce98fdfe",
+          "context-bookkeeping.json": "edaf5459446a74ca2f7d2e565777b96583c38f1422b29d51b487e4339f98b087",
+          "events.jsonl": "13ecdfc709fd24720fadb0efde9bc7f001765d28a3cf8a8bad6765d755f3c9ab",
+          "item.json": "717dc9955be1eecd1c01f0143b2b511da954816f13f062c14a4192b0c4025e77",
+          "outcome.json": "e175a118f5512dce5daa635b6477bb6a76d503057ca80f6be2a7abe4b08bf30e"
+        },
+        "measured_times": {
+          "cleanup_seconds": 0.159670253,
+          "daemon_connection_seconds": null,
+          "item_wall_seconds_including_setup": 143.475004526,
+          "native_work_seconds": 136.593441757,
+          "setup_seconds": 6.878881008
+        },
+        "usage_coverage": "terminal_transcripts",
+        "provider_usage": {
+          "semantics": "provider_reported_counters_not_estimates",
+          "record_count": 26,
+          "all_fields_complete": true,
+          "input_tokens": 105167,
+          "output_tokens": 10937,
+          "total_tokens": 116104
+        }
+      },
+      "published_source_file": "results/native_v7/score-public-arc_easy-item17.json"
+    },
+    {
+      "source_file": "/tmp/latentmas-one-item-control/20261112t032828z-arc_easy-18/score-public.json",
+      "source_sha256": "4814f9534c3a173d3313017eac4f3a0fa9167552932b18ace8587322fb105f3b",
+      "source_schema": "occ3.native.score_summary.v1",
+      "created_unix_ns": 1794454254732204287,
+      "denominator": 20,
+      "explicit_attempt_count": 1,
+      "score_eligible": 1,
+      "strict_correct": 1,
+      "incomplete_or_ineligible": 19,
+      "strict_accuracy_all20": 0.05,
+      "eligible_row": {
+        "idx": 18,
+        "run_id": "924a4236f607496fb63f7e47b61b3ab5",
+        "status": "complete",
+        "correct": true,
+        "score_eligible": true,
+        "transport_valid": true,
+        "cleanup_confirmed": true,
+        "cleanup_issue_count": 0,
+        "format_valid": true,
+        "truncated": false,
+        "error_code": null,
+        "question_sha256": "8f6bc20f63d1e9d7f05c40047cb2d907acee8f781dba562246e045a02233bc49",
+        "raw_final_sha256": "b31572fd2ae4d18e9da6aca2535d370012cffdac4776a282b3d9cfd0a7678444",
+        "artifact_sha256": {
+          "cleanup.json": "2207ef50f5f452ab7e461a6541f821033a53605cce32c16efeb699dbce98fdfe",
+          "context-bookkeeping.json": "9fb469232a6f2c57ec5daccffbbb65dbb42c14c516b42920fd271423c6782453",
+          "events.jsonl": "ba54bc2b53f5e33a1ddc749a7f222c00823a41dea5333c92d63108973d367e5d",
+          "item.json": "759f466c71e243cd78e14b517265dc332495f1f418ab0970b0dd361cc2d4c93f",
+          "outcome.json": "99a45cd2cb284819b652a6bb270d845680e1db424eb86d65c2b362c4db761286"
+        },
+        "measured_times": {
+          "cleanup_seconds": 0.129629642,
+          "daemon_connection_seconds": null,
+          "item_wall_seconds_including_setup": 131.330518217,
+          "native_work_seconds": 124.201599974,
+          "setup_seconds": 7.126028911
+        },
+        "usage_coverage": "terminal_transcripts",
+        "provider_usage": {
+          "semantics": "provider_reported_counters_not_estimates",
+          "record_count": 26,
+          "all_fields_complete": true,
+          "input_tokens": 97770,
+          "output_tokens": 7350,
+          "total_tokens": 105120
+        }
+      },
+      "published_source_file": "results/native_v7/score-public-arc_easy-item18.json"
+    },
+    {
+      "source_file": "/tmp/latentmas-one-item-control/20261112t033057z-arc_easy-19/score-public.json",
+      "source_sha256": "63c0a5e3e3455b751bf6f17eeb08a74da6a5ef4d40224bb2cc01d935595aa7a5",
+      "source_schema": "occ3.native.score_summary.v1",
+      "created_unix_ns": 1794454380007550868,
+      "denominator": 20,
+      "explicit_attempt_count": 1,
+      "score_eligible": 1,
+      "strict_correct": 1,
+      "incomplete_or_ineligible": 19,
+      "strict_accuracy_all20": 0.05,
+      "eligible_row": {
+        "idx": 19,
+        "run_id": "dddabc8894d6421cb8aacc4aadc746b1",
+        "status": "complete",
+        "correct": true,
+        "score_eligible": true,
+        "transport_valid": true,
+        "cleanup_confirmed": true,
+        "cleanup_issue_count": 0,
+        "format_valid": true,
+        "truncated": false,
+        "error_code": null,
+        "question_sha256": "3813784171bf0cfc28f783cc54d8bcf31f3380b228edfb1ae1f0a57b7f97e35e",
+        "raw_final_sha256": "9abc6aad0655e05d7aef272122a5260fbd607ba65be31e4b93a0b1794cf3ed79",
+        "artifact_sha256": {
+          "cleanup.json": "2207ef50f5f452ab7e461a6541f821033a53605cce32c16efeb699dbce98fdfe",
+          "context-bookkeeping.json": "84fd96e55bdd29a294b839dcf4c8c7d13939114b54abb64b1c26833d70f20a00",
+          "events.jsonl": "e3033a440f3d4d30fc453fc63a7dfb0d523b4036cecdaffb7c5745a2acfeaabb",
+          "item.json": "1c02217a7196f52a1214be1ee962ed4b236fd7e2dd855df1eecebc15cb654ee1",
+          "outcome.json": "95e7b29a202b6be27deb984e88815f2e0f5242fc964bb05c9de01fdda016b867"
+        },
+        "measured_times": {
+          "cleanup_seconds": 0.151336081,
+          "daemon_connection_seconds": null,
+          "item_wall_seconds_including_setup": 106.205193904,
+          "native_work_seconds": 99.353035084,
+          "setup_seconds": 6.849394495
+        },
+        "usage_coverage": "terminal_transcripts",
+        "provider_usage": {
+          "semantics": "provider_reported_counters_not_estimates",
+          "record_count": 26,
+          "all_fields_complete": true,
+          "input_tokens": 95274,
+          "output_tokens": 6193,
+          "total_tokens": 101467
+        }
+      },
+      "published_source_file": "results/native_v7/score-public-arc_easy-item19.json"
     }
   ],
   "cumulative_arithmetic": {
@@ -155,12 +563,7 @@
       8,
       9,
       10,
-      11
-    ],
-    "eligible_items": 12,
-    "correct": 12,
-    "accuracy_among_eligible": 1.0,
-    "unscored_projection_indices": [
+      11,
       12,
       13,
       14,
@@ -170,12 +573,73 @@
       18,
       19
     ],
-    "note": "Disjoint union of the a-cohort (0-9) and separately scored items 10 and 11. Not a combined scorer run or a completed 20-item evaluation."
+    "eligible_items": 20,
+    "correct": 20,
+    "accuracy_among_eligible": 1.0,
+    "unscored_projection_indices": [],
+    "wilson_95_ci": [
+      0.8389,
+      1.0
+    ],
+    "note": "Disjoint union of the a-cohort (0-9) and separately scored items 10-19 (items 10-11 on 2026-11-11, items 12-19 on 2026-11-12). Not a combined scorer run."
   },
   "limitations": [
     "Each individual public score has denominator=20, score_eligible=1 and strict_correct=1. Its strict_accuracy_all20=0.05 is a projection count, not accuracy on 20 evaluated items.",
     "Only already scored source rows are aggregated; no model inference, answer extraction, rescoring or answer repair was performed for this summary.",
-    "ARC-Easy item 12 remains excluded. Its provenance and cleanup safety audit was incomplete when remote access failed.",
+    "The first ARC-Easy item-12 attempt (2026-11-11) failed and remains excluded. Item 12 is counted only from a separate fresh attempt with a fresh plan and authorization; the failed attempt was not replayed.",
+    "The paired single-agent baseline also scores 20/20 on items 0-19, so these items are at the ceiling and show no native gain.",
     "Native v7 is a smaller paired-subset track with different execution contracts and budgets; these results do not establish channel-only gains, efficiency or speedup."
+  ],
+  "paired_first20_comparison": {
+    "basis": "per-item correctness on shared indices 0-19; b = comparison-only correct, c = native-only correct; exact two-sided binomial McNemar",
+    "native_correct": 20,
+    "n": 20,
+    "baseline": {
+      "source_file": "results/glm53_arc_easy_baseline_safe.json",
+      "source_sha256": "7405bef934f43dbf074acf0d6d1069838a2b12aff950b9abf7c9f61f8c08d3d3",
+      "correct": 20,
+      "b": 0,
+      "c": 0,
+      "mcnemar_p": 1.0
+    },
+    "textmas_sequential": {
+      "source_file": "results/glm53_arc_easy_textmas_sequential_safe.json",
+      "source_sha256": "a9b8fbc0f9c36e0696f2bd9dd9b20f3174675bef9b4f27be26c6bcf3a4a0b927",
+      "correct": 20,
+      "b": 0,
+      "c": 0,
+      "mcnemar_p": 1.0
+    },
+    "textmas_hierarchical": {
+      "source_file": "results/glm53_arc_easy_textmas_hierarchical_safe.json",
+      "source_sha256": "474521348421a79f703a43e2f9dba32982074c57d749e1d91bbb27104beea819",
+      "correct": 13,
+      "b": 0,
+      "c": 7,
+      "mcnemar_p": 0.015625
+    }
+  },
+  "measured_first20": {
+    "semantics": "item_wall_seconds_including_setup from each public score report; provider-reported token counters summed over all role records per item",
+    "runs": "items 0-9 in serial a-cohort batches; later items in one-item runs",
+    "n": 20,
+    "mean_item_wall_s": 154.236,
+    "median_item_wall_s": 145.614,
+    "min_item_wall_s": 103.16,
+    "max_item_wall_s": 280.076,
+    "mean_input_tokens_per_item": 102662.6,
+    "mean_output_tokens_per_item": 10309.4
+  },
+  "excluded_attempts": [
+    {
+      "idx": 12,
+      "run_root": "/home/nvidia/occ3-deploy/native-v7-batch-arc-easy-b-20261111t134256z",
+      "status": "excluded, not scored",
+      "record": "results/native_v7/excluded-attempts-summary.json",
+      "scored_by_fresh_attempt": {
+        "run_root": "/home/nvidia/occ3-deploy/native-v7-batch-arc-easy-r12-20261112t031218z",
+        "published_source_file": "results/native_v7/score-public-arc_easy-item12.json"
+      }
+    }
   ]
 }

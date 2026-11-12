@@ -44,13 +44,19 @@ item-19 retry attempts are recorded in
 attempt, the v7 retry completed item 19 (correct) and the full native cohort
 is pinned-scorer verified at 17/19.
 
+Update 2026-11-12: the native OCC-3 v7 ARC-Easy and ARC-Challenge runs on the
+first 20 items are complete. All 20 items of each task are scored correct
+(20/20 each). The single-agent baseline also scores 20/20 on these items, so
+they show no native gain. See the ARC sections below.
+
 ## Results at a glance
 
-Correct items / scored items, as of 2026-11-11. The three HTTP conditions ran
-the full item sets. Native OCC-3 v7 ran only partial subsets of the first 20
-items, so its column is not comparable with the full-set columns.
+Correct items / scored items, as of 2026-11-12. The three HTTP conditions ran
+the full item sets. Native OCC-3 v7 ran only on the first 20 items of five
+tasks, and only partly for GSM8K, HumanEval+ and MBPP+, so its column is not
+comparable with the full-set columns.
 
-| Benchmark | Single-agent baseline | TextMAS sequential | TextMAS hierarchical | Native OCC-3 v7 (partial) |
+| Benchmark | Single-agent baseline | TextMAS sequential | TextMAS hierarchical | Native OCC-3 v7 (first-20 subsets) |
 |---|---:|---:|---:|---:|
 | AIME 2024 | 11/30 | 16/30 | 18/30 | not run |
 | AIME 2025 | 10/30 | 11/30 | 13/30 | not run |
@@ -59,19 +65,19 @@ items, so its column is not comparable with the full-set columns.
 | MedQA | 174/300 | 268/300 | 109/300 | not run |
 | HumanEval+ | 142/164 | 143/164 | 149/164 | 8/9 (aggregate; verification pending) |
 | MBPP+ | 303/378 | 303/378 | 323/378 | 8/9 (aggregate; verification pending) |
-| ARC-Easy | 285/300 | 290/300 | 200/300 | 12/12 |
-| ARC-Challenge | 286/300 | 297/300 | 215/300 | 10/10 |
+| ARC-Easy | 285/300 | 290/300 | 200/300 | 20/20 |
+| ARC-Challenge | 286/300 | 297/300 | 215/300 | 20/20 |
 
 Native OCC-3 v7 progress against the first 20 items of each task:
 
 | Benchmark | Planned | Scored | Correct | Not yet scored |
 |---|---:|---:|---:|---|
 | GSM8K | 20 | 19 | 17 | 1 (item 1) |
-| ARC-Easy | 20 | 12 | 12 | 8 (items 12-19) |
-| ARC-Challenge | 20 | 10 | 10 | 10 (items 10-19) |
+| ARC-Easy | 20 | 20 | 20 | 0 |
+| ARC-Challenge | 20 | 20 | 20 | 0 |
 | HumanEval+ | 20 | 9 | 8 | 11 (indices not established) |
 | MBPP+ | 20 | 9 | 8 | 11 (indices not established) |
-| Total | 100 | 59 | - | 41 |
+| Total | 100 | 77 | - | 23 |
 
 - All 27 HTTP runs are complete. TextMAS makes four 4096-token calls per item
   against one baseline call, so it is not budget matched.
@@ -81,9 +87,14 @@ Native OCC-3 v7 progress against the first 20 items of each task:
   efficiency or speedup.
 - GSM8K native on the same 19 items: native 17, baseline 18, TextMAS
   sequential 18 (exact McNemar p=1.0).
-- ARC-Easy 12/12 is arithmetic across disjoint score reports, not a combined
-  scorer run. The HumanEval+ and MBPP+ native counts are recovered historical
-  aggregates; full source validation and per-item coverage are pending.
+- ARC native on the same 20 items: ARC-Easy native 20, baseline 20, TextMAS
+  sequential 20, hierarchical 13; ARC-Challenge native 20, baseline 20,
+  sequential 19, hierarchical 16. The single agent is already at the ceiling
+  on both tasks, so these items show no native gain.
+- The ARC 20/20 totals are arithmetic across disjoint score reports, not one
+  combined scorer run. The HumanEval+ and MBPP+ native counts are recovered
+  historical aggregates; full source validation and per-item coverage are
+  pending.
 - The historical OCC-3 GSM8K run (13/14 adjudicated, items 0-13) is a separate
   condition; see the GSM8K first-20 section.
 - Intervals and McNemar tests for each task are in the sections below.
@@ -229,19 +240,30 @@ all role records). Safe rows and summary:
 `results/native_v7/score-public-arc_easy-a-cohort.json`. The a-cohort interval
 is wide (n=10, Wilson 95% CI 72.2-100%).
 
-Continuation items 10 and 11 were each independently scored correct, with
-transport, cleanup and format gates valid. Together with the a-cohort, this is
-**12/12 correct among eligible items 0-11**, by arithmetic across disjoint
-source scores, not a combined scorer run. Each single-item public report uses
-`denominator=20`, `score_eligible=1`, `strict_correct=1`; its `1/20` projection
-count is not accuracy on 20 evaluated items. Source hashes, safe item metadata
-and the cumulative arithmetic are in
-`results/glm53_arc_easy_native_occ3_v7_continuation_summary.json`. The individual
-public scorer reports are also preserved in
-`results/native_v7/score-public-arc_easy-item10.json` and
-`results/native_v7/score-public-arc_easy-item11.json`.
-Items 12-19 remain unscored here; item 12 was attempted and excluded, with its
-follow-up provenance and cleanup safety audit incomplete after SSH access failed.
+Continuation items 10-19 were each run and scored separately, one item per
+run, with the same pinned scorer and source contract: items 10 and 11 on
+2026-11-11 and items 12-19 on 2026-11-12. All ten have transport, cleanup and
+format gates valid and are scored correct. Together with the a-cohort, this is
+**20/20 correct on items 0-19** (Wilson 95% CI 83.9-100%), by arithmetic across
+disjoint source scores, not one combined scorer run. Each single-item public
+report uses `denominator=20`, `score_eligible=1`, `strict_correct=1`; its `1/20`
+projection count is not accuracy on 20 evaluated items.
+
+Paired on items 0-19: baseline 20/20 (McNemar b=0, c=0), TextMAS sequential
+20/20 (b=0, c=0), TextMAS hierarchical 13/20 (b=0, c=7, p=0.016). The single
+agent already scores 20/20, so these items show no native gain; the
+hierarchical gap is the letter-choice collapse described above. Mean item wall
+154.2 s including setup (range 103-280 s); ~102.7k prompt + ~10.3k completion
+tokens per item (provider-reported sums over all role records).
+
+The first item-12 attempt (2026-11-11) failed and stays excluded; see
+[Excluded native v7 attempts](#excluded-native-v7-attempts). Item 12 is counted
+only from a separate fresh attempt. Source hashes, safe item metadata, the
+paired comparison and the cumulative arithmetic are in
+`results/glm53_arc_easy_native_occ3_v7_continuation_summary.json`. The
+individual public scorer reports are in
+`results/native_v7/score-public-arc_easy-item10.json` to
+`results/native_v7/score-public-arc_easy-item19.json`.
 
 ### ARC-Challenge (interim, 300 items)
 
@@ -264,8 +286,24 @@ hierarchical 7/10 (b=0, c=3, p=0.25). Mean item wall 170.5 s including setup;
 ~107.0k prompt + ~12.6k completion tokens per item. Safe rows and summary:
 `results/glm53_arc_challenge_native_occ3_v7_safe.json` /
 `results/glm53_arc_challenge_native_occ3_v7_summary.json`; public scorer report
-in `results/native_v7/score-public-arc_challenge-a-cohort.json`. B-cohort
-outstanding; n=10 intervals wide (72.2-100%).
+in `results/native_v7/score-public-arc_challenge-a-cohort.json`. The n=10
+interval is wide (72.2-100%).
+
+Continuation items 10-19 ran on 2026-11-12, one item per run, with the same
+pinned scorer and source contract. All ten have transport, cleanup and format
+gates valid and are scored correct. Together with the a-cohort, this is
+**20/20 correct on items 0-19** (Wilson 95% CI 83.9-100%), by arithmetic across
+disjoint source scores, not one combined scorer run. Paired on items 0-19:
+baseline 20/20 (McNemar b=0, c=0), TextMAS sequential 19/20 (b=0, c=1, p=1.0),
+TextMAS hierarchical 16/20 (b=0, c=4, p=0.125). As with ARC-Easy, the single
+agent already scores 20/20, so these items show no native gain. Mean item wall
+158.6 s including setup (range 113-227 s); ~103.9k prompt + ~11.2k completion
+tokens per item. Source hashes, safe item metadata, the paired comparison and
+the cumulative arithmetic are in
+`results/glm53_arc_challenge_native_occ3_v7_continuation_summary.json`. The
+individual public scorer reports are in
+`results/native_v7/score-public-arc_challenge-item10.json` to
+`results/native_v7/score-public-arc_challenge-item19.json`.
 
 ### GSM8K (full 300-item run)
 
@@ -541,11 +579,12 @@ They are not scored incorrect answers, and this is not an exhaustive attempt led
 | MBPP+ / 9 | r6-20261111t130500z | `file_owner_type_or_bound`; scorer `input_file_type_or_size` | Journal exceeds the 384 MiB read bound; runner self-report of completion does not verify the later gates |
 | MBPP+ / 9 | r9-20261111t131248z | `occ3_source_busy` | Source capture refused before admission; no scored answer |
 | HumanEval+ / 9 | r9-20261111t090000z | `worker_log_changed` | Role setup stopped; cleanup unconfirmed; no scored answer |
-| ARC-Easy / 12 | b-20261111t134256z | `occ3_completed_binding_count` | No scored answer; runner reported cleanup, but follow-up provenance and cleanup safety audit remains incomplete |
+| ARC-Easy / 12 | b-20261111t134256z | `occ3_completed_binding_count` | No scored answer. Follow-up audit: the critic ended its captured turn without the `occ3_handoff` call, so no transfer happened; server state ended clean. Item 12 is scored from a separate fresh attempt |
 
 Safe metadata and source bindings are in
-`results/native_v7/excluded-attempts-summary.json`. No guard was bypassed,
-failed attempt replayed or new scorer run performed for this report update.
+`results/native_v7/excluded-attempts-summary.json`. No guard was bypassed, no
+failed attempt was replayed, and no scorer was rerun for this report update.
+The fresh item-12 attempt used a new plan and authorization.
 
 ## NOT-RUN and pending verification
 
@@ -554,9 +593,8 @@ failed attempt replayed or new scorer run performed for this report update.
 - Native OCC-3 GSM8K item 1 (setup failure in its original batch, never
   retried), and a completed rerun of items 0-13 on the PR #279 stack. The later
   item-0 smoke failed and remains separate from these denominators.
-- Native OCC-3 ARC-Easy items 12-19 and ARC-Challenge items 10-19 have no
-  completed scored results in this update. ARC-Easy item 12 was attempted and
-  excluded, not unstarted; items 10 and 11 are scored above.
+- A combined 20-item scorer run for native ARC-Easy and ARC-Challenge. The
+  20/20 totals add disjoint cohort and per-item score reports.
 - Native OCC-3 HumanEval+ and MBPP+ 20-item projections remain incomplete.
   Historical sandbox aggregates record 8/9 each, but full source validation
   and exact per-item coverage remain pending. The recovered aggregate evidence
@@ -576,10 +614,10 @@ failed attempt replayed or new scorer run performed for this report update.
 | `results/glm53_gsm8k_occ3_clean.jsonl` | OCC-3 rows: hop states, receipt ids, native/total hops, wall time, scoring notes |
 | `results/glm53_gsm8k_native_occ3_v7_safe.json` | Native OCC-3 v7 cohort: per-item correct/truncated/tokens/latency rows (19 eligible items), source sha pins |
 | `results/glm53_gsm8k_native_occ3_v7_summary.json` | Native OCC-3 v7 cohort summary: 17/19 (89.5%), CI, McNemar vs paired baseline, latency and token aggregates |
-| `results/native_v7/score-public-*.json` | Pinned-scorer public reports per native cohort (item 0, batch items 2-18, item 19 v7, ARC-Easy a-cohort and items 10/11, ARC-Challenge a-cohort): counts, hashes, usage; no predictions |
+| `results/native_v7/score-public-*.json` | Pinned-scorer public reports per native cohort (item 0, batch items 2-18, item 19 v7, ARC-Easy and ARC-Challenge a-cohorts and items 10-19): counts, hashes, usage; no predictions |
 | `results/glm53_arc_easy_native_occ3_v7_safe.json` + `_summary.json` | Native OCC-3 v7 ARC-Easy a-cohort (items 0-9): 10/10 correct, paired McNemar vs baseline/TextMAS, latency and token aggregates |
 | `results/glm53_arc_challenge_native_occ3_v7_safe.json` + `_summary.json` | Native OCC-3 v7 ARC-Challenge a-cohort (items 0-9): 10/10 correct, paired McNemar vs baseline/TextMAS, latency and token aggregates |
-| `results/glm53_arc_easy_native_occ3_v7_continuation_summary.json` | Individually scored items 10 and 11; source-bound arithmetic total 12/12 on items 0-11, not a combined scorer run |
+| `results/glm53_arc_easy_native_occ3_v7_continuation_summary.json`, `results/glm53_arc_challenge_native_occ3_v7_continuation_summary.json` | Separately scored items 10-19; source-bound arithmetic totals 20/20 on items 0-19 and the paired first-20 comparison; not a combined scorer run |
 | `results/native_v7/code-sandbox-recovered-summary.json` | Historical tool-result aggregates: HumanEval+ and MBPP+ 8/9 each; full source validation and per-item coverage pending |
 | `results/native_v7/excluded-attempts-summary.json` | Selected failed attempts and source-bound safe metadata; not scored answers or an exhaustive ledger |
 | `harness/runner.py`, `harness/bench_lib.py` | Resumable runner and OpenAI-compatible client adapter for the LatentMAS prompts |

@@ -34,17 +34,20 @@
   baselines score 10/10 each; sequential scores 10/10 and 9/10 respectively
   (ARC-Challenge b=0, c=1, p=1.0); hierarchical scores 6/10 and 7/10.
   Published safe rows, summaries and public scores.
-- Added independently scored native ARC-Easy items 10 and 11, both correct,
-  with their public scorer reports preserved. Cumulative 12/12 on items 0-11 is arithmetic across disjoint score reports,
-  not a combined scorer run or a completed 20-item evaluation.
+- Added separately scored native ARC-Easy items 10-19 and ARC-Challenge
+  items 10-19, all correct, with their public scorer reports. Native totals
+  are 20/20 on the first 20 items of each task, by arithmetic across disjoint
+  score reports, not a combined scorer run. Paired single-agent baselines also
+  score 20/20, so these items show no native gain.
 - Added recovered historical native sandbox aggregates: HumanEval+ and MBPP+
   8/9 each. Full scorer/sandbox source validation and per-item coverage remain
   pending; no transport, latency, cost or channel-only gain is inferred.
 - Added safe exclusion metadata for HumanEval+ item 9, MBPP+ item 9 attempts
-  and ARC-Easy item 12. Failed attempts do not count as scored answers; the
-  ARC-Easy item-12 provenance and cleanup safety audit remains incomplete.
+  and ARC-Easy item 12. Failed attempts do not count as scored answers. The
+  follow-up audit of the failed ARC-Easy item-12 attempt found no transfer
+  and clean server state; item 12 is scored from a separate fresh attempt.
 - Added a results-at-a-glance table for all nine benchmarks and a native
-  OCC-3 v7 progress table: 59 of 100 planned first-20 items scored.
+  OCC-3 v7 progress table: 77 of 100 planned first-20 items scored.
 - Fixed stale NOT-RUN and sandbox prose to match completed HTTP conditions
   and the limited native evidence. Four-call TextMAS remains separate from
   the one-call baseline; execution budgets are not matched.

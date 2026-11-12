@@ -19,6 +19,12 @@
       "source_file": "/tmp/latentmas-one-item-control/20261111t134256z-arc_easy-12/failure-metadata.txt",
       "source_sha256": "868262240af023af67694e456b6009f3034a9e74f04282be14b67fdc6c14da13",
       "scope": "Selected status/error fields only; source is not copied wholesale."
+    },
+    {
+      "source_id": "arc_easy12_followup_audit",
+      "source_file": "/tmp/latentmas-arc-easy12-audit-20261112.md",
+      "source_sha256": "8a54283e6a9b6c9a3cabed61f546fbba3ca72c46fb731d2132f3900308ba6795",
+      "scope": "Read-only audit 2026-11-12 of saved server logs and client cleanup records for this attempt. No question, solution, gold or model-answer content copied."
     }
   ],
   "excluded_attempts": [
@@ -73,7 +79,8 @@
       "run_root": "/home/nvidia/occ3-deploy/native-v7-batch-arc-easy-b-20261111t134256z",
       "source_ids": [
         "arc_easy12_outcome",
-        "arc_easy12_failure_metadata"
+        "arc_easy12_failure_metadata",
+        "arc_easy12_followup_audit"
       ],
       "driver_terminal_status": "failed_uncertain",
       "driver_reason": "item_exit_or_work_cleanup_bound",
@@ -82,12 +89,17 @@
       "observed_source_error_code": "occ3_completed_binding_count",
       "score_eligible": false,
       "correct": null,
-      "audit_note": "No scored answer. Source capture/provenance did not complete. Cleanup was acknowledged in runner metadata, but the follow-up provenance and cleanup safety audit remains incomplete because remote access failed."
+      "audit_note": "No scored answer. Follow-up audit (2026-11-12): the critic ended its captured source turn with finish_reason=stop and no occ3_handoff call, so the client refused with occ3_completed_binding_count. No transfer happened and nothing needed replay. All 8 server ranks ended with no active, in-flight, reserved or capturing state; the client acknowledged all cleanup commands. Item 12 is scored only from a separate fresh attempt.",
+      "followup_audit_complete": true,
+      "scored_by_fresh_attempt": {
+        "run_root": "/home/nvidia/occ3-deploy/native-v7-batch-arc-easy-r12-20261112t031218z",
+        "published_source_file": "results/native_v7/score-public-arc_easy-item12.json"
+      }
     }
   ],
   "publication_limits": [
     "This is not an exhaustive attempt ledger. All listed attempts remain excluded from eligible correctness denominators; none is relabeled as a scored incorrect answer.",
     "Full HumanEval+ and MBPP+ public scorer and sandbox artifacts were unavailable locally during this update. code-sandbox-recovered-summary.json records only historical tool-result aggregates, with full source validation and per-item coverage pending. Queue metadata is not substitute scoring evidence.",
-    "Configured DGX SSH access was blocked. No alternate route, credential, guard bypass, replay, new inference or new scorer run was used for this report update."
+    "During the 2026-11-11 update, configured DGX SSH access was blocked. The ARC-Easy item-12 follow-up audit was made on 2026-11-12 after access was restored. No alternate route, credential, guard bypass, replay, new inference or new scorer run was used for these report updates."
   ]
 }
