@@ -23,7 +23,7 @@ from .span_policy import marker_table_from_wire, select_span_v2
 from .latent_registry import LatentRegistry
 from .latent_types import admission_probe
 from .latent_types import (LatentError, UniformRequestCancellation, Publication, RequestSlice, RuntimeProfile, require_members,
-                           SessionEnrollment, decode_descriptor, require,
+                           SessionEnrollment, capture_hold_settings, decode_descriptor, require,
                            validate_control_payload)
 from .prefix_layout import prefix_span
 from .alignment_dispatch import aligner_for, artifact_resident_bytes, load_frozen_artifact
@@ -1227,6 +1227,148 @@ def _consume_capacity_available(scheduler, prompt_tokens):
         if available() + evictable() < prompt_tokens + page:
             return False
     return True
+
+
+#: abort_message prefix of the leader's resolve signal for a parked capture.
+CAPTURE_HOLD_SIGNAL = "occ3_capture_hold_"
+_CAPTURE_INFLIGHT = "latent_worker.admit_request.capture_inflight"
+
+
+class CaptureHold:
+    """A capture parked before admission: no Req exists, the record is untouched."""
+    __slots__ = ("rid", "recv_req", "seq", "signal", "parked_at", "deadline", "due_at")
+
+    def __init__(self, recv_req, seq, now, drain, deadline):
+        self.rid, self.recv_req, self.seq = recv_req.rid, recv_req, seq
+        self.signal = CAPTURE_HOLD_SIGNAL + str(seq)
+        self.parked_at, self.deadline = now, deadline
+        self.due_at = min(now + drain, deadline)
+
+
+def _capture_hold_settings():
+    """Reservation settings, or None when it is disabled or misconfigured."""
+    try:
+        settings = capture_hold_settings()
+    except ValueError:
+        return None
+    return settings if settings.window > 0 else None
+
+
+def _capture_hold_rows(scheduler):
+    """Unfinished in-flight rows: the set the capture admission check reads."""
+    collect = getattr(scheduler, "collect_inflight_reqs", None)
+    rows = list(collect()) if callable(collect) else []
+    chunked = getattr(scheduler, "chunked_req", None)
+    if chunked is not None and not any(row is chunked for row in rows):
+        rows.append(chunked)
+    return [row for row in rows
+            if not (callable(getattr(row, "finished", None)) and row.finished())]
+
+
+def _capture_hold_agree(scheduler, value):
+    """True when every rank gathered the same value. A split only declines."""
+    try:
+        values = _runtime(scheduler).gather(value)
+    except Exception:
+        return False
+    return all(item == values[0] for item in values)
+
+
+def capture_hold_park(scheduler, recv_req, error):
+    """Park a capture that the worker declined only for in-flight work.
+
+    Runs on every rank at the admission seam, after the rank-uniform decline
+    and before any refusal is sent. Nothing is mutated at that point: no Req
+    is queued and the one-shot record is still reserved. True means the raw
+    request is held; the scheduler drains for it and sends nothing now.
+    """
+    settings = _capture_hold_settings()
+    try:
+        descriptor = decode_descriptor(getattr(recv_req, "occ3_worker_descriptor", None))
+    except Exception:
+        descriptor = None
+    # Rank-uniform gate (decline code, request type, replay flag, settings):
+    # every rank takes the same branch, so the gather below stays matched.
+    if (settings is None or getattr(error, "code", None) != "quota"
+            or type(descriptor) is not CaptureWorkerDescriptor
+            or getattr(scheduler, "occ3_capture_hold_replay", False)):
+        return False
+    eligible = (isinstance(error, LatentError) and error.detail == _CAPTURE_INFLIGHT
+                and getattr(scheduler, "occ3_capture_hold", None) is None
+                and not getattr(scheduler, "_engine_paused", False))
+    agreed = _capture_hold_agree(scheduler, {"hold": "park", "rid": recv_req.rid, "eligible": eligible})
+    if not (agreed and eligible):
+        return False
+    seq = getattr(scheduler, "occ3_capture_hold_seq", 0) + 1
+    scheduler.occ3_capture_hold_seq = seq
+    hold = CaptureHold(recv_req, seq, time.monotonic(), settings.drain, descriptor.deadline)
+    scheduler.occ3_capture_hold = hold
+    logger.info("occ3 capture hold parked rid=%s seq=%d drain_seconds=%.3f",
+                hold.rid, seq, settings.drain)
+    return True
+
+
+def _capture_hold_action(scheduler, hold, settings, rows):
+    """This rank's view of the resolution. The caller gathers it."""
+    if time.monotonic() >= hold.deadline:
+        return "decline"
+    if not rows:
+        return "admit"
+    if (settings is None or settings.preempt != "retract"
+            or getattr(scheduler, "_engine_paused", False)):
+        return "decline"
+    limit = getattr(scheduler, "max_queued_requests", None)
+    if limit is not None and len(scheduler.waiting_queue) + len(rows) > limit:
+        return "decline"
+    # Only a plain row resumes from the same output position after the stock
+    # retract path. An attached or eager row would be aborted by it, and a row
+    # with input embeddings would restart its output.
+    if any(getattr(row, "occ3_attached", False) or getattr(row, "occ3_force_eager", False)
+           or getattr(row, "input_embeds", None) is not None
+           or getattr(row, "beam_group", None) is not None for row in rows):
+        return "decline"
+    return "retract"
+
+
+def _capture_hold_resolve(scheduler, hold):
+    """Every rank, same iteration: admit, retract then admit, or decline."""
+    action = _capture_hold_action(scheduler, hold, _capture_hold_settings(),
+                                  _capture_hold_rows(scheduler))
+    if not _capture_hold_agree(scheduler, {"hold": hold.seq, "rid": hold.rid, "action": action}):
+        action = "decline"
+    scheduler.occ3_capture_hold = None
+    retracted = 0
+    if action == "retract":
+        retracted = len(scheduler._occ3_capture_hold_retract())
+    if action == "decline":
+        # Still mutation-free: the same refusal the worker decline would have sent.
+        scheduler._occ3_reject_received(hold.recv_req, "occ3_busy_batch")
+    else:
+        # The unchanged admission path decides. A replay is never parked again.
+        scheduler.occ3_capture_hold_replay = True
+        try:
+            scheduler.handle_generate_request(hold.recv_req)
+        finally:
+            scheduler.occ3_capture_hold_replay = False
+    logger.info("occ3 capture hold resolved rid=%s seq=%d action=%s waited_seconds=%.3f retracted=%d",
+                hold.rid, hold.seq, action, time.monotonic() - hold.parked_at, retracted)
+
+
+def capture_hold_abort(scheduler, recv_req):
+    """Route an AbortReq past a capture reservation. True: nothing else to abort."""
+    message = getattr(recv_req, "abort_message", None)
+    hold = getattr(scheduler, "occ3_capture_hold", None)
+    if isinstance(message, str) and message.startswith(CAPTURE_HOLD_SIGNAL):
+        # The leader's resolve signal is never an abort. A stale one is dropped.
+        if hold is not None and message == hold.signal and recv_req.rid == hold.rid:
+            _capture_hold_resolve(scheduler, hold)
+        return True
+    if hold is not None and (getattr(recv_req, "abort_all", False) or recv_req.rid == hold.rid):
+        # Client cancel or disconnect before admission: there is nothing to undo.
+        scheduler.occ3_capture_hold = None
+        scheduler._occ3_reject_received(hold.recv_req, "occ3_cancelled")
+        logger.info("occ3 capture hold released rid=%s seq=%d reason=cancelled", hold.rid, hold.seq)
+    return False
 
 
 def release_consume_cohort(scheduler, req):

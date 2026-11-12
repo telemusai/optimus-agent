@@ -170,6 +170,7 @@ class TestScheduler(PinnedCase):
             calls.append("all-rank-admission")
             raise RuntimeError("one rank missing")
         worker.admit_request = incomplete
+        worker.capture_hold_park = lambda *args: False
         fn = self.sources.function("managers/scheduler.py", "handle_generate_request", "Scheduler",
             get_disagg=lambda: NS(disaggregation_bootstrap_port=1234),
             BeamCoordinator=NS(request_beam_width=lambda req: 1), Req=lambda *a, **kw: NS(), array=array)
@@ -188,6 +189,7 @@ class TestScheduler(PinnedCase):
     def test_busy_admission_decline_keeps_its_own_retryable_code(self):
         import ast as _ast
         worker = types.ModuleType("occ3_sglang.latent_worker")
+        worker.capture_hold_park = lambda *args: False
         codes = []
 
         class QuotaDecline(RuntimeError):
