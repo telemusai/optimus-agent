@@ -675,10 +675,12 @@ def validate_control_payload(value, *, result=False):
 # Capture reservation knobs. The frontend installer and the scheduler ranks read
 # the same per-boot environment. A ValueError carries the fixed decline code.
 # The ranks compare their values before a capture is parked; a difference only
-# declines. No capture is parked when a queue limit (max_queued_requests) or a
+# declines. No capture is parked when a queue limit (max_queued_requests), a
 # request timeout sweep (SGLANG_REQ_WAITING_TIMEOUT, SGLANG_REQ_RUNNING_TIMEOUT)
-# is configured: a held request could be rejected or expire there. That capture
-# gets the busy decline at once and the frontend sends it again.
+# or receive skipping (scheduler_recv_interval above 1) is configured: a held
+# request could be rejected or expire there, and a skipped receive drops the
+# signal that ends the hold. That capture gets the busy decline at once and the
+# frontend sends it again.
 CAPTURE_BUSY_WAIT_MAX_SECONDS = 10.0
 CAPTURE_BUSY_WAIT_DEFAULT_SECONDS = 10.0
 CAPTURE_DRAIN_DEFAULT_SECONDS = 2.0
@@ -704,8 +706,10 @@ def capture_busy_wait_seconds(raw):
 
 
 def capture_drain_seconds(raw, window):
-    """OCC3_CAPTURE_DRAIN_SECONDS: how long one parked capture holds new ordinary
-    prefills while running requests finish. Never longer than the busy window."""
+    """OCC3_CAPTURE_DRAIN_SECONDS: the time one parked capture gives running
+    requests to finish while new ordinary prefills wait. The scheduler ends the
+    hold in its next iteration after that time. Never longer than the busy
+    window."""
     if raw is None:
         return min(CAPTURE_DRAIN_DEFAULT_SECONDS, window)
     return _knob_seconds(raw, window, "capture_drain_seconds_invalid")

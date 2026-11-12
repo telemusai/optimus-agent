@@ -82,8 +82,9 @@ def _capture_hold_settings_from_env():
       or a row that cannot resume from the same output position, is never
       retracted; the capture is then declined as with "off".
     The scheduler does not use the reservation when a queue limit
-    (max_queued_requests) or a request timeout sweep
-    (SGLANG_REQ_WAITING_TIMEOUT or SGLANG_REQ_RUNNING_TIMEOUT) is configured.
+    (max_queued_requests), a request timeout sweep
+    (SGLANG_REQ_WAITING_TIMEOUT or SGLANG_REQ_RUNNING_TIMEOUT) or receive
+    skipping (scheduler_recv_interval above 1) is configured.
     Such a capture gets the busy refusal at once and the busy wait sends the
     same request again.
     An unparseable or out-of-range value -> InstallationError with the fixed

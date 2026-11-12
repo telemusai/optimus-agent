@@ -2,15 +2,17 @@
 
 The scheduler loop in this file is a small model. Forward passes, KV and
 tokens are deterministic stand-ins. The exact pinned sources are only the
-named patched methods: handle_generate_request, _occ3_prefill_selection,
-_poll_timeout_aborts, abort_request, _occ3_abort_attached,
-_occ3_reject_received, _occ3_capture_hold_retract, pause_generation,
-continue_generation, collect_inflight_reqs, _add_request_to_queue,
-_abort_on_queued_limit, _set_or_validate_priority, and schedule_batch
-retract_all, release_req and Req.reset_for_retract. Admission and the hold
-policy are the real latent_worker code. Ranks are threads that meet in a
-barrier for every gather, so an unmatched collective fails the test. Each rank
-has its own clock and its own environment, as a rank process has.
+named patched methods: ingest_requests, handle_generate_request,
+_occ3_prefill_selection, _poll_timeout_aborts, abort_request,
+_occ3_abort_attached, _occ3_reject_received, _occ3_capture_hold_retract,
+pause_generation, continue_generation, collect_inflight_reqs,
+_add_request_to_queue, _abort_on_queued_limit, _set_or_validate_priority, the
+request receiver's recv_requests and _broadcast_reqs_across_ranks, and
+schedule_batch retract_all, release_req and Req.reset_for_retract. Admission
+and the hold policy are the real latent_worker code. Ranks are threads that
+meet in a barrier for every gather and every request broadcast, so an
+unmatched collective fails the test. Each rank has its own clock and its own
+environment, as a rank process has.
 
 This is not a SGLang, GPU, NCCL or TP8 runtime proof.
 """
@@ -40,12 +42,13 @@ from test_latent_types import capture
 
 SCHED = "managers/scheduler.py"
 BATCH = "managers/schedule_batch.py"
+RECV = "managers/scheduler_components/request_receiver.py"
 INFLIGHT = "latent_worker.admit_request.capture_inflight"
 DT = 0.0625  # model seconds per scheduler iteration, exact in binary
 KNOBS = ("OCC3_CAPTURE_BUSY_WAIT_SECONDS", "OCC3_CAPTURE_DRAIN_SECONDS", "OCC3_CAPTURE_PREEMPT",
          "SGLANG_REQ_WAITING_TIMEOUT", "SGLANG_REQ_RUNNING_TIMEOUT")
-EXACT = ("handle_generate_request", "_occ3_prefill_selection", "_poll_timeout_aborts",
-         "abort_request", "_occ3_abort_attached", "_occ3_reject_received",
+EXACT = ("ingest_requests", "handle_generate_request", "_occ3_prefill_selection",
+         "_poll_timeout_aborts", "abort_request", "_occ3_abort_attached", "_occ3_reject_received",
          "_occ3_capture_hold_retract", "pause_generation", "continue_generation",
          "collect_inflight_reqs", "_add_request_to_queue", "_abort_on_queued_limit",
          "_set_or_validate_priority")
@@ -155,21 +158,33 @@ class Clock:
 
 
 class Bus:
-    """all_gather stand-in. Every rank must enter the same collective."""
+    """Stand-in for all_gather and for the request broadcast. Every rank must
+    enter the same collective. The log holds the gathers only."""
     def __init__(self, ranks):
         self.slots = [None] * ranks
         self.result = None
         self.log = []
+        self.mixed = False
         self.barrier = threading.Barrier(ranks, action=self._snapshot, timeout=20)
 
     def _snapshot(self):
-        self.result = list(self.slots)
-        self.log.append(self.result)
+        kinds = {kind for kind, _ in self.slots}
+        self.mixed = self.mixed or len(kinds) > 1
+        self.result = [value for _, value in self.slots]
+        if kinds == {"gather"}:
+            self.log.append(self.result)
+
+    def _meet(self, kind, rank, value):
+        self.slots[rank] = (kind, value)
+        self.barrier.wait()
+        assert not self.mixed, "ranks entered different collectives"
+        return list(self.result)
 
     def gather(self, rank, value):
-        self.slots[rank] = value
-        self.barrier.wait()
-        return list(self.result)
+        return self._meet("gather", rank, value)
+
+    def broadcast(self, rank, value, src):
+        return self._meet("broadcast", rank, value)[src]
 
     def holds(self):
         return [values for values in self.log if "hold" in values[0]]
@@ -283,14 +298,70 @@ def make_row_class(sources):
     return Row
 
 
+class Skipper:
+    """Receive skipper stand-in with the pinned shape: a counter that lets one
+    iteration in `interval` receive."""
+    def __init__(self, interval):
+        self.interval, self.count = interval, 0
+
+    def handle(self, last_batch):
+        self.count += 1
+        if self.count < self.interval:
+            return False
+        self.count = 0
+        return True
+
+
+class Receiver:
+    """Request receiver of one rank. recv_requests and
+    _broadcast_reqs_across_ranks are the exact applied methods. The socket
+    read and the broadcast transport are stand-ins."""
+    scripted_scheduler_hook = input_blocker = tp_cpu_group = None
+
+    def __init__(self, sources, rank, socket):
+        self.rank, self.socket = rank, socket
+        self.tp_group = NS(rank=rank.index, ranks=[0])
+        self.get_last_batch = lambda: rank.last_batch
+        for name in ("recv_requests", "_broadcast_reqs_across_ranks"):
+            setattr(self, name, types.MethodType(sources.function(
+                RECV, name, "SchedulerRequestReceiver", get_parallel=lambda: rank.parallel,
+                broadcast_pyobj=lambda data, index, group, src: rank.occ3_runtime.bus.broadcast(
+                    index, data, src)), self))
+
+    @property
+    def recv_skipper(self):
+        return self.rank.recv_skipper  # the scheduler and its receiver share one skipper
+
+    def _pull_raw_reqs(self):
+        """Rank 0 reads the socket. A request that is not read stays in it."""
+        if self.rank.index:
+            return None
+        pulled, self.socket[:] = list(self.socket), []
+        return pulled
+
+    def _apply_mm_receiver(self, recv_reqs):
+        return recv_reqs
+
+    def _sanitize_occ3_request(self, recv_req):
+        return None
+
+    unwrap_pickle_wrapper = _finalize_shm_features = _sanitize_occ3_request
+
+
 class Rank:
     """One TP rank: exact patched decision methods around a model loop."""
-    def __init__(self, sources, bus, index, rank_time, *, skew=3.75, max_queued=None,
-                 allow_drop=False):
+    def __init__(self, sources, bus, index, rank_time, socket, *, skew=3.75, max_queued=None,
+                 allow_drop=False, recv_interval=1):
         self.index, self.rank_time, self.allow_drop = index, rank_time, allow_drop
         self.clock = Clock(skew=index * skew)  # rank clocks differ on purpose
         self.environ = ChainMap({}, os.environ)  # a write stays on this rank
         self.occ3_runtime = Runtime(bus, index)
+        self.parallel = NS(pp_size=1, pp_rank=0, attn_tp_rank=index, attn_cp_rank=0,
+                           enable_dp_attention=False, tp_size=len(bus.slots))
+        # As the pinned maybe_create: no skipper unless the interval is above 1.
+        self.recv_skipper = Skipper(recv_interval) if recv_interval > 1 else None
+        self.request_receiver = Receiver(sources, self, socket)
+        self.polls, self.signals = 0, []
         self.sent, self.freed, self.trace, self.made, self.dropped = [], [], [], [], []
         self.waiting_queue, self.chunked_req = [], None
         self.running_batch, self.last_batch = Batch([]), None
@@ -309,7 +380,8 @@ class Rank:
         self.model_config = NS(hf_eos_token_id=[2], vocab_size=100)
         self.metrics_collector = None
         self.metrics_reporter = NS(enable_metrics=False, last_gen_throughput=0.0,
-                                   current_scheduler_metrics_enabled=False)
+                                   current_scheduler_metrics_enabled=False,
+                                   record_scheduler_active=lambda: None)
         self.kv_events_publisher = NS(publish_kv_events=lambda: None)
         self.tree_cache = NS(cache_controller=None)
         self.spec_algorithm = NS(is_dflash_family=lambda: False, is_uno=lambda: False,
@@ -335,7 +407,7 @@ class Rank:
             envs=NS(SGLANG_REQ_WAITING_TIMEOUT=EnvSeconds(self.environ, "SGLANG_REQ_WAITING_TIMEOUT"),
                     SGLANG_REQ_RUNNING_TIMEOUT=EnvSeconds(self.environ, "SGLANG_REQ_RUNNING_TIMEOUT"),
                     SGLANG_RUST_SERVER=NS(get=lambda: False)),
-            get_parallel=lambda: NS(pp_size=1, pp_rank=0),
+            get_parallel=lambda: self.parallel,
             get_disagg=lambda: NS(disaggregation_bootstrap_port=1),
             get_serving=lambda: NS(allow_auto_truncate=False),
             get_device=lambda: NS(mlx_enable_sampling=False),
@@ -349,6 +421,15 @@ class Rank:
             setattr(self, name, types.MethodType(
                 sources.function(SCHED, name, "Scheduler", **namespace), self))
         self._occ3_abort_matches = sources.function(SCHED, "_occ3_abort_matches", "Scheduler")
+        poll = self._poll_timeout_aborts
+
+        def polled():
+            self.polls += 1
+            local = poll()
+            self.signals.extend(item.abort_message for item in local)
+            return local
+
+        self._poll_timeout_aborts = polled
         node = sources.node(SCHED, "handle_generate_request", "Scheduler")
         self.recv_fields = {n.attr for n in ast.walk(node) if isinstance(n, ast.Attribute)
                             and isinstance(n.value, ast.Name) and n.value.id == "recv_req"}
@@ -404,13 +485,16 @@ class Rank:
                       chunks=request.chunks)
         return NS(**fields)
 
-    def poll(self):
-        """Leader only: the one place a clock decides for a reservation."""
-        return self._poll_timeout_aborts()
-
-    def step(self, items):
+    def step(self):
+        """One loop iteration: the exact ingest_requests, then the model forward."""
         self.rank_time.local.clock, self.rank_time.local.rank = self.clock, self
-        for item in items:
+        self.ingest_requests()
+        if not self._engine_paused:
+            self._run()
+
+    def process_input_requests(self, recv_reqs):
+        """Dispatch stand-in. Each rank works on its own copy of a request."""
+        for item in recv_reqs:
             if isinstance(item, AbortReq):
                 self.abort_request(copy.copy(item))
                 continue
@@ -419,8 +503,6 @@ class Rank:
             self.handle_generate_request(recv)
             for row in self.made[before:]:
                 row.chunks = row.chunks_left = item.chunks
-        if not self._engine_paused:
-            self._run()
 
     # Model of get_next_batch_to_run, run_batch and process_batch_result.
     def _run(self):
@@ -509,10 +591,12 @@ class World:
     def __init__(self, sources, monkeypatch, ranks=2, **kw):
         self.bus = Bus(ranks)
         self.rank_time = RankTime()
+        self.socket = []  # sent by the frontend and not read by rank 0 yet
         monkeypatch.setattr(w, "time", self.rank_time)
         monkeypatch.setattr(w, "os", RankOS(self.rank_time.local))
         monkeypatch.setattr(w, "_runtime", lambda scheduler=None: scheduler.occ3_runtime)
-        self.ranks = [Rank(sources, self.bus, index, self.rank_time, **kw) for index in range(ranks)]
+        self.ranks = [Rank(sources, self.bus, index, self.rank_time, self.socket, **kw)
+                      for index in range(ranks)]
         self.pool = ThreadPoolExecutor(ranks)
         self.ticks, self.busy, self.signals, self.marks = 0, [], [], [0]
 
@@ -521,12 +605,15 @@ class World:
         return self.ranks[0]
 
     def tick(self, *incoming):
-        local = self.leader.poll()
-        self.signals.extend((self.ticks, item.abort_message) for item in local)
-        items = [*incoming, *local]
-        for future in [self.pool.submit(rank.step, items) for rank in self.ranks]:
+        self.socket.extend(incoming)
+        emitted = len(self.leader.signals)
+        for future in [self.pool.submit(rank.step) for rank in self.ranks]:
             future.result()
         assert not self.bus.barrier.broken, "a rank missed a collective"
+        assert not self.bus.mixed, "ranks entered different collectives"
+        assert not any(rank.polls for rank in self.ranks[1:]), "only rank 0 polls"
+        # What the leader's poll emitted. A skipped receive does not dispatch it.
+        self.signals.extend((self.ticks, message) for message in self.leader.signals[emitted:])
         for rank in self.ranks:
             rank.clock.now += DT
         self.ticks += 1
@@ -571,6 +658,7 @@ class World:
 
     def assert_clean(self):
         """No leaked hold, pause, queue slot or KV after the scenario."""
+        assert self.socket == []
         for rank in self.ranks:
             assert getattr(rank, "occ3_capture_hold", None) is None
             assert not getattr(rank, "occ3_capture_hold_replay", False)
@@ -890,7 +978,10 @@ def test_the_descriptor_deadline_ends_a_reservation_before_the_drain_bound(world
     assert sim.refusals("rid") == ["occ3_busy_batch"] and sim.record().state == "reserved"
 
 
-def test_only_the_leader_reads_a_clock_for_the_reservation(sources):
+def test_only_the_leader_decides_when_a_reservation_is_resolved(sources):
+    """Rank 0 alone compares a clock with the drain bound and emits the signal.
+    Each rank still reads its own clock for the deadline verdict, and the ranks
+    gather that verdict (see the deadline split test above)."""
     ingest = ast.unparse(sources.node(SCHED, "ingest_requests", "Scheduler"))
     assert "attn_tp_rank == 0" in ingest and "local_reqs = self._poll_timeout_aborts()" in ingest
     poll = ast.unparse(sources.node(SCHED, "_poll_timeout_aborts", "Scheduler"))
@@ -1056,6 +1147,82 @@ def test_the_same_traffic_is_reserved_without_a_queue_limit_or_a_timeout_sweep(
     sim.assert_clean()
 
 
+@pytest.mark.parametrize("preempt", ["off", "retract"])
+@pytest.mark.parametrize("interval", [2, 3, 4])
+def test_a_server_that_skips_receives_keeps_the_immediate_decline(
+        world, monkeypatch, preempt, interval):
+    """Review B2. With scheduler_recv_interval above 1 the exact recv_requests
+    returns before the broadcast on each iteration that its skipper skips. The
+    leader's signals of that iteration are lost, and a parked capture could be
+    held past its drain bound. So no capture is parked on such a server. It
+    gets the busy refusal in the iteration that receives it, and every
+    ordinary request runs exactly as it does without the capture."""
+    monkeypatch.setenv("OCC3_CAPTURE_PREEMPT", preempt)
+    rows = {"long": ticks(5.0), "later": 4}
+    traffic = [once(0, generate("long", rows["long"])), once(1.25, generate("later", 4))]
+
+    def received(at):
+        """Iteration in which the server reads a request that was sent at `at`."""
+        return next(tick for tick in range(ticks(at), ticks(at) + interval)
+                    if (tick + 1) % interval == 0)
+
+    seen = {}
+    for case in ("no_capture", "capture", "reservation_disabled"):
+        if case == "reservation_disabled":
+            monkeypatch.setenv("OCC3_CAPTURE_BUSY_WAIT_SECONDS", "0")
+        sim = seen[case] = world(recv_interval=interval)
+        sim.run(7.0, *traffic, *([] if case == "no_capture" else [once(1.0, cap(4))]))
+        for rid, count in rows.items():
+            assert sim.stream(rid) == reference(rid, count) and sim.done(rid)
+            assert sim.refusals(rid) == []
+        assert sim.signals == [] and retractions(sim) == {}
+        sim.assert_clean()
+    sim = seen["capture"]
+    assert hold_gathers(sim) == [("park", "rid", False)]
+    assert ("abort", "rid", "occ3_busy_batch") in sim.sent_in(received(1.0))
+    assert sim.refusals("rid") == ["occ3_busy_batch"] and sim.first_run("rid") is None
+    assert sim.record().state == "reserved" and not sim.record().admitted_capture
+    # The receive cadence alone delays a request. The capture adds nothing.
+    assert ordinary(sim, rows) == ordinary(seen["no_capture"], rows)
+    assert sim.first_run("long") == received(0) and sim.first_run("later") == received(1.25)
+    # The same server with the reservation disabled does exactly the same.
+    assert ([rank.view() for rank in sim.ranks]
+            == [rank.view() for rank in seen["reservation_disabled"].ranks])
+
+
+def test_a_skipped_receive_drops_the_signal_that_ends_a_hold(world):
+    """Why the park above is refused. This state cannot come from the admission
+    seam: the skippers are attached after the park. The exact recv_requests
+    then drops the leader's signal on each skipped iteration, and the hold and
+    the waiting prefill last until the next iteration that receives."""
+    sim = parked(world)
+    due = ticks(1.0) + ticks(2.0)
+    sim.each(lambda rank: setattr(rank, "recv_skipper", Skipper(4)))
+    sim.run(4.0)
+    # Emitted in four iterations, dispatched only in the last one.
+    assert sim.signals == [(at, "occ3_capture_hold_1") for at in range(due, due + 4)]
+    assert hold_gathers(sim) == [("park", "rid", True), ("resolve", "rid", "decline")]
+    assert ("abort", "rid", "occ3_busy_batch") in sim.sent_in(due + 3)
+    assert sim.first_run("load-b") == due + 3  # three iterations after the drain bound
+    for rid, count in (("load-a", ticks(5.0)), ("load-b", 4)):
+        assert sim.stream(rid) == reference(rid, count) and sim.done(rid)
+    sim.assert_clean()
+
+
+def test_the_park_reads_the_skipper_that_gates_the_receive(sources):
+    """The worker reads scheduler.recv_skipper. The applied scheduler creates
+    the skipper there and gives the same object to its receiver. recv_requests
+    returns on a skipped iteration before the broadcast that carries the
+    leader's signals."""
+    text = sources.text[SCHED]
+    assert text.count("self.recv_skipper = SchedulerRecvSkipper.maybe_create()") == 1
+    assert text.count("recv_skipper=self.recv_skipper,") == 1
+    recv = ast.unparse(sources.node(RECV, "recv_requests", "SchedulerRequestReceiver"))
+    gate = recv.index("if not self.recv_skipper.handle(self.get_last_batch()):")
+    assert gate < recv.index("return []", gate) < recv.index(
+        "self._broadcast_reqs_across_ranks(recv_reqs, local_reqs)")
+
+
 SPLITS = {
     "busy_wait_disabled": {"OCC3_CAPTURE_BUSY_WAIT_SECONDS": "0"},
     "drain": {"OCC3_CAPTURE_DRAIN_SECONDS": "1"},
@@ -1064,22 +1231,28 @@ SPLITS = {
     "waiting_timeout": {"SGLANG_REQ_WAITING_TIMEOUT": "30"},
     "running_timeout": {"SGLANG_REQ_RUNNING_TIMEOUT": "30"},
     "queue_limit": {"max_queued_requests": 8},
+    "receive_skipper": {"recv_skipper": 1},
 }
 
 
 @pytest.mark.parametrize("odd", [0, 2], ids=["leader_differs", "last_rank_differs"])
 @pytest.mark.parametrize("split", SPLITS)
 def test_ranks_with_different_reservation_inputs_decline_together(world, split, odd):
-    """Review S2. Each rank is a process with its own environment. One of
-    three ranks reads another reservation setting, or has a queue limit or a
-    timeout sweep that the others do not have. No rank decides alone. All
-    ranks enter the same park collective: a rank that returned before it
-    would leave the barrier unmatched and fail the test. The gathered values
-    differ, so every rank sends the immediate busy refusal."""
+    """Reviews S2 and B2. Each rank is a process with its own environment. One
+    of three ranks reads another reservation setting, or has a queue limit, a
+    timeout sweep or a receive skipper that the others do not have. No rank
+    decides alone. All ranks enter the same park collective: a rank that
+    returned before it would leave the barrier unmatched and fail the test.
+    The gathered values differ, so every rank sends the immediate busy
+    refusal."""
     sim = world(ranks=3)
     for name, value in SPLITS[split].items():
         if name == "max_queued_requests":
             sim.ranks[odd].max_queued_requests = value
+        elif name == "recv_skipper":
+            # Interval 1 lets every iteration receive. A rank that skipped
+            # alone would already miss the request broadcast.
+            sim.ranks[odd].recv_skipper = Skipper(value)
         else:
             sim.ranks[odd].environ[name] = value
     sim.run(7.0, once(0, generate("long", ticks(5.0))), once(1.0, cap(4)),
@@ -1170,11 +1343,13 @@ DEFAULTS = [10.0, 2.0, "off"]
     ({"SGLANG_REQ_WAITING_TIMEOUT": "soon"}, {}, DEFAULTS),
     ({}, {"_engine_paused": True}, DEFAULTS),
     ({}, {"occ3_capture_hold": "another capture"}, DEFAULTS),
+    ({}, {"recv_skipper": Skipper(4)}, DEFAULTS),
 ])
 def test_rank_local_inputs_are_gathered_and_never_return_early(monkeypatch, environ, state, settings):
-    """Reviews B1 and S2. This rank alone reads its settings, its queue limit,
-    its timeout sweeps and its scheduler state. Each of them goes into the one
-    collective as an ineligible value. None returns before it."""
+    """Reviews B1, S2 and B2. This rank alone reads its settings, its queue
+    limit, its timeout sweeps, its receive skipper and its scheduler state.
+    Each of them goes into the one collective as an ineligible value. None
+    returns before it."""
     for name in KNOBS:
         monkeypatch.delenv(name, raising=False)
     for name, value in environ.items():

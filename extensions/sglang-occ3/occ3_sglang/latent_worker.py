@@ -1305,7 +1305,10 @@ def capture_hold_park(scheduler, recv_req, error):
                 # queue limit could then reject one and a timeout sweep could
                 # expire one, so those servers keep the immediate decline.
                 and getattr(scheduler, "max_queued_requests", None) is None
-                and not _capture_hold_sla_sweeps())
+                and not _capture_hold_sla_sweeps()
+                # A receive skipper drops the leader's resolve signal on each
+                # iteration it skips, so a hold could outlast its drain bound.
+                and getattr(scheduler, "recv_skipper", None) is None)
     agreed = _capture_hold_agree(scheduler, {
         "hold": "park", "rid": recv_req.rid, "eligible": eligible,
         "settings": None if settings is None else [settings.window, settings.drain, settings.preempt]})
