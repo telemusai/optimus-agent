@@ -1332,6 +1332,12 @@ def _capture_hold_action(scheduler, hold, settings, rows):
     limit = getattr(scheduler, "max_queued_requests", None)
     if limit is not None and len(scheduler.waiting_queue) + len(rows) + 1 > limit:
         return "decline"
+    # An OCC-3 row that is queued runs first. The capture would wait behind
+    # its whole turn and meet the queue bound after admission.
+    grammar = getattr(getattr(scheduler, "grammar_manager", None), "grammar_queue", ())
+    if any(getattr(row, "occ3_attached", False) or getattr(row, "occ3_force_eager", False)
+           for row in (*scheduler.waiting_queue, *grammar)):
+        return "decline"
     if not rows:
         return "admit"
     if settings is None or settings.preempt != "retract" or _capture_hold_sla_sweeps():

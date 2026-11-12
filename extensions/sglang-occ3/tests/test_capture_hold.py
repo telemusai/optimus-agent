@@ -1064,3 +1064,62 @@ def test_invalid_reservation_knobs_carry_fixed_codes(environ, code):
     with pytest.raises(ValueError) as caught:
         latent_types.capture_hold_settings(environ)
     assert str(caught.value) == code
+
+
+def plain(**changes):
+    return NS(**{"occ3_attached": False, "occ3_force_eager": False, "input_embeds": None,
+                 "beam_group": None, **changes})
+
+
+@pytest.mark.parametrize("preempt, state, rows, expected", [
+    ("off", {}, [], "admit"),
+    ("off", {}, [plain()], "decline"),
+    ("retract", {}, [plain(), plain()], "retract"),
+    ("retract", {}, [], "admit"),
+    ("retract", {"_engine_paused": True}, [], "decline"),
+    ("retract", {"max_queued_requests": 3, "waiting_queue": [plain(), plain()]}, [], "admit"),
+    ("retract", {"max_queued_requests": 3, "waiting_queue": [plain(), plain(), plain()]}, [], "decline"),
+    ("retract", {"max_queued_requests": 3, "waiting_queue": [plain()]}, [plain()], "retract"),
+    ("retract", {"max_queued_requests": 3, "waiting_queue": [plain()]}, [plain(), plain()], "decline"),
+    ("retract", {"waiting_queue": [plain(occ3_force_eager=True)]}, [], "decline"),
+    ("retract", {"waiting_queue": [plain(occ3_attached=True)]}, [plain()], "decline"),
+    ("off", {"grammar_manager": NS(grammar_queue=[plain(occ3_force_eager=True)])}, [], "decline"),
+    ("retract", {}, [plain(), plain(occ3_force_eager=True)], "decline"),
+    ("retract", {}, [plain(occ3_attached=True)], "decline"),
+    ("retract", {}, [plain(input_embeds=[[0.0]])], "decline"),
+    ("retract", {}, [plain(beam_group=object())], "decline"),
+])
+def test_resolution_verdict_table(monkeypatch, preempt, state, rows, expected):
+    for name in KNOBS:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(w, "time", NS(monotonic=lambda: 100.0))
+    scheduler = NS(**{"waiting_queue": [], **state})
+    settings = latent_types.CaptureHoldSettings(10.0, 2.0, preempt)
+    hold = NS(deadline=101.0)
+    assert w._capture_hold_action(scheduler, hold, settings, rows) == expected
+    assert w._capture_hold_action(scheduler, NS(deadline=100.0), settings, rows) == "decline"
+    if expected == "retract":
+        assert w._capture_hold_action(scheduler, hold, None, rows) == "decline"
+        monkeypatch.setenv("SGLANG_REQ_WAITING_TIMEOUT", "5")
+        assert w._capture_hold_action(scheduler, hold, settings, rows) == "decline"
+
+
+def test_a_drained_reservation_declines_while_an_occ3_row_is_queued(world):
+    """The scheduler drains inside the window, but a queued OCC-3 row runs
+    first. A capture admitted behind it would spend its one-shot record and
+    then wait for that row's whole turn."""
+    sim = world()
+    sim.run(1.5, once(0, generate("short", ticks(2.0))), once(1.0, cap(4)),
+            once(1.25, generate("occ3-row", ticks(1.0))))
+    sim.each(lambda rank: vars(rank.row("occ3-row")).update(
+        occ3_attached=True, occ3_queue_deadline=None, occ3_worker_descriptor=NS(deadline=1e9)))
+    sim.run(4.0)
+    drained = sim.last_run("short") + 1
+    assert sim.signals == [(drained, "occ3_capture_hold_1")]
+    assert hold_gathers(sim) == [("park", "rid", True), ("resolve", "rid", "decline")]
+    assert sim.refusals("rid") == ["occ3_busy_batch"] and sim.first_run("rid") is None
+    assert sim.record().state == "reserved" and not sim.record().admitted_capture
+    assert sim.first_run("occ3-row") == drained
+    for rid, count in (("short", ticks(2.0)), ("occ3-row", ticks(1.0))):
+        assert sim.stream(rid) == reference(rid, count) and sim.done(rid)
+    sim.assert_clean()
