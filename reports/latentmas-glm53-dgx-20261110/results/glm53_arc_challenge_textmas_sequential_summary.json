@@ -1,0 +1,29 @@
+{
+  "task": "arc_challenge",
+  "condition": "sequential",
+  "n": 300,
+  "correct": 297,
+  "accuracy": 0.99,
+  "ci_lo": 0.9710159953649371,
+  "ci_hi": 0.9965934432372818,
+  "mcnemar_b": 2,
+  "mcnemar_c": 13,
+  "mcnemar_p": 0.00738525390625,
+  "wall_s": 0,
+  "mean_latency_s": 36.104,
+  "median_latency_s": 33.325,
+  "p95_latency_s": 66.323,
+  "prompt_per_item": 4210.046666666667,
+  "completion_per_item": 4065.1766666666667,
+  "reasoning_per_item": 2005.9433333333334,
+  "truncation_rate": 0.043333333333333335,
+  "invalid_answer_rate": 0.0033333333333333335,
+  "tasks_per_s": null,
+  "row_dedupe": {
+    "rows_before": 328,
+    "rows_after": 300,
+    "reason": "restart race: two runner processes appended the same indices after a kill did not land; kept first occurrence per idx",
+    "policy": "keep_first_occurrence_per_idx"
+  },
+  "concurrency_note": "mixed 16 and 32 in-flight (client) after mid-condition restart; accuracy unaffected (independent per-request sampling); latency not comparable"
+}

@@ -1,0 +1,22 @@
+{
+  "task": "gsm8k",
+  "condition": "baseline",
+  "n": 300,
+  "correct": 280,
+  "accuracy": 0.9333333333333333,
+  "ci_lo": 0.8992762041322797,
+  "ci_hi": 0.9564328232030161,
+  "mcnemar_b": null,
+  "mcnemar_c": null,
+  "mcnemar_p": null,
+  "wall_s": 76.2,
+  "mean_latency_s": 2.702,
+  "median_latency_s": 2.466,
+  "p95_latency_s": 4.24,
+  "prompt_per_item": 138.08666666666667,
+  "completion_per_item": 251.52666666666667,
+  "reasoning_per_item": 128.04333333333332,
+  "truncation_rate": 0.0033333333333333335,
+  "invalid_answer_rate": 0.0033333333333333335,
+  "tasks_per_s": 3.9382
+}

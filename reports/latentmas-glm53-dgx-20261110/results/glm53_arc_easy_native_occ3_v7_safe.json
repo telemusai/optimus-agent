@@ -1,0 +1,118 @@
+{
+ "cohort_note": "Native OCC-3 a-cohort: first-10 projection of the first-20 paired cohort; 3 serial batches (a/a2 + retry batches), run roots: arc-easy-a2-20261111t055343z, arc-easy-r4-20261111t055343z, arc-easy-r6-20261111t055343z",
+ "condition": "occ3_agent_native_v7",
+ "denominator": 20,
+ "row_count": 10,
+ "rows": [
+  {
+   "completion_tokens": 6257,
+   "correct": true,
+   "exec_error": false,
+   "idx": 0,
+   "latency_s": 107.236,
+   "prompt_tokens": 95653,
+   "reasoning_tokens": null,
+   "truncated": false
+  },
+  {
+   "completion_tokens": 8029,
+   "correct": true,
+   "exec_error": false,
+   "idx": 1,
+   "latency_s": 147.753,
+   "prompt_tokens": 98787,
+   "reasoning_tokens": null,
+   "truncated": false
+  },
+  {
+   "completion_tokens": 15039,
+   "correct": true,
+   "exec_error": false,
+   "idx": 2,
+   "latency_s": 154.126,
+   "prompt_tokens": 111873,
+   "reasoning_tokens": null,
+   "truncated": false
+  },
+  {
+   "completion_tokens": 24120,
+   "correct": true,
+   "exec_error": false,
+   "idx": 3,
+   "latency_s": 280.076,
+   "prompt_tokens": 128245,
+   "reasoning_tokens": null,
+   "truncated": false
+  },
+  {
+   "completion_tokens": 12586,
+   "correct": true,
+   "exec_error": false,
+   "idx": 4,
+   "latency_s": 159.488,
+   "prompt_tokens": 107279,
+   "reasoning_tokens": null,
+   "truncated": false
+  },
+  {
+   "completion_tokens": 13287,
+   "correct": true,
+   "exec_error": false,
+   "idx": 5,
+   "latency_s": 166.686,
+   "prompt_tokens": 107863,
+   "reasoning_tokens": null,
+   "truncated": false
+  },
+  {
+   "completion_tokens": 8550,
+   "correct": true,
+   "exec_error": false,
+   "idx": 6,
+   "latency_s": 202.778,
+   "prompt_tokens": 99528,
+   "reasoning_tokens": null,
+   "truncated": false
+  },
+  {
+   "completion_tokens": 12289,
+   "correct": true,
+   "exec_error": false,
+   "idx": 7,
+   "latency_s": 188.602,
+   "prompt_tokens": 104317,
+   "reasoning_tokens": null,
+   "truncated": false
+  },
+  {
+   "completion_tokens": 10313,
+   "correct": true,
+   "exec_error": false,
+   "idx": 8,
+   "latency_s": 173.789,
+   "prompt_tokens": 101170,
+   "reasoning_tokens": null,
+   "truncated": false
+  },
+  {
+   "completion_tokens": 8213,
+   "correct": true,
+   "exec_error": false,
+   "idx": 9,
+   "latency_s": 135.273,
+   "prompt_tokens": 98758,
+   "reasoning_tokens": null,
+   "truncated": false
+  }
+ ],
+ "schema": "latents.bench.item_safe.v1",
+ "source_file": {
+  "score_private": "/tmp/arc-easy-native-a2-score-private.json",
+  "score_public": "/tmp/arc-easy-native-a2-score-public.json"
+ },
+ "source_sha256": {
+  "score_private": "29bfd7f06303047ab2a93910f5a29ab6473156960da3e1b0e4ad642a11dc29c1",
+  "score_public": "ccc204fdf1749878b5695f00b565c1765f464b54cf05d18cd86e6754bd3d661d"
+ },
+ "task": "arc_easy"
+}

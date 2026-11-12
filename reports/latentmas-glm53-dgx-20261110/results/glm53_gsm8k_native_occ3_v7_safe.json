@@ -1,0 +1,210 @@
+{
+ "schema": "latents.bench.item_safe.v1",
+ "task": "gsm8k",
+ "condition": "occ3_agent_native_v7",
+ "denominator": 20,
+ "row_count": 19,
+ "rows": [
+  {
+   "idx": 0,
+   "correct": true,
+   "truncated": false,
+   "exec_error": false,
+   "prompt_tokens": 93080,
+   "completion_tokens": 9871,
+   "reasoning_tokens": null,
+   "latency_s": 137.02
+  },
+  {
+   "idx": 2,
+   "correct": false,
+   "truncated": false,
+   "exec_error": false,
+   "prompt_tokens": 111625,
+   "completion_tokens": 27674,
+   "reasoning_tokens": null,
+   "latency_s": 256.243
+  },
+  {
+   "idx": 3,
+   "correct": true,
+   "truncated": false,
+   "exec_error": false,
+   "prompt_tokens": 88446,
+   "completion_tokens": 8158,
+   "reasoning_tokens": null,
+   "latency_s": 115.376
+  },
+  {
+   "idx": 4,
+   "correct": true,
+   "truncated": false,
+   "exec_error": false,
+   "prompt_tokens": 88783,
+   "completion_tokens": 9288,
+   "reasoning_tokens": null,
+   "latency_s": 161.358
+  },
+  {
+   "idx": 5,
+   "correct": true,
+   "truncated": false,
+   "exec_error": false,
+   "prompt_tokens": 87841,
+   "completion_tokens": 9036,
+   "reasoning_tokens": null,
+   "latency_s": 117.032
+  },
+  {
+   "idx": 6,
+   "correct": true,
+   "truncated": false,
+   "exec_error": false,
+   "prompt_tokens": 86885,
+   "completion_tokens": 6776,
+   "reasoning_tokens": null,
+   "latency_s": 101.745
+  },
+  {
+   "idx": 7,
+   "correct": true,
+   "truncated": false,
+   "exec_error": false,
+   "prompt_tokens": 110980,
+   "completion_tokens": 22228,
+   "reasoning_tokens": null,
+   "latency_s": 176.401
+  },
+  {
+   "idx": 8,
+   "correct": true,
+   "truncated": false,
+   "exec_error": false,
+   "prompt_tokens": 105065,
+   "completion_tokens": 42293,
+   "reasoning_tokens": null,
+   "latency_s": 258.461
+  },
+  {
+   "idx": 9,
+   "correct": true,
+   "truncated": false,
+   "exec_error": false,
+   "prompt_tokens": 100334,
+   "completion_tokens": 13426,
+   "reasoning_tokens": null,
+   "latency_s": 153.086
+  },
+  {
+   "idx": 10,
+   "correct": true,
+   "truncated": false,
+   "exec_error": false,
+   "prompt_tokens": 87515,
+   "completion_tokens": 8151,
+   "reasoning_tokens": null,
+   "latency_s": 182.695
+  },
+  {
+   "idx": 11,
+   "correct": true,
+   "truncated": false,
+   "exec_error": false,
+   "prompt_tokens": 106929,
+   "completion_tokens": 17511,
+   "reasoning_tokens": null,
+   "latency_s": 192.247
+  },
+  {
+   "idx": 12,
+   "correct": false,
+   "truncated": false,
+   "exec_error": false,
+   "prompt_tokens": 85708,
+   "completion_tokens": 6535,
+   "reasoning_tokens": null,
+   "latency_s": 105.596
+  },
+  {
+   "idx": 13,
+   "correct": true,
+   "truncated": false,
+   "exec_error": false,
+   "prompt_tokens": 111442,
+   "completion_tokens": 19232,
+   "reasoning_tokens": null,
+   "latency_s": 169.407
+  },
+  {
+   "idx": 14,
+   "correct": true,
+   "truncated": false,
+   "exec_error": false,
+   "prompt_tokens": 96049,
+   "completion_tokens": 12336,
+   "reasoning_tokens": null,
+   "latency_s": 186.174
+  },
+  {
+   "idx": 15,
+   "correct": true,
+   "truncated": false,
+   "exec_error": false,
+   "prompt_tokens": 107814,
+   "completion_tokens": 20903,
+   "reasoning_tokens": null,
+   "latency_s": 236.459
+  },
+  {
+   "idx": 16,
+   "correct": true,
+   "truncated": false,
+   "exec_error": false,
+   "prompt_tokens": 111682,
+   "completion_tokens": 21539,
+   "reasoning_tokens": null,
+   "latency_s": 250.31
+  },
+  {
+   "idx": 17,
+   "correct": true,
+   "truncated": false,
+   "exec_error": false,
+   "prompt_tokens": 87762,
+   "completion_tokens": 8023,
+   "reasoning_tokens": null,
+   "latency_s": 129.701
+  },
+  {
+   "idx": 18,
+   "correct": true,
+   "truncated": false,
+   "exec_error": false,
+   "prompt_tokens": 89199,
+   "completion_tokens": 8633,
+   "reasoning_tokens": null,
+   "latency_s": 107.111
+  },
+  {
+   "idx": 19,
+   "correct": true,
+   "truncated": false,
+   "exec_error": false,
+   "prompt_tokens": 110800,
+   "completion_tokens": 14782,
+   "reasoning_tokens": null,
+   "latency_s": 189.583
+  }
+ ],
+ "source_file": {
+  "item00": "/home/nvidia/latentmas-bench/results/gsm8k-native-v7-item00-20261110T152933Z/score-public.json",
+  "batch_175110z_items02_18": "/home/nvidia/occ3-deploy/native-v7-batch-20261110t175110z/score-public.json",
+  "item19_v7": "/home/nvidia/occ3-deploy/native-v7-batch-gsm8k-item19-v7-20261111t055343z/score-public.json"
+ },
+ "source_sha256": {
+  "item00": "a43ae5ab9f6c14fb7acc49c3697bff55ac7f41e8c97c4fd321794894a6445a6a",
+  "batch_175110z_items02_18": "451da6e5485313412d7254ff37537df7afc635bffd9ce67191a109121e05a99e",
+  "item19_v7": "ea08f636cc2aede28905146b6f2388027b2ce8d9440d8fb763cb41a5374a4e90"
+ },
+ "cohort_note": "Items 0, 2-18, 19 of the 20-item historical paired cohort. Item 1 never ran (setup failure in a prior batch, not retried). Latency is per-item wall time including setup; the native condition runs serially with one four-role child team per item."
+}
