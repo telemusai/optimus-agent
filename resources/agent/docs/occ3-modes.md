@@ -66,11 +66,15 @@ an alternative endpoint, change model configuration or silently switch models.
 - Input persistence precedes preparation. Normal cancellation also cancels
   preparation. A failed or invalid preparation result stops the turn instead of
   silently falling back to an ordinary execution.
-- Preparation uses at most 256 KiB of serialized effective context, including
-  images. Each stage has a 120-second limit, a 128 KiB response limit and a
-  16 KiB public-draft limit. Its output budget is at most 4096 tokens, reduced
-  to the selected model's output and estimated remaining-context limits. Inputs
-  that do not fit fail visibly; images and history are not silently discarded.
+- Each actual tool-free role request uses at most 256 KiB of serialized context
+  after preparation, including images, retained history and any earlier drafts in
+  sequential mode. Hidden Thinking is stripped before this per-role check. The
+  raw original transcript and normal parent/Judger request are not subject to
+  this preparation cap. Each stage has a 120-second limit, a 128 KiB response
+  limit and a 16 KiB public-draft limit. Its output budget is at most 4096 tokens,
+  reduced to the selected model's output and estimated remaining-context limits.
+  Role inputs that do not fit fail visibly; images, history and drafts are not
+  silently discarded.
 - Tool-call output, refusal, missing usable text and incomplete output are not
   valid advisory drafts. No automatic role retries or model fallback are added.
 - `/stats` shows a separate **OCC3.1 preparation overhead** category. Its known

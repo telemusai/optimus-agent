@@ -1,0 +1,1 @@
+- Fixed OCC3.1 preparation rejecting chats whose raw history exceeded 256 KiB only because of hidden Thinking blocks, and incorrectly applying that preparation-only limit to the normal parent request after the advisory drafts. Tool-free role requests still retain the strict 256 KiB limit and fail before provider spending when their transformed context is oversized.

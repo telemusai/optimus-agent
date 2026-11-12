@@ -278,7 +278,7 @@ impl AgentSession {
         let convert = options.convert_to_llm.ok_or("OCC3.1 provider context conversion is unavailable")?;
         let source = self.agent.messages();
         let transform = self.textmas.lock().unwrap().original_transform.clone();
-        // Bound the effective, extension-transformed and policy-converted snapshot, not stale full history.
+        // Prepare the transformed snapshot used by tool-free roles and reused by the normal parent.
         let (transformed, messages) = tokio::select! {
             biased;
             _ = run.signal.cancelled() => return Err("OCC3.1 preparation was cancelled".into()),
@@ -290,7 +290,8 @@ impl AgentSession {
             }) => result.map_err(|_| "OCC3.1 context preparation timed out")?,
         };
         let original = Context::new(Some(self.agent.system_prompt()), messages, None);
-        contract::check_context_bound(&original)?;
+        // Only the tool-free role requests are subject to the preparation context bound.
+        // The normal parent keeps this full history and appends advice in its own context hook.
         let mut drafts = Vec::new();
         for role in TextMasRole::ALL {
             if run.signal.is_cancelled() || parent_signal.as_ref().is_some_and(CancellationToken::is_cancelled) || self.agent.model() != run.model {
@@ -301,9 +302,6 @@ impl AgentSession {
             drafts.push((role, draft));
         }
         let advisory = contract::advisory_message(&drafts);
-        let mut final_context = original;
-        final_context.messages.push(Message::User(advisory.clone()));
-        contract::check_context_bound(&final_context)?;
         Ok((advisory, PreparedSnapshot { source, transformed }))
     }
 

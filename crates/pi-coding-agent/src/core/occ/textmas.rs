@@ -313,6 +313,44 @@ mod tests {
     }
 
     #[test]
+    fn serialized_context_bound_is_exact_for_utf8_and_json_escapes() {
+        fn text(ascii_len: usize) -> String { format!("é雪\"\\\n{}", "x".repeat(ascii_len)) }
+        fn context(text: String) -> Context {
+            Context::new(None, vec![Message::User(UserMessage::new(UserContent::Text(text), 1))], None)
+        }
+        fn encoded_len(context: &Context) -> usize { serde_json::to_vec(context).unwrap().len() }
+
+        let mut low = 0;
+        let mut high = MAX_CONTEXT_BYTES;
+        while low < high {
+            let mid = (low + high + 1) / 2;
+            if encoded_len(&context(text(mid))) <= MAX_CONTEXT_BYTES { low = mid; } else { high = mid - 1; }
+        }
+        let exact = context(text(low));
+        assert_eq!(encoded_len(&exact), MAX_CONTEXT_BYTES);
+        assert!(check_context_bound(&exact).is_ok());
+        let json = serde_json::to_string(&exact).unwrap();
+        assert!(json.contains('é') && json.contains('雪'));
+        assert!(json.contains("\\\"") && json.contains("\\\\") && json.contains("\\n"));
+
+        let mut over_text = text(low);
+        assert_eq!(over_text.pop(), Some('x'));
+        over_text.push('é');
+        let over = context(over_text);
+        assert_eq!(encoded_len(&over), MAX_CONTEXT_BYTES + 1);
+        assert!(check_context_bound(&over).is_err());
+    }
+
+    #[test]
+    fn near_cap_sequential_drafts_overflow_while_hierarchical_context_still_fits() {
+        let original = Context::new(None, vec![Message::User(UserMessage::new(UserContent::Text("x".repeat(MAX_CONTEXT_BYTES - 8192)), 1))], None);
+        let drafts = vec![(TextMasRole::Planner, "x".repeat(MAX_DRAFT_BYTES))];
+        let hierarchical = role_context(&original, TextMasMode::Hierarchical, TextMasRole::Critic, &drafts).unwrap();
+        assert!(MAX_CONTEXT_BYTES - serde_json::to_vec(&hierarchical).unwrap().len() < MAX_DRAFT_BYTES);
+        assert!(role_context(&original, TextMasMode::Sequential, TextMasRole::Critic, &drafts).is_err());
+    }
+
+    #[test]
     fn refusal_empty_and_partial_outputs_fail_closed() {
         assert!(public_draft(&AssistantMessage::default()).is_err());
         let mut response = AssistantMessage::default();

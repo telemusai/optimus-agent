@@ -1,8 +1,8 @@
 //! OCC3.1 native execution through a registered offline, non-latent custom provider.
 use pi_ai::providers::faux::*;
-use pi_ai::types::{AssistantMessage, ContentBlock, Context, Model, ToolCall};
-use pi_coding_agent::core::occ::{textmas::{TextMasMode, TextMasUsageLedger, usage_record}, textmas_settings};
-use pi_coding_agent::core::extensions::types::InputSource;
+use pi_ai::types::{AssistantMessage, ContentBlock, Context, Message, Model, ToolCall};
+use pi_coding_agent::core::occ::{textmas::{MAX_CONTEXT_BYTES, TextMasMode, TextMasUsageLedger, usage_record}, textmas_settings};
+use pi_coding_agent::core::extensions::types::{ExtensionEvent, ExtensionFactory, InputSource};
 use pi_coding_agent::core::agent_session::{AgentSession, PromptOptions};
 use pi_coding_agent::core::agent_session_services::*;
 use pi_coding_agent::core::auth_storage::AuthStorage;
@@ -57,6 +57,15 @@ impl Fixture {
     }
 
     async fn session(&self, depth: i64, retry: bool) -> Arc<AgentSession> {
+        self.session_with_extensions(depth, retry, Vec::new()).await
+    }
+
+    async fn session_with_extensions(
+        &self,
+        depth: i64,
+        retry: bool,
+        extension_factories: Vec<ExtensionFactory>,
+    ) -> Arc<AgentSession> {
         let cwd = self
             .root
             .path()
@@ -102,6 +111,7 @@ impl Fixture {
                 cwd: cwd.clone(),
                 agent_dir: profile.clone(),
                 settings_manager: Some(settings),
+                extension_factories,
                 no_extensions: true,
                 no_skills: true,
                 no_prompt_templates: true,
@@ -192,6 +202,85 @@ async fn turn(session: &Arc<AgentSession>, text: &str, options: Option<PromptOpt
     result
 }
 fn text_reply(text: &str) -> AssistantMessage { faux_assistant_message(text.into(), None) }
+
+const DENSE_IMAGE_BYTES: usize = 150_000;
+const DENSE_IMAGE_MIME: &str = "application/x-occ31-image-density";
+
+fn dense_image_block(block: &serde_json::Value) -> bool {
+    block.get("type").and_then(serde_json::Value::as_str) == Some("image")
+        && block.get("mimeType").and_then(serde_json::Value::as_str) == Some(DENSE_IMAGE_MIME)
+        && block
+            .get("data")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|data| data.len() == DENSE_IMAGE_BYTES)
+}
+
+fn image_density_extension(audit: Arc<Mutex<Vec<usize>>>) -> ExtensionFactory {
+    Arc::new(move |api| {
+        let audit = audit.clone();
+        Box::pin(async move {
+            api.on(
+                "context",
+                Arc::new(move |event, _| {
+                    let audit = audit.clone();
+                    Box::pin(async move {
+                        let ExtensionEvent::Context(payload) = event else {
+                            return None;
+                        };
+                        let mut messages = payload.messages;
+                        let dense_blocks = messages
+                            .iter()
+                            .filter_map(|message| {
+                                message.get("content").and_then(serde_json::Value::as_array)
+                            })
+                            .map(|blocks| {
+                                blocks
+                                    .iter()
+                                    .filter(|block| dense_image_block(block))
+                                    .count()
+                            })
+                            .sum::<usize>();
+                        audit.lock().unwrap().push(dense_blocks);
+                        let mut retained = false;
+                        for message in messages.iter_mut().rev() {
+                            let Some(blocks) = message
+                                .get_mut("content")
+                                .and_then(serde_json::Value::as_array_mut)
+                            else {
+                                continue;
+                            };
+                            for block in blocks {
+                                if dense_image_block(block) {
+                                    if retained {
+                                        block["data"] = json!("OCC31_DUPLICATE_IMAGE_DEDUPED");
+                                    } else {
+                                        retained = true;
+                                    }
+                                }
+                            }
+                        }
+                        Some(json!({"messages": messages}))
+                    })
+                }),
+            );
+            Ok(())
+        })
+    })
+}
+
+fn dense_image_count(context: &Context) -> usize {
+    context.messages.iter().map(|message| match message {
+        Message::User(user) => match &user.content {
+            pi_ai::types::UserContent::Blocks(blocks) => blocks.iter().filter(|block| matches!(
+                block,
+                pi_ai::types::ImageOrTextContent::Image(image) if image.mime_type == DENSE_IMAGE_MIME && image.data.len() == DENSE_IMAGE_BYTES
+            )).count(),
+            _ => 0,
+        },
+        _ => 0,
+    }).sum()
+}
+
 fn ledger(session: &AgentSession) -> TextMasUsageLedger {
     let mut ledger = TextMasUsageLedger::default();
     for entry in session.session_manager.lock().unwrap().get_entries() {
@@ -258,6 +347,118 @@ async fn sequential_and_hierarchical_are_real_distinct_graphs_and_keep_final_too
         assert_eq!(ledger(&session).summary().unwrap().calls, 3);
         session.dispose_async(Some(false)).await;
     }
+}
+
+#[tokio::test]
+async fn hidden_thinking_over_cap_does_not_block_roles_or_the_normal_parent() {
+    let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let f = Fixture::new();
+    let transform_audit = Arc::new(Mutex::new(Vec::new()));
+    let session = f.session_with_extensions(0, false, vec![image_density_extension(transform_audit.clone())]).await;
+    let dense_image = pi_ai::types::ImageContent::new("A".repeat(DENSE_IMAGE_BYTES), DENSE_IMAGE_MIME);
+    let private_history = format!("LARGE_PRIVATE_HISTORY{}", "x".repeat(MAX_CONTEXT_BYTES));
+    let private_thinking = pi_ai::types::ThinkingContent {
+        thinking_signature: Some("PRIVATE_THINKING_SIGNATURE".into()),
+        ..faux_thinking(&private_history)
+    };
+    f.reply(
+        faux_assistant_message(
+            FauxAssistantContent::Blocks(vec![
+                ContentBlock::Thinking(private_thinking.clone()),
+                ContentBlock::Text(faux_text("HISTORY_ANSWER")),
+            ]),
+            None,
+        ),
+        None,
+        None,
+    );
+    turn(&session, "HISTORY_REQUEST", Some(PromptOptions {
+        images: Some(vec![dense_image.clone()]), source: Some(InputSource::Rpc), ..Default::default()
+    })).await.unwrap();
+    transform_audit.lock().unwrap().clear();
+    let file = session.session_file().unwrap();
+    textmas_settings::set_mode(&file, TextMasMode::Sequential).unwrap();
+    f.drafts(&file);
+    f.reply(text_reply("FINAL_ANSWER"), None, None);
+    turn(&session, "CURRENT_REQUEST", Some(PromptOptions {
+        images: Some(vec![dense_image]), source: Some(InputSource::Rpc), ..Default::default()
+    })).await.unwrap();
+    assert_eq!(transform_audit.lock().unwrap().as_slice(), &[2], "one extension transform sees both dense images; role and parent reuse it");
+
+    let contexts = f.captured.lock().unwrap().clone();
+    assert_eq!(
+        contexts.len(),
+        5,
+        "ordinary history, three roles, normal parent"
+    );
+    for (offset, role) in ["planner", "critic", "refiner"].iter().enumerate() {
+        let context = &contexts[offset + 1];
+        assert!(context.tools.is_none());
+        assert!(context
+            .system_prompt
+            .as_ref()
+            .unwrap()
+            .contains(&format!("advisory role: {role}")));
+        assert!(serde_json::to_vec(context).unwrap().len() <= MAX_CONTEXT_BYTES);
+        assert_eq!(dense_image_count(context), 1, "extension-deduplicated image density is bounded for {role}");
+        let text = serde_json::to_string(context).unwrap();
+        assert!(text.contains("HISTORY_ANSWER") && text.contains("CURRENT_REQUEST"));
+        assert!(!text.contains("LARGE_PRIVATE_HISTORY"));
+    }
+    let parent = &contexts[4];
+    assert!(parent.tools.is_some());
+    assert!(serde_json::to_vec(parent).unwrap().len() > MAX_CONTEXT_BYTES);
+    assert_eq!(dense_image_count(parent), 1);
+    let parent_text = serde_json::to_string(parent).unwrap();
+    assert!(parent_text.contains("OCC31_DUPLICATE_IMAGE_DEDUPED"));
+    let parent_thinking = parent
+        .messages
+        .iter()
+        .filter_map(|message| match message {
+            Message::Assistant(assistant) => Some(assistant),
+            _ => None,
+        })
+        .flat_map(|assistant| &assistant.content)
+        .find_map(|block| match block {
+            ContentBlock::Thinking(thinking) if thinking.thinking == private_history => Some(thinking),
+            _ => None,
+        })
+        .expect("normal parent retains the exact hidden Thinking block");
+    assert_eq!(parent_thinking, &private_thinking);
+    assert!(
+        parent_text.contains("LARGE_PRIVATE_HISTORY"),
+        "normal parent history is not truncated"
+    );
+    assert!(
+        parent_text.contains("PLANNER_DRAFT")
+            && parent_text.contains("CRITIC_DRAFT")
+            && parent_text.contains("REFINER_DRAFT")
+    );
+    assert_eq!(ledger(&session).summary().unwrap().calls, 3);
+    session.dispose_async(Some(false)).await;
+}
+
+#[tokio::test]
+async fn oversized_transformed_planner_context_fails_before_any_stage_spending() {
+    let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let f = Fixture::new();
+    let session = f.session(0, false).await;
+    let file = session.session_file().unwrap();
+    textmas_settings::set_mode(&file, TextMasMode::Sequential).unwrap();
+    f.reply(text_reply("MUST_NOT_CALL"), None, None);
+    let oversized_request = "x".repeat(MAX_CONTEXT_BYTES);
+    let error = turn(&session, &oversized_request, None).await.unwrap_err();
+    assert!(error.contains("256 KiB preparation limit"), "{error}");
+    assert!(
+        f.captured.lock().unwrap().is_empty(),
+        "Planner must fail before its provider call"
+    );
+    assert_eq!(
+        ledger(&session).len(),
+        0,
+        "Planner must fail before its Started reservation"
+    );
+    session.dispose_async(Some(false)).await;
 }
 
 #[tokio::test]
