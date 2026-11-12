@@ -39,15 +39,24 @@
   are 20/20 on the first 20 items of each task, by arithmetic across disjoint
   score reports, not a combined scorer run. Paired single-agent baselines also
   score 20/20, so these items show no native gain.
-- Added recovered historical native sandbox aggregates: HumanEval+ and MBPP+
-  8/9 each. Full scorer/sandbox source validation and per-item coverage remain
-  pending; no transport, latency, cost or channel-only gain is inferred.
+- Added native OCC-3 v7 HumanEval+ and MBPP+ first-20 results, scored per item
+  by one combined scorer run per task: HumanEval+ 16/20, MBPP+ 12/20 (correct / scored
+  items). Native is below the single-agent baseline on the same items (pooled
+  28/40 vs 39/40, exact McNemar p=9.8e-04). Eleven of twelve misses do not define the
+  function under the name that the tests call.
+- Added a ledger of all 65 native code attempts; 25 failed attempts are excluded and
+  listed with per-item attempt counts. Counting only first attempts, native is
+  13/20 on HumanEval+ and 10/20 on MBPP+.
+- Changed the recovered historical code aggregates (HumanEval+ and MBPP+ 8/9
+  each) to superseded provenance records; the per-item results replace them.
+- Added native GSM8K item 1 (2026-11-12), scored correct; native GSM8K is
+  18/20 on the first 20 items.
 - Added safe exclusion metadata for HumanEval+ item 9, MBPP+ item 9 attempts
   and ARC-Easy item 12. Failed attempts do not count as scored answers. The
   follow-up audit of the failed ARC-Easy item-12 attempt found no transfer
   and clean server state; item 12 is scored from a separate fresh attempt.
 - Added a results-at-a-glance table for all nine benchmarks and a native
-  OCC-3 v7 progress table: 77 of 100 planned first-20 items scored.
+  OCC-3 v7 progress table: 100 of 100 planned first-20 items scored.
 - Fixed stale NOT-RUN and sandbox prose to match completed HTTP conditions
   and the limited native evidence. Four-call TextMAS remains separate from
   the one-call baseline; execution budgets are not matched.

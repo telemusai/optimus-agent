@@ -26,7 +26,7 @@ significant drop vs baseline (McNemar b=103, c=38, p=4.1e-08) and the same
 letter-choice hierarchical collapse as GPQA/ARC.
 The GSM8K native OCC-3 v7 cohort is complete and pinned-scorer verified at
 **17/19 correct on eligible items** (89.5%, exact McNemar p=1.0 vs the paired
-baseline on the same 19 items; item 1 never ran, item 19 was completed by the
+baseline on the same 19 items; item 1 had no score then, item 19 was completed by the
 v7 retry after the daemon upgrade to 0.1.45); see
 [GSM8K_OCC3_NATIVE_V7.md](GSM8K_OCC3_NATIVE_V7.md).
 Four calls per item versus one baseline call are not budget matched.
@@ -49,22 +49,38 @@ first 20 items are complete. All 20 items of each task are scored correct
 (20/20 each). The single-agent baseline also scores 20/20 on these items, so
 they show no native gain. See the ARC sections below.
 
+Update 2026-11-12 09:27 UTC (code tasks and GSM8K item 1): the native OCC-3 v7
+HumanEval+ and MBPP+ runs on the first 20 items are complete and scored per
+item, with one combined scorer run per task and the same offline sandbox and
+tests as the HTTP harness. HumanEval+ is **16/20** and MBPP+ **12/20**.
+On the same items the single-agent baseline scores 20/20 and 19/20. Pooled over both
+tasks, native is below the baseline (28/40 vs 39/40, exact McNemar b=11, c=0,
+p=9.8e-04). Eleven of the twelve native code misses do not define the function
+under the name that the tests call. Failed native attempts got fresh attempts;
+counting only first attempts, with a failed first attempt as wrong, native is
+13/20 on HumanEval+ and 10/20 on MBPP+.
+GSM8K item 1 ran with a fresh plan and authorization and scored correct (its
+only earlier attempt, on 2026-11-10, ended before any score), so native GSM8K
+is 18/20 on the first 20 items.
+All 100 planned native first-20 items now have a score (86 correct).
+These results replace the recovered 8/9 code aggregates. See the code-task
+and GSM8K sections below.
+
 ## Results at a glance
 
 Correct items / scored items, as of 2026-11-12. The three HTTP conditions ran
 the full item sets. Native OCC-3 v7 ran only on the first 20 items of five
-tasks, and only partly for GSM8K, HumanEval+ and MBPP+, so its column is not
-comparable with the full-set columns.
+tasks, so its column is not comparable with the full-set columns.
 
 | Benchmark | Single-agent baseline | TextMAS sequential | TextMAS hierarchical | Native OCC-3 v7 (first-20 subsets) |
 |---|---:|---:|---:|---:|
 | AIME 2024 | 11/30 | 16/30 | 18/30 | not run |
 | AIME 2025 | 10/30 | 11/30 | 13/30 | not run |
-| GSM8K | 280/300 | 277/300 | 286/300 | 17/19 |
+| GSM8K | 280/300 | 277/300 | 286/300 | 18/20 |
 | GPQA-Diamond | 73/198 | 103/198 | 10/198 | not run |
 | MedQA | 174/300 | 268/300 | 109/300 | not run |
-| HumanEval+ | 142/164 | 143/164 | 149/164 | 8/9 (aggregate; verification pending) |
-| MBPP+ | 303/378 | 303/378 | 323/378 | 8/9 (aggregate; verification pending) |
+| HumanEval+ | 142/164 | 143/164 | 149/164 | 16/20 |
+| MBPP+ | 303/378 | 303/378 | 323/378 | 12/20 |
 | ARC-Easy | 285/300 | 290/300 | 200/300 | 20/20 |
 | ARC-Challenge | 286/300 | 297/300 | 215/300 | 20/20 |
 
@@ -72,12 +88,12 @@ Native OCC-3 v7 progress against the first 20 items of each task:
 
 | Benchmark | Planned | Scored | Correct | Not yet scored |
 |---|---:|---:|---:|---|
-| GSM8K | 20 | 19 | 17 | 1 (item 1) |
+| GSM8K | 20 | 20 | 18 | 0 |
 | ARC-Easy | 20 | 20 | 20 | 0 |
 | ARC-Challenge | 20 | 20 | 20 | 0 |
-| HumanEval+ | 20 | 9 | 8 | 11 (indices not established) |
-| MBPP+ | 20 | 9 | 8 | 11 (indices not established) |
-| Total | 100 | 77 | - | 23 |
+| HumanEval+ | 20 | 20 | 16 | 0 |
+| MBPP+ | 20 | 20 | 12 | 0 |
+| Total | 100 | 100 | - | 0 |
 
 - All 27 HTTP runs are complete. TextMAS makes four 4096-token calls per item
   against one baseline call, so it is not budget matched.
@@ -85,16 +101,19 @@ Native OCC-3 v7 progress against the first 20 items of each task:
   `latent_mas` method, which was not run. Its execution contract and budgets
   differ from the HTTP conditions, so it cannot establish a channel-only gain,
   efficiency or speedup.
-- GSM8K native on the same 19 items: native 17, baseline 18, TextMAS
-  sequential 18 (exact McNemar p=1.0).
+- GSM8K native on the same 20 items: native 18, baseline 19, TextMAS
+  sequential 19 (exact McNemar p=1.0).
 - ARC native on the same 20 items: ARC-Easy native 20, baseline 20, TextMAS
   sequential 20, hierarchical 13; ARC-Challenge native 20, baseline 20,
   sequential 19, hierarchical 16. The single agent is already at the ceiling
   on both tasks, so these items show no native gain.
-- The ARC 20/20 totals are arithmetic across disjoint score reports, not one
-  combined scorer run. The HumanEval+ and MBPP+ native counts are recovered
-  historical aggregates; full source validation and per-item coverage are
-  pending.
+- Code tasks native on the same scored items: HumanEval+ native 16, baseline
+  20, TextMAS sequential 20, hierarchical 19 (20 items); MBPP+ native 12,
+  baseline 19, sequential 15, hierarchical 17 (20 items). Pooled over both
+  tasks vs the baseline: b=11, c=0, exact McNemar p=9.8e-04.
+- The ARC 20/20 totals and the GSM8K first-20 total are arithmetic across disjoint score
+  reports, not one combined scorer run. The HumanEval+ and MBPP+ native counts
+  come from one combined scorer run per task.
 - The historical OCC-3 GSM8K run (13/14 adjudicated, items 0-13) is a separate
   condition; see the GSM8K first-20 section.
 - Intervals and McNemar tests for each task are in the sections below.
@@ -185,24 +204,82 @@ docker container (no network, read-only, uid 65534). One sample per item.
   token and latency rows plus source sha256 values are in
   `results/*_safe.json`, and aggregate metrics in `results/*_summary.json`.
 
-#### Native OCC-3 code-task aggregates (limited historical evidence)
+#### Native OCC-3 v7 code tasks (first 20 items)
 
-Recovered tool-result aggregates report the following existing sandbox scores
-on 2026-11-11. This update did not run inference or rescore answers.
+Native OCC-3 v7 ran the first 20 items of each code task, one item per run,
+each with a fresh plan and authorization, on 2026-11-11 and 2026-11-12. Each
+task is scored by one combined scorer run over all completed runs
+(2026-11-12 09:27 UTC, tag `pr1-20261112t092735z`). The pinned scorer checks the
+transport, cleanup and format gates. The offline sandbox join then runs the
+last ```python block with the gold tests. The tests, extractor,
+`latentmas-sandbox:py311` image, docker options and 20 s timeout are the same
+as in the HTTP harness above, and the first-20 manifests match items 0-19 of
+the HTTP manifests.
 
-| Task | Sandbox correct / reported eligible | Accuracy among eligible | Observation time (UTC) |
-|---|---:|---:|---|
-| HumanEval+ | 8/9 | 88.9% | 12:22:55 |
-| MBPP+ | 8/9 | 88.9% | 13:12:41 |
+| Task | Scored items | Correct | Accuracy | 95% CI | Not scored | Mean item wall (range) | Tokens per item (prompt + completion) |
+|---|---:|---:|---:|---|---|---|---|
+| HumanEval+ | 20 | 16 | 80.0% | 58.4-91.9% | - | 283.8 s (192-474 s) | 124.2k + 26.1k |
+| MBPP+ | 20 | 12 | 60.0% | 38.7-78.1% | - | 293.6 s (155-409 s) | 125.9k + 29.5k |
 
-Each aggregate has a 20-item projection denominator but only nine reported
-eligible items. Neither is a completed 20-item evaluation. The full public
-scorer and sandbox artifacts could not be retrieved after configured DGX SSH
-access failed. Full source validation and per-item membership therefore remain
-pending. These recovered counts do not independently verify transport or
-cleanup gates, and support no per-item comparisons, token or latency claims.
-Safe aggregate evidence and its limits are recorded in
-`results/native_v7/code-sandbox-recovered-summary.json`.
+Paired with the HTTP conditions on the same scored items (b = HTTP-condition-only
+correct, c = native-only correct, exact McNemar):
+
+| Items | Native | Baseline | TextMAS sequential | TextMAS hierarchical |
+|---|---:|---:|---:|---:|
+| HumanEval+ (20) | 16/20 | 20/20 (b=4, c=0, p=0.125) | 20/20 (b=4, c=0, p=0.125) | 19/20 (b=3, c=0, p=0.25) |
+| MBPP+ (20) | 12/20 | 19/20 (b=7, c=0, p=0.016) | 15/20 (b=5, c=2, p=0.453) | 17/20 (b=7, c=2, p=0.18) |
+| Pooled (40) | 28/40 | 39/40 (b=11, c=0, p=9.8e-04) | 35/40 (b=9, c=2, p=0.065) | 36/40 (b=10, c=2, p=0.039) |
+
+- Native scores below the single-agent baseline on both tasks. Pooled over both
+  tasks, every discordant pair favors the baseline (b=11, c=0, p=9.8e-04),
+  which is significant at 5%. Per task: HumanEval+ b=4, c=0, p=0.125 (not
+  significant); MBPP+ b=7, c=0, p=0.016.
+  The pooled difference to TextMAS sequential is not significant (b=9, c=2,
+  p=0.065). Pooled, native is also below TextMAS hierarchical (b=10, c=2,
+  p=0.039); this p-value is not corrected for the three comparisons.
+- Counting each item only from its first attempt, with a failed first attempt
+  counted as wrong, native is 13/20 on HumanEval+ (first attempts failed on items
+  0, 5, 6, 9, 16) and 10/20 on MBPP+ (items 3, 6, 9, 10, 14, 17, 19). The HTTP
+  conditions made one attempt per item.
+- Eleven of the twelve native misses fail with `NameError` (HumanEval+ 6, 9, 11, 17;
+  MBPP+ 3, 9, 10, 12, 13, 17, 19). In each case the extracted code parses and defines a
+  function, but not under the entry-point name that the gold tests call.
+  MBPP+ 15 fails with `AssertionError`.
+  In this contract only the planner receives the problem text. The critic,
+  refiner and judger receive native state only, and their instructions do not
+  ask them to keep the exact function name. A likely cause is that the exact
+  identifier is lost across the native handoffs; this is not proven.
+- No scored native item was truncated. The native roles use the Optimus
+  provider budget, not the 4096-token HTTP cap, and make several calls per role,
+  so their token counts are not comparable with the HTTP rows.
+- HumanEval+ 0, 9, 16 and MBPP+ 9, 10, 14, 17, 19 are scored from runs after the PR #284
+  server-extension update (capture-busy fix, deployed 2026-11-12 07:49 UTC);
+  the other items ran before it. The model, sampling, controller, runner,
+  profile and projection pins are the same for every scored run. The driver
+  and scorer read bound was raised from 384 MiB to 1024 MiB for runs from
+  2026-11-12 08:23 UTC. The combined run uses the 1024 MiB scorer
+  (`score_native_*_v2.py`, otherwise unchanged).
+- 25 of 65 native code attempts failed and are excluded (HumanEval+ 9 of
+  29, MBPP+ 16 of 36). A failed item got fresh attempts within the limits of the
+  retry runs. A completed attempt and a wrong answer were never rerun. These
+  retries give native more attempts per item than the one-sample HTTP
+  conditions. Per-item attempt counts and failure reasons are in
+  [Excluded native v7 attempts](#excluded-native-v7-attempts).
+
+Safe rows and summaries: `results/glm53_humanevalplus_native_occ3_v7_safe.json`,
+`results/glm53_mbppplus_native_occ3_v7_safe.json` and their `_summary.json`
+files. The combined public scorer reports are
+`results/native_v7/score-public-humanevalplus-combined.json` and
+`results/native_v7/score-public-mbppplus-combined.json`. Sanitized sandbox rows
+(exception class only, no code or test text) are in
+`results/native_v7/sandbox-view-humanevalplus-combined.json` and
+`results/native_v7/sandbox-view-mbppplus-combined.json`.
+
+These results replace the recovered 8/9 aggregates of the earlier report. Each
+scored item is now tied to one run directory and its source pins. Items 0-8
+still give 8/9 on each task. HumanEval+ item 0 is now scored from a fresh
+attempt, because its first attempt failed the driver final-format metadata
+check; both attempts are recorded below.
 
 Native v7 is a separate, smaller paired-subset track, not the full HTTP sweep.
 Execution contracts and budgets differ, so these results cannot establish a
@@ -377,6 +454,18 @@ baseline 18, TextMAS-sequential 18, p=1.0. Safe rows and summary:
 `results/glm53_gsm8k_native_occ3_v7_safe.json`, per-item public score
 reports in `results/native_v7/score-public-*.json`. See
 [GSM8K_OCC3_NATIVE_V7.md](GSM8K_OCC3_NATIVE_V7.md).
+
+Item 1 ran on 2026-11-12 with a fresh plan and authorization (GSM8K v7
+controller, runner and pinned scorer `score_native_gsm8k_v7.py`, as for item
+19). All transport, cleanup and format gates are valid, and the item is scored
+correct. Native GSM8K is therefore **18/20** on the first 20 items, by
+arithmetic across disjoint score reports, not one combined scorer run. Paired on
+the 20 items: native 18, baseline 19, TextMAS sequential 19, exact McNemar
+p=1.0. Item 1 had one earlier attempt (2026-11-10, batch
+`native-v7-batch-20261110t161939z`). It ended `blocked`
+(`standby_contract_not_met`) before any score and stays excluded.
+Score report: `results/native_v7/score-public-gsm8k-item01.json`;
+source-bound totals: `results/glm53_gsm8k_native_occ3_v7_continuation_summary.json`.
 
 OCC-3 protocol labels on the 14 items in the historical `clean` file (that
 filename does not certify isolated scoring or completed native use):
@@ -571,8 +660,49 @@ bindings, strict scoring, accounting and sanitized evidence.
 
 ## Excluded native v7 attempts
 
-These selected failed attempts remain outside eligible correctness denominators.
-They are not scored incorrect answers, and this is not an exhaustive attempt ledger.
+Failed attempts remain outside eligible correctness denominators. They are
+not scored incorrect answers.
+
+Code tasks: `results/native_v7/code-attempts-ledger.json` lists every HumanEval+
+and MBPP+ attempt in the batch roots on the DGX (snapshot 2026-11-12
+09:27 UTC): 65 attempts, 40 scored, 25 failed. Every item not listed below
+was scored from its first attempt.
+
+| Task / item | Attempts | Failed attempts (recorded reason) | Scored |
+|---|---:|---|---|
+| HumanEval+ / 0 | 2 | 1 (`final_format_metadata_mismatch`) | yes |
+| HumanEval+ / 5 | 2 | 1 (`role_generation_failed_or_truncated`) | yes |
+| HumanEval+ / 6 | 2 | 1 (`role_reported_failure`) | yes |
+| HumanEval+ / 9 | 6 | 5 (`role_generation_failed_or_truncated`, `role_reported_failure` x3, `worker_log_changed`) | yes |
+| HumanEval+ / 16 | 2 | 1 (`role_reported_failure`) | yes |
+| MBPP+ / 3 | 3 | 2 (`role_generation_failed_or_truncated` x2) | yes |
+| MBPP+ / 6 | 4 | 3 (`role_generation_failed_or_truncated` x3) | yes |
+| MBPP+ / 9 | 5 | 4 (`file_owner_type_or_bound`, `role_generation_failed_or_truncated`, `role_reported_failure` x2) | yes |
+| MBPP+ / 10 | 2 | 1 (`role_generation_failed_or_truncated`) | yes |
+| MBPP+ / 14 | 3 | 2 (`owned_cleanup_unconfirmed`, `worker_log_changed`) | yes |
+| MBPP+ / 17 | 3 | 2 (`role_reported_failure` x2) | yes |
+| MBPP+ / 19 | 3 | 2 (`file_owner_type_or_bound`, `role_generation_failed_or_truncated`) | yes |
+
+Recorded reasons of the 25 failed code attempts: `role_generation_failed_or_truncated` 10, `role_reported_failure` 9, `file_owner_type_or_bound` 2, `worker_log_changed` 2, `final_format_metadata_mismatch` 1, `owned_cleanup_unconfirmed` 1.
+`role_reported_failure` means that a role ended with `RLM_CHILD_STATUS: blocked`.
+Five of the 9 such attempts were inspected (HumanEval+ 9 on 2026-11-12 at 08:38 UTC
+and the first HumanEval+ 16 attempt; MBPP+ 9 on 2026-11-12 at 08:57 UTC and both
+earlier MBPP+ 17 attempts). In each, the blocked role had received a completed
+native delivery. One refiner stated that the received state lacked the function
+name and the tests.
+`final_format_metadata_mismatch` and `file_owner_type_or_bound` are driver
+checks that failed after the native run itself had completed; these attempts
+also stay excluded.
+
+GSM8K: item 1 had one failed attempt before its scored 2026-11-12 attempt (batch
+`native-v7-batch-20261110t161939z`, `blocked` with `standby_contract_not_met`).
+The item-19 and item-0 attempts that did not count are described in
+[GSM8K_OCC3_NATIVE_V7.md](GSM8K_OCC3_NATIVE_V7.md).
+
+Audited detail for selected attempts. The recorded failure here is the cause
+that the audit found. The attempt ledger keeps the runner outcome reason,
+which can differ: MBPP+ 9 `r9-20261111t131248z` is
+`role_generation_failed_or_truncated` in the ledger.
 
 | Task / item | Attempt | Recorded failure | Scoring status |
 |---|---|---|---|
@@ -581,25 +711,19 @@ They are not scored incorrect answers, and this is not an exhaustive attempt led
 | HumanEval+ / 9 | r9-20261111t090000z | `worker_log_changed` | Role setup stopped; cleanup unconfirmed; no scored answer |
 | ARC-Easy / 12 | b-20261111t134256z | `occ3_completed_binding_count` | No scored answer. Follow-up audit: the critic ended its captured turn without the `occ3_handoff` call, so no transfer happened; server state ended clean. Item 12 is scored from a separate fresh attempt |
 
-Safe metadata and source bindings are in
-`results/native_v7/excluded-attempts-summary.json`. No guard was bypassed, no
-failed attempt was replayed, and no scorer was rerun for this report update.
-The fresh item-12 attempt used a new plan and authorization.
+Safe metadata and source bindings for these selected attempts are in
+`results/native_v7/excluded-attempts-summary.json`. No guard was bypassed and
+no failed attempt was replayed or resumed. Every fresh attempt used a new plan
+and authorization.
 
 ## NOT-RUN and pending verification
 
 - The `latent_mas` condition, because it needs model internals; this also
   applies to the native OCC-3 track. Manifests are listed in `MANIFESTS.json`.
-- Native OCC-3 GSM8K item 1 (setup failure in its original batch, never
-  retried), and a completed rerun of items 0-13 on the PR #279 stack. The later
-  item-0 smoke failed and remains separate from these denominators.
-- A combined 20-item scorer run for native ARC-Easy and ARC-Challenge. The
-  20/20 totals add disjoint cohort and per-item score reports.
-- Native OCC-3 HumanEval+ and MBPP+ 20-item projections remain incomplete.
-  Historical sandbox aggregates record 8/9 each, but full source validation
-  and exact per-item coverage remain pending. The recovered aggregate evidence
-  alone does not establish which nine indices are eligible. Item-9 failed
-  attempts remain excluded as recorded above.
+- A completed rerun of native OCC-3 GSM8K items 0-13 on the PR #279 stack. The
+  later item-0 smoke failed and remains separate from these denominators.
+- A combined 20-item scorer run for native ARC-Easy, ARC-Challenge and GSM8K.
+  Their first-20 totals add disjoint cohort and per-item score reports.
 - AIME and GPQA at a higher token cap.
 - Token accounting for the historical OCC-3 API rows. The native v7 cohort
   does carry provider-reported token sums per item (see the safe rows), but the
@@ -614,12 +738,17 @@ The fresh item-12 attempt used a new plan and authorization.
 | `results/glm53_gsm8k_occ3_clean.jsonl` | OCC-3 rows: hop states, receipt ids, native/total hops, wall time, scoring notes |
 | `results/glm53_gsm8k_native_occ3_v7_safe.json` | Native OCC-3 v7 cohort: per-item correct/truncated/tokens/latency rows (19 eligible items), source sha pins |
 | `results/glm53_gsm8k_native_occ3_v7_summary.json` | Native OCC-3 v7 cohort summary: 17/19 (89.5%), CI, McNemar vs paired baseline, latency and token aggregates |
-| `results/native_v7/score-public-*.json` | Pinned-scorer public reports per native cohort (item 0, batch items 2-18, item 19 v7, ARC-Easy and ARC-Challenge a-cohorts and items 10-19): counts, hashes, usage; no predictions |
+| `results/glm53_gsm8k_native_occ3_v7_continuation_summary.json` | Separately scored GSM8K item 1 (2026-11-12); source-bound arithmetic total 18/20 on items 0-19 and the paired first-20 comparison; not a combined scorer run |
+| `results/native_v7/score-public-*.json` | Pinned-scorer public reports per native cohort (GSM8K item 0, batch items 2-18, item 19 v7 and item 1; ARC-Easy and ARC-Challenge a-cohorts and items 10-19; HumanEval+ and MBPP+ combined runs): counts, hashes, usage; no predictions |
 | `results/glm53_arc_easy_native_occ3_v7_safe.json` + `_summary.json` | Native OCC-3 v7 ARC-Easy a-cohort (items 0-9): 10/10 correct, paired McNemar vs baseline/TextMAS, latency and token aggregates |
 | `results/glm53_arc_challenge_native_occ3_v7_safe.json` + `_summary.json` | Native OCC-3 v7 ARC-Challenge a-cohort (items 0-9): 10/10 correct, paired McNemar vs baseline/TextMAS, latency and token aggregates |
 | `results/glm53_arc_easy_native_occ3_v7_continuation_summary.json`, `results/glm53_arc_challenge_native_occ3_v7_continuation_summary.json` | Separately scored items 10-19; source-bound arithmetic totals 20/20 on items 0-19 and the paired first-20 comparison; not a combined scorer run |
-| `results/native_v7/code-sandbox-recovered-summary.json` | Historical tool-result aggregates: HumanEval+ and MBPP+ 8/9 each; full source validation and per-item coverage pending |
-| `results/native_v7/excluded-attempts-summary.json` | Selected failed attempts and source-bound safe metadata; not scored answers or an exhaustive ledger |
+| `results/glm53_humanevalplus_native_occ3_v7_safe.json` + `_summary.json` | Native OCC-3 v7 HumanEval+ (20 scored first-20 items): per-item correct, exception class, tokens, latency and run root; paired McNemar vs baseline/TextMAS; first-attempt view and attempt counts |
+| `results/glm53_mbppplus_native_occ3_v7_safe.json` + `_summary.json` | Native OCC-3 v7 MBPP+ (20 scored first-20 items), same fields |
+| `results/native_v7/sandbox-view-humanevalplus-combined.json`, `results/native_v7/sandbox-view-mbppplus-combined.json` | Sanitized sandbox rows of the combined code runs: executed, correct, exception class; no code, test or gold text |
+| `results/native_v7/code-attempts-ledger.json` | Every HumanEval+ and MBPP+ native attempt, scored and failed, with recorded reasons; control metadata only |
+| `results/native_v7/code-sandbox-recovered-summary.json` | Superseded historical tool-result aggregates (HumanEval+ and MBPP+ 8/9 each), kept for provenance |
+| `results/native_v7/excluded-attempts-summary.json` | Audited detail for selected failed attempts; not scored answers |
 | `harness/runner.py`, `harness/bench_lib.py` | Resumable runner and OpenAI-compatible client adapter for the LatentMAS prompts |
 | `harness/occ3_lib.py`, `harness/occ3_v3_prompts.py` | Historical OCC-3 helpers/prompts, retained unchanged; not a validated team recipe |
 | `smoke-validation.md`, `server-smoke-excerpt.txt` | Post-update smoke failure and bounded server-log evidence |

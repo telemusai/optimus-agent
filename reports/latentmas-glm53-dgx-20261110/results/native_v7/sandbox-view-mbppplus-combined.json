@@ -1,0 +1,175 @@
+{
+  "schema": "latents.bench.native_sandbox_view.v1",
+  "task": "mbppplus",
+  "combined_scorer_tag": "pr1-20261112t092735z",
+  "denominator": 20,
+  "score_eligible": 20,
+  "sandbox_correct": 12,
+  "rows": [
+    {
+      "idx": 0,
+      "status": "complete",
+      "prediction_present": true,
+      "executed": true,
+      "correct": true,
+      "error_type": null
+    },
+    {
+      "idx": 1,
+      "status": "complete",
+      "prediction_present": true,
+      "executed": true,
+      "correct": true,
+      "error_type": null
+    },
+    {
+      "idx": 2,
+      "status": "complete",
+      "prediction_present": true,
+      "executed": true,
+      "correct": true,
+      "error_type": null
+    },
+    {
+      "idx": 3,
+      "status": "complete",
+      "prediction_present": true,
+      "executed": true,
+      "correct": false,
+      "error_type": "NameError"
+    },
+    {
+      "idx": 4,
+      "status": "complete",
+      "prediction_present": true,
+      "executed": true,
+      "correct": true,
+      "error_type": null
+    },
+    {
+      "idx": 5,
+      "status": "complete",
+      "prediction_present": true,
+      "executed": true,
+      "correct": true,
+      "error_type": null
+    },
+    {
+      "idx": 6,
+      "status": "complete",
+      "prediction_present": true,
+      "executed": true,
+      "correct": true,
+      "error_type": null
+    },
+    {
+      "idx": 7,
+      "status": "complete",
+      "prediction_present": true,
+      "executed": true,
+      "correct": true,
+      "error_type": null
+    },
+    {
+      "idx": 8,
+      "status": "complete",
+      "prediction_present": true,
+      "executed": true,
+      "correct": true,
+      "error_type": null
+    },
+    {
+      "idx": 9,
+      "status": "complete",
+      "prediction_present": true,
+      "executed": true,
+      "correct": false,
+      "error_type": "NameError"
+    },
+    {
+      "idx": 10,
+      "status": "complete",
+      "prediction_present": true,
+      "executed": true,
+      "correct": false,
+      "error_type": "NameError"
+    },
+    {
+      "idx": 11,
+      "status": "complete",
+      "prediction_present": true,
+      "executed": true,
+      "correct": true,
+      "error_type": null
+    },
+    {
+      "idx": 12,
+      "status": "complete",
+      "prediction_present": true,
+      "executed": true,
+      "correct": false,
+      "error_type": "NameError"
+    },
+    {
+      "idx": 13,
+      "status": "complete",
+      "prediction_present": true,
+      "executed": true,
+      "correct": false,
+      "error_type": "NameError"
+    },
+    {
+      "idx": 14,
+      "status": "complete",
+      "prediction_present": true,
+      "executed": true,
+      "correct": true,
+      "error_type": null
+    },
+    {
+      "idx": 15,
+      "status": "complete",
+      "prediction_present": true,
+      "executed": true,
+      "correct": false,
+      "error_type": "AssertionError"
+    },
+    {
+      "idx": 16,
+      "status": "complete",
+      "prediction_present": true,
+      "executed": true,
+      "correct": true,
+      "error_type": null
+    },
+    {
+      "idx": 17,
+      "status": "complete",
+      "prediction_present": true,
+      "executed": true,
+      "correct": false,
+      "error_type": "NameError"
+    },
+    {
+      "idx": 18,
+      "status": "complete",
+      "prediction_present": true,
+      "executed": true,
+      "correct": true,
+      "error_type": null
+    },
+    {
+      "idx": 19,
+      "status": "complete",
+      "prediction_present": true,
+      "executed": true,
+      "correct": false,
+      "error_type": "NameError"
+    }
+  ],
+  "semantics": "Sanitized view of the private sandbox report: exception class names only, no prediction, test or gold text.",
+  "sandbox_scorer_sha256": "549ce6484d0d13a47d76d5afadf9d67a33abdc3536a1ff6d1066a02aa3b6ac5d",
+  "sandbox_report_sha256": "c970cbe32213f327b4ac80c11c2f099998a64d4907094a1926f966336d5717eb",
+  "score_public_sha256": "c4610be474b85bfe547ce1498cf5beafea665b81338cd9c66aeedb8155ce09a6",
+  "published_score_public_file": "results/native_v7/score-public-mbppplus-combined.json"
+}

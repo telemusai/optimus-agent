@@ -25,8 +25,8 @@ four-role OCC-3 native-handoff condition (`occ3_agent_native_v7`).
   terminals. Total item wall time 48.9 min (mean 172.5 s, median 171.7 s,
   range 102.9-264.5 s).
 - Item 0 was validated separately (see `results/gsm8k-native-v7-item00-*`);
-  item 1 failed setup in the prior batch and was not rerun. Both remain
-  outside this batch's denominator.
+  item 1 failed setup in the prior batch and was not rerun in this batch.
+  Both remain outside this batch's denominator.
 
 The final numbers come from pinned offline scorers, not the runner (the plan
 records `scoring: offline_separate_runner_groups_no_correctness_join`):
@@ -73,9 +73,9 @@ admission.
 - 17/19 is a single sample on one benchmark. Exact McNemar against the paired
   20-item historical cohort (19 shared items: native 17, baseline 18,
   TextMAS-sequential 18) is p=1.0 - no significant difference.
-- Item 1 remains NOT-RUN (setup failure in the item-1 batch, never retried);
-  it is excluded from the eligible count, and the 20-item denominator note is
-  in the summary JSON.
+- Item 1 did not run in this cohort (setup failure in the item-1 batch). It
+  ran separately on 2026-11-12; see the last section. The 19-item cohort
+  numbers above do not include it.
 
 ## Later item-19 attempts (2026-11-11)
 
@@ -112,3 +112,26 @@ batch.
   and the pinned scorer marked it correct.** The 17/19 cohort number above
   includes this item. Full artifact set retained on the DGX (111 role-cycle
   snapshots, standby records, cleanup proof).
+
+## Item 1 (2026-11-12)
+
+Item 1 ran once on 2026-11-12 in a one-item batch (`native-v7-batch-gsm8k-item1-20261112t091814z`)
+with a fresh plan and authorization. It used the GSM8K v7 controller and
+runner, prior root `native-v7-batch-gsm8k-item19-v7-20261111t055343z`, and the
+pinned scorer `score_native_gsm8k_v7.py` (sha256
+`ddb0f3ea854374bb637711bfcda67a62c41fa8aa45be206b9f303042fe597c1c`), the same scorer as the item-19 v7
+retry. The server ran the PR #284 server-extension update (capture-busy fix,
+deployed 2026-11-12 07:49 UTC).
+
+- Outcome: `complete`, all transport, cleanup and format gates valid; scored
+  **correct**. Item wall time 116.4 s; provider-reported tokens
+  95,623 input + 6,346 output over 26 role records.
+- First 20 items: **18/20** (wrong: 2, 12), by arithmetic across
+  disjoint score reports, not one combined scorer run.
+- Paired on items 0-19: native 18, baseline 19 (b=1, c=0, p=1.0),
+  TextMAS sequential 19 (b=1, c=0, p=1.0). Exact McNemar.
+- Item 1's only earlier attempt (batch `native-v7-batch-20261110t161939z`,
+  2026-11-10) ended `blocked` with `standby_contract_not_met` before any score.
+  It stays excluded. No other attempt on item 1 ran.
+- Public score report: `results/native_v7/score-public-gsm8k-item01.json`.
+  Source-bound totals: `results/glm53_gsm8k_native_occ3_v7_continuation_summary.json`.

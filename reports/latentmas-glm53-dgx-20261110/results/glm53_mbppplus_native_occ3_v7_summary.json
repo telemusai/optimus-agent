@@ -1,0 +1,102 @@
+{
+  "task": "mbppplus",
+  "condition": "occ3_agent_native_v7",
+  "n": 20,
+  "correct": 12,
+  "accuracy": 0.6,
+  "ci_lo": 0.3865779423152061,
+  "ci_hi": 0.7811960325858074,
+  "denominator_note": "20 of the 20 first-20 items have a scored native answer; not scored: []",
+  "not_scored_items": [],
+  "intent_to_treat_all20": {
+    "denominator": 20,
+    "native_correct": 12,
+    "native_no_answer_counted_wrong": 0,
+    "http_same_20": {
+      "baseline": 19,
+      "textmas_sequential": 15,
+      "textmas_hierarchical": 17
+    }
+  },
+  "mean_latency_s": 293.55,
+  "median_latency_s": 313.404,
+  "p95_latency_s": 409.069,
+  "min_latency_s": 155.098,
+  "max_latency_s": 409.345,
+  "wall_s": 5871.1,
+  "latency_semantics": "item_wall_seconds_including_setup, serial single-item native runs",
+  "prompt_per_item": 125921.2,
+  "completion_per_item": 29487.5,
+  "reasoning_per_item": null,
+  "token_semantics": "provider-reported counters summed over all role records per item",
+  "truncation_rate": 0.0,
+  "wrong_items": [
+    3,
+    9,
+    10,
+    12,
+    13,
+    15,
+    17,
+    19
+  ],
+  "wrong_error_types": {
+    "3": "NameError",
+    "9": "NameError",
+    "10": "NameError",
+    "12": "NameError",
+    "13": "NameError",
+    "15": "AssertionError",
+    "17": "NameError",
+    "19": "NameError"
+  },
+  "scoring": "pinned offline scorer score_native_mbppplus_v2.py (sha256 6c27734b893f0336685949ae4d81714ed320d4058dddf0ed53ad48e9a6561ac5; v2 differs from v1 only in the 1024 MiB read bound) + native_extract_code.py (sha256 872b16019d39f6f0059d30f71391e0981d93744167338efdd2f7239d5cc75e9c, last ```python block) + sandbox_score_code.py (sha256 549ce6484d0d13a47d76d5afadf9d67a33abdc3536a1ff6d1066a02aa3b6ac5d): same latentmas-sandbox:py311 image, docker options, 20 s timeout and prediction+gold program as the HTTP harness",
+  "manifest_sha256": "afd1226e458f07322ad93e23ecd7316973d031ccca90633c65d7881709bf9f4d",
+  "combined_scorer_tag": "pr1-20261112t092735z",
+  "score_public_sha256": "c4610be474b85bfe547ce1498cf5beafea665b81338cd9c66aeedb8155ce09a6",
+  "sandbox_report_sha256": "c970cbe32213f327b4ac80c11c2f099998a64d4907094a1926f966336d5717eb",
+  "mcnemar_b_vs_baseline": 7,
+  "mcnemar_c_vs_baseline": 0,
+  "mcnemar_p_vs_baseline": 0.015625,
+  "paired_against_baseline": "glm53_mbppplus_baseline (n=20 shared items: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]); baseline correct 19/20",
+  "mcnemar_b_vs_textmas_sequential": 5,
+  "mcnemar_c_vs_textmas_sequential": 2,
+  "mcnemar_p_vs_textmas_sequential": 0.453125,
+  "paired_against_textmas_sequential": "glm53_mbppplus_textmas_sequential (n=20 shared items: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]); TextMAS sequential correct 15/20",
+  "mcnemar_b_vs_textmas_hierarchical": 7,
+  "mcnemar_c_vs_textmas_hierarchical": 2,
+  "mcnemar_p_vs_textmas_hierarchical": 0.1796875,
+  "paired_against_textmas_hierarchical": "glm53_mbppplus_textmas_hierarchical (n=20 shared items: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]); TextMAS hierarchical correct 17/20",
+  "mcnemar_semantics": "b = comparison-condition-only correct, c = native-only correct; exact two-sided binomial",
+  "snapshot_utc": "2026-11-12T09:27:35Z",
+  "budget_matched_to_baseline": false,
+  "published_score_public_file": "results/native_v7/score-public-mbppplus-combined.json",
+  "published_sandbox_view_file": "results/native_v7/sandbox-view-mbppplus-combined.json",
+  "attempts": {
+    "total": 36,
+    "failed_excluded": 16,
+    "scored": 20
+  },
+  "attempts_note": "Failed attempts are excluded and listed in results/native_v7/code-attempts-ledger.json. A failed item got fresh attempts; a completed attempt was never rerun.",
+  "first_attempt_view": {
+    "denominator": 20,
+    "first_attempt_correct": 10,
+    "first_attempt_failed": [
+      3,
+      6,
+      9,
+      10,
+      14,
+      17,
+      19
+    ],
+    "semantics": "each item counted once from its earliest attempt; a failed first attempt counts as no answer (wrong)"
+  },
+  "items_after_pr284_server_update": [
+    9,
+    10,
+    14,
+    17,
+    19
+  ]
+}
