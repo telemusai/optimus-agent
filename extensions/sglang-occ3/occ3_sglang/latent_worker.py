@@ -1246,9 +1246,10 @@ class CaptureHold:
 
 
 def _capture_hold_settings():
-    """Reservation settings, or None when it is disabled or misconfigured."""
+    """Reservation settings of this rank, or None when it is disabled or
+    misconfigured. The read is rank-local: capture_hold_park gathers it."""
     try:
-        settings = capture_hold_settings()
+        settings = capture_hold_settings(os.environ)
     except ValueError:
         return None
     return settings if settings.window > 0 else None
@@ -1282,21 +1283,34 @@ def capture_hold_park(scheduler, recv_req, error):
     is queued and the one-shot record is still reserved. True means the raw
     request is held; the scheduler drains for it and sends nothing now.
     """
-    settings = _capture_hold_settings()
     try:
         descriptor = decode_descriptor(getattr(recv_req, "occ3_worker_descriptor", None))
     except Exception:
         descriptor = None
-    # Rank-uniform gate (decline code, request type, replay flag, settings):
-    # every rank takes the same branch, so the gather below stays matched.
-    if (settings is None or getattr(error, "code", None) != "quota"
+    # Rank-agreed gate: the gathered decline code, the broadcast request and
+    # the replay flag of an agreed resolution. Every rank enters the gather
+    # below, or none does.
+    if (getattr(error, "code", None) != "quota"
             or type(descriptor) is not CaptureWorkerDescriptor
             or getattr(scheduler, "occ3_capture_hold_replay", False)):
         return False
-    eligible = (isinstance(error, LatentError) and error.detail == _CAPTURE_INFLIGHT
+    # Everything from here is read on this rank only, so it is gathered and
+    # never returns early. One rank that differs makes every rank decline.
+    settings = _capture_hold_settings()
+    eligible = (settings is not None
+                and isinstance(error, LatentError) and error.detail == _CAPTURE_INFLIGHT
                 and getattr(scheduler, "occ3_capture_hold", None) is None
-                and not getattr(scheduler, "_engine_paused", False))
-    agreed = _capture_hold_agree(scheduler, {"hold": "park", "rid": recv_req.rid, "eligible": eligible})
+                and not getattr(scheduler, "_engine_paused", False)
+                # A hold keeps new ordinary requests in the waiting queue. A
+                # queue limit could then reject one and a timeout sweep could
+                # expire one, so those servers keep the immediate decline.
+                and getattr(scheduler, "max_queued_requests", None) is None
+                and not _capture_hold_sla_sweeps())
+    agreed = _capture_hold_agree(scheduler, {
+        "hold": "park", "rid": recv_req.rid, "eligible": eligible,
+        "settings": None if settings is None else [settings.window, settings.drain, settings.preempt]})
+    if not agreed:
+        logger.warning("occ3 capture hold not parked rid=%s reason=no_rank_agreement", recv_req.rid)
     if not (agreed and eligible):
         return False
     seq = getattr(scheduler, "occ3_capture_hold_seq", 0) + 1
@@ -1309,8 +1323,9 @@ def capture_hold_park(scheduler, recv_req, error):
 
 
 def _capture_hold_sla_sweeps():
-    """True when a stock waiting or running timeout sweep is enabled. A row
-    retracted for a capture turn could then be aborted by that sweep."""
+    """True when a stock waiting or running timeout sweep is enabled. A request
+    held in the queue, or a row retracted for a capture turn, could then be
+    aborted by that sweep."""
     for name in ("SGLANG_REQ_WAITING_TIMEOUT", "SGLANG_REQ_RUNNING_TIMEOUT"):
         raw = os.environ.get(name)
         if raw is None:

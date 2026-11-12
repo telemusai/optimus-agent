@@ -9,7 +9,8 @@ continue_generation, collect_inflight_reqs, _add_request_to_queue,
 _abort_on_queued_limit, _set_or_validate_priority, and schedule_batch
 retract_all, release_req and Req.reset_for_retract. Admission and the hold
 policy are the real latent_worker code. Ranks are threads that meet in a
-barrier for every gather, so an unmatched collective fails the test.
+barrier for every gather, so an unmatched collective fails the test. Each rank
+has its own clock and its own environment, as a rank process has.
 
 This is not a SGLang, GPU, NCCL or TP8 runtime proof.
 """
@@ -18,11 +19,13 @@ from __future__ import annotations
 import ast
 import copy
 import logging
+import os
 import sys
 import threading
 import time as real_time
 import types
 from array import array
+from collections import ChainMap
 from concurrent.futures import ThreadPoolExecutor
 from http import HTTPStatus
 from types import SimpleNamespace as NS
@@ -97,6 +100,48 @@ class RankTime:
 
     def __getattr__(self, name):
         return getattr(real_time, name)
+
+
+class RankOS:
+    """os module stand-in for latent_worker: each rank thread reads its own
+    environment."""
+    def __init__(self, local):
+        self.local = local
+
+    @property
+    def environ(self):
+        rank = getattr(self.local, "rank", None)
+        return os.environ if rank is None else rank.environ
+
+    def __getattr__(self, name):
+        return getattr(os, name)
+
+
+class EnvSeconds:
+    """Pinned EnvFloat(-1) stand-in: unset or unparsable reads as -1, which is off."""
+    def __init__(self, environ, name):
+        self.environ, self.name = environ, name
+
+    def get(self):
+        try:
+            return float(self.environ.get(self.name, -1))
+        except ValueError:
+            return -1.0
+
+
+class Stats:
+    """time_stats stand-in: the entry times that the stock timeout sweeps read,
+    set by the pinned rules."""
+    def __init__(self, clock):
+        self.clock, self.wait_queue_entry_time, self.forward_entry_time = clock, 0.0, 0.0
+        self.trace_ctx = NS(abort=lambda **kw: None)
+
+    def set_wait_queue_entry_time(self):
+        self.wait_queue_entry_time = self.clock.perf_counter()
+
+    def set_forward_entry_time(self):
+        if self.forward_entry_time == 0.0:
+            self.forward_entry_time = self.clock.perf_counter()
 
 
 class Clock:
@@ -226,7 +271,7 @@ def make_row_class(sources):
             self.return_logprob = self.return_sampling_mask = False
             self.priority = kw.get("priority")
             self.extend_range = NS(end=len(self.origin_input_ids))
-            self.time_stats = NS(set_wait_queue_entry_time=lambda: None, wait_queue_entry_time=0.0)
+            self.time_stats = None  # Rank._row gives every row its Stats
             self.cache_request_handle = None
             self.weight_version_events = None
             self.send_token_offset = 0
@@ -244,6 +289,7 @@ class Rank:
                  allow_drop=False):
         self.index, self.rank_time, self.allow_drop = index, rank_time, allow_drop
         self.clock = Clock(skew=index * skew)  # rank clocks differ on purpose
+        self.environ = ChainMap({}, os.environ)  # a write stays on this rank
         self.occ3_runtime = Runtime(bus, index)
         self.sent, self.freed, self.trace, self.made, self.dropped = [], [], [], [], []
         self.waiting_queue, self.chunked_req = [], None
@@ -286,8 +332,8 @@ class Rank:
             AbortReq=AbortReq, HTTPStatus=HTTPStatus, DisaggregationMode=mode, time=self.clock,
             array=array, sys=sys, logger=logging.getLogger("occ3.sim"), FINISH_ABORT=Abort,
             Req=self._row, BeamCoordinator=NS(request_beam_width=lambda recv: 1),
-            envs=NS(SGLANG_REQ_WAITING_TIMEOUT=NS(get=lambda: 0),
-                    SGLANG_REQ_RUNNING_TIMEOUT=NS(get=lambda: 0),
+            envs=NS(SGLANG_REQ_WAITING_TIMEOUT=EnvSeconds(self.environ, "SGLANG_REQ_WAITING_TIMEOUT"),
+                    SGLANG_REQ_RUNNING_TIMEOUT=EnvSeconds(self.environ, "SGLANG_REQ_RUNNING_TIMEOUT"),
                     SGLANG_RUST_SERVER=NS(get=lambda: False)),
             get_parallel=lambda: NS(pp_size=1, pp_rank=0),
             get_disagg=lambda: NS(disaggregation_bootstrap_port=1),
@@ -336,6 +382,7 @@ class Rank:
 
     def _row(self, rid, input_text, input_ids, sampling_params, **kw):
         row = self.Row(rid, input_text, input_ids, sampling_params, **kw)
+        row.time_stats = Stats(self.clock)
         self.made.append(row)
         return row
 
@@ -362,7 +409,7 @@ class Rank:
         return self._poll_timeout_aborts()
 
     def step(self, items):
-        self.rank_time.local.clock = self.clock
+        self.rank_time.local.clock, self.rank_time.local.rank = self.clock, self
         for item in items:
             if isinstance(item, AbortReq):
                 self.abort_request(copy.copy(item))
@@ -419,6 +466,7 @@ class Rank:
     def _prefill(self, row):
         if row.is_retracted:
             row.is_retracted, row.chunks_left = False, row.chunks
+        row.time_stats.set_forward_entry_time()
         row.kv.holds_kv = True
         if row.chunks_left > 1:
             row.chunks_left -= 1
@@ -462,10 +510,11 @@ class World:
         self.bus = Bus(ranks)
         self.rank_time = RankTime()
         monkeypatch.setattr(w, "time", self.rank_time)
+        monkeypatch.setattr(w, "os", RankOS(self.rank_time.local))
         monkeypatch.setattr(w, "_runtime", lambda scheduler=None: scheduler.occ3_runtime)
         self.ranks = [Rank(sources, self.bus, index, self.rank_time, **kw) for index in range(ranks)]
         self.pool = ThreadPoolExecutor(ranks)
-        self.ticks, self.busy, self.signals = 0, [], []
+        self.ticks, self.busy, self.signals, self.marks = 0, [], [], [0]
 
     @property
     def leader(self):
@@ -477,9 +526,11 @@ class World:
         items = [*incoming, *local]
         for future in [self.pool.submit(rank.step, items) for rank in self.ranks]:
             future.result()
+        assert not self.bus.barrier.broken, "a rank missed a collective"
         for rank in self.ranks:
             rank.clock.now += DT
         self.ticks += 1
+        self.marks.append(len(self.leader.sent))
         self.busy.append(self.leader.busy())
         views = [rank.view() for rank in self.ranks]
         assert all(view == views[0] for view in views), "ranks left lockstep"
@@ -503,6 +554,10 @@ class World:
 
     def done(self, rid):
         return ("done", rid, None) in self.leader.sent
+
+    def sent_in(self, tick):
+        """What the leader sent in one iteration."""
+        return self.leader.sent[self.marks[tick]:self.marks[tick + 1]]
 
     def first_run(self, rid):
         """Iteration of the first forward that holds this request."""
@@ -639,7 +694,10 @@ def test_polling_alone_is_refused_at_every_attempt_under_the_same_traffic(world,
     sim = world()
     sender = Sender(cap(8), at=2.0, window=10.0)
     sim.run(13.0, load(0.5, ticks(1.0)), sender)
-    assert all(sim.busy) and sim.bus.holds() == [] and sim.signals == []
+    assert all(sim.busy) and sim.signals == []
+    # Each attempt: the ranks compare the disabled setting and park nothing.
+    assert hold_gathers(sim) == [("park", "rid", False)] * len(sender.sent_at)
+    assert all(value["settings"] is None for values in sim.bus.holds() for value in values)
     assert len(sender.sent_at) >= 8
     assert sim.refusals("rid") == ["occ3_busy_batch"] * len(sender.sent_at)
     assert sim.first_run("rid") is None and sim.record().state == "reserved"
@@ -924,33 +982,120 @@ def test_a_paused_engine_never_parks_and_never_admits_a_parked_capture(world):
     sim.assert_clean()
 
 
-@pytest.mark.parametrize("mode", ["off", "retract"])
-def test_a_full_queue_declines_instead_of_dropping_a_request(world, monkeypatch, mode):
-    """max_queued_requests=2. The capture and each retracted row need a slot."""
-    monkeypatch.setenv("OCC3_CAPTURE_PREEMPT", mode)
-    sim = world(max_queued=2)
-    running = ticks(1.5) if mode == "off" else ticks(6.0)
-    sim.run(8.0, once(0, generate("run", running)), once(1.0, cap(4)),
-            once(1.25, generate("held-1", 4)), once(1.5, generate("held-2", 4)))
-    assert hold_gathers(sim) == [("park", "rid", True), ("resolve", "rid", "decline")]
+def ordinary(sim, rows):
+    """What each ordinary client gets, and the iterations of its first and last forward."""
+    return {rid: (sim.stream(rid), sim.done(rid), sim.refusals(rid), sim.first_run(rid),
+                  sim.last_run(rid)) for rid in rows}
+
+
+@pytest.mark.parametrize("preempt", ["off", "retract"])
+@pytest.mark.parametrize("limit, environ, later", [
+    (1, {}, (1.25, 1.5)),
+    (None, {"SGLANG_REQ_WAITING_TIMEOUT": "0.5"}, (1.25,)),
+    (None, {"SGLANG_REQ_RUNNING_TIMEOUT": "8"}, (1.25,)),
+    (None, {"SGLANG_REQ_WAITING_TIMEOUT": "soon"}, (1.25,)),
+], ids=["queue_limit", "waiting_timeout", "running_timeout", "unparsable_timeout"])
+def test_a_queue_limit_or_a_timeout_sweep_keeps_the_immediate_decline(
+        world, monkeypatch, preempt, limit, environ, later):
+    """Review B1. A decode runs from 0 s to 5 s, the capture comes at 1.0 s
+    and ordinary requests come after it. A parked capture would keep those
+    requests in the waiting queue. There max_queued_requests=1 rejects the
+    second one, and a 0.5 s waiting timeout expires the first one. So no
+    capture is parked on such a server. It gets the busy refusal in the same
+    iteration, and every ordinary request runs exactly as it does without the
+    capture. A dropped ordinary row fails in Rank._release_aborted_request."""
+    monkeypatch.setenv("OCC3_CAPTURE_PREEMPT", preempt)
+    for name, value in environ.items():
+        monkeypatch.setenv(name, value)
+    rows = {"long": ticks(5.0), **{f"later-{index}": 4 for index in range(len(later))}}
+    traffic = [once(0, generate("long", rows["long"])),
+               *(once(at, generate(f"later-{index}", 4)) for index, at in enumerate(later))]
+    seen = {}
+    for case in ("no_capture", "capture", "reservation_disabled"):
+        if case == "reservation_disabled":
+            monkeypatch.setenv("OCC3_CAPTURE_BUSY_WAIT_SECONDS", "0")
+        sim = seen[case] = world(max_queued=limit)
+        sim.run(7.0, *traffic, *([] if case == "no_capture" else [once(1.0, cap(4))]))
+        for rid, count in rows.items():
+            assert sim.stream(rid) == reference(rid, count) and sim.done(rid)
+            assert sim.refusals(rid) == []
+        assert sim.signals == [] and retractions(sim) == {}
+        assert all(rank.dropped == [] for rank in sim.ranks)
+        sim.assert_clean()
+    sim = seen["capture"]
+    assert hold_gathers(sim) == [("park", "rid", False)]
+    assert ("abort", "rid", "occ3_busy_batch") in sim.sent_in(ticks(1.0))
     assert sim.refusals("rid") == ["occ3_busy_batch"] and sim.first_run("rid") is None
-    assert retractions(sim) == {} and sim.record().state == "reserved"
-    for rid, count in (("run", running), ("held-1", 4), ("held-2", 4)):
+    assert sim.record().state == "reserved" and not sim.record().admitted_capture
+    # No ordinary request is one iteration late.
+    assert ordinary(sim, rows) == ordinary(seen["no_capture"], rows)
+    assert [sim.first_run(f"later-{index}") for index in range(len(later))] == [
+        ticks(at) for at in later]
+    # The same server with the reservation disabled does exactly the same.
+    assert ([rank.view() for rank in sim.ranks]
+            == [rank.view() for rank in seen["reservation_disabled"].ranks])
+
+
+@pytest.mark.parametrize("limit, environ", [
+    (None, {}), (None, {"SGLANG_REQ_WAITING_TIMEOUT": "-1", "SGLANG_REQ_RUNNING_TIMEOUT": "0"})],
+    ids=["unset", "disabled_values"])
+def test_the_same_traffic_is_reserved_without_a_queue_limit_or_a_timeout_sweep(
+        world, monkeypatch, limit, environ):
+    """Control for the test above: the capture is parked and admitted when the
+    decode ends, and the later request waits only for that."""
+    for name, value in environ.items():
+        monkeypatch.setenv(name, value)
+    sim = world(max_queued=limit)
+    sim.run(7.0, once(0, generate("long", ticks(2.5))), once(1.0, cap(4)),
+            once(1.25, generate("later-0", 4)))
+    assert hold_gathers(sim) == [("park", "rid", True), ("resolve", "rid", "admit")]
+    assert sim.refusals("rid") == [] and sim.first_run("rid") == sim.last_run("long") + 1
+    assert sim.first_run("later-0") == sim.last_run("rid") + 1
+    for rid, count in (("long", ticks(2.5)), ("later-0", 4), ("rid", 4)):
         assert sim.stream(rid) == reference(rid, count) and sim.done(rid)
-        assert sim.refusals(rid) == []
     sim.assert_clean()
 
 
-@pytest.mark.parametrize("name, value", [("SGLANG_REQ_WAITING_TIMEOUT", "30"),
-                                         ("SGLANG_REQ_RUNNING_TIMEOUT", "0.5"),
-                                         ("SGLANG_REQ_WAITING_TIMEOUT", "soon")])
-def test_retract_is_not_used_while_a_stock_timeout_sweep_is_enabled(world, monkeypatch, name, value):
-    monkeypatch.setenv("OCC3_CAPTURE_PREEMPT", "retract")
-    monkeypatch.setenv(name, value)
-    sim = world()
-    sim.run(4.0, once(0, generate("long", ticks(6.0))), once(1.0, cap(4)))
-    assert hold_gathers(sim) == [("park", "rid", True), ("resolve", "rid", "decline")]
-    assert sim.refusals("rid") == ["occ3_busy_batch"] and retractions(sim) == {}
+SPLITS = {
+    "busy_wait_disabled": {"OCC3_CAPTURE_BUSY_WAIT_SECONDS": "0"},
+    "drain": {"OCC3_CAPTURE_DRAIN_SECONDS": "1"},
+    "preempt": {"OCC3_CAPTURE_PREEMPT": "retract"},
+    "invalid_preempt": {"OCC3_CAPTURE_PREEMPT": "maybe"},
+    "waiting_timeout": {"SGLANG_REQ_WAITING_TIMEOUT": "30"},
+    "running_timeout": {"SGLANG_REQ_RUNNING_TIMEOUT": "30"},
+    "queue_limit": {"max_queued_requests": 8},
+}
+
+
+@pytest.mark.parametrize("odd", [0, 2], ids=["leader_differs", "last_rank_differs"])
+@pytest.mark.parametrize("split", SPLITS)
+def test_ranks_with_different_reservation_inputs_decline_together(world, split, odd):
+    """Review S2. Each rank is a process with its own environment. One of
+    three ranks reads another reservation setting, or has a queue limit or a
+    timeout sweep that the others do not have. No rank decides alone. All
+    ranks enter the same park collective: a rank that returned before it
+    would leave the barrier unmatched and fail the test. The gathered values
+    differ, so every rank sends the immediate busy refusal."""
+    sim = world(ranks=3)
+    for name, value in SPLITS[split].items():
+        if name == "max_queued_requests":
+            sim.ranks[odd].max_queued_requests = value
+        else:
+            sim.ranks[odd].environ[name] = value
+    sim.run(7.0, once(0, generate("long", ticks(5.0))), once(1.0, cap(4)),
+            once(1.25, generate("later", 4)))
+    park, = sim.bus.holds()
+    assert [value == park[odd] for value in park] == [index == odd for index in range(3)]
+    assert ("abort", "rid", "occ3_busy_batch") in sim.sent_in(ticks(1.0))
+    assert sim.refusals("rid") == ["occ3_busy_batch"] and sim.first_run("rid") is None
+    assert sim.signals == [] and retractions(sim) == {}
+    for rank in sim.ranks:
+        assert getattr(rank, "occ3_capture_hold", None) is None
+        assert rank.occ3_runtime.record.state == "reserved" and not rank.occ3_runtime.poisoned
+    assert sim.first_run("later") == ticks(1.25)
+    for rid, count in (("long", ticks(5.0)), ("later", 4)):
+        assert sim.stream(rid) == reference(rid, count) and sim.done(rid)
+    sim.assert_clean()
 
 
 @pytest.mark.parametrize("name, value", [("SGLANG_REQ_WAITING_TIMEOUT", "-1"),
@@ -993,7 +1138,9 @@ def quota(detail=INFLIGHT):
     return LatentError("quota", detail=detail)
 
 
-def test_rank_uniform_gates_return_before_any_collective(monkeypatch):
+def test_rank_agreed_gates_return_before_any_collective(monkeypatch):
+    """The decline code was gathered, the request is the same broadcast and the
+    replay flag follows an agreed resolution. Only these may return early."""
     for name in KNOBS:
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setattr(w, "_runtime", lambda scheduler=None: scheduler.occ3_runtime)
@@ -1005,14 +1152,56 @@ def test_rank_uniform_gates_return_before_any_collective(monkeypatch):
     assert not w.capture_hold_park(scheduler, receiver, quota())
     assert not w.capture_hold_park(scheduler, NS(rid="rid", occ3_worker_descriptor={}), quota())
     assert not w.capture_hold_park(gate(occ3_capture_hold_replay=True), recv, quota())
-    for name, value in (("OCC3_CAPTURE_BUSY_WAIT_SECONDS", "0"),
-                        ("OCC3_CAPTURE_BUSY_WAIT_SECONDS", "11"),
-                        ("OCC3_CAPTURE_DRAIN_SECONDS", "soon"),
-                        ("OCC3_CAPTURE_PREEMPT", "maybe")):
-        monkeypatch.setenv(name, value)
-        assert not w.capture_hold_park(scheduler, recv, quota())
-        monkeypatch.delenv(name)
     assert not hasattr(scheduler, "occ3_capture_hold")
+
+
+DEFAULTS = [10.0, 2.0, "off"]
+
+
+@pytest.mark.parametrize("environ, state, settings", [
+    ({"OCC3_CAPTURE_BUSY_WAIT_SECONDS": "0"}, {}, None),
+    ({"OCC3_CAPTURE_BUSY_WAIT_SECONDS": "11"}, {}, None),
+    ({"OCC3_CAPTURE_DRAIN_SECONDS": "soon"}, {}, None),
+    ({"OCC3_CAPTURE_PREEMPT": "maybe"}, {}, None),
+    ({}, {"max_queued_requests": 4096}, DEFAULTS),
+    ({"OCC3_CAPTURE_PREEMPT": "retract"}, {"max_queued_requests": 0}, [10.0, 2.0, "retract"]),
+    ({"SGLANG_REQ_WAITING_TIMEOUT": "30"}, {}, DEFAULTS),
+    ({"SGLANG_REQ_RUNNING_TIMEOUT": "0.5"}, {}, DEFAULTS),
+    ({"SGLANG_REQ_WAITING_TIMEOUT": "soon"}, {}, DEFAULTS),
+    ({}, {"_engine_paused": True}, DEFAULTS),
+    ({}, {"occ3_capture_hold": "another capture"}, DEFAULTS),
+])
+def test_rank_local_inputs_are_gathered_and_never_return_early(monkeypatch, environ, state, settings):
+    """Reviews B1 and S2. This rank alone reads its settings, its queue limit,
+    its timeout sweeps and its scheduler state. Each of them goes into the one
+    collective as an ineligible value. None returns before it."""
+    for name in KNOBS:
+        monkeypatch.delenv(name, raising=False)
+    for name, value in environ.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setattr(w, "_runtime", lambda scheduler=None: scheduler.occ3_runtime)
+    seen = []
+    scheduler = NS(occ3_runtime=NS(gather=lambda value: seen.append(value) or [value] * 2),
+                   waiting_queue=[], **state)
+    assert not w.capture_hold_park(scheduler, NS(rid="rid", occ3_worker_descriptor=capture()), quota())
+    assert seen == [{"hold": "park", "rid": "rid", "eligible": False, "settings": settings}]
+    assert getattr(scheduler, "occ3_capture_hold", None) == state.get("occ3_capture_hold")
+    assert not hasattr(scheduler, "occ3_capture_hold_seq")
+
+
+@pytest.mark.parametrize("other", [[10.0, 1.0, "off"], [10.0, 2.0, "retract"], [5.0, 2.0, "off"], None])
+def test_a_settings_split_declines_while_every_rank_is_eligible(monkeypatch, caplog, other):
+    for name in KNOBS:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(w, "_runtime", lambda scheduler=None: scheduler.occ3_runtime)
+    scheduler = NS(occ3_runtime=NS(gather=lambda value: [value, {**value, "settings": other}]),
+                   waiting_queue=[], max_queued_requests=None)
+    recv = NS(rid="rid", occ3_worker_descriptor=capture())
+    with caplog.at_level(logging.WARNING, logger=w.logger.name):
+        assert not w.capture_hold_park(scheduler, recv, quota())
+    assert not hasattr(scheduler, "occ3_capture_hold")
+    assert [record.getMessage() for record in caplog.records] == [
+        "occ3 capture hold not parked rid=rid reason=no_rank_agreement"]
 
 
 def test_a_quota_decline_for_another_reason_is_not_parked(monkeypatch):
@@ -1022,11 +1211,12 @@ def test_a_quota_decline_for_another_reason_is_not_parked(monkeypatch):
     monkeypatch.setattr(w, "time", NS(monotonic=lambda: 100.0))
     seen = []
     scheduler = NS(occ3_runtime=NS(gather=lambda value: seen.append(value) or [value] * 2),
-                   waiting_queue=[])
+                   waiting_queue=[], max_queued_requests=None)
     recv = NS(rid="rid", occ3_worker_descriptor=capture())
     assert not w.capture_hold_park(scheduler, recv, LatentError("quota"))
-    assert seen == [{"hold": "park", "rid": "rid", "eligible": False}]
+    assert seen == [{"hold": "park", "rid": "rid", "eligible": False, "settings": DEFAULTS}]
     assert w.capture_hold_park(scheduler, recv, quota())
+    assert seen[1:] == [{"hold": "park", "rid": "rid", "eligible": True, "settings": DEFAULTS}]
     hold = scheduler.occ3_capture_hold
     assert (hold.rid, hold.seq, hold.signal) == ("rid", 1, "occ3_capture_hold_1")
     assert (hold.parked_at, hold.due_at, hold.deadline) == (100.0, 102.0, 1000.0)

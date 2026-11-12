@@ -674,6 +674,11 @@ def validate_control_payload(value, *, result=False):
 
 # Capture reservation knobs. The frontend installer and the scheduler ranks read
 # the same per-boot environment. A ValueError carries the fixed decline code.
+# The ranks compare their values before a capture is parked; a difference only
+# declines. No capture is parked when a queue limit (max_queued_requests) or a
+# request timeout sweep (SGLANG_REQ_WAITING_TIMEOUT, SGLANG_REQ_RUNNING_TIMEOUT)
+# is configured: a held request could be rejected or expire there. That capture
+# gets the busy decline at once and the frontend sends it again.
 CAPTURE_BUSY_WAIT_MAX_SECONDS = 10.0
 CAPTURE_BUSY_WAIT_DEFAULT_SECONDS = 10.0
 CAPTURE_DRAIN_DEFAULT_SECONDS = 2.0
@@ -708,7 +713,9 @@ def capture_drain_seconds(raw, window):
 
 def capture_preempt_mode(raw):
     """OCC3_CAPTURE_PREEMPT: "off" (drain only) or "retract" (operator opt-in:
-    rows still running after the drain are retracted and resume later)."""
+    plain rows still running after the drain are retracted and resume later. A
+    session row, or a row that cannot resume from the same output position, is
+    never retracted; the capture is then declined as with "off")."""
     if raw is None:
         return CAPTURE_PREEMPT_DEFAULT
     if raw not in CAPTURE_PREEMPT_MODES:
