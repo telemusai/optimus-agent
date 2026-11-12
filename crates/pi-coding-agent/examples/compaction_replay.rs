@@ -11,7 +11,8 @@
 //!       Runs the REAL auto-compaction path end to end offline: private roots,
 //!       in-process fixture provider with canned deterministic summaries, real
 //!       SessionManager JSONL, CompactionMetrics phase rows via the recorder
-//!       injection seam, provider call log, retained-state digests.
+//!       injection seam, provider call log, complete content-free attempt evidence,
+//!       retained-state digests, and existing-reply useful-continuation intervals.
 //!   bench-local --fixture <dir|case> --iters N --out <json> [--warmup N]
 //!          [--stamp SHA256] [--git DESCRIBE] [--chunk-context-window N]
 //!       Microbenchmarks of the pure local kernels through their real entry
@@ -30,17 +31,18 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use pi_agent_core::performance_metrics::{
-    AgentLoopPerformanceMetrics, PerformanceMetricEvent, PerformanceMetricIdScope,
-    PerformanceMetricMeasurement as Measurement, PerformanceMetricOperation as Operation,
-    PerformanceMetricOutcome as Outcome, PerformanceMetricRecorder,
+    elapsed_metric_ms, AgentLoopPerformanceMetrics, PerformanceMetricEvent,
+    PerformanceMetricIdScope, PerformanceMetricMeasurement as Measurement,
+    PerformanceMetricOperation as Operation, PerformanceMetricOutcome as Outcome,
+    PerformanceMetricRecorder,
 };
-use pi_agent_core::types::{AgentMessage, CustomAgentMessage};
+use pi_agent_core::types::{AgentEvent, AgentMessage, CustomAgentMessage};
 use pi_ai::api_registry::{register_api_provider_simple, ApiProviderSimple, SimpleStreamFunction};
 use pi_ai::types::StreamFunction;
 use pi_ai::types::{
     AssistantMessage, AssistantMessageEvent, ContentBlock, Context, ImageOrTextContent,
-    InputModality, Message, Model, SimpleStreamOptions, TextContent, ThinkingContent, ToolCall,
-    ToolResultMessage, Usage, UserContent, UserMessage,
+    InputModality, Message, Model, ProviderResponse, ProviderUsageObservation, SimpleStreamOptions,
+    TextContent, ThinkingContent, ToolCall, ToolResultMessage, Usage, UserContent, UserMessage,
 };
 use pi_ai::utils::event_stream::{
     create_assistant_message_event_stream, AssistantMessageEventStream,
@@ -1390,12 +1392,13 @@ fn count_context_chars(context: &Context) -> (usize, usize) {
 /// tool-call ids, image blocks, and every path under the case root (normalized
 /// to `<ROOT>`). This catches chunking/serialization regressions that keep the
 /// chunk count and sizes unchanged.
-fn request_payload_digest(
+fn request_payload(
     state: &ProviderState,
     context: &Context,
-) -> (String, usize, usize, Option<usize>) {
+) -> (Value, usize, usize, Option<usize>) {
     let mut messages: Vec<Value> = Vec::with_capacity(context.messages.len());
     let mut total_chars = 0usize;
+    let mut longest_chars = 0usize;
     for message in &context.messages {
         let role = message.role();
         let mut texts: Vec<String> = Vec::new();
@@ -1446,7 +1449,9 @@ fn request_payload_digest(
                 }
             }
         }
-        total_chars += texts.iter().map(|text| text.chars().count()).sum::<usize>();
+        let message_chars = texts.iter().map(|text| text.chars().count()).sum::<usize>();
+        total_chars += message_chars;
+        longest_chars = longest_chars.max(message_chars);
         messages.push(json!({ "role": role, "texts": texts, "tool_calls": tool_calls }));
     }
     let system_prompt = context
@@ -1470,12 +1475,16 @@ fn request_payload_digest(
             &encoded,
         );
     }
-    let digest = sha256_hex(encoded.as_bytes());
     let system_prompt_chars = context
         .system_prompt
         .as_ref()
         .map(|prompt| prompt.chars().count());
-    (digest, total_chars, context.messages.len(), system_prompt_chars)
+    (payload, total_chars, longest_chars, system_prompt_chars)
+}
+
+fn payload_sha256(payload: &Value) -> String {
+    let encoded = serde_json::to_string(payload).unwrap_or_default();
+    sha256_hex(encoded.as_bytes())
 }
 
 fn record_call(
@@ -1514,7 +1523,7 @@ fn respond(
     let (total_chars, longest_chars) = count_context_chars(context);
     let message_count = context.messages.len();
     let max_tokens = options.and_then(|options| options.stream.max_tokens);
-    let (payload_sha256, _, _, system_prompt_chars) = request_payload_digest(state, context);
+    let (payload, _, _, system_prompt_chars) = request_payload(state, context);
     let reply = build_reply(state, model, is_summary_call);
     let stream = create_assistant_message_event_stream();
     let delay_ms = state.delay_ms.load(Ordering::SeqCst);
@@ -1523,7 +1532,16 @@ fn respond(
     } else {
         state.turn_calls.fetch_add(1, Ordering::SeqCst) + 1
     };
-    if delay_ms == 0 {
+    let stream_options = options.cloned().map(|options| options.stream);
+    let has_callbacks = stream_options.as_ref().is_some_and(|options| {
+        options.on_payload.is_some()
+            || options.on_response.is_some()
+            || options.on_stream_observation.is_some()
+            || options.on_usage_observation.is_some()
+    });
+    if delay_ms == 0 && !has_callbacks {
+        // Preserve the original unobserved synchronous fixture path. In particular,
+        // an inactive metrics recorder cannot add scheduling or callback behavior.
         for event in events_for(reply.clone()) {
             stream.push(event);
         }
@@ -1537,25 +1555,98 @@ fn respond(
             longest_chars,
             max_tokens,
             elapsed_ms(started),
-            payload_sha256,
+            payload_sha256(&payload),
             system_prompt_chars,
         );
         return stream;
     }
-    // Emulated network latency: the reply lands after the delay.
-    let state_for_task = Arc::clone(state);
-    let handle = tokio::runtime::Handle::try_current();
-    match handle {
-        Ok(handle) => {
-            let task_stream = stream.clone();
-            handle.spawn(async move {
-                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-                for event in events_for(reply.clone()) {
-                    task_stream.push(event);
+
+    let task_state = Arc::clone(state);
+    let task_stream = stream.clone();
+    let task_model = model.clone();
+    let task = async move {
+        let mut effective_payload = payload;
+        if let Some(on_payload) = stream_options
+            .as_ref()
+            .and_then(|options| options.on_payload.clone())
+        {
+            if let Some(replacement) = on_payload(effective_payload.clone(), &task_model).await {
+                effective_payload = replacement;
+            }
+        }
+        let effective_payload_sha256 = payload_sha256(&effective_payload);
+        if delay_ms > 0 && tokio::runtime::Handle::try_current().is_ok() {
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+        }
+        if let Some(on_response) = stream_options
+            .as_ref()
+            .and_then(|options| options.on_response.clone())
+        {
+            on_response(
+                ProviderResponse {
+                    status: 200,
+                    // This in-process fixture has no actual transport. Do not claim
+                    // an SSE or WebSocket transport label that was not observed.
+                    headers: Default::default(),
+                },
+                &task_model,
+            )
+            .await;
+        }
+        let observe = stream_options
+            .as_ref()
+            .and_then(|options| options.on_stream_observation.clone());
+        let observe_usage = stream_options
+            .as_ref()
+            .and_then(|options| options.on_usage_observation.clone());
+        for event in events_for(reply.clone()) {
+            if let Some(observe) = &observe {
+                observe("raw_event");
+            }
+            let is_done = matches!(&event, AssistantMessageEvent::Done { .. });
+            match &event {
+                AssistantMessageEvent::TextDelta { delta, .. } if !delta.is_empty() => {
+                    if let Some(observe) = &observe {
+                        observe("text");
+                    }
                 }
-                task_stream.end(Some(reply));
+                AssistantMessageEvent::ThinkingDelta { delta, .. } if !delta.is_empty() => {
+                    if let Some(observe) = &observe {
+                        observe("thinking");
+                    }
+                }
+                AssistantMessageEvent::ToolCallDelta { delta, .. } if !delta.is_empty() => {
+                    if let Some(observe) = &observe {
+                        observe("tool");
+                    }
+                }
+                AssistantMessageEvent::Done { .. } => {
+                    if let Some(observe_usage) = &observe_usage {
+                        observe_usage(
+                            ProviderUsageObservation {
+                                input_tokens: Some(Some(reply.usage.input)),
+                                cached_input_tokens: Some(Some(reply.usage.cache_read)),
+                                output_tokens: Some(Some(reply.usage.output)),
+                                total_tokens: Some(Some(reply.usage.total_tokens)),
+                                // The normalized fixture usage has no authoritative
+                                // cache/reasoning overlap or reasoning-token detail.
+                                ..Default::default()
+                            },
+                            &task_model,
+                        )
+                        .await;
+                    }
+                    if let Some(observe) = &observe {
+                        observe("terminal");
+                    }
+                }
+                _ => {}
+            }
+            if is_done {
+                // Publish provider evidence before the terminal event can settle
+                // the headless turn and release the replay reader.
                 record_call(
-                    &state_for_task,
+                    &task_state,
                     seq,
                     is_summary_call,
                     message_count,
@@ -1563,28 +1654,20 @@ fn respond(
                     longest_chars,
                     max_tokens,
                     elapsed_ms(started),
-                    payload_sha256,
+                    effective_payload_sha256.clone(),
                     system_prompt_chars,
                 );
-            });
+            }
+            task_stream.push(event);
+        }
+        task_stream.end(Some(reply));
+    };
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => {
+            handle.spawn(task);
         }
         Err(_) => {
-            for event in events_for(reply.clone()) {
-                stream.push(event);
-            }
-            stream.end(Some(reply));
-            record_call(
-                state,
-                seq,
-                is_summary_call,
-                message_count,
-                total_chars,
-                longest_chars,
-                max_tokens,
-                elapsed_ms(started),
-                payload_sha256,
-                system_prompt_chars,
-            );
+            futures::executor::block_on(task);
         }
     }
     stream
@@ -1599,8 +1682,11 @@ fn register_fixture_provider(state: &Arc<ProviderState>) {
     );
     let stream_state = Arc::clone(state);
     let stream: StreamFunction = Arc::new(
-        move |model: &Model, context: &Context, _options: Option<&pi_ai::types::StreamOptions>| {
-            let simple = SimpleStreamOptions::default();
+        move |model: &Model, context: &Context, options: Option<&pi_ai::types::StreamOptions>| {
+            let simple = SimpleStreamOptions {
+                stream: options.cloned().unwrap_or_default(),
+                ..Default::default()
+            };
             respond(&stream_state, model, context, Some(&simple))
         },
     );
@@ -1678,6 +1764,8 @@ fn phase_rows(events: &[PerformanceMetricEvent]) -> Vec<Value> {
             json!({
                 "operation": event.operation.as_str(),
                 "outcome": event.outcome.map(|outcome| outcome.as_str()),
+                "correlation": event.correlation.as_ref(),
+                "identity": event.identity.as_ref(),
                 "total_ms": event
                     .measurements
                     .as_ref()
@@ -1702,16 +1790,26 @@ fn provider_attempt_rows(events: &[PerformanceMetricEvent]) -> Vec<Value> {
             )
         })
         .map(|event| {
+            let measurement = |key: Measurement| {
+                event
+                    .measurements
+                    .as_ref()
+                    .and_then(|map| map.get(&key).cloned().flatten())
+            };
             json!({
                 "outcome": event.outcome.map(|outcome| outcome.as_str()),
-                "total_ms": event
-                    .measurements
-                    .as_ref()
-                    .and_then(|map| map.get(&Measurement::TotalMs).cloned().flatten()),
-                "dispatch_to_network_terminal_ms": event
-                    .measurements
-                    .as_ref()
-                    .and_then(|map| map.get(&Measurement::DispatchToNetworkTerminalMs).cloned().flatten()),
+                // These two legacy fields remain for existing report consumers.
+                "total_ms": measurement(Measurement::TotalMs),
+                "dispatch_to_network_terminal_ms": measurement(Measurement::DispatchToNetworkTerminalMs),
+                // The full records are already content-free. Export them rather
+                // than maintaining a lossy second allowlist in the replay report.
+                // Deliberately exclude error_message even if another recorder opted in.
+                "correlation": event.correlation.as_ref(),
+                "identity": event.identity.as_ref(),
+                "measurements": event.measurements.as_ref(),
+                "usage": event.usage.as_ref(),
+                "error_class": event.error_class.as_ref().map(|class| class.as_str()),
+                "http_status": event.http_status,
             })
         })
         .collect()
@@ -1914,10 +2012,21 @@ struct ReplayOptions {
     timeout_secs: u64,
 }
 
+#[derive(Clone, Default)]
+struct ContinuationTiming {
+    compaction_started_at: Option<f64>,
+    compaction_ended_at: Option<f64>,
+    first_text_at: Option<f64>,
+    reply_ended_at: Option<f64>,
+    armed_after_successful_compaction: bool,
+}
+
 #[derive(Default)]
 struct ObservedCompaction {
     starts: Mutex<Vec<String>>,
     ends: Mutex<Vec<Value>>,
+    continuation: Mutex<ContinuationTiming>,
+    event_order: Mutex<Vec<&'static str>>,
 }
 
 fn private_auth_options() -> Option<AuthStorageOptions> {
@@ -2102,9 +2211,15 @@ async fn run_replay_case(
     let observed = Arc::new(ObservedCompaction::default());
     {
         let observed = Arc::clone(&observed);
+        let metric_clock = Arc::clone(&recorder);
         session.subscribe(Arc::new(move |event: AgentSessionEvent| match event {
             AgentSessionEvent::CompactionStart { reason, .. } => {
                 observed.starts.lock().unwrap().push(reason);
+                observed.event_order.lock().unwrap().push("compaction_start");
+                let mut timing = observed.continuation.lock().unwrap();
+                timing
+                    .compaction_started_at
+                    .get_or_insert_with(|| metric_clock.monotonic_now());
             }
             AgentSessionEvent::CompactionEnd {
                 reason,
@@ -2114,6 +2229,7 @@ async fn run_replay_case(
                 error_message,
                 ..
             } => {
+                observed.event_order.lock().unwrap().push("compaction_end");
                 observed.ends.lock().unwrap().push(json!({
                     "reason": reason,
                     "aborted": aborted,
@@ -2122,6 +2238,38 @@ async fn run_replay_case(
                     "tokens_before": result.as_ref().map(|result| result.tokens_before),
                     "first_kept_entry_id": result.as_ref().map(|result| result.first_kept_entry_id.clone()),
                 }));
+                let mut timing = observed.continuation.lock().unwrap();
+                timing
+                    .compaction_ended_at
+                    .get_or_insert_with(|| metric_clock.monotonic_now());
+                if result.is_some() && !aborted {
+                    // A later reply after a failed compaction is not useful
+                    // post-compaction evidence.
+                    timing.armed_after_successful_compaction = true;
+                }
+            }
+            AgentSessionEvent::Agent(AgentEvent::MessageUpdate {
+                assistant_message_event: AssistantMessageEvent::TextDelta { delta, .. },
+                ..
+            }) if !delta.is_empty() => {
+                observed.event_order.lock().unwrap().push("text_delta");
+                let mut timing = observed.continuation.lock().unwrap();
+                if timing.armed_after_successful_compaction && timing.first_text_at.is_none() {
+                    timing.first_text_at = Some(metric_clock.monotonic_now());
+                }
+            }
+            AgentSessionEvent::Agent(AgentEvent::MessageEnd { message })
+                if matches!(&message, AgentMessage::Message(Message::Assistant(_))) =>
+            {
+                observed
+                    .event_order
+                    .lock()
+                    .unwrap()
+                    .push("assistant_message_end");
+                let mut timing = observed.continuation.lock().unwrap();
+                if timing.first_text_at.is_some() && timing.reply_ended_at.is_none() {
+                    timing.reply_ended_at = Some(metric_clock.monotonic_now());
+                }
             }
             _ => {}
         }));
@@ -2237,6 +2385,39 @@ async fn run_replay_case(
     let events = recorder.events.lock().unwrap().clone();
     let starts = observed.starts.lock().unwrap().clone();
     let ends = observed.ends.lock().unwrap().clone();
+    let continuation_event_order = observed.event_order.lock().unwrap().clone();
+    let continuation_timing = observed.continuation.lock().unwrap().clone();
+    let continuation_ordered = matches!(
+        (
+            continuation_timing.compaction_started_at,
+            continuation_timing.compaction_ended_at,
+            continuation_timing.first_text_at,
+            continuation_timing.reply_ended_at,
+        ),
+        (Some(started), Some(ended), Some(first_text), Some(reply_ended))
+            if started <= ended && ended <= first_text && first_text <= reply_ended
+    );
+    let continuation_metrics = json!({
+        "successful_compaction_observed": continuation_timing.armed_after_successful_compaction,
+        "complete": continuation_ordered,
+        "observed_event_order": continuation_event_order,
+        "compaction_start_to_first_text_ms": elapsed_metric_ms(
+            continuation_timing.compaction_started_at,
+            continuation_timing.first_text_at,
+        ),
+        "compaction_end_to_first_text_ms": elapsed_metric_ms(
+            continuation_timing.compaction_ended_at,
+            continuation_timing.first_text_at,
+        ),
+        "first_text_to_reply_end_ms": elapsed_metric_ms(
+            continuation_timing.first_text_at,
+            continuation_timing.reply_ended_at,
+        ),
+        "compaction_start_to_reply_end_ms": elapsed_metric_ms(
+            continuation_timing.compaction_started_at,
+            continuation_timing.reply_ended_at,
+        ),
+    });
     let provider_calls = state.calls.lock().unwrap().clone();
     let summary_calls = state.summary_calls.load(Ordering::SeqCst);
     let turn_calls = state.turn_calls.load(Ordering::SeqCst);
@@ -2311,6 +2492,7 @@ async fn run_replay_case(
         "phases": phase_rows(&events),
         "provider_attempts": provider_attempt_rows(&events),
         "provider_calls": provider_calls,
+        "continuation": continuation_metrics,
         "provider_call_counts": {
             "summary": summary_calls,
             "turn": turn_calls,
@@ -2875,5 +3057,342 @@ fn main() {
             eprintln!("error: {error}");
             std::process::exit(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn load_observability_fixture(name: &str) -> LoadedFixture {
+        let case_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("examples/fixtures/compaction-observability")
+            .join(name);
+        load_fixture(&case_dir).expect("static observability fixture must use the legacy schema")
+    }
+
+    async fn run_observability_fixture(fixture: &LoadedFixture, work: &Path) -> Value {
+        let options = ReplayOptions {
+            provider_delay_ms: 1,
+            summary_failure: None,
+            context_window: 1_000_000.0,
+            keep_recent: Some(64.0),
+            work: work.to_path_buf(),
+            timeout_secs: 90,
+        };
+        let counter = AtomicU64::new(0);
+        tokio::time::timeout(
+            Duration::from_secs(options.timeout_secs),
+            run_replay_case(fixture, &options, &counter),
+        )
+        .await
+        .expect("observability replay must complete within 90 seconds")
+        .expect("observability replay must succeed")
+    }
+
+    fn event_position(case: &Value, token: &str) -> usize {
+        case["continuation"]["observed_event_order"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .position(|event| event.as_str() == Some(token))
+            .unwrap_or_else(|| panic!("missing {token} in continuation event order"))
+    }
+
+    fn assert_one_ordinary_turn_and_no_content_export(case: &Value) {
+        assert_eq!(case["provider_call_counts"]["turn"], json!(1));
+        assert_eq!(case["determinism_key"]["turn_calls"], json!(1));
+        assert!(
+            case["provider_call_counts"]["summary"]
+                .as_u64()
+                .unwrap_or(0)
+                >= 1
+        );
+        let ordinary_calls = case["provider_calls"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|call| call["is_summary_call"] != json!(true))
+            .count();
+        // The one existing prompt must produce this one reply; no second model
+        // turn or synthetic continuation prompt is permitted.
+        assert_eq!(ordinary_calls, 1);
+        for attempt in case["provider_attempts"].as_array().unwrap() {
+            assert!(attempt.get("error_message").is_none());
+        }
+        let serialized = case.to_string();
+        for forbidden in [
+            "fixture-secret-do-not-export",
+            HARNESS_API_KEY,
+            HARNESS_SUMMARY,
+            "harness replay trigger turn",
+        ] {
+            assert!(!serialized.contains(forbidden));
+        }
+    }
+
+    #[tokio::test]
+    async fn pre_turn_replay_produces_real_continuation_and_turn_end_stays_incomplete() {
+        let pre_turn = load_observability_fixture("pre-turn-user-last");
+        let turn_end = load_observability_fixture("turn-end-assistant-last");
+        assert!(matches!(
+            pre_turn.records.last(),
+            Some(FixtureRecord::User { .. })
+        ));
+        assert!(matches!(
+            turn_end.records.last(),
+            Some(FixtureRecord::Assistant { .. })
+        ));
+
+        let model = fixture_model_for_estimates();
+        let settings = default_compaction_settings();
+        let pre_turn_tokens = estimate_context_tokens(&pre_turn.to_agent_messages(&model)).tokens;
+        let turn_end_tokens = estimate_context_tokens(&turn_end.to_agent_messages(&model)).tokens;
+        assert!(should_compact_for_model(pre_turn_tokens, &model, &settings));
+        assert!(!should_compact_for_model(
+            turn_end_tokens,
+            &model,
+            &settings
+        ));
+
+        // Allocate both roots before replay changes process-local private-root
+        // environment variables, and keep both alive through both runs.
+        let pre_turn_root = tempfile::tempdir().unwrap();
+        let turn_end_root = tempfile::tempdir().unwrap();
+        let pre_turn = run_observability_fixture(&pre_turn, pre_turn_root.path()).await;
+        let turn_end = run_observability_fixture(&turn_end, turn_end_root.path()).await;
+
+        assert_eq!(
+            pre_turn["continuation"]["successful_compaction_observed"],
+            json!(true)
+        );
+        assert_eq!(pre_turn["continuation"]["complete"], json!(true));
+        let compaction_end = event_position(&pre_turn, "compaction_end");
+        let first_text = event_position(&pre_turn, "text_delta");
+        let reply_end = event_position(&pre_turn, "assistant_message_end");
+        assert!(compaction_end < first_text);
+        assert!(first_text < reply_end);
+
+        let start_to_text = pre_turn["continuation"]["compaction_start_to_first_text_ms"]
+            .as_f64()
+            .unwrap();
+        let end_to_text = pre_turn["continuation"]["compaction_end_to_first_text_ms"]
+            .as_f64()
+            .unwrap();
+        let text_to_end = pre_turn["continuation"]["first_text_to_reply_end_ms"]
+            .as_f64()
+            .unwrap();
+        let start_to_end = pre_turn["continuation"]["compaction_start_to_reply_end_ms"]
+            .as_f64()
+            .unwrap();
+        for interval in [start_to_text, end_to_text, text_to_end, start_to_end] {
+            assert!(interval.is_finite());
+            assert!(interval >= 0.0);
+        }
+        assert!(start_to_text >= end_to_text);
+        assert!(start_to_end >= start_to_text);
+        assert_one_ordinary_turn_and_no_content_export(&pre_turn);
+
+        assert_eq!(turn_end["continuation"]["complete"], json!(false));
+        let turn_text = event_position(&turn_end, "text_delta");
+        let turn_reply_end = event_position(&turn_end, "assistant_message_end");
+        let turn_compaction_end = event_position(&turn_end, "compaction_end");
+        assert!(turn_text < turn_reply_end);
+        assert!(turn_reply_end < turn_compaction_end);
+        for key in [
+            "compaction_start_to_first_text_ms",
+            "compaction_end_to_first_text_ms",
+            "first_text_to_reply_end_ms",
+            "compaction_start_to_reply_end_ms",
+        ] {
+            assert!(turn_end["continuation"][key].is_null());
+        }
+        assert_one_ordinary_turn_and_no_content_export(&turn_end);
+    }
+
+    #[test]
+    fn attempt_export_is_terminal_one_for_one_and_content_free() {
+        use pi_agent_core::performance_metrics::{
+            PerformanceMetricComponent, PerformanceMetricCorrelation, PerformanceMetricErrorClass,
+            PerformanceMetricIdentity, PerformanceMetricUsageV1,
+        };
+
+        let attempt = |id: &str, outcome: Outcome, error_message: Option<&str>| {
+            let mut event = PerformanceMetricEvent::new(Operation::ProviderAttempt);
+            event.correlation = Some(PerformanceMetricCorrelation {
+                action_id: Some("fixture-action".into()),
+                logical_request_id: Some(format!("logical-{id}")),
+                provider_attempt_id: Some(id.into()),
+                tool_call_id: None,
+            });
+            event.identity = Some(PerformanceMetricIdentity {
+                provider: Some(Some("fixture-provider".into())),
+                model: Some(Some("fixture-model".into())),
+                api: Some(Some("fixture-api".into())),
+                component: Some(PerformanceMetricComponent::Compaction),
+                tool: None,
+            });
+            event.outcome = Some(outcome);
+            event.measurements = Some(
+                [
+                    (Measurement::TotalMs, Some(5.0)),
+                    (Measurement::WaitMs, Some(1.0)),
+                    (Measurement::StreamingMs, None),
+                ]
+                .into_iter()
+                .collect(),
+            );
+            event.usage = Some(PerformanceMetricUsageV1::provider_unavailable());
+            event.error_class = error_message.map(|_| PerformanceMetricErrorClass::Unknown);
+            event.http_status = Some(if error_message.is_some() { 503 } else { 200 });
+            event.error_message = error_message.map(str::to_string);
+            event
+        };
+        let terminal_success = attempt("attempt-success", Outcome::Success, None);
+        let started = attempt("attempt-started", Outcome::Started, None);
+        let terminal_failure = attempt(
+            "attempt-failure",
+            Outcome::Failure,
+            Some("fixture-secret-do-not-export"),
+        );
+        let logical = PerformanceMetricEvent::new(Operation::LogicalRequest);
+        let events = vec![terminal_success, started, terminal_failure, logical];
+        let terminal: Vec<_> = events
+            .iter()
+            .filter(|event| {
+                event.operation == Operation::ProviderAttempt
+                    && event.outcome != Some(Outcome::Started)
+            })
+            .collect();
+        let rows = provider_attempt_rows(&events);
+        assert_eq!(rows.len(), terminal.len());
+        assert_eq!(rows.len(), 2);
+
+        for (row, event) in rows.iter().zip(terminal) {
+            let expected = serde_json::to_value(event).unwrap();
+            for field in [
+                "outcome",
+                "correlation",
+                "identity",
+                "measurements",
+                "usage",
+                "error_class",
+                "http_status",
+            ] {
+                assert_eq!(
+                    row[field], expected[field],
+                    "field {field} must be complete"
+                );
+            }
+            assert_eq!(row["total_ms"], expected["measurements"]["total_ms"]);
+            assert!(row.get("error_message").is_none());
+        }
+        let serialized = serde_json::to_string(&rows).unwrap();
+        assert!(!serialized.contains("fixture-secret-do-not-export"));
+        assert!(!serialized.contains("error_message"));
+    }
+
+    #[tokio::test]
+    async fn fixture_callbacks_preserve_replacement_payload_and_order() {
+        let state = Arc::new(ProviderState::new("fixture-callback-test", "fixture-root"));
+        let model = Model::new(
+            "fixture-model",
+            "fixture-model",
+            "fixture-api",
+            "fixture-provider",
+            "https://fixture.invalid",
+        );
+        let context = Context {
+            messages: vec![Message::user(UserMessage::new(
+                UserContent::Text("hello".into()),
+                1,
+            ))],
+            ..Default::default()
+        };
+        let mut options = SimpleStreamOptions::default();
+        options.stream.max_tokens = Some(64.0);
+        let order = Arc::new(Mutex::new(Vec::<String>::new()));
+
+        let callback_order = Arc::clone(&order);
+        options.stream.on_payload = Some(Arc::new(move |mut payload, _| {
+            let callback_order = Arc::clone(&callback_order);
+            Box::pin(async move {
+                tokio::task::yield_now().await;
+                callback_order.lock().unwrap().push("payload".into());
+                payload["system_prompt"] = json!("replacement-payload");
+                Some(payload)
+            })
+        }));
+        let callback_order = Arc::clone(&order);
+        options.stream.on_response = Some(Arc::new(move |response, _| {
+            let callback_order = Arc::clone(&callback_order);
+            Box::pin(async move {
+                tokio::task::yield_now().await;
+                assert_eq!(response.status, 200);
+                assert!(response.headers.is_empty());
+                callback_order.lock().unwrap().push("response".into());
+            })
+        }));
+        let callback_order = Arc::clone(&order);
+        options.stream.on_stream_observation = Some(Arc::new(move |stage| {
+            callback_order
+                .lock()
+                .unwrap()
+                .push(format!("stage:{stage}"));
+        }));
+        let callback_order = Arc::clone(&order);
+        options.stream.on_usage_observation = Some(Arc::new(move |usage, _| {
+            let callback_order = Arc::clone(&callback_order);
+            Box::pin(async move {
+                tokio::task::yield_now().await;
+                assert_eq!(usage.input_tokens, Some(Some(1.0)));
+                assert_eq!(usage.cached_input_tokens, Some(Some(0.0)));
+                assert_eq!(usage.output_tokens, Some(Some(1.0)));
+                assert_eq!(usage.total_tokens, Some(Some(2.0)));
+                callback_order.lock().unwrap().push("usage".into());
+            })
+        }));
+
+        let stream = respond(&state, &model, &context, Some(&options));
+        let result = tokio::time::timeout(Duration::from_secs(2), stream.result())
+            .await
+            .expect("fixture response must complete");
+        assert_eq!(result.stop_reason, "stop");
+
+        let order = order.lock().unwrap().clone();
+        let position = |name: &str| {
+            order
+                .iter()
+                .position(|entry| entry == name)
+                .unwrap_or_else(|| panic!("missing {name} in {order:?}"))
+        };
+        assert_eq!(position("payload"), 0);
+        assert!(position("payload") < position("response"));
+        assert!(position("response") < position("stage:text"));
+        assert!(position("stage:text") < position("usage"));
+        assert!(position("usage") < position("stage:terminal"));
+        assert_eq!(position("stage:terminal"), order.len() - 1);
+        assert_eq!(
+            order
+                .iter()
+                .filter(|entry| *entry == "stage:raw_event")
+                .count(),
+            5
+        );
+
+        let calls = state.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["max_tokens"], json!(64.0));
+        let expected_replacement = json!({
+            "system_prompt": "replacement-payload",
+            "message_count": 1,
+            "total_chars": 5,
+            "messages": [{"role": "user", "texts": ["hello"], "tool_calls": []}],
+        });
+        let expected_sha256 = payload_sha256(&expected_replacement);
+        assert_eq!(
+            calls[0]["payload_sha256"].as_str(),
+            Some(expected_sha256.as_str())
+        );
     }
 }
