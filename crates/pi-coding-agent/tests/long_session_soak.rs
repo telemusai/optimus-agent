@@ -400,10 +400,6 @@ impl InProcessRuntimeHost for SoakHost {
                     available_thinking_levels: session.get_available_thinking_levels(),
                     is_streaming: session.is_streaming(),
                     is_compacting: session.is_compacting(),
-                    occ3_native_dead: session
-                        .experimental_native_occ3()
-                        .map(|native| native.is_dead())
-                        .unwrap_or(false),
                     is_bash_running: session.is_bash_running(),
                     retry_attempt: session.retry_attempt() as f64,
                     steering_mode: session.steering_mode(),
