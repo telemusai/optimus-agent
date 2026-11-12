@@ -403,9 +403,11 @@ class BufferProfile:
     #: move. Between 0 and capture_busy_wait_seconds, so a 0 window forces
     #: 0. The default 0 accounts for no reservation; the installer sets the
     #: per-boot value from OCC3_CAPTURE_DRAIN_SECONDS (default 2 s, capped by
-    #: the window). OCC3_CAPTURE_PREEMPT (default "off"; "retract" is an
-    #: operator opt-in) only selects what the scheduler does with rows that
-    #: outlast the drain, so no frontend bound depends on it.
+    #: the window). An explicit profile given to the installer must state the
+    #: window and drain of the environment, because the scheduler ranks apply
+    #: those. OCC3_CAPTURE_PREEMPT (default "off"; "retract" is an operator
+    #: opt-in) only selects what the scheduler does with rows that outlast
+    #: the drain, so no frontend bound depends on it.
     capture_drain_seconds: float = 0.0
 
     @property

@@ -87,7 +87,10 @@ def _capture_hold_settings_from_env():
     Such a capture gets the busy refusal at once and the busy wait sends the
     same request again.
     An unparseable or out-of-range value -> InstallationError with the fixed
-    code of that knob, so a mistyped value never serves a default.
+    code of that knob, so a mistyped value never serves a default. The knobs
+    are read for every installation. An explicit buffer profile must state
+    the same window and drain, or the installation is refused with
+    capture_profile_mismatch.
     """
     from .latent_types import capture_hold_settings
     try:
@@ -1011,18 +1014,26 @@ async def install_native_runtime(app, tokenizer_manager, *, experimental_opt_in=
         from .chat_adapter import BufferProfile
         # Only the default profile takes the per-boot turn window and capture
         # busy-wait knobs; a trusted caller's explicit profile passes through
-        # untouched.
+        # untouched. The scheduler ranks apply the capture knobs of the
+        # environment in both cases, so the knobs are always validated here.
+        # The preempt mode is only validated; only the ranks use it.
         if buffer_profile is None:
             max_turn = _max_turn_seconds_from_env()
-            # The preempt mode is validated here; only the scheduler ranks use it.
             hold = _capture_hold_settings_from_env()
             profile = BufferProfile(max_turn_seconds=max_turn,
                                     capture_busy_wait_seconds=hold.window,
                                     capture_drain_seconds=hold.drain)
         else:
+            hold = _capture_hold_settings_from_env()
             profile = buffer_profile
         if type(profile) is not BufferProfile or profile.max_buffer_bytes > 4194304:
             raise InstallationError("unsupported_buffer_profile")
+        # An explicit profile must state the window and drain the ranks apply.
+        # A frontend with a shorter drain would time out a parked capture, and
+        # a 0 window would not disable the scheduler reservation.
+        if ((profile.capture_busy_wait_seconds, profile.capture_drain_seconds)
+                != (hold.window, hold.drain)):
+            raise InstallationError("capture_profile_mismatch")
         snapshot = _snapshot_precommit(app, tokenizer_manager, key)
         components = await _construct_components(app, tokenizer_manager, key, profile)
         startup_state.mark_backend_constructed()

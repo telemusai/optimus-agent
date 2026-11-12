@@ -1222,8 +1222,11 @@ async def test_max_turn_window_env_never_overrides_explicit_profile(
     override only replaces the default profile, it must not mutate a profile
     the trusted caller constructed deliberately."""
     monkeypatch.setenv("OCC3_MAX_TURN_SECONDS", "720")
+    _capture_env(monkeypatch)
     from occ3_sglang.chat_adapter import BufferProfile
-    explicit = BufferProfile(max_turn_seconds=300)
+    # The capture drain is the one of the environment (default 2 s): the
+    # scheduler ranks apply it for every profile.
+    explicit = BufferProfile(max_turn_seconds=300, capture_drain_seconds=2)
     f = transaction_fixture
     receipt = await install.install_native_runtime(f.app, f.tm,
         experimental_opt_in=True, buffer_profile=explicit)
@@ -1270,16 +1273,19 @@ async def test_capture_busy_wait_env_invalid_declines_install_fail_closed(
     assert getattr(f.app, install._INSTALLED_ATTR, None) is None
 
 
-async def test_capture_busy_wait_env_never_overrides_explicit_profile(
+async def test_capture_busy_wait_env_refuses_an_explicit_profile_with_another_window(
         transaction_fixture, monkeypatch):
-    monkeypatch.setenv("OCC3_CAPTURE_BUSY_WAIT_SECONDS", "2")
+    """The environment never replaces an explicit profile. A profile with a
+    0 window would not disable the reservation that the scheduler ranks run
+    for the 2 s window of the environment, so the installation is refused."""
+    _capture_env(monkeypatch, "2")
     from occ3_sglang.chat_adapter import BufferProfile
     explicit = BufferProfile(capture_busy_wait_seconds=0)
     f = transaction_fixture
     receipt = await install.install_native_runtime(f.app, f.tm,
         experimental_opt_in=True, buffer_profile=explicit)
-    assert receipt.installed
-    assert getattr(f.app, install._INSTALLED_ATTR).adapter.profile is explicit
+    assert not receipt.installed and receipt.code == "capture_profile_mismatch"
+    assert getattr(f.app, install._INSTALLED_ATTR, None) is None
 
 
 @pytest.mark.parametrize("seconds", [-.1, 10.5, float("nan"), float("inf")])
@@ -1447,13 +1453,90 @@ async def test_capture_preempt_env_invalid_declines_install_fail_closed(
     assert machine.state.value == "DECLINED" and machine.code == "capture_preempt_invalid"
 
 
-async def test_capture_reservation_env_never_overrides_explicit_profile(transaction_fixture, monkeypatch):
-    _capture_env(monkeypatch, "6", "3", "retract")
+##############################
+# An explicit buffer profile must state the capture settings of the environment
+
+async def _install_explicit(f, profile):
+    return await install.install_native_runtime(f.app, f.tm, experimental_opt_in=True,
+                                                buffer_profile=profile)
+
+
+@pytest.mark.parametrize("env, changes", [
+    ((None, None), {}),                                   # all defaults: drain 0 against 2
+    ((None, None), {"capture_drain_seconds": 1}),
+    ((None, None), {"capture_busy_wait_seconds": 0}),     # 0 window, reservation on
+    (("0", None), {}),                                    # reservation off, window 10
+    ((None, "0"), {"capture_drain_seconds": 2}),
+    (("6", "3"), {"capture_busy_wait_seconds": 4, "capture_drain_seconds": 1}),
+    (("6", "3"), {"capture_busy_wait_seconds": 6, "capture_drain_seconds": 2}),
+    (("6", "3"), {"capture_busy_wait_seconds": 4, "capture_drain_seconds": 3}),
+])
+@pytest.mark.parametrize("preempt", [None, "retract"])
+async def test_explicit_profile_that_disagrees_with_the_capture_settings_is_refused(
+        transaction_fixture, monkeypatch, env, changes, preempt):
+    """The scheduler ranks apply the window and drain of the environment. A
+    frontend with a shorter drain would time out a parked capture, and a 0
+    window would not disable the reservation."""
+    from occ3_sglang import startup_state
     from occ3_sglang.chat_adapter import BufferProfile
-    explicit = BufferProfile(capture_busy_wait_seconds=4, capture_drain_seconds=1)
-    f = transaction_fixture
-    receipt = await install.install_native_runtime(f.app, f.tm,
-        experimental_opt_in=True, buffer_profile=explicit)
+    _capture_env(monkeypatch, *env, preempt)
+    receipt = await _install_explicit(transaction_fixture, BufferProfile(**changes))
+    assert not receipt.installed and receipt.code == "capture_profile_mismatch"
+    assert getattr(transaction_fixture.app, install._INSTALLED_ATTR, None) is None
+    machine = startup_state.current()
+    assert machine.state.value == "DECLINED" and machine.code == "capture_profile_mismatch"
+    assert machine.stage == "install" and not machine.backend_constructed
+    assert machine.rollback_completed is True
+
+
+@pytest.mark.parametrize("env, changes", [
+    ((None, None, None), {"capture_drain_seconds": 2}),
+    ((None, None, "retract"), {"capture_drain_seconds": 2}),
+    ((None, "0", None), {}),
+    (("0", None, None), {"capture_busy_wait_seconds": 0}),
+    (("1.5", None, None), {"capture_busy_wait_seconds": 1.5, "capture_drain_seconds": 1.5}),
+    (("4", None, "off"), {"capture_busy_wait_seconds": 4, "capture_drain_seconds": 2}),
+    (("6", "3", "retract"), {"capture_busy_wait_seconds": 6, "capture_drain_seconds": 3}),
+])
+async def test_explicit_profile_that_matches_the_capture_settings_keeps_its_identity(
+        transaction_fixture, monkeypatch, env, changes):
+    from occ3_sglang.chat_adapter import BufferProfile
+    _capture_env(monkeypatch, *env)
+    explicit = BufferProfile(max_turn_seconds=120, **changes)
+    receipt = await _install_explicit(transaction_fixture, explicit)
     assert receipt.installed
-    profile = getattr(f.app, install._INSTALLED_ATTR).adapter.profile
-    assert profile is explicit and profile.capture_drain_seconds == 1
+    assert getattr(transaction_fixture.app, install._INSTALLED_ATTR).adapter.profile is explicit
+
+
+@pytest.mark.parametrize("env, code", [
+    (("11", None, None), "capture_busy_wait_seconds_invalid"),
+    ((None, "abc", None), "capture_drain_seconds_invalid"),
+    (("4", "4.01", None), "capture_drain_seconds_invalid"),
+    ((None, None, "on"), "capture_preempt_invalid"),
+    (("11", "abc", "on"), "capture_busy_wait_seconds_invalid"),
+])
+@pytest.mark.parametrize("changes", [{}, {"capture_drain_seconds": 2}],
+                         ids=["default_profile_values", "environment_default_values"])
+async def test_invalid_capture_environment_refuses_an_explicit_profile_with_the_knob_code(
+        transaction_fixture, monkeypatch, env, code, changes):
+    """An explicit profile does not hide a mistyped knob: the scheduler ranks
+    read the same environment."""
+    from occ3_sglang import startup_state
+    from occ3_sglang.chat_adapter import BufferProfile
+    _capture_env(monkeypatch, *env)
+    receipt = await _install_explicit(transaction_fixture, BufferProfile(**changes))
+    assert not receipt.installed and receipt.code == code
+    assert getattr(transaction_fixture.app, install._INSTALLED_ATTR, None) is None
+    assert startup_state.current().code == code
+
+
+@pytest.mark.parametrize("env, code", [
+    ((None, None, None), "unsupported_buffer_profile"),
+    ((None, None, "on"), "capture_preempt_invalid"),
+])
+async def test_unsupported_explicit_profile_is_refused_before_the_comparison(
+        transaction_fixture, monkeypatch, env, code):
+    _capture_env(monkeypatch, *env)
+    receipt = await _install_explicit(transaction_fixture, object())
+    assert not receipt.installed and receipt.code == code
+    assert getattr(transaction_fixture.app, install._INSTALLED_ATTR, None) is None
