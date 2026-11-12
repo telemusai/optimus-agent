@@ -368,12 +368,45 @@ fn serialize_conversation_parallel(messages: &[Message]) -> Option<String> {
         SERIALIZE_MESSAGES_THRESHOLD,
         |message, index| serialize_message_parts(message, &plan[index]),
     )?;
-    let count: usize = part_lists.iter().map(Vec::len).sum();
-    let mut parts: Vec<String> = Vec::with_capacity(count);
-    for list in part_lists {
-        parts.extend(list);
+    Some(assemble_serialized_parts(part_lists))
+}
+
+/// Compute the exact `parts.join("\n\n")` capacity with checked arithmetic.
+fn checked_serialized_capacity(part_count: usize, content_bytes: usize) -> Option<usize> {
+    let separator_bytes = if part_count == 0 {
+        0
+    } else {
+        (part_count - 1).checked_mul(2)?
+    };
+    content_bytes.checked_add(separator_bytes)
+}
+
+/// Assemble per-message parts exactly as `parts.join("\n\n")` did, without
+/// materializing a second flattened vector or copying through `join`.
+fn assemble_serialized_parts(part_lists: Vec<Vec<String>>) -> String {
+    let capacity = part_lists
+        .iter()
+        .flatten()
+        .try_fold((0usize, 0usize), |(part_count, content_bytes), part| {
+            Some((
+                part_count.checked_add(1)?,
+                content_bytes.checked_add(part.len())?,
+            ))
+        })
+        .and_then(|(part_count, content_bytes)| {
+            checked_serialized_capacity(part_count, content_bytes)
+        });
+    // Capacity is only an optimization. Any arithmetic overflow skips
+    // preallocation and follows this same append path; it never changes output
+    // or selects the sequential fallback.
+    let mut serialized = capacity.map_or_else(String::new, String::with_capacity);
+    for (index, part) in part_lists.into_iter().flatten().enumerate() {
+        if index != 0 {
+            serialized.push_str("\n\n");
+        }
+        serialized.push_str(&part);
     }
-    Some(parts.join("\n\n"))
+    serialized
 }
 
 /// Render one message's serialized parts (0 to 3 non-empty strings).
@@ -997,6 +1030,184 @@ mod tests {
             )),
         ];
         assert_eq!(serialize_conversation(&messages), reference(&messages));
+    }
+
+    #[test]
+    fn checked_serialized_capacity_preserves_zero_and_rejects_overflow() {
+        assert_eq!(checked_serialized_capacity(0, 0), Some(0));
+        assert_eq!(checked_serialized_capacity(1, 0), Some(0));
+        assert_eq!(checked_serialized_capacity(2, 0), Some(2));
+        assert_eq!(checked_serialized_capacity(3, 7), Some(11));
+        // Arithmetic-only boundaries: none of these values is passed to an
+        // allocator, so no large-allocation stunt is needed.
+        assert_eq!(checked_serialized_capacity(1, usize::MAX), Some(usize::MAX));
+        assert_eq!(checked_serialized_capacity(2, usize::MAX), None);
+        assert_eq!(checked_serialized_capacity(usize::MAX, 0), None);
+    }
+
+    #[test]
+    fn serialized_part_assembly_matches_join_for_empty_single_and_many_lists() {
+        let cases: Vec<Vec<Vec<String>>> = vec![
+            vec![],
+            vec![vec![]],
+            vec![vec!["only".to_string()]],
+            vec![
+                vec!["first".to_string(), "second\r\n界".to_string()],
+                vec![],
+                vec!["🙂".to_string(), String::new()],
+            ],
+        ];
+        for part_lists in cases {
+            let reference = part_lists
+                .iter()
+                .flatten()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            assert_eq!(assemble_serialized_parts(part_lists), reference);
+        }
+    }
+
+    #[test]
+    fn serialize_conversation_assembly_handles_empty_single_and_many_below_threshold() {
+        fn user(text: &str, timestamp: i64) -> Message {
+            Message::User(UserMessage::new(
+                UserContent::Text(text.to_string()),
+                timestamp,
+            ))
+        }
+
+        let empty: Vec<Message> = Vec::new();
+        assert!(serialize_conversation_parallel(&empty).is_none());
+        assert_eq!(serialize_conversation(&empty), "");
+
+        let single = vec![user("one 界🙂", 1)];
+        assert!(serialize_conversation_parallel(&single).is_none());
+        assert_eq!(serialize_conversation(&single), "[User]: one 界🙂");
+
+        let many = vec![
+            user("", 2),
+            Message::Assistant(AssistantMessage {
+                content: vec![ContentBlock::Thinking(pi_ai::types::ThinkingContent::new(
+                    "not serialized",
+                ))],
+                ..Default::default()
+            }),
+            user("first\r\n第二 🙂", 3),
+            user("last", 4),
+        ];
+        let expected = "[User]: first\r\n第二 🙂\n\n[User]: last";
+        assert!(serialize_conversation_parallel(&many).is_none());
+        assert_eq!(serialize_conversation_sequential(&many), expected);
+        assert_eq!(serialize_conversation(&many), expected);
+    }
+
+    #[test]
+    fn serialize_conversation_parallel_matches_sequential_for_large_mixed_unicode() {
+        use crate::core::compaction::parallel::{
+            approx_llm_messages_bytes, SERIALIZE_AVG_MESSAGE_BYTES, SERIALIZE_BYTES_THRESHOLD,
+            SERIALIZE_MESSAGES_THRESHOLD,
+        };
+        use pi_ai::types::ToolResultMessage;
+
+        fn payload(index: usize, part: &str) -> String {
+            let unit =
+                format!("entry={index}; part={part}; ascii=abcdefgh; unicode=é界🙂; newline=\r\n");
+            let mut output = String::with_capacity(36_100);
+            while output.len() < 36_000 {
+                output.push_str(&unit);
+            }
+            output
+        }
+
+        let mut messages = Vec::new();
+        for index in 0..SERIALIZE_MESSAGES_THRESHOLD {
+            let message = match index % 8 {
+                0 => Message::User(UserMessage::new(
+                    UserContent::Blocks(vec![
+                        ImageOrTextContent::Text(TextContent::new(payload(index, "user-blocks"))),
+                        ImageOrTextContent::Image(Default::default()),
+                    ]),
+                    index as i64,
+                )),
+                1 => Message::Assistant(AssistantMessage {
+                    content: vec![
+                        ContentBlock::Thinking(pi_ai::types::ThinkingContent::new(payload(
+                            index,
+                            "THINKING_SENTINEL",
+                        ))),
+                        ContentBlock::Text(TextContent::new(payload(index, "assistant-text"))),
+                        ContentBlock::Text(TextContent::new("visible tail".to_string())),
+                    ],
+                    ..Default::default()
+                }),
+                2 | 4 => {
+                    let (id, name) = if index % 8 == 2 {
+                        (format!("paired-{index}"), "paired_tool")
+                    } else {
+                        (format!("pending-{index}"), "pending_tool")
+                    };
+                    let mut arguments = serde_json::Map::new();
+                    arguments.insert("path".to_string(), json!(format!("src/{index}/界.rs")));
+                    Message::Assistant(AssistantMessage {
+                        content: vec![
+                            ContentBlock::Text(TextContent::new(payload(index, name))),
+                            ContentBlock::ToolCall(ToolCall::new(id, name, arguments)),
+                        ],
+                        ..Default::default()
+                    })
+                }
+                3 | 5 => {
+                    let paired = index % 8 == 3;
+                    let id = if paired {
+                        format!("paired-{}", index - 1)
+                    } else {
+                        format!("missing-{index}")
+                    };
+                    let name = if paired { "paired_tool" } else { "orphan_tool" };
+                    Message::ToolResult(ToolResultMessage::new(
+                        id,
+                        name,
+                        vec![
+                            ImageOrTextContent::Text(TextContent::new(payload(index, name))),
+                            ImageOrTextContent::Image(Default::default()),
+                        ],
+                        !paired,
+                        index as i64,
+                    ))
+                }
+                6 => Message::Assistant(AssistantMessage {
+                    content: vec![ContentBlock::Thinking(pi_ai::types::ThinkingContent::new(
+                        payload(index, "THINKING_SENTINEL"),
+                    ))],
+                    ..Default::default()
+                }),
+                7 => Message::User(UserMessage::new(
+                    UserContent::Text(payload(index, "user-text")),
+                    index as i64,
+                )),
+                _ => unreachable!(),
+            };
+            messages.push(message);
+        }
+
+        let bytes = approx_llm_messages_bytes(&messages);
+        assert!(messages.len() >= SERIALIZE_MESSAGES_THRESHOLD);
+        assert!(bytes >= SERIALIZE_BYTES_THRESHOLD);
+        assert!(bytes / messages.len() >= SERIALIZE_AVG_MESSAGE_BYTES);
+
+        let parallel = serialize_conversation_parallel(&messages)
+            .expect("large mixed input must take the real parallel serializer");
+        let sequential = serialize_conversation_sequential(&messages);
+        assert_eq!(parallel.as_bytes(), sequential.as_bytes());
+        assert_eq!(
+            serialize_conversation(&messages).as_bytes(),
+            sequential.as_bytes()
+        );
+        assert!(!sequential.contains("THINKING_SENTINEL"));
+        assert!(sequential.contains("pending_tool"));
+        assert!(sequential.contains("orphan_tool (call outside excerpt)"));
+        assert!(sequential.contains("\r\n"));
     }
 
     #[test]

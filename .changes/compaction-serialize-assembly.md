@@ -1,0 +1,1 @@
+- Removed the intermediate flattened vector from large compaction conversation serialization by appending the existing ordered parts into a pre-sized string; added byte-for-byte parity coverage for Unicode, CRLF, incomplete tools, small inputs, and the real above-threshold parallel path.
