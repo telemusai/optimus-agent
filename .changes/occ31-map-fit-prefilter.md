@@ -1,0 +1,1 @@
+- Improved OCC3.1 dense preparation by avoiding map-context cloning and JSON encoding when unchanged UTF-8 source bytes already exceed the 256 KiB request bound; all borderline candidates retain the exact serialized-size and token-budget checks.
