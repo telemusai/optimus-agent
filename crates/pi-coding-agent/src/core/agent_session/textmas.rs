@@ -378,51 +378,53 @@ impl AgentSession {
             || ensure_textmas_current(self, run, parent_signal),
         )?;
         let map_count = plan.map_contexts.len();
-        let map_calls = stream::iter(plan.map_contexts.iter().cloned().enumerate().map(
-            |(index, context)| async move {
-                let call_index = u32::try_from(index)
-                    .map_err(|_| "OCC3.1 mapper call index overflow".to_string())?;
-                self.run_textmas_role(
-                    run,
-                    TextMasRole::Mapper,
-                    Some(call_index),
-                    context,
-                    parent_signal,
-                )
-                .await
-            },
-        ))
-        .buffered(3)
-        .try_collect::<Vec<_>>()
-        .await?;
-        let mut briefs = map_calls;
-        let mut reduce_count = 0usize;
-        while briefs.len() > 1 {
-            ensure_textmas_current(self, run, parent_signal)?;
-            let contexts = plan.reduction_contexts_with_control(
-                &run.model,
-                &briefs,
-                || ensure_textmas_current(self, run, parent_signal),
-            )?;
-            let first_index = reduce_count;
-            let context_count = contexts.len();
-            briefs = stream::iter(contexts.into_iter().enumerate().map(
-                |(offset, context)| async move {
-                    let call_index = u32::try_from(first_index + offset)
-                        .map_err(|_| "OCC3.1 reducer call index overflow".to_string())?;
+        let map_calls = collect_indexed_textmas_calls(stream::iter(
+            plan.map_contexts
+                .iter()
+                .cloned()
+                .enumerate()
+                .map(|(index, context)| async move {
+                    let call_index = u32::try_from(index)
+                        .map_err(|_| "OCC3.1 mapper call index overflow".to_string())?;
                     self.run_textmas_role(
                         run,
-                        TextMasRole::Reducer,
+                        TextMasRole::Mapper,
                         Some(call_index),
                         context,
                         parent_signal,
                     )
                     .await
-                },
-            ))
-            .buffered(3)
-            .try_collect::<Vec<_>>()
-            .await?;
+                    .map(|text| (index, text))
+                }),
+        ))
+        .await?;
+        let mut briefs = map_calls;
+        let mut reduce_count = 0usize;
+        while briefs.len() > 1 {
+            ensure_textmas_current(self, run, parent_signal)?;
+            let contexts = plan.reduction_contexts_with_control(&run.model, &briefs, || {
+                ensure_textmas_current(self, run, parent_signal)
+            })?;
+            let first_index = reduce_count;
+            let context_count = contexts.len();
+            briefs =
+                collect_indexed_textmas_calls(stream::iter(contexts.into_iter().enumerate().map(
+                    |(offset, context)| async move {
+                        let source_index = first_index + offset;
+                        let call_index = u32::try_from(source_index)
+                            .map_err(|_| "OCC3.1 reducer call index overflow".to_string())?;
+                        self.run_textmas_role(
+                            run,
+                            TextMasRole::Reducer,
+                            Some(call_index),
+                            context,
+                            parent_signal,
+                        )
+                        .await
+                        .map(|text| (source_index, text))
+                    },
+                )))
+                .await?;
             reduce_count = first_index + context_count;
         }
         let brief = briefs
@@ -620,6 +622,21 @@ fn ensure_textmas_current(
         Ok(())
     }
 }
+
+/// Keep at most three role calls in flight and restore source indices before a next level.
+/// Return the first observed error immediately, sorting only after complete success.
+async fn collect_indexed_textmas_calls<S, F>(calls: S) -> Result<Vec<String>, String>
+where
+    S: futures::Stream<Item = F>,
+    F: std::future::Future<Output = Result<(usize, String), String>>,
+{
+    let mut indexed = calls.buffer_unordered(3).try_collect::<Vec<_>>().await?;
+    indexed.sort_by_key(|(index, _)| *index);
+    Ok(indexed.into_iter().map(|(_, text)| text).collect())
+}
+#[cfg(test)]
+#[path = "textmas_indexed_tests.rs"]
+mod indexed_tests;
 
 async fn resize_textmas_images(
     session: &Arc<AgentSession>,

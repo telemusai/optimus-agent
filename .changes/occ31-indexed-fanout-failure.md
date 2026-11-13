@@ -1,0 +1,1 @@
+- Fixed OCC3.1 indexed mapper and reducer fan-out to return the first observed error at bounded concurrency 3, drop unfinished admitted calls, and leave never-admitted calls out of usage accounting. Successful outputs are restored to logical source order only after the complete collection succeeds; failed levels publish no drafts and start no later-level work.

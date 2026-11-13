@@ -919,6 +919,91 @@ async fn invalid_preferences_and_transcript_persistence_fail_before_any_advisory
     }
 }
 
+
+
+#[tokio::test]
+async fn model_change_cancels_every_admitted_mapper_only_once() {
+    let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let f = Fixture::new();
+    let session = f.session(0, true).await;
+    f.reply(text_reply("HISTORY_ANSWER"), None, None);
+    let history = "h".repeat(MAX_CONTEXT_BYTES * 12);
+    turn(&session, &history, None).await.unwrap();
+    let baseline_calls = f.captured.lock().unwrap().len();
+    let file = session.session_file().unwrap();
+    textmas_settings::set_mode(&file, TextMasMode::Sequential).unwrap();
+    let mapper_gate = Arc::new(tokio::sync::Semaphore::new(0));
+    // Faux responses are consumed once per provider call. Arm every admitted
+    // mapper with the same gate so model invalidation, rather than an empty
+    // scripted-response queue, determines the terminal behavior.
+    for _ in 0..3 {
+        f.reply(
+            text_reply("STALE_MODEL_DRAFT"),
+            Some(file.clone()),
+            Some(mapper_gate.clone()),
+        );
+    }
+    let running = tokio::spawn({
+        let session = session.clone();
+        async move { session.prompt("CURRENT_REQUEST", None).await }
+    });
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while f.captured.lock().unwrap().len() < baseline_calls + 3 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("bounded mapper admission follows the oversized history");
+    let mut other = session.model().unwrap();
+    other.id = "another-ordinary-model".into();
+    session.set_model(other, Default::default()).await.unwrap();
+    let _ = tokio::time::timeout(Duration::from_secs(10), running)
+        .await
+        .expect("model invalidation settles the mapper fan-out");
+    idle(&session).await;
+    {
+        let captured = f.captured.lock().unwrap();
+        assert_eq!(
+            captured.len(),
+            baseline_calls + 3,
+            "no later level, role, parent, or unadmitted mapper"
+        );
+        assert!(captured[baseline_calls..].iter().all(|context| {
+            context
+                .system_prompt
+                .as_deref()
+                .unwrap_or_default()
+                .contains("advisory role: mapper")
+        }));
+    }
+    let mut identities = std::collections::BTreeMap::<u64, Vec<String>>::new();
+    for line in std::fs::read_to_string(session.session_file().unwrap())
+        .unwrap()
+        .lines()
+    {
+        let entry: serde_json::Value = serde_json::from_str(line).unwrap();
+        if entry["customType"] == "occ31_textmas_usage" && entry["data"]["role"] == "mapper" {
+            identities
+                .entry(entry["data"]["callIndex"].as_u64().unwrap())
+                .or_default()
+                .push(entry["data"]["status"].as_str().unwrap().to_string());
+        }
+    }
+    assert_eq!(identities.len(), 3);
+    for (index, statuses) in identities {
+        assert_eq!(
+            statuses.iter().map(String::as_str).collect::<Vec<_>>(),
+            ["started", "cancelled"],
+            "mapper {index}: one Started and exactly one Cancelled"
+        );
+    }
+    assert_eq!(ledger(&session).summary().unwrap().calls, 3);
+    assert!(!serde_json::to_string(&session.messages())
+        .unwrap()
+        .contains("STALE_MODEL_DRAFT"));
+    session.dispose_async(Some(false)).await;
+}
+
 #[tokio::test]
 async fn model_change_cancels_the_advisory_call_instead_of_reinterpreting_its_draft() {
     let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
