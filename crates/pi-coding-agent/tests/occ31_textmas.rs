@@ -1,7 +1,7 @@
 //! OCC3.1 native execution through a registered offline, non-latent custom provider.
 use pi_ai::providers::faux::*;
 use pi_ai::types::{AssistantMessage, ContentBlock, Context, Message, Model, ToolCall};
-use pi_coding_agent::core::occ::{textmas::{MAX_CONTEXT_BYTES, TextMasMode, TextMasUsageLedger, usage_record}, textmas_settings};
+use pi_coding_agent::core::occ::{textmas::{MAX_CONTEXT_BYTES, TextMasCallStatus, TextMasMode, TextMasRole, TextMasUsageLedger, TextMasUsageRecord, usage_record}, textmas_settings};
 use pi_coding_agent::core::extensions::types::{ExtensionEvent, ExtensionFactory, InputSource};
 use pi_coding_agent::core::agent_session::{AgentSession, PromptOptions};
 use pi_coding_agent::core::agent_session_services::*;
@@ -249,7 +249,133 @@ impl Drop for Fixture {
     }
 }
 
+#[derive(Clone, Default)]
+struct RoleProbe {
+    active: Arc<std::sync::atomic::AtomicUsize>,
+    peak: Arc<std::sync::atomic::AtomicUsize>,
+    entered: Arc<Mutex<Vec<String>>>,
+    exited: Arc<Mutex<Vec<String>>>,
+    parent_calls: Arc<std::sync::atomic::AtomicUsize>,
+    capacity_refusals: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl RoleProbe {
+    async fn wait_for_roles(&self, count: usize) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while self.entered.lock().unwrap().len() < count { tokio::task::yield_now().await; }
+        }).await.expect("all independent roles entered");
+    }
+    async fn wait_for_exit(&self, role: &str) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !self.exited.lock().unwrap().iter().any(|entry| entry == role) { tokio::task::yield_now().await; }
+        }).await.expect("released role did not finish");
+    }
+}
+
+struct ActiveRole(RoleProbe, &'static str);
+impl Drop for ActiveRole {
+    fn drop(&mut self) {
+        self.0.active.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        self.0.exited.lock().unwrap().push(self.1.into());
+    }
+}
+
+#[derive(Clone)]
+struct ControlledRole {
+    message: AssistantMessage,
+    gate: Option<Arc<tokio::sync::Semaphore>>,
+    admission_gate: Option<Arc<tokio::sync::Semaphore>>,
+    reject_if_busy: bool,
+}
+impl Default for ControlledRole {
+    fn default() -> Self {
+        Self { message: text_reply(""), gate: None, admission_gate: None, reject_if_busy: false }
+    }
+}
+
+fn provider_error(text: &str) -> AssistantMessage {
+    faux_assistant_message("".into(), Some(FauxAssistantMessageOptions {
+        stop_reason: Some("error".into()), error_message: Some(text.into()), ..Default::default()
+    }))
+}
+
+async fn controlled_wait(gate: &Arc<tokio::sync::Semaphore>, signal: Option<&tokio_util::sync::CancellationToken>) -> bool {
+    tokio::select! {
+        permit = gate.acquire() => { permit.unwrap().forget(); true },
+        _ = async { if let Some(signal) = signal { signal.cancelled().await } else { std::future::pending::<()>().await } } => false,
+    }
+}
+
+fn controlled_roles(f: &Fixture, roles: [ControlledRole; 3], probe: RoleProbe) {
+    let roles = Arc::new(roles);
+    let steps = (0..4).map(|_| {
+        let roles = roles.clone();
+        let probe = probe.clone();
+        let captured = f.captured.clone();
+        FauxResponseStep::Factory(Arc::new(move |context, options, _, model| {
+            assert_eq!(model.provider, "textmas-custom-nonlatent");
+            assert_eq!(model.api, "offline-textmas-api");
+            let options = options.unwrap();
+            assert_eq!(options.api_key.as_deref(), Some("synthetic-textmas-key"));
+            captured.lock().unwrap().push(context.clone());
+            if context.tools.is_some() {
+                probe.parent_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let message = text_reply("PRACTICAL_FINAL_ANSWER");
+                return Box::pin(async move { message });
+            }
+            assert!(options.inference_state.is_none());
+            assert!(options.source_capture.is_none());
+            assert!(options.max_tokens.unwrap() <= 2048.0);
+            assert_eq!(options.timeout_ms, Some(120000.0));
+            assert!(serde_json::to_vec(&context).unwrap().len() <= MAX_CONTEXT_BYTES);
+            let prompt = context.system_prompt.as_deref().unwrap_or_default();
+            let (index, role): (usize, &'static str) = if prompt.contains("advisory role: planner") {
+                (0, "planner")
+            } else if prompt.contains("advisory role: critic") {
+                (1, "critic")
+            } else if prompt.contains("advisory role: refiner") {
+                (2, "refiner")
+            } else { panic!("expected one independent reasoning role") };
+            let behavior = roles[index].clone();
+            let signal = options.signal.clone();
+            // Keep the response factory reusable: only this per-call clone enters the future.
+            let call_probe = probe.clone();
+            Box::pin(async move {
+                if let Some(gate) = behavior.admission_gate.as_ref() {
+                    if !controlled_wait(gate, signal.as_ref()).await {
+                        return provider_error("synthetic admission cancelled; no active work was published");
+                    }
+                }
+                if behavior.reject_if_busy && call_probe.active.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+                    call_probe.entered.lock().unwrap().push(role.into());
+                    call_probe.capacity_refusals.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    return provider_error("synthetic provider capacity limit");
+                }
+                let active = call_probe.active.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                call_probe.peak.fetch_max(active, std::sync::atomic::Ordering::SeqCst);
+                // Waiters know this active call is visible before they release a gated peer.
+                call_probe.entered.lock().unwrap().push(role.into());
+                let _active = ActiveRole(call_probe, role);
+                if let Some(gate) = behavior.gate.as_ref() {
+                    let _ = controlled_wait(gate, signal.as_ref()).await;
+                }
+                behavior.message
+            })
+        }))
+    }).collect();
+    f.provider.append_responses(steps);
+}
+
+fn role_usage(session: &AgentSession) -> Vec<TextMasUsageRecord> {
+    session.session_manager.lock().unwrap().get_entries().iter().filter_map(usage_record).collect()
+}
+fn terminal_status(session: &AgentSession, role: TextMasRole) -> Vec<TextMasCallStatus> {
+    role_usage(session).into_iter().filter(|record| record.role == role && record.status != TextMasCallStatus::Started)
+        .map(|record| record.status).collect()
+}
+
 async fn idle(session: &Arc<AgentSession>) {
+
     let _ = tokio::time::timeout(Duration::from_secs(20), session.wait_for_headless_idle()).await.expect("session settled");
 }
 async fn turn(session: &Arc<AgentSession>, text: &str, options: Option<PromptOptions>) -> Result<(), String> {
@@ -807,6 +933,256 @@ async fn provider_error_refusal_empty_and_tool_attempt_fail_without_retry_or_exe
 }
 
 #[tokio::test]
+async fn hierarchical_overlap_preserves_order_usage_and_sequential_dependencies() {
+    let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    for mode in [TextMasMode::Hierarchical, TextMasMode::Sequential] {
+        let f = Fixture::new();
+        let session = f.session(0, false).await;
+        textmas_settings::set_mode(&session.session_file().unwrap(), mode).unwrap();
+        let gates = [
+            Arc::new(tokio::sync::Semaphore::new(0)),
+            Arc::new(tokio::sync::Semaphore::new(0)),
+            Arc::new(tokio::sync::Semaphore::new(0)),
+        ];
+        let texts = ["PLANNER_DRAFT", "CRITIC_DRAFT", "REFINER_DRAFT"];
+        let roles = gates.iter().zip(texts).map(|(gate, text)| ControlledRole {
+            message: text_reply(text),
+            gate: if mode == TextMasMode::Hierarchical { Some(gate.clone()) } else { None },
+            ..Default::default()
+        }).collect::<Vec<_>>();
+        let probe = RoleProbe::default();
+        controlled_roles(&f, roles.try_into().ok().unwrap(), probe.clone());
+        if mode == TextMasMode::Hierarchical {
+            let running = tokio::spawn({ let session = session.clone(); async move { session.prompt("CURRENT_REQUEST", None).await } });
+            let _cleanup = AbortOnDrop(running.abort_handle());
+            probe.wait_for_roles(3).await;
+            // Synthetic inverse completion: no ordering result depends on timing granularity.
+            gates[1].add_permits(1); probe.wait_for_exit("critic").await;
+            gates[2].add_permits(1); probe.wait_for_exit("refiner").await;
+            gates[0].add_permits(1);
+            tokio::time::timeout(Duration::from_secs(10), running).await.unwrap().unwrap().unwrap();
+        } else {
+            turn(&session, "CURRENT_REQUEST", None).await.unwrap();
+        }
+        idle(&session).await;
+        assert_eq!(probe.peak.load(std::sync::atomic::Ordering::SeqCst), if mode == TextMasMode::Hierarchical { 3 } else { 1 });
+        assert_eq!(probe.parent_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let contexts = f.captured.lock().unwrap().clone();
+        assert_eq!(contexts.len(), 4);
+        for name in ["planner", "critic", "refiner"] {
+            let label = format!("advisory role: {name}");
+            let matched = contexts.iter().filter(|context| context.system_prompt.as_deref().is_some_and(|prompt| prompt.contains(&label))).collect::<Vec<_>>();
+            assert_eq!(matched.len(), 1, "role {name} must have exactly one correlated context");
+            let text = serde_json::to_string(&matched[0]).unwrap();
+            assert!(text.contains("CURRENT_REQUEST") && text.contains("TEXTMAS_PROJECT_INSTRUCTIONS"));
+            if name == "critic" {
+                assert_eq!(text.contains("PLANNER_DRAFT"), mode == TextMasMode::Sequential);
+            } else if name == "refiner" {
+                assert_eq!(text.contains("PLANNER_DRAFT"), mode == TextMasMode::Sequential);
+                assert_eq!(text.contains("CRITIC_DRAFT"), mode == TextMasMode::Sequential);
+            }
+        }
+        let parent = serde_json::to_string(&contexts[3].messages).unwrap();
+        let planner_pos = parent.find("PLANNER_DRAFT").unwrap();
+        let critic_pos = parent.find("CRITIC_DRAFT").unwrap();
+        let refiner_pos = parent.find("REFINER_DRAFT").unwrap();
+        assert!(planner_pos < critic_pos && critic_pos < refiner_pos);
+        for role in TextMasRole::ALL {
+            assert_eq!(terminal_status(&session, role), vec![TextMasCallStatus::Completed]);
+        }
+        if mode == TextMasMode::Hierarchical {
+            assert_eq!(probe.exited.lock().unwrap().as_slice(), ["critic", "refiner", "planner"]);
+            let records = role_usage(&session);
+            let terminal = records.iter().filter(|record| record.status != TextMasCallStatus::Started).collect::<Vec<_>>();
+            assert_eq!(terminal.len(), 3);
+            assert!(terminal.iter().all(|record| record.usage_known));
+            // Ordinary faux responses estimate token counters; a zero price is still unknown cost.
+            assert!(terminal.iter().all(|record| !record.cost_known));
+            let expected_tokens = terminal.iter().map(|record| {
+                let usage = record.usage.as_ref().unwrap();
+                if usage.total_tokens > 0.0 { usage.total_tokens }
+                else { usage.input + usage.output + usage.cache_read + usage.cache_write }
+            }).sum::<f64>();
+            let expected_input = terminal.iter().map(|record| record.usage.as_ref().unwrap().input).sum::<f64>();
+            let expected_output = terminal.iter().map(|record| record.usage.as_ref().unwrap().output).sum::<f64>();
+            let summary = ledger(&session).summary().unwrap();
+            assert_eq!(summary.calls, 3);
+            assert_eq!(summary.unknown_usage_calls, 0);
+            assert_eq!(summary.unknown_cost_calls, 3);
+            assert_eq!(summary.known_tokens, expected_tokens);
+            assert_eq!(summary.known_subtotal.input, expected_input);
+            assert_eq!(summary.known_subtotal.output, expected_output);
+        }
+        session.dispose_async(Some(false)).await;
+    }
+
+    // Controlled synthetic simultaneous completion: release all three in-flight roles together.
+    let f = Fixture::new();
+    let session = f.session(0, false).await;
+    textmas_settings::set_mode(&session.session_file().unwrap(), TextMasMode::Hierarchical).unwrap();
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let role = |text| ControlledRole { message: text_reply(text), gate: Some(gate.clone()), ..Default::default() };
+    let probe = RoleProbe::default();
+    controlled_roles(&f, [role("PLANNER_DRAFT"), role("CRITIC_DRAFT"), role("REFINER_DRAFT")], probe.clone());
+    let running = tokio::spawn({ let session = session.clone(); async move { session.prompt("CURRENT_REQUEST", None).await } });
+    let _cleanup = AbortOnDrop(running.abort_handle());
+    probe.wait_for_roles(3).await;
+    gate.add_permits(3);
+    tokio::time::timeout(Duration::from_secs(10), running).await.unwrap().unwrap().unwrap();
+    idle(&session).await;
+    assert_eq!(probe.peak.load(std::sync::atomic::Ordering::SeqCst), 3);
+    assert_eq!(probe.parent_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    for role in TextMasRole::ALL {
+        assert_eq!(terminal_status(&session, role), vec![TextMasCallStatus::Completed]);
+    }
+    let parent = serde_json::to_string(&f.captured.lock().unwrap().last().unwrap().messages).unwrap();
+    let planner_pos = parent.find("PLANNER_DRAFT").unwrap();
+    let critic_pos = parent.find("CRITIC_DRAFT").unwrap();
+    let refiner_pos = parent.find("REFINER_DRAFT").unwrap();
+    assert!(planner_pos < critic_pos && critic_pos < refiner_pos);
+    session.dispose_async(Some(false)).await;
+}
+
+
+#[tokio::test]
+async fn hierarchical_each_role_failure_promptly_cancels_inflight_siblings() {
+    let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    for (failed_index, failed_role) in TextMasRole::ALL.into_iter().enumerate() {
+        let f = Fixture::new();
+        let session = f.session(0, false).await;
+        textmas_settings::set_mode(&session.session_file().unwrap(), TextMasMode::Hierarchical).unwrap();
+        let slow = Arc::new(tokio::sync::Semaphore::new(0));
+        let fail = Arc::new(tokio::sync::Semaphore::new(0));
+        let roles = TextMasRole::ALL.into_iter().enumerate().map(|(index, role)| ControlledRole {
+            message: if index == failed_index { provider_error(&format!("selected {} failure", role.as_str())) } else { text_reply(role.as_str()) },
+                        gate: Some(if index == failed_index { fail.clone() } else { slow.clone() }),
+            reject_if_busy: false, ..Default::default()
+        }).collect::<Vec<_>>();
+        let probe = RoleProbe::default();
+        controlled_roles(&f, roles.try_into().ok().unwrap(), probe.clone());
+        let running = tokio::spawn({ let session = session.clone(); async move { session.prompt("CURRENT_REQUEST", None).await } });
+        let _cleanup = AbortOnDrop(running.abort_handle());
+        probe.wait_for_roles(3).await;
+        fail.add_permits(1);
+        let result = tokio::time::timeout(Duration::from_secs(5), running).await.unwrap().unwrap();
+        assert!(result.unwrap_err().contains(&format!("OCC3.1 {}", failed_role.as_str())));
+        assert_eq!(probe.parent_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(f.captured.lock().unwrap().len(), 3);
+        for role in TextMasRole::ALL {
+            let expected = if role == failed_role { TextMasCallStatus::Failed } else { TextMasCallStatus::Cancelled };
+            assert_eq!(terminal_status(&session, role), vec![expected], "failed role {failed_role:?}; sibling {role:?}");
+        }
+        let records = role_usage(&session);
+        assert_eq!(records.iter().filter(|record| record.status == TextMasCallStatus::Started).count(), 3);
+        assert_eq!(records.iter().filter(|record| record.call_index.is_some()).count(), 0);
+        assert_eq!(records.iter().map(|record| record.action_id.clone()).collect::<std::collections::HashSet<_>>().len(), 1);
+        let terminal = records.iter().filter(|record| record.status != TextMasCallStatus::Started).collect::<Vec<_>>();
+        let cancelled = terminal.iter().filter(|record| record.status == TextMasCallStatus::Cancelled).collect::<Vec<_>>();
+        assert_eq!(cancelled.len(), 2);
+        assert!(cancelled.iter().all(|record| !record.usage_known && !record.cost_known));
+        let failed = terminal.iter().find(|record| record.status == TextMasCallStatus::Failed).unwrap();
+        assert!(failed.usage_known, "the deterministic provider error retains estimated tokens");
+        let summary = ledger(&session).summary().unwrap();
+        assert_eq!(summary.calls, 3);
+        assert_eq!(summary.unknown_usage_calls, 2, "failed role has usage; both cancelled siblings remain unknown");
+        assert_eq!(summary.unknown_cost_calls, 3);
+        slow.add_permits(2);
+        session.dispose_async(Some(false)).await;
+    }
+}
+
+#[tokio::test]
+async fn hierarchical_parent_abort_cancels_every_role_without_parent_execution() {
+    let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let f = Fixture::new();
+    let session = f.session(0, false).await;
+    textmas_settings::set_mode(&session.session_file().unwrap(), TextMasMode::Hierarchical).unwrap();
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let role = |text| ControlledRole { message: text_reply(text), gate: Some(gate.clone()), reject_if_busy: false, ..Default::default() };
+    let probe = RoleProbe::default();
+    controlled_roles(&f, [role("STALE_PLANNER"), role("STALE_CRITIC"), role("STALE_REFINER")], probe.clone());
+    let running = tokio::spawn({ let session = session.clone(); async move { session.prompt("CURRENT_REQUEST", None).await } });
+    let _cleanup = AbortOnDrop(running.abort_handle());
+    probe.wait_for_roles(3).await;
+    session.abort().await.unwrap();
+    assert!(tokio::time::timeout(Duration::from_secs(10), running).await.unwrap().unwrap().is_err());
+    idle(&session).await;
+    assert_eq!(probe.parent_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert_eq!(f.captured.lock().unwrap().len(), 3);
+    for role in TextMasRole::ALL {
+        assert_eq!(terminal_status(&session, role), vec![TextMasCallStatus::Cancelled]);
+    }
+    assert!(!serde_json::to_string(&session.messages()).unwrap().contains("STALE_"));
+    gate.add_permits(3);
+    session.dispose_async(Some(false)).await;
+}
+
+#[tokio::test]
+async fn hierarchical_provider_capacity_refusal_fails_without_serial_fallback() {
+    let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let f = Fixture::new();
+    let session = f.session(0, false).await;
+    textmas_settings::set_mode(&session.session_file().unwrap(), TextMasMode::Hierarchical).unwrap();
+    let planner_gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let critic_admission = Arc::new(tokio::sync::Semaphore::new(0));
+    let refiner_admission = Arc::new(tokio::sync::Semaphore::new(0));
+    let probe = RoleProbe::default();
+    controlled_roles(&f, [
+        ControlledRole { message: text_reply("PLANNER_DRAFT"), gate: Some(planner_gate.clone()), ..Default::default() },
+        ControlledRole { message: provider_error("unused rejection message"), admission_gate: Some(critic_admission.clone()), reject_if_busy: true, ..Default::default() },
+        ControlledRole { message: text_reply("REFINER_DRAFT"), admission_gate: Some(refiner_admission.clone()), ..Default::default() },
+    ], probe.clone());
+    let running = tokio::spawn({ let session = session.clone(); async move { session.prompt("CURRENT_REQUEST", None).await } });
+    let _cleanup = AbortOnDrop(running.abort_handle());
+    probe.wait_for_roles(1).await;
+    assert_eq!(probe.entered.lock().unwrap().as_slice(), ["planner"]);
+    critic_admission.add_permits(1);
+    let error = tokio::time::timeout(Duration::from_secs(10), running).await.unwrap().unwrap().unwrap_err();
+    assert!(error.contains("OCC3.1 critic"), "{error}");
+    assert_eq!(probe.capacity_refusals.load(std::sync::atomic::Ordering::SeqCst), 1, "the gated busy-refusal path must execute");
+    assert_eq!(probe.peak.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(probe.entered.lock().unwrap().as_slice(), ["planner", "critic"]);
+    assert_eq!(probe.parent_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert_eq!(terminal_status(&session, TextMasRole::Planner), vec![TextMasCallStatus::Cancelled]);
+    assert_eq!(terminal_status(&session, TextMasRole::Critic), vec![TextMasCallStatus::Failed]);
+    let refiner = terminal_status(&session, TextMasRole::Refiner);
+    assert!(refiner.is_empty() || refiner == [TextMasCallStatus::Cancelled]);
+    let records = role_usage(&session);
+    let started = records.iter().filter(|record| record.status == TextMasCallStatus::Started).count();
+    let terminal = records.iter().filter(|record| record.status != TextMasCallStatus::Started).count();
+    assert!((2..=3).contains(&started) && started == terminal);
+    assert_eq!(ledger(&session).summary().unwrap().calls, started);
+    planner_gate.add_permits(1);
+    refiner_admission.add_permits(1);
+    session.dispose_async(Some(false)).await;
+}
+
+
+#[tokio::test(start_paused = true)]
+async fn hierarchical_timeout_cancels_siblings_without_resetting_role_deadlines() {
+    let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let f = Fixture::new();
+    let session = f.session(0, false).await;
+    textmas_settings::set_mode(&session.session_file().unwrap(), TextMasMode::Hierarchical).unwrap();
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let role = |text| ControlledRole { message: text_reply(text), gate: Some(gate.clone()), reject_if_busy: false, ..Default::default() };
+    let probe = RoleProbe::default();
+    controlled_roles(&f, [role("LATE_PLANNER"), role("LATE_CRITIC"), role("LATE_REFINER")], probe.clone());
+    let running = tokio::spawn({ let session = session.clone(); async move { session.prompt("CURRENT_REQUEST", None).await } });
+    let _cleanup = AbortOnDrop(running.abort_handle());
+    probe.wait_for_roles(3).await;
+    tokio::time::advance(Duration::from_secs(121)).await;
+    let result = tokio::time::timeout(Duration::from_secs(10), running).await.unwrap().unwrap();
+    assert!(result.unwrap_err().contains("timed out"));
+    assert_eq!(probe.parent_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    let statuses = TextMasRole::ALL.into_iter().flat_map(|role| terminal_status(&session, role)).collect::<Vec<_>>();
+    assert_eq!(statuses.iter().filter(|status| **status == TextMasCallStatus::TimedOut).count(), 1);
+    assert_eq!(statuses.iter().filter(|status| **status == TextMasCallStatus::Cancelled).count(), 2);
+    assert_eq!(ledger(&session).summary().unwrap().calls, 3);
+    gate.add_permits(3);
+    session.dispose_async(Some(false)).await;
+}
+#[tokio::test]
 async fn cancellation_settles_without_final_execution_and_next_turn_has_fresh_roles() {
     let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
     let f = Fixture::new();
@@ -851,23 +1227,24 @@ async fn cancellation_settles_without_final_execution_and_next_turn_has_fresh_ro
 #[tokio::test]
 async fn final_provider_retry_reuses_three_drafts_without_another_stage_call() {
     let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
-    let f = Fixture::new();
-    let session = f.session(0, true).await;
-    let file = session.session_file().unwrap();
-    textmas_settings::set_mode(&file, TextMasMode::Sequential).unwrap();
-    f.drafts(&file);
-    f.reply(faux_assistant_message("".into(), Some(FauxAssistantMessageOptions { stop_reason: Some("error".into()), error_message: Some("temporary provider failure".into()), ..Default::default() })), None, None);
-    f.reply(text_reply("RETRIED_JUDGER"), None, None);
-    turn(&session, "CURRENT_REQUEST", None).await.unwrap();
-    let contexts = f.captured.lock().unwrap();
-    assert_eq!(contexts.len(), 5);
-    assert!(contexts[3].tools.is_some() && contexts[4].tools.is_some());
-    assert!(serde_json::to_string(&contexts[4].messages).unwrap().contains("REFINER_DRAFT"));
-    drop(contexts);
-    assert_eq!(ledger(&session).summary().unwrap().calls, 3);
-    session.dispose_async(Some(false)).await;
+    for mode in [TextMasMode::Sequential, TextMasMode::Hierarchical] {
+        let f = Fixture::new();
+        let session = f.session(0, true).await;
+        let file = session.session_file().unwrap();
+        textmas_settings::set_mode(&file, mode).unwrap();
+        f.drafts(&file);
+        f.reply(faux_assistant_message("".into(), Some(FauxAssistantMessageOptions { stop_reason: Some("error".into()), error_message: Some("temporary provider failure".into()), ..Default::default() })), None, None);
+        f.reply(text_reply("RETRIED_JUDGER"), None, None);
+        turn(&session, "CURRENT_REQUEST", None).await.unwrap();
+        let contexts = f.captured.lock().unwrap();
+        assert_eq!(contexts.len(), 5);
+        assert!(contexts[3].tools.is_some() && contexts[4].tools.is_some());
+        assert!(serde_json::to_string(&contexts[4].messages).unwrap().contains("REFINER_DRAFT"));
+        drop(contexts);
+        assert_eq!(ledger(&session).summary().unwrap().calls, 3);
+        session.dispose_async(Some(false)).await;
+    }
 }
-
 #[tokio::test]
 async fn usage_records_are_deduplicated_in_disk_inventory_and_context_tree() {
     use pi_coding_agent::core::occ::textmas::{TextMasCallStatus, TextMasRole, TextMasUsageRecord, USAGE_CUSTOM_TYPE};
@@ -924,22 +1301,29 @@ async fn model_change_cancels_the_advisory_call_instead_of_reinterpreting_its_dr
     let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
     let f = Fixture::new();
     let session = f.session(0, true).await;
-    let file = session.session_file().unwrap();
-    textmas_settings::set_mode(&file, TextMasMode::Hierarchical).unwrap();
-    f.reply(text_reply("STALE_MODEL_DRAFT"), Some(file), Some(Arc::new(tokio::sync::Semaphore::new(0))));
+    textmas_settings::set_mode(&session.session_file().unwrap(), TextMasMode::Hierarchical).unwrap();
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let role = |text| ControlledRole { message: text_reply(text), gate: Some(gate.clone()), reject_if_busy: false, ..Default::default() };
+    let probe = RoleProbe::default();
+    controlled_roles(&f, [role("STALE_PLANNER"), role("STALE_CRITIC"), role("STALE_REFINER")], probe.clone());
     let running = tokio::spawn({ let session = session.clone(); async move { session.prompt("CURRENT_REQUEST", None).await } });
-    tokio::time::timeout(Duration::from_secs(10), async {
-        while f.captured.lock().unwrap().is_empty() { tokio::task::yield_now().await; }
-    }).await.unwrap();
-    let mut other = session.model().unwrap(); other.id = "another-ordinary-model".into();
+    let _cleanup = AbortOnDrop(running.abort_handle());
+    probe.wait_for_roles(3).await;
+    let mut other = session.model().unwrap();
+    other.id = "another-ordinary-model".into();
     session.set_model(other, Default::default()).await.unwrap();
-    let _ = tokio::time::timeout(Duration::from_secs(10), running).await.unwrap();
+    assert!(tokio::time::timeout(Duration::from_secs(10), running).await.unwrap().unwrap().is_err());
     idle(&session).await;
-    assert_eq!(f.captured.lock().unwrap().len(), 1);
-    assert_eq!(ledger(&session).summary().unwrap().calls, 1);
-    assert!(!serde_json::to_string(&session.messages()).unwrap().contains("STALE_MODEL_DRAFT"));
+    assert_eq!(f.captured.lock().unwrap().len(), 3);
+    assert_eq!(probe.parent_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    for role in TextMasRole::ALL {
+        assert_eq!(terminal_status(&session, role), vec![TextMasCallStatus::Cancelled]);
+    }
+    assert!(!serde_json::to_string(&session.messages()).unwrap().contains("STALE_"));
+    gate.add_permits(3);
     session.dispose_async(Some(false)).await;
 }
+
 
 #[tokio::test]
 async fn queued_all_batch_keeps_both_user_inputs_and_delivers_all_three_drafts() {

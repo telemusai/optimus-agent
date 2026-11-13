@@ -328,26 +328,51 @@ impl AgentSession {
             }
         }
         let mut drafts = Vec::new();
-        for role in TextMasRole::ALL {
-            ensure_textmas_current(self, run, parent_signal.as_ref())?;
-            let context = match role_request(&run.model, &active_original, run.mode, role, &drafts)
-            {
-                Ok(context) => context,
-                Err(error) if error.reducible && preparation_note.is_none() => {
-                    let reduction = self
-                        .reduce_textmas_context(run, &original, parent_signal.as_ref())
-                        .await?;
-                    active_original = reduction.original;
-                    preparation_note = Some(reduction.note);
-                    role_request(&run.model, &active_original, run.mode, role, &drafts)
-                        .map_err(|error| error.message)?
-                }
-                Err(error) => return Err(error.message),
-            };
-            let draft = self
-                .run_textmas_role(run, role, None, context, parent_signal.as_ref())
-                .await?;
-            drafts.push((role, draft));
+        if run.mode == TextMasMode::Hierarchical {
+            // Preflight validated every independent role against active_original.
+            // Preserve that input for all three calls instead of serializing them.
+            let contexts = TextMasRole::ALL
+                .into_iter()
+                .map(|role| {
+                    ensure_textmas_current(self, run, parent_signal.as_ref())?;
+                    role_request(&run.model, &active_original, run.mode, role, &[])
+                        .map_err(|error| error.message)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let ordered = futures::future::try_join_all(
+                TextMasRole::ALL.into_iter().zip(contexts).map(|(role, context)| {
+                    self.run_textmas_role(run, role, None, context, parent_signal.as_ref())
+                }),
+            )
+            .await?;
+            drafts.extend(TextMasRole::ALL.into_iter().zip(ordered));
+        } else {
+            for role in TextMasRole::ALL {
+                ensure_textmas_current(self, run, parent_signal.as_ref())?;
+                let context = match role_request(
+                    &run.model,
+                    &active_original,
+                    run.mode,
+                    role,
+                    &drafts,
+                ) {
+                    Ok(context) => context,
+                    Err(error) if error.reducible && preparation_note.is_none() => {
+                        let reduction = self
+                            .reduce_textmas_context(run, &original, parent_signal.as_ref())
+                            .await?;
+                        active_original = reduction.original;
+                        preparation_note = Some(reduction.note);
+                        role_request(&run.model, &active_original, run.mode, role, &drafts)
+                            .map_err(|error| error.message)?
+                    }
+                    Err(error) => return Err(error.message),
+                };
+                let draft = self
+                    .run_textmas_role(run, role, None, context, parent_signal.as_ref())
+                    .await?;
+                drafts.push((role, draft));
+            }
         }
         let advisory = contract::advisory_message_with_note(&drafts, preparation_note.as_deref());
         Ok((
