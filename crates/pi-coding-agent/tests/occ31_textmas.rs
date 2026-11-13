@@ -16,6 +16,30 @@ use std::time::Duration;
 
 static ENV: Mutex<()> = Mutex::new(());
 
+const HIERARCHICAL_CONCURRENCY_ENV: &str = "PRIME_AGENT_OCC3_TEXTMAS_HIERARCHICAL_CONCURRENCY";
+
+// All suites hold ENV while using Fixture because profiles are process-global.
+// Scope this second process-global setting too, and restore it on every exit path.
+struct ScopedHierarchicalConcurrencyEnv(Option<std::ffi::OsString>);
+impl ScopedHierarchicalConcurrencyEnv {
+    fn set(value: Option<&str>) -> Self {
+        let previous = std::env::var_os(HIERARCHICAL_CONCURRENCY_ENV);
+        match value {
+            Some(value) => std::env::set_var(HIERARCHICAL_CONCURRENCY_ENV, value),
+            None => std::env::remove_var(HIERARCHICAL_CONCURRENCY_ENV),
+        }
+        Self(previous)
+    }
+}
+impl Drop for ScopedHierarchicalConcurrencyEnv {
+    fn drop(&mut self) {
+        match self.0.take() {
+            Some(value) => std::env::set_var(HIERARCHICAL_CONCURRENCY_ENV, value),
+            None => std::env::remove_var(HIERARCHICAL_CONCURRENCY_ENV),
+        }
+    }
+}
+
 // A bounded fixture assertion must not detach its still-waiting prompt task.
 struct AbortOnDrop(tokio::task::AbortHandle);
 impl Drop for AbortOnDrop {
@@ -474,6 +498,7 @@ fn ledger(session: &AgentSession) -> TextMasUsageLedger {
 #[tokio::test]
 async fn sequential_and_hierarchical_are_real_distinct_graphs_and_keep_final_tools_history_images() {
     let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let _concurrency = ScopedHierarchicalConcurrencyEnv::set(None);
     for mode in [TextMasMode::Sequential, TextMasMode::Hierarchical] {
         let f = Fixture::new();
         let session = f.session(0, false).await;
@@ -623,6 +648,7 @@ async fn hidden_thinking_over_cap_does_not_block_roles_or_the_normal_parent() {
 #[tokio::test]
 async fn oversized_single_message_uses_bounded_chunked_preparation_in_both_modes() {
     let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let _concurrency = ScopedHierarchicalConcurrencyEnv::set(None);
     for mode in [TextMasMode::Sequential, TextMasMode::Hierarchical] {
         let f = Fixture::new();
         let session = f.session(0, false).await;
@@ -878,6 +904,7 @@ async fn valid_oversized_png_is_resized_only_for_advisory_preparation() {
 #[tokio::test]
 async fn off_internal_extension_and_child_turns_never_fan_out() {
     let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let _concurrency = ScopedHierarchicalConcurrencyEnv::set(None);
     let f = Fixture::new();
     let session = f.session(0, false).await;
     f.reply(text_reply("ORDINARY"), None, None);
@@ -935,6 +962,7 @@ async fn provider_error_refusal_empty_and_tool_attempt_fail_without_retry_or_exe
 #[tokio::test]
 async fn hierarchical_overlap_preserves_order_usage_and_sequential_dependencies() {
     let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let _concurrency = ScopedHierarchicalConcurrencyEnv::set(Some("3"));
     for mode in [TextMasMode::Hierarchical, TextMasMode::Sequential] {
         let f = Fixture::new();
         let session = f.session(0, false).await;
@@ -1047,6 +1075,7 @@ async fn hierarchical_overlap_preserves_order_usage_and_sequential_dependencies(
 #[tokio::test]
 async fn hierarchical_each_role_failure_promptly_cancels_inflight_siblings() {
     let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let _concurrency = ScopedHierarchicalConcurrencyEnv::set(Some("3"));
     for (failed_index, failed_role) in TextMasRole::ALL.into_iter().enumerate() {
         let f = Fixture::new();
         let session = f.session(0, false).await;
@@ -1094,6 +1123,7 @@ async fn hierarchical_each_role_failure_promptly_cancels_inflight_siblings() {
 #[tokio::test]
 async fn hierarchical_parent_abort_cancels_every_role_without_parent_execution() {
     let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let _concurrency = ScopedHierarchicalConcurrencyEnv::set(Some("3"));
     let f = Fixture::new();
     let session = f.session(0, false).await;
     textmas_settings::set_mode(&session.session_file().unwrap(), TextMasMode::Hierarchical).unwrap();
@@ -1118,8 +1148,126 @@ async fn hierarchical_parent_abort_cancels_every_role_without_parent_execution()
 }
 
 #[tokio::test]
+async fn hierarchical_default_preserves_provider_capacity_one() {
+    let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let _concurrency = ScopedHierarchicalConcurrencyEnv::set(None);
+    let f = Fixture::new();
+    let session = f.session(0, false).await;
+    textmas_settings::set_mode(&session.session_file().unwrap(), TextMasMode::Hierarchical).unwrap();
+    let planner_gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let probe = RoleProbe::default();
+    // No provider capability is advertised. The synthetic provider refuses the
+    // critic if the previous role is still active. Default hierarchical execution
+    // must finish all three ordered roles without admitting that busy request.
+    controlled_roles(&f, [
+        ControlledRole { message: text_reply("PLANNER_DRAFT"), gate: Some(planner_gate.clone()), ..Default::default() },
+        ControlledRole { message: text_reply("CRITIC_DRAFT"), reject_if_busy: true, ..Default::default() },
+        ControlledRole { message: text_reply("REFINER_DRAFT"), ..Default::default() },
+    ], probe.clone());
+    let running = tokio::spawn({ let session = session.clone(); async move { session.prompt("CURRENT_REQUEST", None).await } });
+    let _cleanup = AbortOnDrop(running.abort_handle());
+    probe.wait_for_roles(1).await;
+    planner_gate.add_permits(1);
+    probe.wait_for_exit("planner").await;
+    let result = tokio::time::timeout(Duration::from_secs(10), running).await.unwrap().unwrap();
+    assert!(result.is_ok(), "capacity-one hierarchical preparation must complete, not fail: {result:?}");
+    idle(&session).await;
+    assert_eq!(probe.capacity_refusals.load(std::sync::atomic::Ordering::SeqCst), 0, "no provider-aware capability was advertised, so serial scheduling must avoid a busy refusal");
+    assert_eq!(probe.peak.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(probe.parent_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(probe.entered.lock().unwrap().as_slice(), ["planner", "critic", "refiner"]);
+    for role in TextMasRole::ALL {
+        assert_eq!(terminal_status(&session, role), vec![TextMasCallStatus::Completed]);
+    }
+    let parent = serde_json::to_string(&f.captured.lock().unwrap().last().unwrap().messages).unwrap();
+    assert!(parent.find("PLANNER_DRAFT").unwrap() < parent.find("CRITIC_DRAFT").unwrap());
+    assert!(parent.find("CRITIC_DRAFT").unwrap() < parent.find("REFINER_DRAFT").unwrap());
+    assert_eq!(ledger(&session).summary().unwrap().calls, 3);
+    session.dispose_async(Some(false)).await;
+}
+
+#[tokio::test]
+async fn hierarchical_configured_two_is_bounded_ordered_and_work_conserving() {
+    let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let _concurrency = ScopedHierarchicalConcurrencyEnv::set(Some("2"));
+    let f = Fixture::new();
+    let session = f.session(0, false).await;
+    textmas_settings::set_mode(&session.session_file().unwrap(), TextMasMode::Hierarchical).unwrap();
+    let gates = [Arc::new(tokio::sync::Semaphore::new(0)), Arc::new(tokio::sync::Semaphore::new(0)), Arc::new(tokio::sync::Semaphore::new(0))];
+    let probe = RoleProbe::default();
+    controlled_roles(&f, [
+        ControlledRole { message: text_reply("PLANNER_DRAFT"), gate: Some(gates[0].clone()), ..Default::default() },
+        ControlledRole { message: text_reply("CRITIC_DRAFT"), gate: Some(gates[1].clone()), ..Default::default() },
+        ControlledRole { message: text_reply("REFINER_DRAFT"), gate: Some(gates[2].clone()), ..Default::default() },
+    ], probe.clone());
+    let running = tokio::spawn({ let session = session.clone(); async move { session.prompt("CURRENT_REQUEST", None).await } });
+    let _cleanup = AbortOnDrop(running.abort_handle());
+    probe.wait_for_roles(2).await;
+    assert_eq!(probe.entered.lock().unwrap().as_slice(), ["planner", "critic"]);
+    assert_eq!(probe.peak.load(std::sync::atomic::Ordering::SeqCst), 2);
+    // Complete the critic while the planner is blocked. The third role must take
+    // the freed capacity-two slot without waiting for a two-item chunk to finish.
+    gates[1].add_permits(1);
+    probe.wait_for_exit("critic").await;
+    probe.wait_for_roles(3).await;
+    assert_eq!(probe.entered.lock().unwrap().as_slice(), ["planner", "critic", "refiner"]);
+    assert_eq!(probe.parent_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert_eq!(probe.peak.load(std::sync::atomic::Ordering::SeqCst), 2);
+    gates[0].add_permits(1);
+    gates[2].add_permits(1);
+    tokio::time::timeout(Duration::from_secs(10), running).await.unwrap().unwrap().unwrap();
+    idle(&session).await;
+    assert_eq!(probe.parent_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(probe.peak.load(std::sync::atomic::Ordering::SeqCst), 2);
+    let parent = serde_json::to_string(&f.captured.lock().unwrap().last().unwrap().messages).unwrap();
+    assert!(parent.find("PLANNER_DRAFT").unwrap() < parent.find("CRITIC_DRAFT").unwrap());
+    assert!(parent.find("CRITIC_DRAFT").unwrap() < parent.find("REFINER_DRAFT").unwrap());
+    for role in TextMasRole::ALL {
+        assert_eq!(terminal_status(&session, role), vec![TextMasCallStatus::Completed]);
+    }
+    assert_eq!(ledger(&session).summary().unwrap().calls, 3);
+    session.dispose_async(Some(false)).await;
+}
+
+#[tokio::test]
+async fn hierarchical_explicit_one_and_invalid_settings_stay_serial() {
+    let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    for value in [Some("1"), Some("0"), Some("4"), Some("not-a-number")] {
+        let _concurrency = ScopedHierarchicalConcurrencyEnv::set(value);
+        let expected_label = format!("configuration {value:?}");
+        let f = Fixture::new();
+        let session = f.session(0, false).await;
+        textmas_settings::set_mode(&session.session_file().unwrap(), TextMasMode::Hierarchical).unwrap();
+        let planner_gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let probe = RoleProbe::default();
+        controlled_roles(&f, [
+            ControlledRole { message: text_reply("PLANNER_DRAFT"), gate: Some(planner_gate.clone()), ..Default::default() },
+            ControlledRole { message: text_reply("CRITIC_DRAFT"), reject_if_busy: true, ..Default::default() },
+            ControlledRole { message: text_reply("REFINER_DRAFT"), ..Default::default() },
+        ], probe.clone());
+        let running = tokio::spawn({ let session = session.clone(); async move { session.prompt("CURRENT_REQUEST", None).await } });
+        let _cleanup = AbortOnDrop(running.abort_handle());
+        probe.wait_for_roles(1).await;
+        assert_eq!(probe.entered.lock().unwrap().len(), 1, "{expected_label} must not admit a sibling before the planner completes");
+        planner_gate.add_permits(1);
+        probe.wait_for_exit("planner").await;
+        tokio::time::timeout(Duration::from_secs(10), running).await.unwrap().unwrap().unwrap();
+        idle(&session).await;
+        assert_eq!(probe.capacity_refusals.load(std::sync::atomic::Ordering::SeqCst), 0, "{expected_label}");
+        assert_eq!(probe.peak.load(std::sync::atomic::Ordering::SeqCst), 1, "{expected_label}");
+        assert_eq!(probe.parent_calls.load(std::sync::atomic::Ordering::SeqCst), 1, "{expected_label}");
+        for role in TextMasRole::ALL {
+            assert_eq!(terminal_status(&session, role), vec![TextMasCallStatus::Completed], "{expected_label}");
+        }
+        assert_eq!(ledger(&session).summary().unwrap().calls, 3, "{expected_label}");
+        session.dispose_async(Some(false)).await;
+    }
+}
+
+#[tokio::test]
 async fn hierarchical_provider_capacity_refusal_fails_without_serial_fallback() {
     let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let _concurrency = ScopedHierarchicalConcurrencyEnv::set(Some("3"));
     let f = Fixture::new();
     let session = f.session(0, false).await;
     textmas_settings::set_mode(&session.session_file().unwrap(), TextMasMode::Hierarchical).unwrap();
@@ -1161,6 +1309,7 @@ async fn hierarchical_provider_capacity_refusal_fails_without_serial_fallback() 
 #[tokio::test(start_paused = true)]
 async fn hierarchical_timeout_cancels_siblings_without_resetting_role_deadlines() {
     let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let _concurrency = ScopedHierarchicalConcurrencyEnv::set(Some("3"));
     let f = Fixture::new();
     let session = f.session(0, false).await;
     textmas_settings::set_mode(&session.session_file().unwrap(), TextMasMode::Hierarchical).unwrap();
@@ -1227,7 +1376,12 @@ async fn cancellation_settles_without_final_execution_and_next_turn_has_fresh_ro
 #[tokio::test]
 async fn final_provider_retry_reuses_three_drafts_without_another_stage_call() {
     let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
-    for mode in [TextMasMode::Sequential, TextMasMode::Hierarchical] {
+    for (mode, configured_concurrency) in [
+        (TextMasMode::Sequential, None),
+        (TextMasMode::Hierarchical, None),
+        (TextMasMode::Hierarchical, Some("3")),
+    ] {
+        let _concurrency = ScopedHierarchicalConcurrencyEnv::set(configured_concurrency);
         let f = Fixture::new();
         let session = f.session(0, true).await;
         let file = session.session_file().unwrap();
@@ -1299,35 +1453,44 @@ async fn invalid_preferences_and_transcript_persistence_fail_before_any_advisory
 #[tokio::test]
 async fn model_change_cancels_the_advisory_call_instead_of_reinterpreting_its_draft() {
     let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
-    let f = Fixture::new();
-    let session = f.session(0, true).await;
-    textmas_settings::set_mode(&session.session_file().unwrap(), TextMasMode::Hierarchical).unwrap();
-    let gate = Arc::new(tokio::sync::Semaphore::new(0));
-    let role = |text| ControlledRole { message: text_reply(text), gate: Some(gate.clone()), reject_if_busy: false, ..Default::default() };
-    let probe = RoleProbe::default();
-    controlled_roles(&f, [role("STALE_PLANNER"), role("STALE_CRITIC"), role("STALE_REFINER")], probe.clone());
-    let running = tokio::spawn({ let session = session.clone(); async move { session.prompt("CURRENT_REQUEST", None).await } });
-    let _cleanup = AbortOnDrop(running.abort_handle());
-    probe.wait_for_roles(3).await;
-    let mut other = session.model().unwrap();
-    other.id = "another-ordinary-model".into();
-    session.set_model(other, Default::default()).await.unwrap();
-    assert!(tokio::time::timeout(Duration::from_secs(10), running).await.unwrap().unwrap().is_err());
-    idle(&session).await;
-    assert_eq!(f.captured.lock().unwrap().len(), 3);
-    assert_eq!(probe.parent_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
-    for role in TextMasRole::ALL {
-        assert_eq!(terminal_status(&session, role), vec![TextMasCallStatus::Cancelled]);
+    for configured_concurrency in [None, Some("3")] {
+        let _concurrency = ScopedHierarchicalConcurrencyEnv::set(configured_concurrency);
+        let expected = if configured_concurrency.is_some() { 3 } else { 1 };
+        let f = Fixture::new();
+        let session = f.session(0, true).await;
+        textmas_settings::set_mode(&session.session_file().unwrap(), TextMasMode::Hierarchical).unwrap();
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let role = |text| ControlledRole { message: text_reply(text), gate: Some(gate.clone()), reject_if_busy: false, ..Default::default() };
+        let probe = RoleProbe::default();
+        controlled_roles(&f, [role("STALE_PLANNER"), role("STALE_CRITIC"), role("STALE_REFINER")], probe.clone());
+        let running = tokio::spawn({ let session = session.clone(); async move { session.prompt("CURRENT_REQUEST", None).await } });
+        let _cleanup = AbortOnDrop(running.abort_handle());
+        probe.wait_for_roles(expected).await;
+        let mut other = session.model().unwrap();
+        other.id = "another-ordinary-model".into();
+        session.set_model(other, Default::default()).await.unwrap();
+        assert!(tokio::time::timeout(Duration::from_secs(10), running).await.unwrap().unwrap().is_err());
+        idle(&session).await;
+        assert_eq!(f.captured.lock().unwrap().len(), expected);
+        assert_eq!(probe.parent_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        for (index, role) in TextMasRole::ALL.into_iter().enumerate() {
+            if index < expected {
+                assert_eq!(terminal_status(&session, role), vec![TextMasCallStatus::Cancelled]);
+            } else {
+                assert!(terminal_status(&session, role).is_empty(), "an unadmitted role has no fabricated usage record");
+            }
+        }
+        assert_eq!(ledger(&session).summary().unwrap().calls, expected);
+        assert!(!serde_json::to_string(&session.messages()).unwrap().contains("STALE_"));
+        gate.add_permits(expected);
+        session.dispose_async(Some(false)).await;
     }
-    assert!(!serde_json::to_string(&session.messages()).unwrap().contains("STALE_"));
-    gate.add_permits(3);
-    session.dispose_async(Some(false)).await;
 }
-
 
 #[tokio::test]
 async fn queued_all_batch_keeps_both_user_inputs_and_delivers_all_three_drafts() {
     let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let _concurrency = ScopedHierarchicalConcurrencyEnv::set(None);
     let f = Fixture::new();
     let session = f.session(0, false).await;
     let file = session.session_file().unwrap();
