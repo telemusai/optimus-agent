@@ -453,6 +453,26 @@ impl AgentSession {
         context: Context,
         parent_signal: Option<&CancellationToken>,
     ) -> Result<String, String> {
+        self.run_textmas_role_with_timeout(
+            run,
+            role,
+            call_index,
+            context,
+            parent_signal,
+            std::time::Duration::from_secs(contract::STAGE_TIMEOUT_SECONDS),
+        )
+        .await
+    }
+
+    async fn run_textmas_role_with_timeout(
+        self: &Arc<Self>,
+        run: &TextMasRun,
+        role: TextMasRole,
+        call_index: Option<u32>,
+        context: Context,
+        parent_signal: Option<&CancellationToken>,
+        stage_timeout: std::time::Duration,
+    ) -> Result<String, String> {
         ensure_textmas_current(self, run, parent_signal)?;
         let output_budget = contract::output_budget(&run.model, &context)?;
         let started = TextMasUsageRecord::new_indexed(
@@ -504,36 +524,21 @@ impl AgentSession {
         // No on_payload extension, latent lease, source capture, or tools are installed on advisory requests.
         let stream_fn =
             crate::core::semantic_edges::unwrap_semantic_edge_stream_fn(&self.agent.stream_fn());
-        let result = tokio::select! {
-            biased;
-            _ = run.signal.cancelled() => Err((TextMasCallStatus::Cancelled, "preparation was cancelled".to_string())),
-            _ = cancelled(parent_signal) => Err((TextMasCallStatus::Cancelled, "preparation was cancelled".to_string())),
-            result = tokio::time::timeout(std::time::Duration::from_secs(contract::STAGE_TIMEOUT_SECONDS), async {
-                if let Some(get_key) = options.get_api_key { request.stream.api_key = get_key(run.model.provider.clone()).await; }
-                let stream = receipt.scope(async { stream_fn(run.model.clone(), context, request).await }).await;
-                while let Some(event) = stream.next().await {
-                    if let Some(partial) = event.partial() {
-                        guard.usage = Some(partial.usage.clone());
-                        if serde_json::to_vec(partial).map_or(true, |bytes| bytes.len() > contract::MAX_STAGE_RESPONSE_BYTES) {
-                            return Err((TextMasCallStatus::Failed, "preparation response exceeded its bound".into()));
-                        }
-                        if partial.content.iter().any(|block| matches!(block, pi_ai::types::ContentBlock::ToolCall(_))) {
-                            return Err((TextMasCallStatus::Failed, "preparation returned a tool call; no tool was executed".into()));
-                        }
-                    }
-                    let terminal = match event { AssistantMessageEvent::Done { message, .. } => Some(message), AssistantMessageEvent::Error { error, .. } => Some(error), _ => None };
-                    if let Some(message) = terminal {
-                        guard.usage = Some(message.usage.clone());
-                        return contract::public_draft(&message).map_err(|error| (TextMasCallStatus::Failed, error));
-                    }
-                }
-                // Some injected/native adapters end directly with a terminal result.
-                if let Some(message) = stream.result_if_ready() {
-                    guard.usage = Some(message.usage.clone());
-                    contract::public_draft(&message).map_err(|error| (TextMasCallStatus::Failed, error))
-                } else { Err((TextMasCallStatus::Failed, "provider ended without a result".into())) }
-            }) => result.unwrap_or_else(|_| Err((TextMasCallStatus::TimedOut, "preparation timed out".into()))),
-        };
+        let request_receipt = receipt.clone();
+        let model = run.model.clone();
+        let result = run_textmas_provider_request(
+            &run.signal,
+            parent_signal,
+            stage_timeout,
+            &mut guard.usage,
+            async move {
+                if let Some(get_key) = options.get_api_key { request.stream.api_key = get_key(model.provider.clone()).await; }
+                let stream = request_receipt.scope(async { stream_fn(model, context, request).await }).await;
+                let result_stream = stream.clone();
+                (Box::pin(stream.into_stream()), move || result_stream.result_if_ready())
+            },
+        )
+        .await;
         let status = match &result {
             Ok(_) => TextMasCallStatus::Completed,
             Err((status, _)) => *status,
@@ -563,6 +568,74 @@ impl AgentSession {
             .map_err(|_| "OCC3.1 usage could not be saved; no final execution or automatic replay".to_string())?;
         *self.own_usage_memo.lock().unwrap() = None;
         Ok(())
+    }
+}
+
+type TextMasProviderResult = Result<String, (TextMasCallStatus, String)>;
+
+async fn run_textmas_provider_request<S, R, F>(
+    run_signal: &CancellationToken,
+    parent_signal: Option<&CancellationToken>,
+    stage_timeout: std::time::Duration,
+    usage: &mut Option<Usage>,
+    open_stream: F,
+) -> TextMasProviderResult
+where
+    S: futures::Stream<Item = AssistantMessageEvent> + Unpin,
+    R: Fn() -> Option<AssistantMessage>,
+    F: std::future::Future<Output = (S, R)>,
+{
+    let deadline = tokio::time::Instant::now() + stage_timeout;
+    if tokio::time::Instant::now() >= deadline {
+        return Err((TextMasCallStatus::TimedOut, "preparation timed out".into()));
+    }
+    let (mut stream, result_if_ready) = tokio::select! {
+        biased;
+        _ = run_signal.cancelled() => return Err((TextMasCallStatus::Cancelled, "preparation was cancelled".to_string())),
+        _ = cancelled(parent_signal) => return Err((TextMasCallStatus::Cancelled, "preparation was cancelled".to_string())),
+        result = tokio::time::timeout_at(deadline, open_stream) => {
+            result.map_err(|_| (TextMasCallStatus::TimedOut, "preparation timed out".to_string()))?
+        },
+    };
+    loop {
+        // Check before every select: a continuously ready stream must not starve either signal.
+        if run_signal.is_cancelled() || parent_signal.is_some_and(CancellationToken::is_cancelled) {
+            return Err((TextMasCallStatus::Cancelled, "preparation was cancelled".to_string()));
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err((TextMasCallStatus::TimedOut, "preparation timed out".into()));
+        }
+        let next = tokio::select! {
+            biased;
+            _ = run_signal.cancelled() => return Err((TextMasCallStatus::Cancelled, "preparation was cancelled".to_string())),
+            _ = cancelled(parent_signal) => return Err((TextMasCallStatus::Cancelled, "preparation was cancelled".to_string())),
+            result = tokio::time::timeout_at(deadline, stream.next()) => match result {
+                Ok(next) => next,
+                Err(_) => return Err((TextMasCallStatus::TimedOut, "preparation timed out".into())),
+            },
+        };
+        let Some(event) = next else { break };
+        if let Some(partial) = event.partial() {
+            *usage = Some(partial.usage.clone());
+            if serde_json::to_vec(partial).map_or(true, |bytes| bytes.len() > contract::MAX_STAGE_RESPONSE_BYTES) {
+                return Err((TextMasCallStatus::Failed, "preparation response exceeded its bound".into()));
+            }
+            if partial.content.iter().any(|block| matches!(block, pi_ai::types::ContentBlock::ToolCall(_))) {
+                return Err((TextMasCallStatus::Failed, "preparation returned a tool call; no tool was executed".into()));
+            }
+        }
+        let terminal = match event { AssistantMessageEvent::Done { message, .. } => Some(message), AssistantMessageEvent::Error { error, .. } => Some(error), _ => None };
+        if let Some(message) = terminal {
+            *usage = Some(message.usage.clone());
+            return contract::public_draft(&message).map_err(|error| (TextMasCallStatus::Failed, error));
+        }
+    }
+    // Some injected/native adapters end directly with a terminal result.
+    if let Some(message) = result_if_ready() {
+        *usage = Some(message.usage.clone());
+        contract::public_draft(&message).map_err(|error| (TextMasCallStatus::Failed, error))
+    } else {
+        Err((TextMasCallStatus::Failed, "provider ended without a result".into()))
     }
 }
 
@@ -735,3 +808,7 @@ async fn resize_textmas_images(
 async fn cancelled(signal: Option<&CancellationToken>) {
     match signal { Some(signal) => signal.cancelled().await, None => std::future::pending::<()>().await }
 }
+
+#[cfg(test)]
+#[path = "textmas_deadline_tests.rs"]
+mod deadline_tests;
