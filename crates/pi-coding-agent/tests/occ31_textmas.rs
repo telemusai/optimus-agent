@@ -778,7 +778,7 @@ async fn off_internal_extension_and_child_turns_never_fan_out() {
 #[tokio::test]
 async fn provider_error_refusal_empty_and_tool_attempt_fail_without_retry_or_execution() {
     let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
-    for case in ["error", "refusal", "empty", "tool", "oversized"] {
+    for case in ["error", "length", "refusal", "empty", "tool", "oversized"] {
         let f = Fixture::new();
         let session = f.session(0, true).await;
         turn(&session, "/mode direct", None).await.unwrap();
@@ -787,13 +787,18 @@ async fn provider_error_refusal_empty_and_tool_attempt_fail_without_retry_or_exe
         let side_effect = f.root.path().join("must-not-exist");
         let message = match case {
             "error" => faux_assistant_message("".into(), Some(FauxAssistantMessageOptions { stop_reason: Some("error".into()), error_message: Some("temporary provider failure".into()), ..Default::default() })),
+            "length" => faux_assistant_message("partial unpublished draft".into(), Some(FauxAssistantMessageOptions { stop_reason: Some("length".into()), ..Default::default() })),
             "refusal" => { let mut m = text_reply("declined"); m.stop_reason_raw = Some("refusal".into()); m },
             "empty" => faux_assistant_message(FauxAssistantContent::Blocks(vec![ContentBlock::Thinking(faux_thinking("PRIVATE_ONLY"))]), None),
             "tool" => faux_assistant_message(ContentBlock::ToolCall(ToolCall::new("unsafe", "bash", json!({"command":format!("touch '{}'",side_effect.display())}).as_object().unwrap().clone())).into(), Some(FauxAssistantMessageOptions { stop_reason: Some("toolUse".into()), ..Default::default() })),
             _ => text_reply(&"x".repeat(16_385)),
         };
         f.reply(message, Some(file), None);
-        assert!(turn(&session, "CURRENT_REQUEST", None).await.is_err(), "{case}");
+        let error = turn(&session, "CURRENT_REQUEST", None).await.unwrap_err();
+        if case == "length" {
+            assert!(error.contains("stop: length"), "{error}");
+            assert!(!error.contains("partial unpublished draft"));
+        }
         assert_eq!(f.captured.lock().unwrap().len(), 1, "no retry/fallback after {case}");
         assert!(!side_effect.exists());
         assert_eq!(ledger(&session).summary().unwrap().calls, 1);

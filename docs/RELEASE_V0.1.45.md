@@ -59,6 +59,10 @@ not a slash command.
   the turn rather than silently executing a fallback. Cancellation settles the
   waiting input and preserves unrelated queued inputs. Normal final retries
   reuse the drafts without repeating preparation.
+- Auxiliary calls allow at most 8192 total output tokens, including private
+  reasoning, subject to the selected model's limits. The public draft remains
+  capped at 16 KiB. Incomplete responses are rejected without automatic retry;
+  the visible error includes the normalized stop reason, not partial output.
 - Generated system-prompt guidance explains the host-managed stages, their
   advisory status and the separate latent controls. It does not assert that a
   mode is enabled or that communication has completed.

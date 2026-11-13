@@ -98,13 +98,17 @@ an alternative endpoint, change model configuration or silently switch models.
   user message is also supplied directly to reduced roles when it fits; otherwise
   it is represented in the brief and the parent still receives the exact message.
 - Each mapper, reducer or role stage has a 120-second limit, a 128 KiB response
-  limit and a 16 KiB public-draft limit. Its output budget is at most 4096 tokens,
-  reduced to the selected model's output and estimated remaining-context limits.
+  limit and a 16 KiB public-draft limit. Its total output budget is at most 8192
+  tokens, including private reasoning and public draft output, and is reduced to
+  the selected model's output and estimated remaining-context limits. This reserve
+  does not enlarge the ordinary parent's context or increase accepted draft size.
   Usage has a stable call ordinal for each mapper/reducer call. Exhausted reduction
   caps, irreducible content, invalid images and cancelled calls are not silently
   discarded or treated as free.
 - Tool-call output, refusal, missing usable text and incomplete output are not
-  valid advisory drafts. No automatic role retries or model fallback are added.
+  valid advisory drafts. A normalized stop reason is included in the visible
+  failure without echoing partial drafts or untrusted provider error details. No
+  automatic role retries or model fallback are added.
 - `/stats` shows a separate **OCC3.1 preparation overhead** category. Its known
   token and estimated-cost subtotals do not include missing reports. Unknown
   usage and cost call counts remain explicit, including interrupted calls.

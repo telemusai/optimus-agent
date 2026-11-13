@@ -66,7 +66,9 @@ impl TextMasRole {
 pub const MAX_CONTEXT_BYTES: usize = 262_144;
 pub const MAX_DRAFT_BYTES: usize = 16_384;
 pub const MAX_STAGE_RESPONSE_BYTES: usize = 131_072;
-pub const MAX_OUTPUT_TOKENS: f64 = 4096.0;
+/// Total provider output per auxiliary call, including private reasoning blocks.
+/// Public text remains bounded separately by `MAX_DRAFT_BYTES`.
+pub const MAX_OUTPUT_TOKENS: f64 = 8192.0;
 pub const STAGE_TIMEOUT_SECONDS: u64 = 120;
 pub const USAGE_CUSTOM_TYPE: &str = "occ31_textmas_usage";
 const USAGE_SCHEMA: &str = "optimus.occ31-usage.v1";
@@ -206,7 +208,15 @@ pub fn public_draft(message: &AssistantMessage) -> Result<String, String> {
         return Err("preparation returned a tool call; no tool was executed".into());
     }
     if message.stop_reason != pi_ai::types::STOP_REASON_STOP || message.error_message.is_some() {
-        return Err("provider did not complete preparation successfully".into());
+        let mut error = format!(
+            "provider did not complete preparation successfully (stop: {})",
+            message.stop_reason
+        );
+        if message.error_message.is_some() {
+            // Do not echo an untrusted provider error or partial draft into the parent context.
+            error.push_str("; provider error");
+        }
+        return Err(error);
     }
     let text = message.content.iter().filter_map(|block| match block { ContentBlock::Text(text) => Some(text.text.as_str()), _ => None }).collect::<Vec<_>>().join("\n");
     let text = text.trim();
@@ -465,6 +475,27 @@ mod tests {
         assert!(matches!(&prepared.messages[0], Message::User(_)));
     }
 
+
+    #[test]
+    fn reasoning_has_bounded_output_headroom_without_enlarging_public_drafts() {
+        let mut model = pi_ai::types::Model::default();
+        model.reasoning = true;
+        model.context_window = 1_048_576.0;
+        model.max_tokens = 262_144.0;
+        let context = Context::new(Some("tool-free advisory role".into()), vec![], None);
+        assert_eq!(output_budget(&model, &context).unwrap(), 8192.0);
+
+        let mut response = AssistantMessage::default();
+        response.content = vec![
+            ContentBlock::Thinking(pi_ai::types::ThinkingContent::new("bounded private reasoning")),
+            ContentBlock::Text(pi_ai::types::TextContent::new("PUBLIC_DRAFT_ONLY")),
+        ];
+        response.usage.output = 5005.0;
+        response.usage.total_tokens = 5005.0;
+        assert_eq!(public_draft(&response).unwrap(), "PUBLIC_DRAFT_ONLY");
+        assert!(!public_draft(&response).unwrap().contains("private reasoning"));
+    }
+
     #[test]
     fn serialized_context_bound_is_exact_for_utf8_and_json_escapes() {
         fn text(ascii_len: usize) -> String { format!("é雪\"\\\n{}", "x".repeat(ascii_len)) }
@@ -512,7 +543,11 @@ mod tests {
         response.stop_reason_raw = Some("SAFETY".into());
         assert!(public_draft(&response).is_err());
         response.stop_reason_raw = None; response.stop_reason = "length".into();
-        assert!(public_draft(&response).is_err());
+        assert!(public_draft(&response).unwrap_err().contains("stop: length"));
+        response.error_message = Some("sensitive upstream detail".into());
+        let error = public_draft(&response).unwrap_err();
+        assert!(error.contains("provider error") && !error.contains("sensitive upstream detail"));
+        response.error_message = None;
         response.stop_reason = "stop".into();
         response.content.push(ContentBlock::Thinking(pi_ai::types::ThinkingContent::new("x".repeat(MAX_STAGE_RESPONSE_BYTES + 1))));
         assert!(public_draft(&response).unwrap_err().contains("response exceeded"), "terminal-only adapters have the same body bound");
