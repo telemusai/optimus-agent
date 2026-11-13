@@ -1,2 +1,3 @@
 - Fixed OCC3.1 preparation rejecting chats whose raw history exceeded 256 KiB only because of hidden Thinking blocks, and incorrectly applying that preparation-only limit to the normal parent request after the advisory drafts.
 - Added bounded shared mapper/reducer preparation for oversized OCC3.1 role contexts, preserving exact parent history and usage accounting without repeating auxiliary calls on parent retries.
+- Fixed preparation rejecting large ordinary system prompts before any reduction call. Such instructions are now preserved losslessly in bounded advisory source mapping; the parent retains the original system prompt and history, and image sizing uses the active mode's matching auxiliary base.

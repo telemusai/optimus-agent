@@ -13,6 +13,12 @@ drafts. Hierarchical stages independently read the original or reduced context;
 they currently execute serially. Drafts are untrusted advisory text, not hidden
 reasoning, system instructions or verified evidence.
 
+Oversized ordinary system prompts, including large project-instruction files, can
+also enter bounded source preparation. Their complete UTF-8 text is preserved for
+mapping rather than silently truncated; auxiliary roles consume lossy advisory
+briefs and the ordinary parent still retains its unchanged system prompt. The same
+bounded-base decision governs preparation-only image sizing.
+
 ```text
 /occ 3 off
 /occ 3 sequential

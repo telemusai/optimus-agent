@@ -72,6 +72,7 @@ pub struct TextMasPreparationPlan {
     base: Context,
     latest_user: Option<UserMessage>,
     include_latest_user: bool,
+    system_instructions_in_source: bool,
     mode: TextMasMode,
     pub map_contexts: Vec<Context>,
 }
@@ -90,6 +91,29 @@ fn preflight_roles(original: &Context, mode: TextMasMode, model: &Model) -> Resu
         output_budget(model, &context)?;
     }
     Ok(())
+}
+
+/// Choose a base that fits every worst-case auxiliary role envelope. When the
+/// ordinary system prompt is too large, the generic OCC role contract replaces it
+/// only for auxiliary calls; the complete original prompt is mapped as source data.
+/// The ordinary parent never receives this replacement base.
+fn preparation_base(original: &Context, mode: TextMasMode, model: &Model) -> (Context, bool) {
+    let base = Context::new(original.system_prompt.clone(), Vec::new(), None);
+    if preflight_roles(&base, mode, model).is_ok() {
+        return (base, false);
+    }
+    if original
+        .system_prompt
+        .as_ref()
+        .is_some_and(|prompt| !prompt.is_empty())
+    {
+        let bounded = Context::new(None, Vec::new(), None);
+        if preflight_roles(&bounded, mode, model).is_ok() {
+            return (bounded, true);
+        }
+    }
+    // Preserve the original error when even the generic role contract cannot fit.
+    (base, false)
 }
 
 fn role_original(
@@ -148,7 +172,8 @@ impl TextMasPreparationPlan {
         if mode == TextMasMode::Off {
             return Err("OCC3.1 preparation is off".into());
         }
-        let base = Context::new(original.system_prompt.clone(), Vec::new(), None);
+        let (base, system_instructions_in_source) = preparation_base(original, mode, model);
+        check()?;
         let latest_user = original
             .messages
             .iter()
@@ -159,9 +184,21 @@ impl TextMasPreparationPlan {
             });
         // Validate the final role envelope before any mapper can spend money.
         let include_latest_user = select_role_template(&base, latest_user.as_ref(), mode, model)?;
-        let items = preparation_items(original, &mut check)?;
+        let mut items = preparation_items(original, &mut check)?;
         if items.is_empty() {
             return Err("OCC3.1 has no public context content to prepare".into());
+        }
+        if system_instructions_in_source {
+            // The fixed OCC role contract supplies auxiliary policy. Preserve every
+            // UTF-8 byte of the original instructions as lossless, chunkable source;
+            // mapper summaries remain lossy advisory data for the unchanged parent.
+            items.insert(
+                0,
+                PreparationItem::text(
+                    "system instructions".into(),
+                    original.system_prompt.clone().unwrap_or_default(),
+                ),
+            );
         }
         let map_contexts = pack_map_contexts(&base, model, items, &mut check)?;
         check()?;
@@ -191,6 +228,7 @@ impl TextMasPreparationPlan {
             base,
             latest_user,
             include_latest_user,
+            system_instructions_in_source,
             mode,
             map_contexts,
         })
@@ -198,6 +236,10 @@ impl TextMasPreparationPlan {
 
     pub fn include_latest_user(&self) -> bool {
         self.include_latest_user
+    }
+
+    pub fn system_instructions_in_source(&self) -> bool {
+        self.system_instructions_in_source
     }
 
     /// Build one level of reducer calls. Each level must reduce the brief count.
@@ -533,7 +575,25 @@ pub fn preparation_image_limit(
     label: &str,
     image: &ImageContent,
 ) -> Result<usize, String> {
-    let base = Context::new(original.system_prompt.clone(), Vec::new(), None);
+    preparation_image_limit_with_mode(
+        original,
+        model,
+        TextMasMode::Sequential,
+        label,
+        image,
+    )
+}
+
+/// Size an image against the same auxiliary base used by this mode's plan.
+/// Using a different worst-case role base can overestimate image capacity.
+pub fn preparation_image_limit_with_mode(
+    original: &Context,
+    model: &Model,
+    mode: TextMasMode,
+    label: &str,
+    image: &ImageContent,
+) -> Result<usize, String> {
+    let (base, _) = preparation_base(original, mode, model);
     let mut empty = image.clone();
     empty.data.clear();
     let item = PreparationItem::Image {
@@ -590,6 +650,8 @@ mod tests {
             TextMasPreparationPlan::new(&original, TextMasMode::Sequential, &model()).unwrap();
         assert!(plan.map_contexts.len() > 1);
         assert!(!plan.include_latest_user());
+        assert!(!plan.system_instructions_in_source());
+        assert_eq!(plan.base.system_prompt.as_deref(), Some("base instructions"));
         let mut recovered = String::new();
         for context in &plan.map_contexts {
             assert!(context.tools.is_none());
@@ -724,6 +786,106 @@ mod tests {
         };
         assert_eq!(error, "cancel-test");
         assert!(checks >= 40);
+    }
+
+    #[test]
+    fn oversized_system_instructions_are_mapped_without_changing_parent_context() {
+        let instructions = format!(
+            "BEGIN_SYSTEM_INSTRUCTIONS\n{}\nEND_SYSTEM_INSTRUCTIONS",
+            "é雪\"\\\n<instruction>".repeat(24_000)
+        );
+        let original = Context::new(
+            Some(instructions.clone()),
+            vec![user("latest request".into())],
+            None,
+        );
+        let original_encoded = serde_json::to_vec(&original).unwrap();
+        let plan =
+            TextMasPreparationPlan::new(&original, TextMasMode::Sequential, &model())
+                .expect("oversized instructions must be prepared, not rejected before mapping");
+        assert!(plan.system_instructions_in_source());
+        assert!(plan.base.system_prompt.is_none());
+        assert!(plan.include_latest_user());
+
+        // Reconstruct the exact UTF-8 source after lossless splitting. The
+        // normal parent context never receives these mapper substitutions.
+        let mut recovered = String::new();
+        for context in &plan.map_contexts {
+            assert!(serde_json::to_vec(context).unwrap().len() <= MAX_CONTEXT_BYTES);
+            assert!(output_budget(&model(), context).is_ok());
+            for message in &context.messages {
+                let Message::User(message) = message else {
+                    continue;
+                };
+                let UserContent::Text(text) = &message.content else {
+                    continue;
+                };
+                if text.starts_with("[OCC3.1 source system instructions") {
+                    let (_, payload) = text.split_once("]\n").unwrap();
+                    recovered.push_str(payload);
+                }
+            }
+        }
+        assert_eq!(recovered, instructions);
+        assert_eq!(serde_json::to_vec(&original).unwrap(), original_encoded);
+        assert_ne!(recovered, instructions[..instructions.len() / 2]);
+
+        for mode in [TextMasMode::Sequential, TextMasMode::Hierarchical] {
+            for (index, role) in TextMasRole::ALL.into_iter().enumerate() {
+                let drafts = TextMasRole::ALL[..index]
+                    .iter()
+                    .map(|prior| (*prior, "bounded summary".to_string()))
+                    .collect::<Vec<_>>();
+                let prepared = role_context(
+                    &plan.reduced_original("bounded summary"),
+                    mode,
+                    role,
+                    &drafts,
+                )
+                .unwrap();
+                assert!(serde_json::to_vec(&prepared).unwrap().len() <= MAX_CONTEXT_BYTES);
+                assert!(output_budget(&model(), &prepared).is_ok());
+            }
+        }
+        let image = ImageContent::new("AA==", "image/png");
+        assert_eq!(
+            preparation_image_limit(&original, &model(), "image", &image).unwrap(),
+            image.data.len(),
+            "image budgeting must use the same bounded auxiliary base"
+        );
+    }
+
+    #[test]
+    fn hierarchical_image_budget_uses_the_hierarchical_auxiliary_base() {
+        // This fits hierarchical role envelopes, but forces sequential mode to
+        // source-map its system prompt because of prior-draft expansion.
+        let instructions = "s".repeat(MAX_CONTEXT_BYTES - 44_000);
+        let original = Context::new(
+            Some(instructions),
+            vec![user("latest request".into())],
+            None,
+        );
+        let (hierarchical_base, projected_hierarchical) =
+            preparation_base(&original, TextMasMode::Hierarchical, &model());
+        let (_, projected_sequential) =
+            preparation_base(&original, TextMasMode::Sequential, &model());
+        assert!(!projected_hierarchical);
+        assert!(projected_sequential);
+        assert!(hierarchical_base.system_prompt.is_some());
+
+        let image = ImageContent::new("a".repeat(60_000), "image/png");
+        let sequential_limit =
+            preparation_image_limit(&original, &model(), "image", &image).unwrap();
+        let hierarchical_limit = preparation_image_limit_with_mode(
+            &original,
+            &model(),
+            TextMasMode::Hierarchical,
+            "image",
+            &image,
+        )
+        .unwrap();
+        assert_ne!(sequential_limit, hierarchical_limit);
+        assert!(hierarchical_limit < image.data.len());
     }
 
     #[test]

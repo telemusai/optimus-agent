@@ -85,6 +85,13 @@ an alternative endpoint, change model configuration or silently switch models.
   truncated. Complete parent history remains authoritative. OCC3.1 does not
   enlarge the model's ordinary parent context window or bypass its provider
   limits; existing parent compaction and failure handling still apply.
+- When the ordinary system prompt leaves insufficient room for worst-case role
+  drafts and response capacity, its complete UTF-8 text is included in the bounded
+  source map instead of being copied unchanged into every auxiliary request. The
+  tool-free role contract remains in force, and its summaries are lossy advisory
+  data. This is not system-prompt truncation: the normal parent retains the complete
+  original system prompt and history. If even the generic role contract cannot fit,
+  preparation still fails visibly before auxiliary provider spending.
 - Images that cannot fit a mapper request may be decoded and resized only in the
   preparation projection. An undecodable oversized image fails visibly. Original
   parent images are never resized, replaced or removed by OCC3.1. The exact latest

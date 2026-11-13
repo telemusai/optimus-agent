@@ -434,8 +434,13 @@ impl AgentSession {
         } else {
             "represented in the brief"
         };
+        let system_source = if plan.system_instructions_in_source() {
+            "complete system instructions were mapped into the lossy auxiliary brief; the parent retains them verbatim; "
+        } else {
+            ""
+        };
         let note = format!(
-            "Used {map_count} shared context-map and {reduce_count} context-reduction calls because an actual role request exceeded its bound; resized {resized_images} preparation-only image(s); latest user message {latest}. Summaries are lossy advisory context, and the complete parent history remains authoritative."
+            "Used {map_count} shared context-map and {reduce_count} context-reduction calls because an actual role request exceeded its bound; {system_source}resized {resized_images} preparation-only image(s); latest user message {latest}. Summaries are lossy advisory context, and the complete parent history remains authoritative."
         );
         Ok(TextMasReduction { original, note })
     }
@@ -674,7 +679,13 @@ async fn resize_textmas_images(
     let mut resized_count = 0usize;
     for (message_index, block_index, label, image) in sources {
         ensure_textmas_current(session, run, parent_signal)?;
-        let limit = context_contract::preparation_image_limit(original, &run.model, &label, &image)?;
+        let limit = context_contract::preparation_image_limit_with_mode(
+            original,
+            &run.model,
+            run.mode,
+            &label,
+            &image,
+        )?;
         if image.data.len() <= limit {
             continue;
         }

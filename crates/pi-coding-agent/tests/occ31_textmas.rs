@@ -589,6 +589,98 @@ async fn large_history_reduction_and_parent_retry_keep_exact_latest_and_do_not_r
 
 
 #[tokio::test]
+async fn large_project_instructions_trigger_bounded_source_preparation() {
+    let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let f = Fixture::new();
+    let instructions = format!(
+        "PROJECT_INSTRUCTIONS_BEGIN\n{}\nPROJECT_INSTRUCTIONS_END",
+        "Preserve exact UTF-8 é雪 and JSON {\"key\": true} in this instruction.\n"
+            .repeat(4_500)
+    );
+    assert!(instructions.len() > MAX_CONTEXT_BYTES);
+    std::fs::write(
+        f.root.path().join("workspace/AGENTS.md"),
+        &instructions,
+    )
+    .unwrap();
+    let session = f.session(0, false).await;
+    let file = session.session_file().unwrap();
+    textmas_settings::set_mode(&file, TextMasMode::Sequential).unwrap();
+    f.dynamic_preparation_replies(64);
+    turn(&session, "CURRENT_REQUEST", None).await.unwrap();
+
+    let contexts = f.captured.lock().unwrap().clone();
+    let role_name = |context: &Context| {
+        let prompt = context.system_prompt.as_deref().unwrap_or_default();
+        ["mapper", "reducer", "planner", "critic", "refiner"]
+            .into_iter()
+            .find(|role| prompt.contains(&format!("advisory role: {role}")))
+    };
+    let parent = contexts
+        .iter()
+        .find(|context| context.tools.is_some())
+        .expect("the ordinary parent still runs after preparation");
+    let original_system = parent.system_prompt.as_deref().unwrap();
+    assert!(original_system.contains(&instructions));
+    assert!(original_system.len() > MAX_CONTEXT_BYTES);
+
+    // All original system-instruction bytes are losslessly available to the
+    // source mapper. They are neither truncated nor copied back into an
+    // oversized auxiliary system prompt.
+    let mut recovered_system = String::new();
+    for context in contexts
+        .iter()
+        .filter(|context| role_name(context) == Some("mapper"))
+    {
+        for message in &context.messages {
+            let Message::User(user) = message else {
+                continue;
+            };
+            let pi_ai::types::UserContent::Text(text) = &user.content else {
+                continue;
+            };
+            if text.starts_with("[OCC3.1 source system instructions") {
+                let (_, payload) = text.split_once("]\n").unwrap();
+                recovered_system.push_str(payload);
+            }
+        }
+    }
+    assert_eq!(recovered_system, original_system);
+    for context in contexts.iter().filter(|context| context.tools.is_none()) {
+        assert!(serde_json::to_vec(context).unwrap().len() <= MAX_CONTEXT_BYTES);
+    }
+    for role in ["planner", "critic", "refiner"] {
+        let context = contexts
+            .iter()
+            .find(|context| role_name(context) == Some(role))
+            .unwrap();
+        let encoded = serde_json::to_string(context).unwrap();
+        assert!(encoded.contains("CURRENT_REQUEST"));
+        assert!(!encoded.contains("PROJECT_INSTRUCTIONS_BEGIN"));
+    }
+    let mapper_count = contexts
+        .iter()
+        .filter(|context| role_name(context) == Some("mapper"))
+        .count();
+    let reducer_count = contexts
+        .iter()
+        .filter(|context| role_name(context) == Some("reducer"))
+        .count();
+    assert!(mapper_count > 1 && reducer_count >= 1);
+    let parent_text = serde_json::to_string(parent).unwrap();
+    assert!(parent_text.contains("PROJECT_INSTRUCTIONS_BEGIN"));
+    assert!(parent_text.contains("PROJECT_INSTRUCTIONS_END"));
+    assert!(parent_text.contains("complete system instructions were mapped"));
+    assert!(parent_text.contains("REFINER_DRAFT"));
+    assert!(serde_json::to_vec(parent).unwrap().len() > MAX_CONTEXT_BYTES);
+    assert_eq!(
+        ledger(&session).summary().unwrap().calls,
+        mapper_count + reducer_count + 3
+    );
+    session.dispose_async(Some(false)).await;
+}
+
+#[tokio::test]
 async fn dense_auxiliary_outputs_force_real_recursive_reduction_and_unique_ordinals() {
     let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
     let f = Fixture::new();
