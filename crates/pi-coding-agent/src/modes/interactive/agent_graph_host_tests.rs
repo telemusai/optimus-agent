@@ -93,3 +93,141 @@ async fn graph_header_reads_roster_pushes_and_stops_its_timer_when_hidden() {
     assert!(bar.borrow().graph_task.is_none());
     assert!(bar.borrow().graph_deadline.is_none());
 }
+
+#[tokio::test]
+async fn graph_uses_only_authoritative_session_activity_and_hiding_cancels_its_existing_timer() {
+    let h = super::super::ui_tests::FrameHarness::new("textmas-graph-host");
+    crate::modes::interactive::theme::theme::init_theme(Some("neon"), false);
+    let activity = super::agent_graph::activity_tests::sequential_fixture();
+    h.mode.borrow_mut().patch_connection_state(|state| {
+        state.session_id = "root".into();
+        state.active_session_id = Some("root-active".into());
+        state.occ3_modes = Some(super::super::wire::Occ3Modes {
+            textmas_mode: crate::core::occ::textmas::TextMasMode::Sequential,
+            textmas_active: true,
+            textmas_activity: Some(activity.clone()),
+            ..Default::default()
+        });
+    });
+    let roster = Arc::new(Roster(Mutex::new(vec![serde_json::to_value(
+        crate::modes::daemon::daemon_session_list::SessionSummary {
+            id: "root".into(),
+            session_id: "root".into(),
+            active_session_id: Some("root-active".into()),
+            lifecycle: "live".into(),
+            runtime_kind: Some("top-level".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap()])));
+    let mut bar = Bar::new(h.mode.clone());
+    *bar.roster.lock().unwrap() = Some(roster.clone());
+    let (send, _receive) = mpsc::channel();
+    *bar.render_send.borrow_mut() = Some(send);
+    let frame = bar.graph_rows(24, 6);
+    let plain = strip_ansi(&frame.join("\n"));
+    assert!(
+        plain.contains("P…") && plain.contains("C…") && plain.contains("R…"),
+        "{plain}"
+    );
+    assert!(frame.join("\n").contains("38;5;82m"));
+    assert!(
+        bar.graph_task.is_some(),
+        "the existing graph timer, not a new activity loop, updates progress"
+    );
+    assert_eq!(
+        roster.0.lock().unwrap().len(),
+        1,
+        "activity cannot add a roster row"
+    );
+    assert_eq!(roster.0.lock().unwrap()[0]["sessionId"], "root");
+
+    let replace =
+        |activity: &crate::core::occ::textmas_activity::TextMasActivitySnapshot,
+         action: &str,
+         status: crate::core::occ::textmas_activity::TextMasActivityStatus| {
+            let mut replacement = activity.clone();
+            replacement.action_id = action.into();
+            replacement.active = matches!(
+                status,
+                crate::core::occ::textmas_activity::TextMasActivityStatus::Running
+            );
+            replacement.stale = false;
+            for call in &mut replacement.calls {
+                call.call_id = call.call_id.replace("action-1", action);
+                call.depends_on = call
+                    .depends_on
+                    .iter()
+                    .map(|id| id.replace("action-1", action))
+                    .collect();
+                call.status = status;
+            }
+            assert!(replacement.is_valid());
+            h.mode.borrow_mut().patch_connection_state(|state| {
+                state.occ3_modes.as_mut().unwrap().textmas_activity = Some(replacement.clone());
+            });
+            replacement
+        };
+    replace(
+        &activity,
+        "second",
+        crate::core::occ::textmas_activity::TextMasActivityStatus::Running,
+    );
+    let before_late = strip_ansi(&bar.graph_rows(24, 6).join("\n"));
+    replace(
+        &activity,
+        "action-1",
+        crate::core::occ::textmas_activity::TextMasActivityStatus::Cancelled,
+    );
+    let after_late = strip_ansi(&bar.graph_rows(24, 6).join("\n"));
+    assert!(
+        after_late.contains("C…"),
+        "late old action is not a new authoritative plan: {after_late}"
+    );
+    assert!(before_late.contains("C…"));
+    let cached_before_stop = h
+        .mode
+        .borrow()
+        .connection_state
+        .as_ref()
+        .unwrap()
+        .occ3_modes
+        .as_ref()
+        .unwrap()
+        .textmas_activity
+        .clone();
+    super::super::native_state::stop_activity(&mut h.mode.borrow_mut());
+    let disconnected = strip_ansi(&bar.graph_rows(24, 6).join("\n"));
+    assert!(disconnected.contains("disconnected"), "{disconnected}");
+    {
+        let mode = h.mode.borrow();
+        let modes = mode
+            .connection_state
+            .as_ref()
+            .unwrap()
+            .occ3_modes
+            .as_ref()
+            .unwrap();
+        assert!(!modes.textmas_active, "disconnect clears the owner flag");
+        assert_eq!(
+            modes.textmas_activity.as_ref(),
+            cached_before_stop.as_ref(),
+            "disconnect changes only the owner flag, never the cached projection"
+        );
+    }
+    assert!(
+        disconnected.contains("C?") && !disconnected.contains("C×"),
+        "{disconnected}"
+    );
+    h.mode.borrow_mut().patch_connection_state(|state| {
+        state.session_id = "other".into();
+        state.active_session_id = Some("other-active".into());
+    });
+    assert!(
+        !bar.graph_rows(24, 6).join("\n").contains("38;5;82m"),
+        "old session activity cannot cross attachment"
+    );
+    assert!(bar.graph_rows(0, 0).is_empty());
+    assert!(bar.graph_task.is_none());
+    assert!(bar.graph_deadline.is_none());
+}

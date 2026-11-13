@@ -1,11 +1,15 @@
 //! Bounded, presentation-only force layout over the existing roster contract.
 use super::communication_activity::{ActivityState, PULSE};
+use super::context_health_indicator;
 use super::generation_throughput::{parent_keys, summary_keys};
 use crate::modes::agents_view::agents_view_state::get_parent_keys;
 use crate::modes::daemon::agent_roster::{
     classify_session_roster_status, AgentRosterStatus, RosterSummaryView,
 };
 use crate::modes::daemon::daemon_session_list::SessionSummary;
+#[path = "textmas_activity_view.rs"]
+mod textmas_activity_view;
+use textmas_activity_view::Projection;
 use crate::modes::interactive::components::subagent_summary_line::{
     linkage_row_for_roster_summary, RosterParent,
 };
@@ -34,6 +38,7 @@ pub(super) struct Graph {
     root: String,
     nodes: Vec<Node>,
     activity: ActivityState,
+    textmas: Projection,
     frame: Option<Instant>,
     started: Option<Instant>,
     settle_until: Option<Instant>,
@@ -163,6 +168,32 @@ impl Graph {
         self.activity.observe_scope(rows, parent, &family, now);
     }
 
+    /// Observe the authoritative, attachment-scoped cache after the roster.
+    /// No activity entry is inserted into rows, sessions or the usage ledger.
+    pub(super) fn observe_activity(
+        &mut self,
+        activity: Option<&crate::core::occ::textmas_activity::TextMasActivitySnapshot>,
+        now: Instant,
+    ) {
+        self.observe_activity_state(activity, activity.is_some_and(|activity| activity.active), now);
+    }
+
+    pub(super) fn observe_activity_state(
+        &mut self,
+        activity: Option<&crate::core::occ::textmas_activity::TextMasActivitySnapshot>,
+        owner_active: bool,
+        now: Instant,
+    ) {
+        // Preserve the legacy no-activity path: no root allocation and no traversal.
+        if activity.is_none() && self.textmas.is_empty() { return; }
+        let root = self.root.clone();
+        if self.textmas.observe_with_owner(&root, activity, owner_active, now) {
+            self.settle_until = Some(now + SETTLE);
+            // Cancellation belongs to the existing graph frame task, not a new timer.
+            self.frame = None;
+        }
+    }
+
     fn arrange(&mut self) {
         // Give each family branch its own sector. Larger subtrees get more
         // room; springs relax around these anchors instead of crossing branches.
@@ -248,6 +279,7 @@ impl Graph {
     pub(super) fn next_frame(&self, now: Instant) -> Option<Instant> {
         (self.nodes.iter().any(|node| node.working)
             || self.activity.live_links(now).next().is_some()
+            || self.textmas.is_active()
             || self.settle_until.is_some_and(|until| now < until))
         .then(|| self.frame.unwrap_or(now) + FRAME)
     }
@@ -263,6 +295,8 @@ impl Graph {
             return Vec::new();
         }
         let (width, height) = (width.min(40), height.min(6));
+        let activity_rows = self.textmas.lines(width, now, height.saturating_sub(2));
+        let height = height.saturating_sub(activity_rows.len()).max(1);
         if self.size != (width, height) {
             self.size = (width, height);
             self.settle_until = Some(now + SETTLE);
@@ -280,8 +314,22 @@ impl Graph {
         }
         self.frame = Some(now);
         let mut canvas = Canvas::new(width, height);
-        let mut points = BTreeMap::new();
+        let mut points: BTreeMap<&str, (i32, i32)> = BTreeMap::new();
+        let mut activity_points: BTreeMap<&str, (i32, i32)> = BTreeMap::new();
         let mut occupied = BTreeSet::new();
+        // Reserve at most nine role/cohort cells before placing real agents.
+        // Sixty-four maps can never evict roster nodes from this view.
+        let activity_nodes = self.textmas.nodes();
+        let columns = activity_nodes.len().div_ceil(height.min(2)).max(1);
+        for (index, activity) in activity_nodes.iter().enumerate() {
+            let row = index / columns;
+            let column = index % columns;
+            let x = (((column * 2 + 1) * width * 2 / (columns * 2)) as i32).clamp(1, (width * 2 - 2) as i32);
+            let rows = activity_nodes.len().div_ceil(columns).max(1);
+            let y = (((row * 2 + 1) * height / (rows * 2)).min(height - 1) * 4 + 2) as i32;
+            activity_points.insert(activity.id.as_str(), (x, y));
+            occupied.insert((x as usize / 2, y as usize / 4));
+        }
         let mut crowding = vec![0; width * height];
         for node in &self.nodes {
             let x = 1 + (node.x * (width * 2 - 3) as f32).round() as i32;
@@ -311,6 +359,22 @@ impl Graph {
         for node in &self.nodes {
             if let Some(parent) = node.parent.as_deref().and_then(|id| points.get(id)) {
                 canvas.line(*parent, points[node.id.as_str()], 1);
+            }
+        }
+        for activity in activity_nodes {
+            let end = activity_points[activity.id.as_str()];
+            for dependency in &activity.dependencies {
+                if let Some(&start) = activity_points.get(dependency.as_str()) {
+                    let unrelated_role_cells = activity_points
+                        .iter()
+                        .filter(|(id, _)| {
+                            id.as_bytes() != activity.id.as_str().as_bytes()
+                                && id.as_bytes() != dependency.as_str().as_bytes()
+                        })
+                        .map(|(_, point)| ((point.0 / 2) as usize, (point.1 / 4) as usize))
+                        .collect();
+                    canvas.activity_dependency(start, end, &unrelated_role_cells);
+                }
             }
         }
         for (from, to, until) in self.activity.live_links(now) {
@@ -352,6 +416,11 @@ impl Graph {
                 light,
             );
         }
+        for activity in activity_nodes {
+            let (x, y) = activity_points[activity.id.as_str()];
+            canvas.marker_green(x, y, activity.glyph,
+                activity.intensity(activity.counts.running > 0 && self.textmas.owner_active(), pulse));
+        }
         let mut lines = canvas.render();
         if self.omitted > 0 {
             let label = format!("+{}", self.omitted);
@@ -367,6 +436,10 @@ impl Graph {
                 );
             }
         }
+        for row in activity_rows {
+            let padding = width.saturating_sub(pi_tui::utils::visible_width(&row));
+            lines.push(format!("{row}{}", " ".repeat(padding)));
+        }
         lines
     }
 }
@@ -375,7 +448,7 @@ struct Canvas {
     width: usize,
     height: usize,
     pixels: Vec<u8>,
-    markers: BTreeMap<(usize, usize), (char, u8)>,
+    markers: BTreeMap<(usize, usize), (char, u8, bool)>,
 }
 impl Canvas {
     fn new(width: usize, height: usize) -> Self {
@@ -388,21 +461,68 @@ impl Canvas {
     }
     fn marker(&mut self, x: i32, y: i32, glyph: char, light: u8) {
         self.markers
-            .insert((x as usize / 2, y as usize / 4), (glyph, light));
+            .insert((x as usize / 2, y as usize / 4), (glyph, light, false));
+    }
+    fn marker_green(&mut self, x: i32, y: i32, glyph: char, light: u8) {
+        self.markers
+            .insert((x as usize / 2, y as usize / 4), (glyph, light, true));
     }
     fn dot(&mut self, x: i32, y: i32, light: u8) {
+        self.coloured_dot(x, y, light, false);
+    }
+    fn coloured_dot(&mut self, x: i32, y: i32, light: u8, green: bool) {
         if x >= 0 && y >= 0 && (x as usize) < self.width * 2 && (y as usize) < self.height * 4 {
             let pixel = &mut self.pixels[y as usize * self.width * 2 + x as usize];
-            *pixel = (*pixel).max(light);
+            // The green bit is used only by recorded TextMAS dependencies.
+            *pixel = (*pixel & 3).max(light) | if green || *pixel & 4 != 0 { 4 } else { 0 };
         }
     }
     fn line(&mut self, a: (i32, i32), b: (i32, i32), light: u8) {
+        self.coloured_line(a, b, light, false);
+    }
+    fn activity_dependency(
+        &mut self,
+        start: (i32, i32),
+        end: (i32, i32),
+        unrelated_role_cells: &BTreeSet<(usize, usize)>,
+    ) {
+        let cell = |point: (i32, i32)| ((point.0 / 2) as usize, (point.1 / 4) as usize);
+        let candidates = [
+            vec![start, end],
+            vec![start, (start.0, end.1), end],
+            vec![start, (end.0, start.1), end],
+        ];
+        'candidate: for candidate in candidates {
+            for segment in candidate.windows(2) {
+                let (a, b) = (segment[0], segment[1]);
+                let steps = (b.0 - a.0).abs().max((b.1 - a.1).abs()).max(1);
+                for i in 0..=steps {
+                    let point = (a.0 + (b.0 - a.0) * i / steps, a.1 + (b.1 - a.1) * i / steps);
+                    if unrelated_role_cells.contains(&cell(point)) {
+                        continue 'candidate;
+                    }
+                }
+            }
+            for segment in candidate.windows(2) {
+                self.line_green(segment[0], segment[1], 1);
+            }
+            return;
+        }
+        // A crowded short canvas cannot draw every genuine cohort link without
+        // implying a third role. Keep that link in Projection, not in its lines.
+    }
+
+    fn line_green(&mut self, a: (i32, i32), b: (i32, i32), light: u8) {
+        self.coloured_line(a, b, light, true);
+    }
+    fn coloured_line(&mut self, a: (i32, i32), b: (i32, i32), light: u8, green: bool) {
         let steps = (b.0 - a.0).abs().max((b.1 - a.1).abs()).max(1);
         for i in 0..=steps {
-            self.dot(
+            self.coloured_dot(
                 a.0 + (b.0 - a.0) * i / steps,
                 a.1 + (b.1 - a.1) * i / steps,
                 light,
+                green,
             );
         }
     }
@@ -411,8 +531,9 @@ impl Canvas {
             .map(|row| {
                 let mut line = String::new();
                 let mut previous = 0;
+                let mut previous_green = false;
                 for col in 0..self.width {
-                    let (mut bits, mut light) = (0u8, 0u8);
+                    let (mut bits, mut light, mut green) = (0u8, 0u8, false);
                     for (dx, dy, bit) in [
                         (0, 0, 1),
                         (0, 1, 2),
@@ -426,7 +547,8 @@ impl Canvas {
                         let pixel = self.pixels[(row * 4 + dy) * self.width * 2 + col * 2 + dx];
                         if pixel > 0 {
                             bits |= bit;
-                            light = light.max(pixel);
+                            light = light.max(pixel & 3);
+                            green |= pixel & 4 != 0;
                         }
                     }
                     let mut glyph = if bits == 0 {
@@ -434,17 +556,25 @@ impl Canvas {
                     } else {
                         char::from_u32(0x2800 + u32::from(bits)).unwrap_or(' ')
                     };
-                    if let Some(&(marker, intensity)) = self.markers.get(&(col, row)) {
+                    if let Some(&(marker, intensity, marker_green)) = self.markers.get(&(col, row)) {
                         glyph = marker;
                         light = intensity;
+                        green = marker_green;
                     }
-                    if light != previous {
-                        line.push_str(match light {
-                            3 => "\x1b[22;1;38;5;39m",
-                            2 => "\x1b[22;38;5;39m",
-                            _ => "\x1b[22;2;38;5;39m",
-                        });
+                    if light != previous || green != previous_green {
+                        if green {
+                            let strength = match light { 3 => "1", 1 => "2", _ => "0" };
+                            line.push_str(&format!("\x1b[22;{strength};38;5;{}m",
+                                super::context_health_indicator::CONTEXT_HEALTH_GREEN));
+                        } else {
+                            line.push_str(match light {
+                                3 => "\x1b[22;1;38;5;39m",
+                                2 => "\x1b[22;38;5;39m",
+                                _ => "\x1b[22;2;38;5;39m",
+                            });
+                        }
                         previous = light;
+                        previous_green = green;
                     }
                     line.push(glyph);
                 }
@@ -458,3 +588,10 @@ impl Canvas {
 #[cfg(test)]
 #[path = "agent_graph_tests.rs"]
 mod tests;
+#[cfg(test)]
+#[path = "agent_graph_activity_tests.rs"]
+pub(super) mod activity_tests;
+
+#[cfg(test)]
+#[path = "agent_graph_activity_benchmark.rs"]
+mod activity_benchmark;

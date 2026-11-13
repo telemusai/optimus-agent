@@ -7,6 +7,10 @@
 use crate::core::context_health::{context_health, ContextHealthBand, ContextHealthInput};
 use pi_tui::utils::visible_width;
 
+/// The established CTX-health green, also used by OCC3.1 role projections.
+/// Keep this as the single source of the ANSI-256 token for both renderers.
+pub(super) const CONTEXT_HEALTH_GREEN: u8 = 82;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum Risk {
     Green,
@@ -66,7 +70,7 @@ impl Indicator {
 
     fn label(&self, compact: bool) -> String {
         let (name, short, colour) = match self.risk {
-            Some(Risk::Green) => ("GREEN", "G", 82),
+            Some(Risk::Green) => ("GREEN", "G", CONTEXT_HEALTH_GREEN),
             Some(Risk::Amber) => ("AMBER", "A", 214),
             Some(Risk::Red) => ("RED", "R", 196),
             None => ("UNKNOWN", "?", 244),
