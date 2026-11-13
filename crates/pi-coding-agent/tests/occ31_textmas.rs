@@ -2,6 +2,7 @@
 use pi_ai::providers::faux::*;
 use pi_ai::types::{AssistantMessage, ContentBlock, Context, Message, Model, ToolCall};
 use pi_coding_agent::core::occ::{textmas::{MAX_CONTEXT_BYTES, TextMasCallStatus, TextMasMode, TextMasRole, TextMasUsageLedger, TextMasUsageRecord, usage_record}, textmas_settings};
+use pi_coding_agent::core::occ::textmas_activity::{TextMasActivitySnapshot, TextMasActivityStatus};
 use pi_coding_agent::core::extensions::types::{ExtensionEvent, ExtensionFactory, InputSource};
 use pi_coding_agent::core::agent_session::{AgentSession, PromptOptions};
 use pi_coding_agent::core::agent_session_services::*;
@@ -398,6 +399,16 @@ fn terminal_status(session: &AgentSession, role: TextMasRole) -> Vec<TextMasCall
         .map(|record| record.status).collect()
 }
 
+fn settled_activity(session: &AgentSession) -> TextMasActivitySnapshot {
+    let activity = session.textmas_activity_snapshot().expect("settled run has an activity projection");
+    assert!(activity.is_valid() && !activity.active);
+    activity
+}
+
+fn activity_role_status(activity: &TextMasActivitySnapshot, role: TextMasRole) -> TextMasActivityStatus {
+    activity.calls.iter().find(|call| call.role == role).expect("one real role call").status
+}
+
 async fn idle(session: &Arc<AgentSession>) {
 
     let _ = tokio::time::timeout(Duration::from_secs(20), session.wait_for_headless_idle()).await.expect("session settled");
@@ -689,6 +700,21 @@ async fn oversized_single_message_uses_bounded_chunked_preparation_in_both_modes
         assert!(parent.contains("PLANNER_DRAFT") && parent.contains("CRITIC_DRAFT") && parent.contains("REFINER_DRAFT"));
         assert!(parent.contains("shared context-map") && parent.contains("lossy advisory"));
         assert_eq!(ledger(&session).summary().unwrap().calls, mapper_count + reducer_count + 3);
+        let activity = session.textmas_activity_snapshot().unwrap();
+        assert!(activity.is_valid() && activity.mode == Some(mode));
+        assert_eq!(activity.calls.iter().filter(|call| call.role == pi_coding_agent::core::occ::textmas::TextMasRole::Mapper).count(), mapper_count);
+        let reducers = activity.calls.iter().filter(|call| call.role == pi_coding_agent::core::occ::textmas::TextMasRole::Reducer).collect::<Vec<_>>();
+        assert_eq!(reducers.len(), reducer_count);
+        for reducer in &reducers {
+            assert!(reducer.level.is_some());
+            assert!(!reducer.depends_on.is_empty());
+            for dependency in &reducer.depends_on {
+                assert!(activity.calls.iter().any(|call| &call.call_id == dependency));
+            }
+        }
+        assert!(reducers.iter().any(|reducer| pi_coding_agent::core::occ::textmas::TextMasRole::ALL.iter().all(|role| {
+            activity.calls.iter().find(|call| call.role == *role).unwrap().depends_on.contains(&reducer.call_id)
+        })), "all real roles consume the actual final reduction brief");
         assert!(!serde_json::to_string(&session.messages()).unwrap().contains("MAPPER_BRIEF"));
         session.dispose_async(Some(false)).await;
     }
@@ -901,6 +927,52 @@ async fn valid_oversized_png_is_resized_only_for_advisory_preparation() {
     session.dispose_async(Some(false)).await;
 }
 
+
+#[tokio::test]
+async fn activity_events_and_snapshot_track_running_then_authoritative_completion() {
+    let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    use pi_coding_agent::core::agent_session::AgentSessionEvent;
+    use pi_coding_agent::core::occ::textmas_activity::{TextMasActivitySnapshot, TextMasActivityStatus};
+    let f = Fixture::new();
+    let session = f.session(0, false).await;
+    let file = session.session_file().unwrap();
+    textmas_settings::set_mode(&file, TextMasMode::Sequential).unwrap();
+    let events = Arc::new(Mutex::new(Vec::<TextMasActivitySnapshot>::new()));
+    let unsubscribe = session.subscribe(Arc::new({ let events = events.clone(); move |event| {
+        if let AgentSessionEvent::TextMasActivity { activity } = event { events.lock().unwrap().push(activity); }
+    }}));
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    f.reply(text_reply("PLANNER_DRAFT"), Some(file), Some(release.clone()));
+    let running = tokio::spawn({ let session = session.clone(); async move { session.prompt("CURRENT_REQUEST", None).await } });
+    let _running_cleanup = AbortOnDrop(running.abort_handle());
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while f.captured.lock().unwrap().is_empty() { tokio::task::yield_now().await; }
+    }).await.unwrap();
+    let running_activity = session.textmas_activity_snapshot().unwrap();
+    assert_eq!(running_activity.session_id, session.session_id());
+    assert!(running_activity.active && !running_activity.stale);
+    assert_eq!(running_activity.calls[0].status, TextMasActivityStatus::Running);
+    assert!(running_activity.calls[1..].iter().all(|call| call.status == TextMasActivityStatus::Queued));
+    assert_eq!(f.captured.lock().unwrap().len(), 1, "planning and snapshots do not spend tokens");
+    release.add_permits(1);
+    f.reply(text_reply("CRITIC_DRAFT"), None, None);
+    f.reply(text_reply("REFINER_DRAFT"), None, None);
+    f.reply(text_reply("PARENT"), None, None);
+    tokio::time::timeout(Duration::from_secs(20), running).await.unwrap().unwrap().unwrap();
+    idle(&session).await;
+    let final_activity = session.textmas_activity_snapshot().unwrap();
+    assert!(!final_activity.active);
+    assert!(final_activity.calls.iter().all(|call| call.status == TextMasActivityStatus::Completed));
+    assert_eq!(f.captured.lock().unwrap().len(), 4, "three role calls plus exactly one parent");
+    let events = events.lock().unwrap();
+    assert!(events.iter().any(|activity| activity.active && activity.calls.iter().any(|call| call.status == TextMasActivityStatus::Running)));
+    assert!(events.iter().all(|activity| activity.session_id == session.session_id() && activity.is_valid()));
+    assert_eq!(events.last().unwrap().calls, final_activity.calls);
+    drop(events);
+    unsubscribe();
+    session.dispose_async(Some(false)).await;
+}
+
 #[tokio::test]
 async fn off_internal_extension_and_child_turns_never_fan_out() {
     let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
@@ -953,6 +1025,10 @@ async fn provider_error_refusal_empty_and_tool_attempt_fail_without_retry_or_exe
             assert!(!error.contains("partial unpublished draft"));
         }
         assert_eq!(f.captured.lock().unwrap().len(), 1, "no retry/fallback after {case}");
+        let activity = session.textmas_activity_snapshot().unwrap();
+        assert!(activity.is_valid() && !activity.active);
+        assert_eq!(activity.calls[0].status, pi_coding_agent::core::occ::textmas_activity::TextMasActivityStatus::Failed);
+        assert!(activity.calls[1..].iter().all(|call| call.status == pi_coding_agent::core::occ::textmas_activity::TextMasActivityStatus::Skipped));
         assert!(!side_effect.exists());
         assert_eq!(ledger(&session).summary().unwrap().calls, 1);
         session.dispose_async(Some(false)).await;
@@ -1100,6 +1176,12 @@ async fn hierarchical_each_role_failure_promptly_cancels_inflight_siblings() {
         for role in TextMasRole::ALL {
             let expected = if role == failed_role { TextMasCallStatus::Failed } else { TextMasCallStatus::Cancelled };
             assert_eq!(terminal_status(&session, role), vec![expected], "failed role {failed_role:?}; sibling {role:?}");
+        }
+        let activity = settled_activity(&session);
+        assert_eq!(activity.calls.len(), 3, "no synthetic roles come from sibling cancellation");
+        for role in TextMasRole::ALL {
+            let expected = if role == failed_role { TextMasActivityStatus::Failed } else { TextMasActivityStatus::Cancelled };
+            assert_eq!(activity_role_status(&activity, role), expected);
         }
         let records = role_usage(&session);
         assert_eq!(records.iter().filter(|record| record.status == TextMasCallStatus::Started).count(), 3);
@@ -1295,6 +1377,12 @@ async fn hierarchical_provider_capacity_refusal_fails_without_serial_fallback() 
     assert_eq!(terminal_status(&session, TextMasRole::Critic), vec![TextMasCallStatus::Failed]);
     let refiner = terminal_status(&session, TextMasRole::Refiner);
     assert!(refiner.is_empty() || refiner == [TextMasCallStatus::Cancelled]);
+    let activity = settled_activity(&session);
+    assert_eq!(activity.calls.len(), 3, "only the three real planned roles appear");
+    assert_eq!(activity_role_status(&activity, TextMasRole::Planner), TextMasActivityStatus::Cancelled);
+    assert_eq!(activity_role_status(&activity, TextMasRole::Critic), TextMasActivityStatus::Failed);
+    let expected_refiner = if refiner.is_empty() { TextMasActivityStatus::Skipped } else { TextMasActivityStatus::Cancelled };
+    assert_eq!(activity_role_status(&activity, TextMasRole::Refiner), expected_refiner);
     let records = role_usage(&session);
     let started = records.iter().filter(|record| record.status == TextMasCallStatus::Started).count();
     let terminal = records.iter().filter(|record| record.status != TextMasCallStatus::Started).count();
@@ -1327,6 +1415,11 @@ async fn hierarchical_timeout_cancels_siblings_without_resetting_role_deadlines(
     let statuses = TextMasRole::ALL.into_iter().flat_map(|role| terminal_status(&session, role)).collect::<Vec<_>>();
     assert_eq!(statuses.iter().filter(|status| **status == TextMasCallStatus::TimedOut).count(), 1);
     assert_eq!(statuses.iter().filter(|status| **status == TextMasCallStatus::Cancelled).count(), 2);
+    let activity = settled_activity(&session);
+    assert_eq!(activity.calls.len(), 3);
+    let activity_statuses = activity.calls.iter().map(|call| call.status).collect::<Vec<_>>();
+    assert_eq!(activity_statuses.iter().filter(|status| **status == TextMasActivityStatus::TimedOut).count(), 1);
+    assert_eq!(activity_statuses.iter().filter(|status| **status == TextMasActivityStatus::Cancelled).count(), 2);
     assert_eq!(ledger(&session).summary().unwrap().calls, 3);
     gate.add_permits(3);
     session.dispose_async(Some(false)).await;
@@ -1395,6 +1488,18 @@ async fn final_provider_retry_reuses_three_drafts_without_another_stage_call() {
         assert!(contexts[3].tools.is_some() && contexts[4].tools.is_some());
         assert!(serde_json::to_string(&contexts[4].messages).unwrap().contains("REFINER_DRAFT"));
         drop(contexts);
+        let activity = session.textmas_activity_snapshot().unwrap();
+        assert!(activity.is_valid() && !activity.active);
+        assert_eq!(activity.mode, Some(mode));
+        assert_eq!(activity.calls.len(), 3, "a parent retry cannot create fresh role identities");
+        if mode == TextMasMode::Sequential {
+            assert_eq!(activity.calls[0].depends_on.len(), 0);
+            assert_eq!(activity.calls[1].depends_on, vec![activity.calls[0].call_id.clone()]);
+            assert_eq!(activity.calls[2].depends_on, vec![activity.calls[1].call_id.clone()]);
+        } else {
+            assert!(activity.calls.iter().all(|call| call.depends_on.is_empty()));
+        }
+        assert!(activity.calls.iter().all(|call| call.status == pi_coding_agent::core::occ::textmas_activity::TextMasActivityStatus::Completed));
         assert_eq!(ledger(&session).summary().unwrap().calls, 3);
         session.dispose_async(Some(false)).await;
     }

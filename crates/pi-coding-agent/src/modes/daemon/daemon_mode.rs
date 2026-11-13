@@ -1849,6 +1849,10 @@ impl DaemonClientHandle {
             .unwrap_or_else(|| state.capabilities.clone())
     }
 
+    pub fn supports_capability_for_session(&self, capability: &str, active_session_id: &str) -> bool {
+        self.capabilities_for_session(active_session_id).contains(capability)
+    }
+
     pub fn supports_extension_ui_for_session(&self, active_session_id: &str) -> bool {
         let state = self.state.lock().expect("daemon client poisoned");
         state
@@ -2134,6 +2138,19 @@ pub fn should_send_daemon_outbound_to_client(
     message: &DaemonOutbound,
 ) -> bool {
     match message {
+        DaemonOutbound::SessionEvent { active_session_id, event, .. }
+            if event.get("type").and_then(Value::as_str) == Some("textmas_activity") =>
+        {
+            client.supports_capability_for_session("occ31_textmas_activity", active_session_id)
+        }
+        DaemonOutbound::Raw(value)
+            if value.get("type").and_then(Value::as_str) == Some("textmas_activity")
+                || (value.get("type").and_then(Value::as_str) == Some("session_event")
+                    && value.get("event").and_then(|event| event.get("type")).and_then(Value::as_str) == Some("textmas_activity")) =>
+        {
+            let active_session_id = value.get("activeSessionId").and_then(Value::as_str).unwrap_or("");
+            client.supports_capability_for_session("occ31_textmas_activity", active_session_id)
+        }
         DaemonOutbound::ExtensionUiRequest {
             active_session_id,
             method,
@@ -8652,6 +8669,9 @@ impl AgentDaemon {
     }
     /// `write(client, message)`.
     fn write(self: &Arc<Self>, client: &Arc<DaemonClientHandle>, message: &DaemonOutbound) -> bool {
+        // Apply the event gate here as well as the live broadcaster: deferred
+        // replay frames call write directly and must not reach older clients.
+        if !should_send_daemon_outbound_to_client(client, message) { return true; }
         let compact_allowed = {
             let state = client.state.lock().expect("daemon client poisoned");
             state.transport.as_deref() == Some("private-framed") && state.authentication_role.as_deref() != Some("session_client")
@@ -8763,6 +8783,11 @@ impl AgentDaemon {
     ) -> bool {
         if client.writer.destroyed() {
             return false;
+        }
+        // This is also a replay/live safety boundary, not only the broadcaster's
+        // preflight check. Session-scoped capabilities apply to either call path.
+        if message.is_some_and(|message| !should_send_daemon_outbound_to_client(client, message)) {
+            return true;
         }
         let private_framed = client.state.lock().expect("daemon client poisoned").transport.as_deref() == Some("private-framed");
         if private_framed {

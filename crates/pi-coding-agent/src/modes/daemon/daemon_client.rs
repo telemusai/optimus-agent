@@ -123,9 +123,12 @@ impl DaemonHello {
     pub fn supports(&self, capability: &str) -> bool {
         // OCC3 configuration metadata and controls are optional schema-47 additions.
         // A capability name alone on an older hello must not make clients rely on them.
-        if capability == "occ31_textmas" && self.schema_revision.unwrap_or(0) < 47 {
-            return false;
-        }
+        let minimum_schema = match capability {
+            "occ31_textmas" => 47,
+            "occ31_textmas_activity" => 48,
+            _ => 0,
+        };
+        if self.schema_revision.unwrap_or(0) < minimum_schema { return false; }
         self.server_capabilities.iter().any(|entry| entry == capability)
     }
 }

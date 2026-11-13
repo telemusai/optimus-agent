@@ -102,8 +102,11 @@ pub const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION: u32 = 7;
 // OCC3.2 preference writes and configuration display metadata. Optional
 // SessionStats/ContextTreeNode textmasUsage reports preparation usage separately.
 // Existing startup, roster and OCC2 command requirements stay unchanged.
-pub const DAEMON_SCHEMA_REVISION: u32 = 47;
-pub const DAEMON_SCHEMA_ID: &str = "protocol-7-schema-47-occ31-textmas";
+// Revision 48 adds optional content-free TextMAS activity on connection state
+// and its typed, client-capability-gated session event. No new command or startup
+// requirement is introduced; old clients never receive the new event.
+pub const DAEMON_SCHEMA_REVISION: u32 = 48;
+pub const DAEMON_SCHEMA_ID: &str = "protocol-7-schema-48-occ31-textmas-activity";
 
 pub type DaemonProtocolName = String;
 pub type DaemonProtocolVersion = u32;
@@ -129,6 +132,8 @@ pub enum DaemonClientCapability {
     ChunkedSnapshot,
     HistoryRanges,
     ClientOwnedSessions,
+    /// Opt-in for typed OCC3.1 lifecycle events unknown to older clients.
+    Occ31TextmasActivity,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -215,6 +220,8 @@ pub enum DaemonServerCapability {
     AgentCommunicationQueueControl,
     /// Optional host-owned TextMAS mode controls and OCC3 configuration metadata.
     Occ31Textmas,
+    /// Optional content-free TextMAS snapshots and typed lifecycle events.
+    Occ31TextmasActivity,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -252,7 +259,7 @@ pub fn daemon_protocol_info() -> DaemonProtocolInfo {
 pub const DAEMON_DEFAULT_CLIENT_CAPABILITIES: [DaemonClientCapability; 2] =
     [DaemonClientCapability::AttachSnapshot, DaemonClientCapability::EventSequence];
 
-pub const DAEMON_SUPPORTED_CLIENT_CAPABILITIES: [DaemonClientCapability; 7] = [
+pub const DAEMON_SUPPORTED_CLIENT_CAPABILITIES: [DaemonClientCapability; 8] = [
     DaemonClientCapability::AttachSnapshot,
     DaemonClientCapability::EventSequence,
     DaemonClientCapability::ExtensionUi,
@@ -260,12 +267,13 @@ pub const DAEMON_SUPPORTED_CLIENT_CAPABILITIES: [DaemonClientCapability; 7] = [
     DaemonClientCapability::ChunkedSnapshot,
     DaemonClientCapability::HistoryRanges,
     DaemonClientCapability::ClientOwnedSessions,
+    DaemonClientCapability::Occ31TextmasActivity,
 ];
 
 /// `DAEMON_DEFAULT_SERVER_CAPABILITIES`: the supported client list plus the
 /// server-only surfaces. `direct_peer_transport` and `agent_roster` are
 /// deliberately absent, exactly as in the TypeScript.
-pub const DAEMON_DEFAULT_SERVER_CAPABILITIES: [DaemonServerCapability; 35] = [
+pub const DAEMON_DEFAULT_SERVER_CAPABILITIES: [DaemonServerCapability; 36] = [
     DaemonServerCapability::AttachSnapshot,
     DaemonServerCapability::EventSequence,
     DaemonServerCapability::ExtensionUi,
@@ -301,6 +309,7 @@ pub const DAEMON_DEFAULT_SERVER_CAPABILITIES: [DaemonServerCapability; 35] = [
     DaemonServerCapability::AgentCommunicationQueue,
     DaemonServerCapability::AgentCommunicationQueueControl,
     DaemonServerCapability::Occ31Textmas,
+    DaemonServerCapability::Occ31TextmasActivity,
 ];
 
 /// `{ dev: number; ino: number }` on the peer transport ticket.
@@ -3177,7 +3186,24 @@ mod tests {
 
     #[test]
     fn keeps_the_advertised_schema_identity() {
-        assert_eq!(DAEMON_SCHEMA_ID, format!("protocol-{DAEMON_PROTOCOL_VERSION}-schema-{DAEMON_SCHEMA_REVISION}-occ31-textmas"));
+        assert_eq!(DAEMON_SCHEMA_ID, format!("protocol-{DAEMON_PROTOCOL_VERSION}-schema-{DAEMON_SCHEMA_REVISION}-occ31-textmas-activity"));
+    }
+
+    #[test]
+    fn textmas_activity_is_opt_in_and_keeps_old_daemon_startup_compatible() {
+        assert!(DAEMON_SUPPORTED_CLIENT_CAPABILITIES.contains(&DaemonClientCapability::Occ31TextmasActivity));
+        assert!(DAEMON_DEFAULT_SERVER_CAPABILITIES.contains(&DaemonServerCapability::Occ31TextmasActivity));
+        assert!(!DAEMON_DEFAULT_CLIENT_CAPABILITIES.contains(&DaemonClientCapability::Occ31TextmasActivity));
+        let old_daemon = DaemonCompatibilityHello {
+            protocol: daemon_protocol_info(), schema_revision: Some(47),
+            server_capabilities: Some(vec![DaemonServerCapability::AttachSnapshot, DaemonServerCapability::OccSessionPreferences, DaemonServerCapability::Occ31Textmas]),
+        };
+        for command in ["create", "attach", "reattach", "get_state", "occ_get_preferences", "occ_set_preferences"] {
+            assert!(meets_daemon_command_compatibility(&old_daemon, &daemon_command_compatibility(command)), "{command}");
+        }
+        for event in ["daemon_hello", "session_event", "session_attached", "session_resynced"] {
+            assert!(meets_daemon_command_compatibility(&old_daemon, &daemon_outbound_compatibility(event)), "{event}");
+        }
     }
 
     #[test]

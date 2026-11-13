@@ -588,6 +588,9 @@ pub struct Occ3Modes {
     /// True while a TextMAS preparation run is active in this session.
     #[serde(default)]
     pub textmas_active: bool,
+    /// Content-free lifecycle metadata; never usage or completed-agent evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub textmas_activity: Option<crate::core::occ::textmas_activity::TextMasActivitySnapshot>,
     pub latent_enabled: bool,
     pub latent_active: bool,
     pub latent_available: bool,
@@ -595,8 +598,15 @@ pub struct Occ3Modes {
 
 /// Optional display metadata must not make an otherwise valid attachment fail.
 fn deserialize_occ3_modes<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Option<Occ3Modes>, D::Error> {
-    let value = serde_json::Value::deserialize(deserializer)?;
-    Ok(serde_json::from_value(value).ok())
+    let mut value = serde_json::Value::deserialize(deserializer)?;
+    let activity = value.get("textmasActivity").cloned()
+        .and_then(|value| serde_json::from_value::<crate::core::occ::textmas_activity::TextMasActivitySnapshot>(value).ok())
+        .filter(|activity| activity.is_valid());
+    if let Some(object) = value.as_object_mut() { object.remove("textmasActivity"); }
+    Ok(serde_json::from_value(value).ok().map(|mut modes: Occ3Modes| {
+        modes.textmas_activity = activity;
+        modes
+    }))
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -1001,6 +1011,10 @@ pub enum AgentConnectionSessionEvent {
     },
     #[serde(rename = "session_action_update")]
     SessionActionUpdate { actions: Value },
+    #[serde(rename = "textmas_activity")]
+    TextMasActivity {
+        activity: crate::core::occ::textmas_activity::TextMasActivitySnapshot,
+    },
     #[serde(rename = "compaction_start")]
     CompactionStart {
         reason: String,
@@ -1155,7 +1169,11 @@ pub fn parse_agent_connection_session_event(mut value: Value) -> Result<AgentCon
             }
         }
     }
-    serde_json::from_value(value)
+    let event: AgentConnectionSessionEvent = serde_json::from_value(value)?;
+    if matches!(&event, AgentConnectionSessionEvent::TextMasActivity { activity } if !activity.is_valid()) {
+        return Err(<serde_json::Error as serde::de::Error>::custom("invalid TextMAS activity"));
+    }
+    Ok(event)
 }
 
 pub fn deserialize_agent_connection_session_event<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<AgentConnectionSessionEvent, D::Error> {
@@ -1176,6 +1194,7 @@ impl AgentConnectionSessionEvent {
             AgentConnectionSessionEvent::RlmSubagentRemoved { .. } => "rlm_subagent_removed",
             AgentConnectionSessionEvent::IpythonSentAgentMessage { .. } => "ipython_sent_agent_message",
             AgentConnectionSessionEvent::SessionActionUpdate { .. } => "session_action_update",
+            AgentConnectionSessionEvent::TextMasActivity { .. } => "textmas_activity",
             AgentConnectionSessionEvent::CompactionStart { .. } => "compaction_start",
             AgentConnectionSessionEvent::SessionInfoChanged { .. } => "session_info_changed",
             AgentConnectionSessionEvent::ThinkingLevelChanged { .. } => "thinking_level_changed",
@@ -1733,6 +1752,43 @@ mod tests {
         let wire = serde_json::to_value(&event).unwrap();
         assert_eq!(wire, json!({"type":"tree_navigated","targetId":"entry-1"}));
         assert_eq!(serde_json::from_value::<AgentConnectionSessionEvent>(wire).unwrap(), event);
+    }
+
+
+    #[test]
+    fn textmas_activity_wire_is_typed_bounded_and_missing_state_stays_compatible() {
+        use crate::core::occ::textmas::{TextMasMode, TextMasRole};
+        use crate::core::occ::textmas_activity::{TextMasActivityCall, TextMasActivitySnapshot, TEXTMAS_ACTIVITY_SCHEMA};
+        use crate::core::occ::textmas_activity::TextMasActivityStatus;
+        let call = TextMasActivityCall::queued("action", TextMasRole::Planner, None, None, vec![]);
+        let activity = TextMasActivitySnapshot {
+            schema: TEXTMAS_ACTIVITY_SCHEMA.into(), session_id: "root".into(), action_id: "action".into(),
+            mode: Some(TextMasMode::Sequential), active: true, stale: false, calls: vec![call],
+        };
+        assert_eq!(activity.calls[0].status, TextMasActivityStatus::Queued);
+        let event = AgentConnectionSessionEvent::TextMasActivity { activity: activity.clone() };
+        let wire = parse_agent_connection_session_event(serde_json::to_value(event).unwrap()).unwrap();
+        assert_eq!(wire.type_name(), "textmas_activity");
+        assert_eq!(wire, AgentConnectionSessionEvent::TextMasActivity { activity: activity.clone() });
+        assert_eq!(serde_json::from_value::<AgentConnectionSessionEvent>(serde_json::to_value(&wire).unwrap()).unwrap(), wire);
+        let mut malformed = serde_json::to_value(&wire).unwrap();
+        malformed["activity"]["calls"][0]["dependsOn"] = json!(["unknown"]);
+        assert!(parse_agent_connection_session_event(malformed).is_err());
+        let base = json!({"textmasMode":"sequential", "textmasActive":true, "latentEnabled":false, "latentActive":false, "latentAvailable":false});
+        let missing: Occ3Modes = serde_json::from_value(base.clone()).unwrap();
+        assert!(missing.textmas_activity.is_none());
+        let mut present = base.clone(); present["textmasActivity"] = serde_json::to_value(&activity).unwrap();
+        assert_eq!(serde_json::from_value::<Occ3Modes>(present).unwrap().textmas_activity.unwrap().session_id, "root");
+        let mut invalid = base; invalid["textmasActivity"] = json!({"schema":"unknown"});
+        let mut attachment = serde_json::to_value(AgentConnectionState { occ3_modes: None, ..Default::default() }).unwrap();
+        attachment["occ3Modes"] = invalid;
+        let recovered: AgentConnectionState = serde_json::from_value(attachment).unwrap();
+        let modes = recovered.occ3_modes.unwrap();
+        assert_eq!(modes.textmas_mode, crate::core::occ::textmas::TextMasMode::Sequential);
+        assert!(modes.textmas_active);
+        assert!(modes.textmas_activity.is_none());
+        let encoded = serde_json::to_value(&activity).unwrap().to_string();
+        for content in ["prompt", "draft", "tool", "usage"] { assert!(!encoded.contains(content)); }
     }
 
     #[test]

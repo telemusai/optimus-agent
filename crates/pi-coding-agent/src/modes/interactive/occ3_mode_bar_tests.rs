@@ -37,7 +37,7 @@ fn snapshot(session: &str, modes: Option<Occ3Modes>) -> local::AgentConnectionSt
 }
 
 fn modes(textmas_mode: TextMasMode, enabled: bool, active: bool, available: bool) -> Occ3Modes {
-    Occ3Modes { textmas_mode, textmas_active: false, latent_enabled: enabled, latent_active: active, latent_available: available }
+    Occ3Modes { textmas_mode, textmas_active: false, textmas_activity: None, latent_enabled: enabled, latent_active: active, latent_available: available }
 }
 
 fn roster() -> Arc<Roster> {

@@ -537,6 +537,7 @@ impl InProcessRuntimeHost for InProcessRuntimeHostAdapter {
                 occ3_native_dead: session.experimental_native_occ3().map(|native| native.is_dead()).unwrap_or(false),
                 occ3_global_opt_in,
                 textmas_active: session.is_textmas_active(),
+                textmas_activity: session.textmas_activity_snapshot(),
                 // `contextUsage: session.getContextUsage()` (snapshot.ts:56).
                 context_usage: serde_json::to_value(session.get_context_usage()).unwrap(),
                 persisted_recap,
