@@ -1,0 +1,44 @@
+{
+  "task": "gpqa",
+  "condition": "baseline",
+  "n": 198,
+  "correct": 73,
+  "accuracy": 0.3686868686868687,
+  "ci_lo": 0.30458094887975057,
+  "ci_hi": 0.43779128756704727,
+  "mcnemar_b": null,
+  "mcnemar_c": null,
+  "mcnemar_p": null,
+  "wall_s": null,
+  "mean_latency_s": 24.816,
+  "median_latency_s": 30.864,
+  "p95_latency_s": 39.952,
+  "prompt_per_item": 318.0808080808081,
+  "completion_per_item": 2947.0454545454545,
+  "reasoning_per_item": 2795.3333333333335,
+  "truncation_rate": 0.5808080808080808,
+  "invalid_answer_rate": 0.5808080808080808,
+  "tasks_per_s": null,
+  "wall_s_note": "two-segment file: historical 160-row run plus PR281-overlay continuation; wall time not comparable",
+  "segments": [
+    {
+      "indices": [
+        0,
+        159
+      ],
+      "correct": 48,
+      "total": 160,
+      "runtime": "historical baseline stack"
+    },
+    {
+      "indices": [
+        160,
+        197
+      ],
+      "correct": 25,
+      "total": 38,
+      "runtime": "PR281 overlay, verbatim-final-only scoring",
+      "source_dir": "gpqa-resume-20261110T135919Z"
+    }
+  ]
+}

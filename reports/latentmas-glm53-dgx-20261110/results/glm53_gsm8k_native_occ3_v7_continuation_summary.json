@@ -1,0 +1,195 @@
+{
+  "schema": "latents.bench.native_continuation_summary.v1",
+  "task": "gsm8k",
+  "condition": "occ3_agent_native_v7",
+  "summary_kind": "safe_aggregate_of_existing_public_scores_not_a_new_scorer_run",
+  "combined_scorer_run": false,
+  "projection_denominator": 20,
+  "budget_matched_to_baseline": false,
+  "prior_cohort": {
+    "published_source_file": "results/glm53_gsm8k_native_occ3_v7_safe.json",
+    "source_sha256": "4eefbaad6089088a6a30b55fa6a112ae81964a3563fb9f13bf84cb1161c81887",
+    "eligible_indices": [
+      0,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19
+    ],
+    "score_eligible": 19,
+    "strict_correct": 17,
+    "note": "Items 0, 2-18 and 19 from three pinned-scorer reports (item 0, batch 175110z, item-19 v7 retry); see that file."
+  },
+  "individual_score_sources": [
+    {
+      "source_file": "/tmp/latentmas-one-item-control/20261112t091814z-gsm8k-1/score-public.json",
+      "source_sha256": "5fb7fa57b34fcba00455920bf09ba4a288d528662ff4badba13df391e3bb93bd",
+      "source_schema": "occ3.native.score_summary.v1",
+      "created_unix_ns": 1794475225008389995,
+      "denominator": 20,
+      "explicit_attempt_count": 1,
+      "score_eligible": 1,
+      "strict_correct": 1,
+      "incomplete_or_ineligible": 19,
+      "strict_accuracy_all20": 0.05,
+      "scorer_sha256": "ddb0f3ea854374bb637711bfcda67a62c41fa8aa45be206b9f303042fe597c1c",
+      "manifest_sha256": "0427d9fb27abdd0985305ffd4471a3aee9962ab25ded04b37f0244f3a5717ee6",
+      "paired_cohort_sha256": "ae7ea74336e00f45db34c610bb448165e006c70b85891a4cef440ec0052df17a",
+      "upstream_utils_sha256": "36a905981170d464e479b2f0b0c6efda874abc84788abc7ff13aa4e4a9560721",
+      "scoring_rule": "unchanged_raw_final_upstream_extract_then_normalize_compare_exact_manifest_gold",
+      "approved_source_artifact_sha256": {
+        "controller_sha256": "ea44e3a52f7d195c88df5b5f43d45ce61149ac06d2e58a05b33bc05eb39a299b",
+        "profile_sha256": "eabac71bf7e167686bc0799faf0deab4479ce8f10681e6a9f2ab1d1d30940751",
+        "projection_sha256": "2b52b12c9589a04c03e70b18504e8e1b35dd567a06732b76918e8e114d4dbdb1",
+        "runner_sha256": "4bcc0153d89424cd471522c8946de19376e473eeb7932b7bc08033f0e4e86bbd"
+      },
+      "run_root": "/home/nvidia/occ3-deploy/native-v7-batch-gsm8k-item1-20261112t091814z",
+      "eligible_row": {
+        "idx": 1,
+        "run_id": "ad35cb0d2ece4c2e88c83aee1a3196bd",
+        "status": "complete",
+        "correct": true,
+        "score_eligible": true,
+        "transport_valid": true,
+        "cleanup_confirmed": true,
+        "cleanup_issue_count": 0,
+        "format_valid": true,
+        "truncated": false,
+        "error_code": null,
+        "question_sha256": "de563650cee0d9af13492eae156046720df4ca9c1f177f29d4ea25b2c9d82c83",
+        "raw_final_sha256": "66983bcb8bcea659d8e19aa185ed8276ac30da8b9a4b2a6b60f2db239ea31b34",
+        "artifact_sha256": {
+          "cleanup.json": "2207ef50f5f452ab7e461a6541f821033a53605cce32c16efeb699dbce98fdfe",
+          "context-bookkeeping.json": "84b8c4843ed319ee4e20e95caf9958e23332a2fe1d363ce3d5c5863e4ecd3e68",
+          "events.jsonl": "3e6b45b834331b8c812cf6c01e3fd46622ca268e74d569598a2aac5f487aaa76",
+          "item.json": "8a14853cde7accfec525db261cea7629f5e285179cd39b6a74a7c69470cc3c06",
+          "outcome.json": "7f2c69cfcbee1a24c0fcabc460fd53882ae1787f977410b8a41108a22f5f75d5"
+        },
+        "measured_times": {
+          "cleanup_seconds": 0.138941043,
+          "daemon_connection_seconds": null,
+          "item_wall_seconds_including_setup": 116.425573024,
+          "native_work_seconds": 109.152707639,
+          "setup_seconds": 7.270152478
+        },
+        "usage_coverage": "terminal_transcripts",
+        "provider_usage": {
+          "semantics": "provider_reported_counters_not_estimates",
+          "record_count": 26,
+          "all_fields_complete": true,
+          "input_tokens": 95623,
+          "output_tokens": 6346,
+          "total_tokens": 101969
+        }
+      },
+      "published_source_file": "results/native_v7/score-public-gsm8k-item01.json"
+    }
+  ],
+  "cumulative_arithmetic": {
+    "eligible_indices": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19
+    ],
+    "eligible_items": 20,
+    "correct": 18,
+    "accuracy_among_eligible": 0.9,
+    "unscored_projection_indices": [],
+    "wilson_95_ci": [
+      0.699,
+      0.9721
+    ],
+    "wrong_indices": [
+      2,
+      12
+    ],
+    "note": "Disjoint union of the 19-item cohort (items 0, 2-19) and separately scored item 1 (2026-11-12). Not a combined scorer run."
+  },
+  "limitations": [
+    "The item-1 public score has denominator=20, score_eligible=1; its strict_accuracy_all20 is a projection count, not accuracy on 20 evaluated items.",
+    "Only already scored source rows are aggregated; no model inference, answer extraction, rescoring or answer repair was performed for this summary.",
+    "Item 1 ran on the 2026-11-12 server (PR #284 server-extension update) with the GSM8K v7 controller, runner and pinned scorer used for item 19; the 19-item cohort ran on 2026-11-10/11 builds.",
+    "Item 1 had one earlier attempt (batch native-v7-batch-20261110t161939z, 2026-11-10): item outcome blocked, reason standby_contract_not_met, before any score. It remains excluded.",
+    "Native v7 is a smaller paired-subset track with different execution contracts and budgets; these results do not establish channel-only gains, efficiency or speedup."
+  ],
+  "paired_first20_comparison": {
+    "basis": "per-item correctness on shared indices 0-19; b = comparison-only correct, c = native-only correct; exact two-sided binomial McNemar",
+    "native_correct": 18,
+    "n": 20,
+    "baseline": {
+      "source_file": "results/glm53_gsm8k_baseline.jsonl",
+      "source_sha256": "3ebe349f16fa0cc25e02d93cee7dfd731f8c7794f81670ab1bcbfef6ace29588",
+      "correct": 19,
+      "b": 1,
+      "c": 0,
+      "mcnemar_p": 1.0
+    },
+    "textmas_sequential": {
+      "source_file": "results/glm53_gsm8k_textmas_seq.jsonl",
+      "source_sha256": "661c85c5b2c3d6637412b903e009e09bf0534362d640a784eb0c6a08c63aef6f",
+      "correct": 19,
+      "b": 1,
+      "c": 0,
+      "mcnemar_p": 1.0
+    }
+  },
+  "measured_first20": {
+    "semantics": "item wall seconds including setup; provider-reported token counters summed over all role records per item",
+    "n": 20,
+    "mean_item_wall_s": 167.122,
+    "median_item_wall_s": 165.382,
+    "min_item_wall_s": 101.745,
+    "max_item_wall_s": 258.461,
+    "mean_input_tokens_per_item": 98178.1,
+    "mean_output_tokens_per_item": 14637.0
+  },
+  "control_dir": "/tmp/latentmas-one-item-control/20261112t091814z-gsm8k-1",
+  "excluded_attempts": [
+    {
+      "idx": 1,
+      "run_root": "/home/nvidia/occ3-deploy/native-v7-batch-20261110t161939z",
+      "item_outcome_status": "blocked",
+      "item_outcome_reason": "standby_contract_not_met",
+      "ledger_terminal": [
+        "failed_uncertain",
+        "item_exit_or_work_cleanup_bound"
+      ],
+      "status": "excluded, not scored",
+      "scored_by_fresh_attempt": {
+        "run_root": "/home/nvidia/occ3-deploy/native-v7-batch-gsm8k-item1-20261112t091814z",
+        "published_source_file": "results/native_v7/score-public-gsm8k-item01.json"
+      }
+    }
+  ]
+}

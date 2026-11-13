@@ -125,3 +125,138 @@ fn occ31_optional_metadata_unknown_values_never_break_legacy_attachment() {
     let old: OldState = serde_json::from_value(value).unwrap();
     assert_eq!(old.session_id, "");
 }
+
+
+#[tokio::test]
+async fn occ31_get_state_reconciles_stale_active_snapshot_with_daemon_idle() {
+    use crate::core::occ::textmas::TextMasMode;
+    use crate::modes::agent_connection::types::Occ3Modes;
+
+    let cached_modes = Occ3Modes {
+        textmas_mode: TextMasMode::Sequential,
+        textmas_active: true,
+        latent_enabled: true,
+        latent_active: false,
+        latent_available: true,
+    };
+    let daemon_modes = Occ3Modes { textmas_active: false, ..cached_modes.clone() };
+    let cached_state = AgentConnectionState {
+        active_session_id: Some("active-a".into()),
+        session_id: "session-a".into(),
+        session_file: Some("/tmp/session-a.jsonl".into()),
+        session_name: Some("preserve me".into()),
+        message_count: 1.0,
+        occ3_modes: Some(cached_modes),
+        ..Default::default()
+    };
+    let daemon_state = AgentConnectionState {
+        occ3_modes: Some(daemon_modes.clone()),
+        ..cached_state.clone()
+    };
+    let transport = OccModesTransport::new(true, serde_json::to_value(&daemon_state).unwrap());
+    let connection = DaemonAgentConnection::new(transport.clone(), "active-a".into(), Default::default());
+    let message: AgentMessage = serde_json::from_value(json!({
+        "role": "user", "content": "preserve transcript", "timestamp": 7
+    })).unwrap();
+    *connection.latest_snapshot.lock().unwrap() = Some(AgentConnectionSnapshot {
+        state: cached_state,
+        messages: vec![message.clone()],
+        ..Default::default()
+    });
+    *connection.latest_snapshot_is_fresh.lock().unwrap() = true;
+
+    let reconciled = connection.get_state().await.unwrap();
+    assert_eq!(
+        reconciled.occ3_modes.as_ref().map(|modes| modes.textmas_active),
+        Some(false),
+        "the authoritative daemon idle state must supersede the stale cached TextMAS activity",
+    );
+    assert_eq!(reconciled.session_id, "session-a");
+    assert_eq!(reconciled.session_file.as_deref(), Some("/tmp/session-a.jsonl"));
+
+    let cached_read = connection.get_state().await.unwrap();
+    assert_eq!(cached_read.occ3_modes, Some(daemon_modes.clone()));
+    let requests = transport.requests.lock().unwrap();
+    let commands: Vec<Value> = requests.iter().map(|entry| entry.0.clone()).collect();
+    assert_eq!(commands, vec![json!({"type":"get_connection_state","activeSessionId":"active-a"})]);
+    drop(requests);
+
+    let snapshot = connection.latest_snapshot.lock().unwrap();
+    let snapshot = snapshot.as_ref().unwrap();
+    assert_eq!(snapshot.state.occ3_modes, Some(daemon_modes));
+    assert_eq!(snapshot.state.session_id, "session-a");
+    assert_eq!(snapshot.state.session_file.as_deref(), Some("/tmp/session-a.jsonl"));
+    assert_eq!(snapshot.messages, vec![message]);
+}
+
+#[tokio::test]
+async fn occ31_get_state_does_not_force_authoritative_textmas_activity_false() {
+    use crate::core::occ::textmas::TextMasMode;
+    use crate::modes::agent_connection::types::Occ3Modes;
+
+    let cached_modes = Occ3Modes {
+        textmas_mode: TextMasMode::Sequential,
+        textmas_active: true,
+        latent_enabled: false,
+        latent_active: false,
+        latent_available: false,
+    };
+    let daemon_modes = Occ3Modes { textmas_mode: TextMasMode::Hierarchical, ..cached_modes.clone() };
+    let cached_state = AgentConnectionState {
+        session_id: "session-a".into(),
+        occ3_modes: Some(cached_modes),
+        ..Default::default()
+    };
+    let daemon_state = AgentConnectionState {
+        occ3_modes: Some(daemon_modes.clone()),
+        ..cached_state.clone()
+    };
+    let transport = OccModesTransport::new(true, serde_json::to_value(&daemon_state).unwrap());
+    let connection = DaemonAgentConnection::new(transport.clone(), "active-a".into(), Default::default());
+    *connection.latest_snapshot.lock().unwrap() = Some(AgentConnectionSnapshot {
+        state: cached_state,
+        ..Default::default()
+    });
+    *connection.latest_snapshot_is_fresh.lock().unwrap() = true;
+
+    let reconciled = connection.get_state().await.unwrap();
+    assert_eq!(reconciled.occ3_modes, Some(daemon_modes.clone()));
+    assert_eq!(transport.requests.lock().unwrap().len(), 1);
+    assert_eq!(
+        connection.latest_snapshot.lock().unwrap().as_ref().unwrap().state.occ3_modes,
+        Some(daemon_modes),
+    );
+}
+
+#[tokio::test]
+async fn occ31_get_state_preserves_fast_path_for_fresh_inactive_modes() {
+    use crate::core::occ::textmas::TextMasMode;
+    use crate::modes::agent_connection::types::Occ3Modes;
+
+    let inactive = |textmas_mode| Occ3Modes {
+        textmas_mode,
+        textmas_active: false,
+        latent_enabled: false,
+        latent_active: false,
+        latent_available: false,
+    };
+    for cached_modes in [
+        None,
+        Some(inactive(TextMasMode::Off)),
+        Some(inactive(TextMasMode::Sequential)),
+    ] {
+        let transport = OccModesTransport::new(true, Value::Null);
+        let connection = DaemonAgentConnection::new(transport.clone(), "active-a".into(), Default::default());
+        *connection.latest_snapshot.lock().unwrap() = Some(AgentConnectionSnapshot {
+            state: AgentConnectionState {
+                occ3_modes: cached_modes.clone(),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        *connection.latest_snapshot_is_fresh.lock().unwrap() = true;
+
+        assert_eq!(connection.get_state().await.unwrap().occ3_modes, cached_modes);
+        assert!(transport.requests.lock().unwrap().is_empty());
+    }
+}

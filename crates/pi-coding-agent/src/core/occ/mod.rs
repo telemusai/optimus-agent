@@ -282,6 +282,7 @@ pub mod prune;
 pub mod selection;
 pub mod session_settings;
 pub mod textmas;
+pub mod textmas_context;
 pub mod textmas_settings;
 
 #[cfg(test)]

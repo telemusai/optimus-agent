@@ -1,0 +1,55 @@
+{
+  "schema": "latents.bench.native_recovered_sandbox_summary.v1",
+  "condition": "occ3_agent_native_v7",
+  "summary_kind": "measured_historical_tool_aggregates_not_full_source_validation",
+  "new_inference_or_scoring": false,
+  "budget_matched_to_baseline": false,
+  "source_recovery_file": "/tmp/latentmas-recovered-sandbox-aggregate-evidence.json",
+  "source_recovery_file_sha256": "f11124d96e3e2f9a432a72ab4da35c833eeee807d163c063eca79d4c851d3eb6",
+  "observations": [
+    {
+      "task": "humanevalplus",
+      "projection_denominator": 20,
+      "reported_score_eligible": 9,
+      "sandbox_correct": 8,
+      "accuracy_among_reported_eligible": 0.8888888888888888,
+      "eligible_indices": null,
+      "full_source_validation": "pending",
+      "public_score_artifact_sha256": null,
+      "sandbox_artifact_sha256": null,
+      "source_observation": {
+        "transcript": "/home/anthony/.config/optimus-rust/sessions/01a1ca6f-0d7b-7624-abfc-9ec370ee875f.jsonl",
+        "result_entry_id": "b5a12257",
+        "result_entry_timestamp": "2026-11-11T12:22:55.922Z",
+        "tool_call_entry_id": "452b9b4e",
+        "result_text_sha256": "eac5ca7be2fc0dc20126af2f48ab752de9c6933d74ca8c591c64ffb789daf05a"
+      }
+    },
+    {
+      "task": "mbppplus",
+      "projection_denominator": 20,
+      "reported_score_eligible": 9,
+      "sandbox_correct": 8,
+      "accuracy_among_reported_eligible": 0.8888888888888888,
+      "eligible_indices": null,
+      "full_source_validation": "pending",
+      "public_score_artifact_sha256": null,
+      "sandbox_artifact_sha256": null,
+      "source_observation": {
+        "transcript": "/home/anthony/.config/optimus-rust/sessions/01a1ca6f-0d7b-7624-abfc-9ec370ee875f.jsonl",
+        "result_entry_id": "45a58322",
+        "result_entry_timestamp": "2026-11-11T13:12:41.119Z",
+        "tool_call_entry_id": "324bdc47",
+        "result_text_sha256": "45e3bc0a9e554f82763476e55c1266c069b56b85f9e9498b1e2249da34f31d58"
+      }
+    }
+  ],
+  "limitations": [
+    "The counts are existing measured sandbox tool-result aggregates, not a fresh rescore or a completed 20-item evaluation.",
+    "Full public scorer and sandbox artifacts remain unavailable after configured DGX SSH access failed. Full source validation is pending.",
+    "The recovered aggregates do not establish exact per-item membership, source artifact hashes, transport or cleanup gates. No such values are inferred.",
+    "Result-text hashes identify historical tool output, not the unavailable public scorer or sandbox files.",
+    "No per-item comparisons, costs, tokens or latencies are inferred from these aggregates. Failed and excluded attempts are not scored answers.",
+    "Native v7 is a separate smaller paired-subset track with different contracts and budgets. Neither native nor four-call HTTP TextMAS establishes a channel-only gain against a one-call baseline."
+  ]
+}

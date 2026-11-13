@@ -6,9 +6,18 @@ OCC3.1 is an optional TextMAS workflow on the selected ordinary model. It does
 not require a latent-capable model, connector or server. Each eligible root user
 turn runs three tool-free preparation calls (Planner, Critic and Refiner), then
 the ordinary parent acts as Judger/executor with its normal tools and approvals.
-Sequential stages receive earlier drafts. Hierarchical stages independently read
-the original context; they currently execute serially. Drafts are untrusted
-advisory text, not hidden reasoning, system instructions or verified evidence.
+Oversized role contexts first use bounded shared mapper/reducer calls and a
+lossy advisory brief; every stage remains bounded and accounted, while the
+parent retains its full original context. Sequential stages receive earlier
+drafts. Hierarchical stages independently read the original or reduced context;
+they currently execute serially. Drafts are untrusted advisory text, not hidden
+reasoning, system instructions or verified evidence.
+
+Oversized ordinary system prompts, including large project-instruction files, can
+also enter bounded source preparation. Their complete UTF-8 text is preserved for
+mapping rather than silently truncated; auxiliary roles consume lossy advisory
+briefs and the ordinary parent still retains its unchanged system prompt. The same
+bounded-base decision governs preparation-only image sizing.
 
 ```text
 /occ 3 off
@@ -46,10 +55,14 @@ not a slash command.
   subtotals and explicit unknown usage/cost counts. No fake replies, model
   identities or child sessions are created for accounting.
 - User input and accounting reservations are persisted before provider work.
-  Failed, interrupted, refused, tool-bearing or oversized preparation stops the
-  turn rather than silently executing a fallback. Cancellation settles the
+  Failed, interrupted, refused, tool-bearing or cap-exhausted preparation stops
+  the turn rather than silently executing a fallback. Cancellation settles the
   waiting input and preserves unrelated queued inputs. Normal final retries
   reuse the drafts without repeating preparation.
+- Auxiliary calls allow at most 8192 total output tokens, including private
+  reasoning, subject to the selected model's limits. The public draft remains
+  capped at 16 KiB. Incomplete responses are rejected without automatic retry;
+  the visible error includes the normalized stop reason, not partial output.
 - Generated system-prompt guidance explains the host-managed stages, their
   advisory status and the separate latent controls. It does not assert that a
   mode is enabled or that communication has completed.
@@ -57,6 +70,22 @@ not a slash command.
 See [the mode guide](../resources/agent/docs/occ3-modes.md) for bounds and costs.
 This is a product adaptation, not the frozen TextMAS benchmark implementation;
 previous benchmark scores are not accuracy claims for this release.
+
+### Completed-turn state convergence
+
+The core turn guard remains the owner of terminal OCC3.1 cleanup. Around the
+terminal event boundary, a daemon-backed interactive client can still hold an
+earlier snapshot whose OCC3.1 activity flag is true. Such a cached snapshot now
+causes a fresh `get_connection_state` read instead of being served indefinitely
+from that cache. Only the OCC mode metadata for the same attached session is merged
+back into the cached snapshot; transcript messages and other cached state are
+not rewritten. An authoritative active response stays active.
+
+The native host also includes cached TextMAS activity in its bounded quiet
+reconciliation. Otherwise-idle cached activity can therefore reach a fresh
+daemon read on the existing five-second cadence. Inactive, unavailable and
+legacy-host mode snapshots keep their existing cache path. Neither the core
+prompt guard nor the 8192-token auxiliary allowance is changed.
 
 ## Protocol and surfaces
 

@@ -2829,18 +2829,36 @@ impl AgentConnection for DaemonAgentConnection {
         if *this.latest_snapshot_is_fresh.lock().unwrap() {
             if let Some(mut snapshot) = this.latest_snapshot.lock().unwrap().clone() {
                 this.filter_occ3_modes(&mut snapshot.state);
-                return Box::pin(async move { Ok(snapshot.state) });
+                let active_textmas = snapshot.state.occ3_modes.as_ref()
+                    .is_some_and(|modes| modes.textmas_active);
+                if !active_textmas {
+                    return Box::pin(async move { Ok(snapshot.state) });
+                }
+                // agent_end may precede TextMAS cleanup. Do not let that cached
+                // active snapshot permanently suppress an authoritative read.
             }
         }
+        let active_session_id = this.active_session_id();
         let command = command_body(
             "get_connection_state",
-            vec![("activeSessionId", Value::String(this.active_session_id()))],
+            vec![("activeSessionId", Value::String(active_session_id.clone()))],
         );
         Box::pin(async move {
             let data = this.request_data(command, None).await?;
             let mut state: AgentConnectionState = serde_json::from_value(data)
                 .map_err(|error| format!("Daemon returned an invalid connection state: {error}"))?;
             this.filter_occ3_modes(&mut state);
+            if this.active_session_id() != active_session_id {
+                return Err("Session changed while reading connection state".into());
+            }
+            // Preserve cached history and merge only authority-owned OCC fields.
+            // A concurrent session switch must never accept the old merge.
+            let mut cached_snapshot = this.latest_snapshot.lock().unwrap();
+            if let Some(snapshot) = cached_snapshot.as_mut() {
+                if snapshot.state.session_id == state.session_id {
+                    snapshot.state.occ3_modes = state.occ3_modes.clone();
+                }
+            }
             Ok(state)
         })
     }
