@@ -144,6 +144,13 @@ a selected mode, a visible tool or a queued request cannot produce that proof.
 Mode configuration (OCC3.1 off/sequential/hierarchical, OCC3.2 on/off) is not
 shown in the status row; use `/occ` or `/occ 3.2` to inspect it.
 
+Terminal activity comes from the daemon, not an unconditional local clear. A
+cached active OCC3.1 snapshot causes a fresh connection-state read, and active
+TextMAS work participates in the existing five-second quiet refresh cadence
+when the other activity flags are idle. Convergence updates only the OCC mode
+metadata for the same session. Transcript history is unchanged, and a live run
+cannot be hidden or bypassed to admit another prompt.
+
 Missing metadata on an older host means unavailable, not enabled.
 
 ## Host compatibility
@@ -153,7 +160,9 @@ capability. The host owns `occ31_get_preferences`, `occ31_set_mode` and the
 independent latent setter `occ32_set_enabled`. TextMAS has no local-write fallback
 when a remote host lacks support. Legacy latent controls can retain their old
 local-write path only with an explicit unverified warning; that is not proof of
-remote host state. The optional `occ3Modes` state describes configuration only.
+remote host state. The optional `occ3Modes` state reports configuration, availability and locally
+reported activity. Its activity flags are not completed-use receipts or proof of
+successful preparation.
 Existing latent wire identities and completed-use validation are unchanged.
 
 An older daemon can still attach and run ordinary chats. Update the host before

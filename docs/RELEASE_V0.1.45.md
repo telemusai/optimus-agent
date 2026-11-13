@@ -71,6 +71,22 @@ See [the mode guide](../resources/agent/docs/occ3-modes.md) for bounds and costs
 This is a product adaptation, not the frozen TextMAS benchmark implementation;
 previous benchmark scores are not accuracy claims for this release.
 
+### Completed-turn state convergence
+
+The core turn guard remains the owner of terminal OCC3.1 cleanup. Around the
+terminal event boundary, a daemon-backed interactive client can still hold an
+earlier snapshot whose OCC3.1 activity flag is true. Such a cached snapshot now
+causes a fresh `get_connection_state` read instead of being served indefinitely
+from that cache. Only the OCC mode metadata for the same attached session is merged
+back into the cached snapshot; transcript messages and other cached state are
+not rewritten. An authoritative active response stays active.
+
+The native host also includes cached TextMAS activity in its bounded quiet
+reconciliation. Otherwise-idle cached activity can therefore reach a fresh
+daemon read on the existing five-second cadence. Inactive, unavailable and
+legacy-host mode snapshots keep their existing cache path. Neither the core
+prompt guard nor the 8192-token auxiliary allowance is changed.
+
 ## Protocol and surfaces
 
 Protocol 7 remains unchanged. Schema 47 adds the optional `occ31_textmas`

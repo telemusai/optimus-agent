@@ -992,3 +992,27 @@ async fn queued_all_batch_keeps_both_user_inputs_and_delivers_all_three_drafts()
     assert_eq!(ledger(&session).summary().unwrap().calls, 3);
     session.dispose_async(Some(false)).await;
 }
+
+
+#[tokio::test]
+async fn successful_turn_clears_activity_and_admits_a_subsequent_turn() {
+    let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let f = Fixture::new();
+    let session = f.session(0, false).await;
+    let file = session.session_file().unwrap();
+    textmas_settings::set_mode(&file, TextMasMode::Sequential).unwrap();
+    f.drafts(&file);
+    f.reply(text_reply("FIRST_PARENT"), None, None);
+    turn(&session, "CURRENT_REQUEST first successful turn", None).await.unwrap();
+    assert!(!session.is_textmas_active(), "the settled parent must clear TextMAS activity");
+    f.drafts(&file);
+    f.reply(text_reply("SECOND_PARENT"), None, None);
+    turn(&session, "CURRENT_REQUEST subsequent user turn", None).await.unwrap();
+    assert!(!session.is_textmas_active(), "the second settled parent must also clear TextMAS activity");
+    let contexts = f.captured.lock().unwrap();
+    assert_eq!(contexts.len(), 8, "both turns must have fresh roles and a parent");
+    assert_eq!(contexts.iter().filter(|context| context.tools.is_some()).count(), 2);
+    drop(contexts);
+    assert_eq!(ledger(&session).summary().unwrap().calls, 6);
+    session.dispose_async(Some(false)).await;
+}
