@@ -1,0 +1,1 @@
+- Added opt-in compaction pre-dispatch and generated-stream timings, complete offline replay attempt and useful-continuation evidence, and metrics-report streaming support without changing compaction behavior or persisted content.

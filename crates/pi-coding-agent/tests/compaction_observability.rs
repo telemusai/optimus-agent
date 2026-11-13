@@ -231,6 +231,8 @@ async fn text_summary_preserves_options_and_records_body_timing_without_content(
     let requests = terminal(&events, Operation::ProviderAttempt);
     assert_eq!(requests.len(), 1);
     let measures = requests[0].measurements.as_ref().unwrap();
+    assert_eq!(measures[&Measurement::WaitMs], Some(10.0));
+    assert_eq!(measures[&Measurement::StreamingMs], Some(30.0));
     assert_eq!(
         measures[&Measurement::DispatchToResponseHeadersMs],
         Some(20.0)
@@ -257,6 +259,99 @@ async fn text_summary_preserves_options_and_records_body_timing_without_content(
     for secret in ["SECRET-HISTORY", "SECRET-API", "SECRET-PAYLOAD", VALID] {
         assert!(!encoded.contains(secret));
     }
+}
+
+#[tokio::test]
+async fn request_windows_stay_null_without_dispatch_or_a_generated_interval() {
+    let recorder = Arc::new(Recorder::default());
+    let clock = recorder.clone();
+    let model = register(
+        "compaction-observed-unavailable-windows",
+        Arc::new(|_, _, _| AssistantMessageEventStream::new()),
+    );
+    let metrics = CompactionMetrics::new(Some(recorder.clone()), &model);
+    let phase = metrics.phase(Operation::CompactionHistory);
+    let request = phase.requests().next();
+    let mut options = SimpleStreamOptions::default();
+    request.observe(&mut options);
+    let observe = options.stream.on_stream_observation.clone().unwrap();
+    clock.clock.store(50, Ordering::SeqCst);
+    observe("text");
+    clock.clock.store(60, Ordering::SeqCst);
+    observe("terminal");
+    request.finish(&response("unavailable"), false);
+
+    // Backwards generated-stage clocks also invalidate streaming_ms, but do not
+    // hide the independently valid request-start and dispatch windows.
+    let request = phase.requests().next();
+    let mut options = SimpleStreamOptions::default();
+    request.observe(&mut options);
+    clock.clock.store(100, Ordering::SeqCst);
+    options.stream.on_payload.as_ref().unwrap()(serde_json::Value::Null, &model).await;
+    let observe = options.stream.on_stream_observation.clone().unwrap();
+    clock.clock.store(120, Ordering::SeqCst);
+    observe("text");
+    clock.clock.store(110, Ordering::SeqCst);
+    observe("text");
+    clock.clock.store(130, Ordering::SeqCst);
+    observe("terminal");
+    request.finish(&response("backwards"), false);
+
+    // Repeated generated-stage timestamps do not establish a positive stream
+    // generation interval.
+    let request = phase.requests().next();
+    let mut options = SimpleStreamOptions::default();
+    request.observe(&mut options);
+    clock.clock.store(200, Ordering::SeqCst);
+    options.stream.on_payload.as_ref().unwrap()(serde_json::Value::Null, &model).await;
+    let observe = options.stream.on_stream_observation.clone().unwrap();
+    clock.clock.store(220, Ordering::SeqCst);
+    observe("text");
+    observe("text");
+    clock.clock.store(230, Ordering::SeqCst);
+    observe("terminal");
+    request.finish(&response("duplicate-clock"), false);
+    phase.finish(Outcome::Success);
+
+    let events = recorder.events.lock().unwrap();
+    let attempts = terminal(&events, Operation::ProviderAttempt);
+    assert_eq!(attempts.len(), 3);
+    let measures = attempts[0].measurements.as_ref().unwrap();
+    assert_eq!(measures[&Measurement::WaitMs], None::<f64>);
+    assert_eq!(measures[&Measurement::StreamingMs], None::<f64>);
+    assert_eq!(measures[&Measurement::DispatchToFirstTextMs], None::<f64>);
+    assert!(measures[&Measurement::LocalDrainMs].is_some());
+    let measures = attempts[1].measurements.as_ref().unwrap();
+    assert_eq!(measures[&Measurement::WaitMs], Some(40.0));
+    assert_eq!(measures[&Measurement::StreamingMs], None::<f64>);
+    assert_eq!(measures[&Measurement::DispatchToFirstTextMs], Some(20.0));
+    let measures = attempts[2].measurements.as_ref().unwrap();
+    assert_eq!(measures[&Measurement::WaitMs], Some(70.0));
+    assert_eq!(measures[&Measurement::StreamingMs], None::<f64>);
+    assert_eq!(measures[&Measurement::DispatchToFirstTextMs], Some(20.0));
+}
+
+#[test]
+fn inactive_observation_does_not_install_callbacks() {
+    let model = Model::new(
+        "compaction-observation-inactive",
+        "compaction-observation-inactive",
+        "compaction-observation-inactive",
+        "faux",
+        "https://fixture.invalid",
+    );
+    let metrics = CompactionMetrics::new(None, &model);
+    let request = metrics
+        .phase(Operation::CompactionHistory)
+        .requests()
+        .next();
+    let mut options = SimpleStreamOptions::default();
+    request.observe(&mut options);
+    assert!(options.stream.on_payload.is_none());
+    assert!(options.stream.on_response.is_none());
+    assert!(options.stream.on_stream_observation.is_none());
+    assert!(options.stream.on_usage_observation.is_none());
+    request.finish(&response("unrecorded"), false);
 }
 
 /// B2/B5: a WebSocket send acknowledgement, real HTTP headers and a provider that only
