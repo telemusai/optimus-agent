@@ -466,7 +466,25 @@ fn map_context(base: &Context, items: &[PreparationItem]) -> Result<Context, Str
     )
 }
 
+fn map_source_bytes_lower_bound(base: &Context, items: &[PreparationItem]) -> usize {
+    items.iter().fold(
+        base.system_prompt.as_ref().map_or(0, String::len),
+        |total, item| {
+            total.saturating_add(match item {
+                PreparationItem::Text { text, .. } => text.len(),
+                PreparationItem::Image { image, .. } => image.data.len(),
+            })
+        },
+    )
+}
+
 fn map_fits(base: &Context, model: &Model, items: &[PreparationItem]) -> bool {
+    // JSON syntax and escaping can only add bytes to these unchanged UTF-8 strings.
+    // Reject certain overflows without cloning and encoding the whole candidate;
+    // every borderline case still uses the exact context and token checks below.
+    if map_source_bytes_lower_bound(base, items) > MAX_CONTEXT_BYTES {
+        return false;
+    }
     map_context(base, items)
         .ok()
         .is_some_and(|context| output_budget(model, &context).is_ok())
@@ -636,6 +654,81 @@ mod tests {
 
     fn user(text: String) -> Message {
         Message::User(UserMessage::new(UserContent::Text(text), 1))
+    }
+
+    fn exact_map_fits(base: &Context, model: &Model, items: &[PreparationItem]) -> bool {
+        map_context(base, items)
+            .ok()
+            .is_some_and(|context| output_budget(model, &context).is_ok())
+    }
+
+    #[test]
+    fn raw_byte_map_prefilter_matches_exact_fitting() {
+        let base = || Context::new(Some("base instructions".into()), Vec::new(), None);
+        let text = |text: String| PreparationItem::text("message 1 user text".into(), text);
+        let cases = vec![
+            ("small fitting text", base(), vec![text("small request".into())]),
+            (
+                "raw bytes below but JSON overhead exceeds the bound",
+                base(),
+                vec![text("x".repeat(MAX_CONTEXT_BYTES - 16))],
+            ),
+            (
+                "raw ASCII bytes alone exceed the bound",
+                base(),
+                vec![text("x".repeat(MAX_CONTEXT_BYTES + 1))],
+            ),
+            (
+                "escaped text below the raw bound still uses the exact check",
+                base(),
+                vec![text("\"".repeat(MAX_CONTEXT_BYTES / 2))],
+            ),
+            (
+                "UTF-8 and JSON-heavy raw bytes exceed the bound",
+                base(),
+                vec![text("é雪\"\\\n".repeat(MAX_CONTEXT_BYTES / 2))],
+            ),
+            (
+                "multiple source items exceed the bound together",
+                base(),
+                vec![
+                    text("a".repeat(MAX_CONTEXT_BYTES / 2)),
+                    PreparationItem::Text {
+                        label: "message 2 user text".into(),
+                        text: "b".repeat(MAX_CONTEXT_BYTES / 2 + 1),
+                        part: 0,
+                    },
+                ],
+            ),
+            (
+                "image data alone exceeds the bound",
+                base(),
+                vec![PreparationItem::Image {
+                    label: "message 1 user image 1".into(),
+                    image: ImageContent::new("A".repeat(MAX_CONTEXT_BYTES + 1), "image/png"),
+                }],
+            ),
+            (
+                "system instructions alone exceed the bound",
+                Context::new(
+                    Some("s".repeat(MAX_CONTEXT_BYTES + 1)),
+                    Vec::new(),
+                    None,
+                ),
+                vec![text("small request".into())],
+            ),
+        ];
+        for (name, base, items) in cases {
+            let exact = exact_map_fits(&base, &model(), &items);
+            let actual = map_fits(&base, &model(), &items);
+            assert_eq!(actual, exact, "{name}");
+            if map_source_bytes_lower_bound(&base, &items) > MAX_CONTEXT_BYTES {
+                assert!(!actual, "certain raw-byte overflow must be rejected: {name}");
+            }
+            if name == "small fitting text" {
+                assert!(actual, "the control case must fit exactly");
+            }
+        }
     }
 
     #[test]
