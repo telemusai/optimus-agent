@@ -1,8 +1,8 @@
 //! OCC3.1 native execution through a registered offline, non-latent custom provider.
 use pi_ai::providers::faux::*;
-use pi_ai::types::{AssistantMessage, ContentBlock, Context, Model, ToolCall};
-use pi_coding_agent::core::occ::{textmas::{TextMasMode, TextMasUsageLedger, usage_record}, textmas_settings};
-use pi_coding_agent::core::extensions::types::InputSource;
+use pi_ai::types::{AssistantMessage, ContentBlock, Context, Message, Model, ToolCall};
+use pi_coding_agent::core::occ::{textmas::{MAX_CONTEXT_BYTES, TextMasMode, TextMasUsageLedger, usage_record}, textmas_settings};
+use pi_coding_agent::core::extensions::types::{ExtensionEvent, ExtensionFactory, InputSource};
 use pi_coding_agent::core::agent_session::{AgentSession, PromptOptions};
 use pi_coding_agent::core::agent_session_services::*;
 use pi_coding_agent::core::auth_storage::AuthStorage;
@@ -57,6 +57,15 @@ impl Fixture {
     }
 
     async fn session(&self, depth: i64, retry: bool) -> Arc<AgentSession> {
+        self.session_with_extensions(depth, retry, Vec::new()).await
+    }
+
+    async fn session_with_extensions(
+        &self,
+        depth: i64,
+        retry: bool,
+        extension_factories: Vec<ExtensionFactory>,
+    ) -> Arc<AgentSession> {
         let cwd = self
             .root
             .path()
@@ -102,6 +111,7 @@ impl Fixture {
                 cwd: cwd.clone(),
                 agent_dir: profile.clone(),
                 settings_manager: Some(settings),
+                extension_factories,
                 no_extensions: true,
                 no_skills: true,
                 no_prompt_templates: true,
@@ -171,6 +181,62 @@ impl Fixture {
             self.reply(faux_assistant_message(FauxAssistantContent::Blocks(vec![ContentBlock::Thinking(faux_thinking("PRIVATE_ROLE_THOUGHT")), ContentBlock::Text(faux_text(role))]), None), Some(file.into()), None);
         }
     }
+
+    fn dynamic_preparation_replies(&self, count: usize) {
+        self.dynamic_preparation_replies_with_parent_failures(count, 0);
+    }
+
+    fn dynamic_preparation_replies_with_parent_failures(&self, count: usize, parent_failures: usize) {
+        self.dynamic_preparation_replies_impl(count, parent_failures, false);
+    }
+
+    fn dynamic_dense_preparation_replies(&self, count: usize) {
+        self.dynamic_preparation_replies_impl(count, 0, true);
+    }
+
+    fn dynamic_preparation_replies_impl(&self, count: usize, parent_failures: usize, dense: bool) {
+        let captured = self.captured.clone();
+        let parent_attempt = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let steps = (0..count).map(|_| {
+            let captured = captured.clone();
+            let parent_attempt = parent_attempt.clone();
+            FauxResponseStep::Factory(Arc::new(move |context, options, _, model| {
+                assert_eq!(model.provider, "textmas-custom-nonlatent");
+                assert_eq!(model.api, "offline-textmas-api");
+                let options = options.unwrap();
+                assert_eq!(options.api_key.as_deref(), Some("synthetic-textmas-key"));
+                captured.lock().unwrap().push(context.clone());
+                let prompt = context.system_prompt.as_deref().unwrap_or_default();
+                if context.tools.is_none() {
+                    assert!(serde_json::to_vec(&context).unwrap().len() <= MAX_CONTEXT_BYTES);
+                }
+                let message = if context.tools.is_some() {
+                    let attempt = parent_attempt.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if attempt < parent_failures {
+                        faux_assistant_message("".into(), Some(FauxAssistantMessageOptions { stop_reason: Some("error".into()), error_message: Some("synthetic parent retry".into()), ..Default::default() }))
+                    } else {
+                        text_reply("PRACTICAL_FINAL_ANSWER")
+                    }
+                } else {
+                    assert!(options.inference_state.is_none());
+                    assert!(options.source_capture.is_none());
+                    assert!(options.max_tokens.unwrap() <= 2048.0);
+                    assert_eq!(options.timeout_ms, Some(120000.0));
+                    let text = if prompt.contains("advisory role: mapper") {
+                        if dense { "\\".repeat(pi_coding_agent::core::occ::textmas::MAX_DRAFT_BYTES) } else { "MAPPER_BRIEF".to_string() }
+                    } else if prompt.contains("advisory role: reducer") {
+                        if dense { "\\".repeat(pi_coding_agent::core::occ::textmas::MAX_DRAFT_BYTES) } else { "REDUCED_BRIEF".to_string() }
+                    } else if prompt.contains("advisory role: planner") { "PLANNER_DRAFT".to_string() }
+                        else if prompt.contains("advisory role: critic") { "CRITIC_DRAFT".to_string() }
+                        else if prompt.contains("advisory role: refiner") { "REFINER_DRAFT".to_string() }
+                        else { panic!("unexpected tool-free OCC3.1 role") };
+                    text_reply(&text)
+                };
+                Box::pin(async move { message })
+            }))
+        }).collect();
+        self.provider.append_responses(steps);
+    }
 }
 
 impl Drop for Fixture {
@@ -192,6 +258,85 @@ async fn turn(session: &Arc<AgentSession>, text: &str, options: Option<PromptOpt
     result
 }
 fn text_reply(text: &str) -> AssistantMessage { faux_assistant_message(text.into(), None) }
+
+const DENSE_IMAGE_BYTES: usize = 150_000;
+const DENSE_IMAGE_MIME: &str = "application/x-occ31-image-density";
+
+fn dense_image_block(block: &serde_json::Value) -> bool {
+    block.get("type").and_then(serde_json::Value::as_str) == Some("image")
+        && block.get("mimeType").and_then(serde_json::Value::as_str) == Some(DENSE_IMAGE_MIME)
+        && block
+            .get("data")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|data| data.len() == DENSE_IMAGE_BYTES)
+}
+
+fn image_density_extension(audit: Arc<Mutex<Vec<usize>>>) -> ExtensionFactory {
+    Arc::new(move |api| {
+        let audit = audit.clone();
+        Box::pin(async move {
+            api.on(
+                "context",
+                Arc::new(move |event, _| {
+                    let audit = audit.clone();
+                    Box::pin(async move {
+                        let ExtensionEvent::Context(payload) = event else {
+                            return None;
+                        };
+                        let mut messages = payload.messages;
+                        let dense_blocks = messages
+                            .iter()
+                            .filter_map(|message| {
+                                message.get("content").and_then(serde_json::Value::as_array)
+                            })
+                            .map(|blocks| {
+                                blocks
+                                    .iter()
+                                    .filter(|block| dense_image_block(block))
+                                    .count()
+                            })
+                            .sum::<usize>();
+                        audit.lock().unwrap().push(dense_blocks);
+                        let mut retained = false;
+                        for message in messages.iter_mut().rev() {
+                            let Some(blocks) = message
+                                .get_mut("content")
+                                .and_then(serde_json::Value::as_array_mut)
+                            else {
+                                continue;
+                            };
+                            for block in blocks {
+                                if dense_image_block(block) {
+                                    if retained {
+                                        block["data"] = json!("OCC31_DUPLICATE_IMAGE_DEDUPED");
+                                    } else {
+                                        retained = true;
+                                    }
+                                }
+                            }
+                        }
+                        Some(json!({"messages": messages}))
+                    })
+                }),
+            );
+            Ok(())
+        })
+    })
+}
+
+fn dense_image_count(context: &Context) -> usize {
+    context.messages.iter().map(|message| match message {
+        Message::User(user) => match &user.content {
+            pi_ai::types::UserContent::Blocks(blocks) => blocks.iter().filter(|block| matches!(
+                block,
+                pi_ai::types::ImageOrTextContent::Image(image) if image.mime_type == DENSE_IMAGE_MIME && image.data.len() == DENSE_IMAGE_BYTES
+            )).count(),
+            _ => 0,
+        },
+        _ => 0,
+    }).sum()
+}
+
 fn ledger(session: &AgentSession) -> TextMasUsageLedger {
     let mut ledger = TextMasUsageLedger::default();
     for entry in session.session_manager.lock().unwrap().get_entries() {
@@ -261,6 +406,350 @@ async fn sequential_and_hierarchical_are_real_distinct_graphs_and_keep_final_too
 }
 
 #[tokio::test]
+async fn hidden_thinking_over_cap_does_not_block_roles_or_the_normal_parent() {
+    let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let f = Fixture::new();
+    let transform_audit = Arc::new(Mutex::new(Vec::new()));
+    let session = f.session_with_extensions(0, false, vec![image_density_extension(transform_audit.clone())]).await;
+    let dense_image = pi_ai::types::ImageContent::new("A".repeat(DENSE_IMAGE_BYTES), DENSE_IMAGE_MIME);
+    let private_history = format!("LARGE_PRIVATE_HISTORY{}", "x".repeat(MAX_CONTEXT_BYTES));
+    let private_thinking = pi_ai::types::ThinkingContent {
+        thinking_signature: Some("PRIVATE_THINKING_SIGNATURE".into()),
+        ..faux_thinking(&private_history)
+    };
+    f.reply(
+        faux_assistant_message(
+            FauxAssistantContent::Blocks(vec![
+                ContentBlock::Thinking(private_thinking.clone()),
+                ContentBlock::Text(faux_text("HISTORY_ANSWER")),
+            ]),
+            None,
+        ),
+        None,
+        None,
+    );
+    turn(&session, "HISTORY_REQUEST", Some(PromptOptions {
+        images: Some(vec![dense_image.clone()]), source: Some(InputSource::Rpc), ..Default::default()
+    })).await.unwrap();
+    transform_audit.lock().unwrap().clear();
+    let file = session.session_file().unwrap();
+    textmas_settings::set_mode(&file, TextMasMode::Sequential).unwrap();
+    f.drafts(&file);
+    f.reply(text_reply("FINAL_ANSWER"), None, None);
+    turn(&session, "CURRENT_REQUEST", Some(PromptOptions {
+        images: Some(vec![dense_image]), source: Some(InputSource::Rpc), ..Default::default()
+    })).await.unwrap();
+    assert_eq!(transform_audit.lock().unwrap().as_slice(), &[2], "one extension transform sees both dense images; role and parent reuse it");
+
+    let contexts = f.captured.lock().unwrap().clone();
+    assert_eq!(
+        contexts.len(),
+        5,
+        "ordinary history, three roles, normal parent"
+    );
+    for (offset, role) in ["planner", "critic", "refiner"].iter().enumerate() {
+        let context = &contexts[offset + 1];
+        assert!(context.tools.is_none());
+        assert!(context
+            .system_prompt
+            .as_ref()
+            .unwrap()
+            .contains(&format!("advisory role: {role}")));
+        assert!(serde_json::to_vec(context).unwrap().len() <= MAX_CONTEXT_BYTES);
+        assert_eq!(dense_image_count(context), 1, "extension-deduplicated image density is bounded for {role}");
+        let text = serde_json::to_string(context).unwrap();
+        assert!(text.contains("HISTORY_ANSWER") && text.contains("CURRENT_REQUEST"));
+        assert!(!text.contains("LARGE_PRIVATE_HISTORY"));
+    }
+    let parent = &contexts[4];
+    assert!(parent.tools.is_some());
+    assert!(serde_json::to_vec(parent).unwrap().len() > MAX_CONTEXT_BYTES);
+    assert_eq!(dense_image_count(parent), 1);
+    let parent_text = serde_json::to_string(parent).unwrap();
+    assert!(parent_text.contains("OCC31_DUPLICATE_IMAGE_DEDUPED"));
+    let parent_thinking = parent
+        .messages
+        .iter()
+        .filter_map(|message| match message {
+            Message::Assistant(assistant) => Some(assistant),
+            _ => None,
+        })
+        .flat_map(|assistant| &assistant.content)
+        .find_map(|block| match block {
+            ContentBlock::Thinking(thinking) if thinking.thinking == private_history => Some(thinking),
+            _ => None,
+        })
+        .expect("normal parent retains the exact hidden Thinking block");
+    assert_eq!(parent_thinking, &private_thinking);
+    assert!(
+        parent_text.contains("LARGE_PRIVATE_HISTORY"),
+        "normal parent history is not truncated"
+    );
+    assert!(
+        parent_text.contains("PLANNER_DRAFT")
+            && parent_text.contains("CRITIC_DRAFT")
+            && parent_text.contains("REFINER_DRAFT")
+    );
+    assert_eq!(ledger(&session).summary().unwrap().calls, 3);
+    session.dispose_async(Some(false)).await;
+}
+
+#[tokio::test]
+async fn oversized_single_message_uses_bounded_chunked_preparation_in_both_modes() {
+    let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    for mode in [TextMasMode::Sequential, TextMasMode::Hierarchical] {
+        let f = Fixture::new();
+        let session = f.session(0, false).await;
+        let file = session.session_file().unwrap();
+        textmas_settings::set_mode(&file, mode).unwrap();
+        f.dynamic_preparation_replies(64);
+        let oversized_request = format!(
+            "BEGIN_SENTINEL:{}:MIDDLE_SENTINEL:{}:END_SENTINEL",
+            "é雪\"\n≤".repeat(40_000),
+            "z".repeat(MAX_CONTEXT_BYTES * 2),
+        );
+        turn(&session, &oversized_request, None).await.unwrap();
+        let contexts = f.captured.lock().unwrap().clone();
+        let role_name = |context: &Context| {
+            let prompt = context.system_prompt.as_deref().unwrap_or_default();
+            ["mapper", "reducer", "planner", "critic", "refiner"].into_iter()
+                .find(|role| prompt.contains(&format!("advisory role: {role}")))
+        };
+        let mapper_count = contexts.iter().filter(|context| role_name(context) == Some("mapper")).count();
+        let reducer_count = contexts.iter().filter(|context| role_name(context) == Some("reducer")).count();
+        assert!(mapper_count > 1, "large source must use multiple mapper calls ({mode:?})");
+        assert!(reducer_count >= 1, "multiple briefs must be reduced ({mode:?})");
+        for context in contexts.iter().filter(|context| context.tools.is_none()) {
+            assert!(serde_json::to_vec(context).unwrap().len() <= MAX_CONTEXT_BYTES);
+            assert!(role_name(context).is_some());
+        }
+        for role in ["planner", "critic", "refiner"] {
+            assert_eq!(contexts.iter().filter(|context| role_name(context) == Some(role)).count(), 1);
+        }
+        let sequential = contexts.iter().find(|context| role_name(context) == Some("critic")).unwrap();
+        let refiner = contexts.iter().find(|context| role_name(context) == Some("refiner")).unwrap();
+        assert_eq!(serde_json::to_string(sequential).unwrap().contains("PLANNER_DRAFT"), mode == TextMasMode::Sequential);
+        assert_eq!(serde_json::to_string(refiner).unwrap().contains("CRITIC_DRAFT"), mode == TextMasMode::Sequential);
+        let parents = contexts.iter().filter(|context| context.tools.is_some()).collect::<Vec<_>>();
+        assert_eq!(parents.len(), 1);
+        let parent = serde_json::to_string(parents[0]).unwrap();
+        assert!(parent.contains("BEGIN_SENTINEL") && parent.contains("MIDDLE_SENTINEL") && parent.contains("END_SENTINEL"));
+        assert!(parent.contains("PLANNER_DRAFT") && parent.contains("CRITIC_DRAFT") && parent.contains("REFINER_DRAFT"));
+        assert!(parent.contains("shared context-map") && parent.contains("lossy advisory"));
+        assert_eq!(ledger(&session).summary().unwrap().calls, mapper_count + reducer_count + 3);
+        assert!(!serde_json::to_string(&session.messages()).unwrap().contains("MAPPER_BRIEF"));
+        session.dispose_async(Some(false)).await;
+    }
+}
+
+#[tokio::test]
+async fn large_history_reduction_and_parent_retry_keep_exact_latest_and_do_not_respend() {
+    let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let f = Fixture::new();
+    let transform_audit = Arc::new(Mutex::new(Vec::new()));
+    let session = f
+        .session_with_extensions(0, true, vec![image_density_extension(transform_audit.clone())])
+        .await;
+    f.reply(text_reply("HISTORY_ANSWER"), None, None);
+    let large_history = format!("HISTORY_BEGIN{}HISTORY_END", "h".repeat(MAX_CONTEXT_BYTES * 2));
+    turn(&session, &large_history, None).await.unwrap();
+    transform_audit.lock().unwrap().clear();
+    let file = session.session_file().unwrap();
+    textmas_settings::set_mode(&file, TextMasMode::Sequential).unwrap();
+    f.dynamic_preparation_replies_with_parent_failures(64, 1);
+    turn(&session, "CURRENT_REQUEST", None).await.unwrap();
+    let contexts = f.captured.lock().unwrap().clone();
+    let prepared = &contexts[1..];
+    let role_name = |context: &Context| {
+        let prompt = context.system_prompt.as_deref().unwrap_or_default();
+        ["mapper", "reducer", "planner", "critic", "refiner"].into_iter()
+            .find(|role| prompt.contains(&format!("advisory role: {role}")))
+    };
+    let mapper_count = prepared.iter().filter(|context| role_name(context) == Some("mapper")).count();
+    let reducer_count = prepared.iter().filter(|context| role_name(context) == Some("reducer")).count();
+    assert!(mapper_count > 1 && reducer_count >= 1);
+    for role in ["planner", "critic", "refiner"] {
+        let context = prepared.iter().find(|context| role_name(context) == Some(role)).unwrap();
+        let encoded = serde_json::to_string(context).unwrap();
+        assert!(encoded.contains("CURRENT_REQUEST"), "small latest request stays exact in the reduced role");
+        assert!(!encoded.contains("HISTORY_BEGIN"), "roles consume the brief, not the oversized raw history");
+    }
+    let parents = prepared.iter().filter(|context| context.tools.is_some()).collect::<Vec<_>>();
+    assert_eq!(parents.len(), 2, "one failed normal parent attempt and its ordinary retry");
+    for parent in parents {
+        let encoded = serde_json::to_string(parent).unwrap();
+        assert!(encoded.contains("HISTORY_BEGIN") && encoded.contains("HISTORY_END"));
+        assert!(encoded.contains("CURRENT_REQUEST") && encoded.contains("REFINER_DRAFT"));
+        assert!(serde_json::to_vec(parent).unwrap().len() > MAX_CONTEXT_BYTES);
+    }
+    assert_eq!(ledger(&session).summary().unwrap().calls, mapper_count + reducer_count + 3);
+    assert_eq!(*transform_audit.lock().unwrap(), vec![0], "one stateful transform is reused by both parent attempts");
+    session.dispose_async(Some(false)).await;
+}
+
+
+#[tokio::test]
+async fn large_project_instructions_trigger_bounded_source_preparation() {
+    let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let f = Fixture::new();
+    let instructions = format!(
+        "PROJECT_INSTRUCTIONS_BEGIN\n{}\nPROJECT_INSTRUCTIONS_END",
+        "Preserve exact UTF-8 é雪 and JSON {\"key\": true} in this instruction.\n"
+            .repeat(4_500)
+    );
+    assert!(instructions.len() > MAX_CONTEXT_BYTES);
+    std::fs::write(
+        f.root.path().join("workspace/AGENTS.md"),
+        &instructions,
+    )
+    .unwrap();
+    let session = f.session(0, false).await;
+    let file = session.session_file().unwrap();
+    textmas_settings::set_mode(&file, TextMasMode::Sequential).unwrap();
+    f.dynamic_preparation_replies(64);
+    turn(&session, "CURRENT_REQUEST", None).await.unwrap();
+
+    let contexts = f.captured.lock().unwrap().clone();
+    let role_name = |context: &Context| {
+        let prompt = context.system_prompt.as_deref().unwrap_or_default();
+        ["mapper", "reducer", "planner", "critic", "refiner"]
+            .into_iter()
+            .find(|role| prompt.contains(&format!("advisory role: {role}")))
+    };
+    let parent = contexts
+        .iter()
+        .find(|context| context.tools.is_some())
+        .expect("the ordinary parent still runs after preparation");
+    let original_system = parent.system_prompt.as_deref().unwrap();
+    assert!(original_system.contains(&instructions));
+    assert!(original_system.len() > MAX_CONTEXT_BYTES);
+
+    // All original system-instruction bytes are losslessly available to the
+    // source mapper. They are neither truncated nor copied back into an
+    // oversized auxiliary system prompt.
+    let mut recovered_system = String::new();
+    for context in contexts
+        .iter()
+        .filter(|context| role_name(context) == Some("mapper"))
+    {
+        for message in &context.messages {
+            let Message::User(user) = message else {
+                continue;
+            };
+            let pi_ai::types::UserContent::Text(text) = &user.content else {
+                continue;
+            };
+            if text.starts_with("[OCC3.1 source system instructions") {
+                let (_, payload) = text.split_once("]\n").unwrap();
+                recovered_system.push_str(payload);
+            }
+        }
+    }
+    assert_eq!(recovered_system, original_system);
+    for context in contexts.iter().filter(|context| context.tools.is_none()) {
+        assert!(serde_json::to_vec(context).unwrap().len() <= MAX_CONTEXT_BYTES);
+    }
+    for role in ["planner", "critic", "refiner"] {
+        let context = contexts
+            .iter()
+            .find(|context| role_name(context) == Some(role))
+            .unwrap();
+        let encoded = serde_json::to_string(context).unwrap();
+        assert!(encoded.contains("CURRENT_REQUEST"));
+        assert!(!encoded.contains("PROJECT_INSTRUCTIONS_BEGIN"));
+    }
+    let mapper_count = contexts
+        .iter()
+        .filter(|context| role_name(context) == Some("mapper"))
+        .count();
+    let reducer_count = contexts
+        .iter()
+        .filter(|context| role_name(context) == Some("reducer"))
+        .count();
+    assert!(mapper_count > 1 && reducer_count >= 1);
+    let parent_text = serde_json::to_string(parent).unwrap();
+    assert!(parent_text.contains("PROJECT_INSTRUCTIONS_BEGIN"));
+    assert!(parent_text.contains("PROJECT_INSTRUCTIONS_END"));
+    assert!(parent_text.contains("complete system instructions were mapped"));
+    assert!(parent_text.contains("REFINER_DRAFT"));
+    assert!(serde_json::to_vec(parent).unwrap().len() > MAX_CONTEXT_BYTES);
+    assert_eq!(
+        ledger(&session).summary().unwrap().calls,
+        mapper_count + reducer_count + 3
+    );
+    session.dispose_async(Some(false)).await;
+}
+
+#[tokio::test]
+async fn dense_auxiliary_outputs_force_real_recursive_reduction_and_unique_ordinals() {
+    let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let f = Fixture::new();
+    let session = f.session(0, true).await;
+    textmas_settings::set_mode(&session.session_file().unwrap(), TextMasMode::Sequential).unwrap();
+    f.dynamic_dense_preparation_replies(96);
+    let source = format!("DENSE_SOURCE_BEGIN{}DENSE_SOURCE_END", "s".repeat(MAX_CONTEXT_BYTES * 20));
+    tokio::time::timeout(Duration::from_secs(120), session.prompt(&source, None))
+        .await
+        .expect("dense stress prompt settled within its explicit bound")
+        .unwrap();
+    idle(&session).await;
+    let contexts = f.captured.lock().unwrap().clone();
+    let role_name = |context: &Context| {
+        let prompt = context.system_prompt.as_deref().unwrap_or_default();
+        ["mapper", "reducer", "planner", "critic", "refiner"].into_iter()
+            .find(|role| prompt.contains(&format!("advisory role: {role}")))
+    };
+    let mapper_count = contexts.iter().filter(|context| role_name(context) == Some("mapper")).count();
+    let reducer_count = contexts.iter().filter(|context| role_name(context) == Some("reducer")).count();
+    assert!(mapper_count > 16 && reducer_count > 3, "dense escaped outputs require multiple actual reduction rounds: {mapper_count} maps, {reducer_count} reductions");
+    let usage = ledger(&session);
+    let ids = usage.records().map(|record| record.call_id()).collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(ids.len(), mapper_count + reducer_count + 3);
+    let mut mapper_ordinals = usage.records().filter(|record| record.role == pi_coding_agent::core::occ::textmas::TextMasRole::Mapper)
+        .map(|record| record.call_index.expect("mapper ordinal")).collect::<Vec<_>>();
+    mapper_ordinals.sort_unstable();
+    assert_eq!(mapper_ordinals, (0..u32::try_from(mapper_count).unwrap()).collect::<Vec<_>>());
+    let mut reducer_ordinals = usage.records().filter(|record| record.role == pi_coding_agent::core::occ::textmas::TextMasRole::Reducer)
+        .map(|record| record.call_index.expect("reducer ordinal")).collect::<Vec<_>>();
+    reducer_ordinals.sort_unstable();
+    assert_eq!(reducer_ordinals, (0..u32::try_from(reducer_count).unwrap()).collect::<Vec<_>>());
+    session.dispose_async(Some(false)).await;
+}
+
+#[tokio::test]
+async fn valid_oversized_png_is_resized_only_for_advisory_preparation() {
+    use base64::Engine as _;
+    let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let f = Fixture::new();
+    let session = f.session(0, true).await;
+    textmas_settings::set_mode(&session.session_file().unwrap(), TextMasMode::Sequential).unwrap();
+    let pixels = image::RgbaImage::from_fn(512, 512, |x, y| {
+        let value = x.wrapping_mul(1_103_515_245).wrapping_add(y.wrapping_mul(12_345));
+        image::Rgba([value as u8, (value >> 8) as u8, (value >> 16) as u8, 255])
+    });
+    let mut encoded = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgba8(pixels).write_to(&mut encoded, image::ImageFormat::Png).unwrap();
+    let original_data = base64::engine::general_purpose::STANDARD.encode(encoded.into_inner());
+    assert!(original_data.len() > MAX_CONTEXT_BYTES, "fixture must actually exceed the role bound");
+    let original = pi_ai::types::ImageContent::new(original_data.clone(), "image/png");
+    f.dynamic_preparation_replies_with_parent_failures(64, 0);
+    turn(&session, "VALID_IMAGE_RESIZE", Some(PromptOptions {
+        images: Some(vec![original]), ..Default::default()
+    })).await.unwrap();
+    let contexts = f.captured.lock().unwrap().clone();
+    let mapper = contexts.iter().find(|context| {
+        context.system_prompt.as_deref().unwrap_or_default().contains("advisory role: mapper")
+    }).expect("valid image reaches mapper preparation");
+    let mapper_json = serde_json::to_string(mapper).unwrap();
+    assert!(!mapper_json.contains(&original_data), "mapper must not receive the oversized original image");
+    let parent = contexts.iter().find(|context| context.tools.is_some()).expect("ordinary parent");
+    let parent_json = serde_json::to_string(parent).unwrap();
+    assert!(parent_json.contains(&original_data), "ordinary parent image bytes are not resized or replaced");
+    assert!(parent_json.contains("resized 1 preparation-only image(s)"), "parent advice records advisory-only resizing");
+    session.dispose_async(Some(false)).await;
+}
+
+#[tokio::test]
 async fn off_internal_extension_and_child_turns_never_fan_out() {
     let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
     let f = Fixture::new();
@@ -289,7 +778,7 @@ async fn off_internal_extension_and_child_turns_never_fan_out() {
 #[tokio::test]
 async fn provider_error_refusal_empty_and_tool_attempt_fail_without_retry_or_execution() {
     let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
-    for case in ["error", "refusal", "empty", "tool", "oversized"] {
+    for case in ["error", "length", "refusal", "empty", "tool", "oversized"] {
         let f = Fixture::new();
         let session = f.session(0, true).await;
         turn(&session, "/mode direct", None).await.unwrap();
@@ -298,13 +787,18 @@ async fn provider_error_refusal_empty_and_tool_attempt_fail_without_retry_or_exe
         let side_effect = f.root.path().join("must-not-exist");
         let message = match case {
             "error" => faux_assistant_message("".into(), Some(FauxAssistantMessageOptions { stop_reason: Some("error".into()), error_message: Some("temporary provider failure".into()), ..Default::default() })),
+            "length" => faux_assistant_message("partial unpublished draft".into(), Some(FauxAssistantMessageOptions { stop_reason: Some("length".into()), ..Default::default() })),
             "refusal" => { let mut m = text_reply("declined"); m.stop_reason_raw = Some("refusal".into()); m },
             "empty" => faux_assistant_message(FauxAssistantContent::Blocks(vec![ContentBlock::Thinking(faux_thinking("PRIVATE_ONLY"))]), None),
             "tool" => faux_assistant_message(ContentBlock::ToolCall(ToolCall::new("unsafe", "bash", json!({"command":format!("touch '{}'",side_effect.display())}).as_object().unwrap().clone())).into(), Some(FauxAssistantMessageOptions { stop_reason: Some("toolUse".into()), ..Default::default() })),
             _ => text_reply(&"x".repeat(16_385)),
         };
         f.reply(message, Some(file), None);
-        assert!(turn(&session, "CURRENT_REQUEST", None).await.is_err(), "{case}");
+        let error = turn(&session, "CURRENT_REQUEST", None).await.unwrap_err();
+        if case == "length" {
+            assert!(error.contains("stop: length"), "{error}");
+            assert!(!error.contains("partial unpublished draft"));
+        }
         assert_eq!(f.captured.lock().unwrap().len(), 1, "no retry/fallback after {case}");
         assert!(!side_effect.exists());
         assert_eq!(ledger(&session).summary().unwrap().calls, 1);
@@ -496,5 +990,29 @@ async fn queued_all_batch_keeps_both_user_inputs_and_delivers_all_three_drafts()
     let final_context = serde_json::to_string(&contexts[3].messages).unwrap();
     assert!(final_context.contains("PLANNER_DRAFT") && final_context.contains("CRITIC_DRAFT") && final_context.contains("REFINER_DRAFT"));
     assert_eq!(ledger(&session).summary().unwrap().calls, 3);
+    session.dispose_async(Some(false)).await;
+}
+
+
+#[tokio::test]
+async fn successful_turn_clears_activity_and_admits_a_subsequent_turn() {
+    let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let f = Fixture::new();
+    let session = f.session(0, false).await;
+    let file = session.session_file().unwrap();
+    textmas_settings::set_mode(&file, TextMasMode::Sequential).unwrap();
+    f.drafts(&file);
+    f.reply(text_reply("FIRST_PARENT"), None, None);
+    turn(&session, "CURRENT_REQUEST first successful turn", None).await.unwrap();
+    assert!(!session.is_textmas_active(), "the settled parent must clear TextMAS activity");
+    f.drafts(&file);
+    f.reply(text_reply("SECOND_PARENT"), None, None);
+    turn(&session, "CURRENT_REQUEST subsequent user turn", None).await.unwrap();
+    assert!(!session.is_textmas_active(), "the second settled parent must also clear TextMAS activity");
+    let contexts = f.captured.lock().unwrap();
+    assert_eq!(contexts.len(), 8, "both turns must have fresh roles and a parent");
+    assert_eq!(contexts.iter().filter(|context| context.tools.is_some()).count(), 2);
+    drop(contexts);
+    assert_eq!(ledger(&session).summary().unwrap().calls, 6);
     session.dispose_async(Some(false)).await;
 }

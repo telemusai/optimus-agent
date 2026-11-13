@@ -25,6 +25,13 @@ pub(super) struct StateRefresh {
     retry_needed: bool,
 }
 
+// Token deltas do not carry every operation's terminal state. Include OCC3.1
+// activity here so a stale terminal snapshot cannot stop quiet reconciliation.
+fn state_needs_reconciliation(state: &local::AgentConnectionState) -> bool {
+    state.is_streaming || state.is_compacting || state.is_bash_running ||
+        state.occ3_modes.as_ref().is_some_and(|modes| modes.textmas_active)
+}
+
 impl StateRefresh {
     pub(super) fn new() -> Self {
         let (send, receive) = mpsc::channel();
@@ -37,6 +44,12 @@ impl StateRefresh {
             last_requested_at: std::time::Instant::now(),
             retry_needed: false,
         }
+    }
+
+    #[cfg(test)]
+    pub(super) fn expire_reconciliation_for_tests(&mut self) {
+        // Exercise the real five-second cadence without a wall-clock delay.
+        self.last_requested_at = std::time::Instant::now() - Duration::from_secs(6);
     }
 
     pub(super) fn invalidate(&mut self) {
@@ -57,7 +70,7 @@ impl StateRefresh {
         session_id: String,
         mode: &InteractiveMode,
     ) {
-        let active = mode.is_agent_streaming() || mode.is_agent_compacting() || mode.is_bash_running();
+        let active = mode.connection_state.as_ref().is_some_and(state_needs_reconciliation);
         let delay = if self.retry_needed && !active { Duration::from_millis(100) } else { Duration::from_secs(5) };
         if self.task.is_some() || (!active && !self.retry_needed) || self.last_requested_at.elapsed() < delay {
             return;
@@ -268,7 +281,22 @@ pub(super) fn track_activity(
 
 #[cfg(test)]
 mod tests {
-    use super::event_requires_snapshot_refresh;
+    use super::*;
+
+    #[test]
+    fn cached_textmas_activity_requires_reconciliation_when_otherwise_idle() {
+        let mut state = local::AgentConnectionState::default();
+        assert!(!state_needs_reconciliation(&state));
+        state.occ3_modes = Some(wire::Occ3Modes {
+            textmas_mode: crate::core::occ::textmas::TextMasMode::Sequential,
+            textmas_active: true,
+            ..Default::default()
+        });
+        assert!(
+            state_needs_reconciliation(&state),
+            "a stale OCC3.1 terminal snapshot must not abandon authoritative convergence"
+        );
+    }
 
     #[test]
     fn compaction_end_requires_snapshot_refresh() {

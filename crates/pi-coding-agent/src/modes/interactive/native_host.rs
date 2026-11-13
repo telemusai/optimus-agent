@@ -7464,6 +7464,43 @@ fn apply_event_legacy_for_speed(
         assert_eq!(mode.borrow().connection_state.as_ref().unwrap().execution_mode, Some(ExecutionMode::Direct));
     }
 
+    #[tokio::test]
+    async fn cached_textmas_activity_reconciles_and_applies_host_idle_state() {
+        let session_id = "occ31-host-refresh";
+        let mode = Rc::new(RefCell::new(stash_mode(session_id)));
+        mode.borrow_mut().apply_connection_state_snapshot(local::AgentConnectionState {
+            session_id: session_id.into(),
+            occ3_modes: Some(wire::Occ3Modes {
+                textmas_mode: crate::core::occ::textmas::TextMasMode::Sequential,
+                textmas_active: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let recorder = Arc::new(RecordingConnection::new());
+        *recorder.state.lock().unwrap() = wire::AgentConnectionState {
+            session_id: session_id.into(),
+            occ3_modes: Some(wire::Occ3Modes {
+                textmas_mode: crate::core::occ::textmas::TextMasMode::Sequential,
+                textmas_active: false,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let connection: Arc<dyn wire::AgentConnection> = recorder.clone();
+        let mut refresh = native_state::StateRefresh::new();
+        refresh.expire_reconciliation_for_tests();
+        refresh.reconcile_if_due(connection, session_id.into(), &mode.borrow());
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !refresh.poll(&mode, session_id) { tokio::task::yield_now().await; }
+        }).await.expect("cached OCC3.1 activity must cause an applied quiet refresh");
+        assert_eq!(recorder.calls().iter().filter(|(name, _)| name == "get_state").count(), 1);
+        assert_eq!(mode.borrow().connection_state.as_ref()
+            .and_then(|state| state.occ3_modes.as_ref())
+            .map(|occ| occ.textmas_active), Some(false));
+        assert!(!mode.borrow().is_agent_streaming());
+    }
+
     #[test]
     fn execution_mode_function_key_is_configurable_and_keeps_editor_draft() {
         use crate::core::keybindings::{KeybindingsConfig, KeybindingsManager, KeybindingSetting};
