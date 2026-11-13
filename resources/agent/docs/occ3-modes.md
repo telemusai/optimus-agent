@@ -57,8 +57,12 @@ an alternative endpoint, change model configuration or silently switch models.
 
 ### Scope, cost and failure handling
 
-- Three extra preparation calls precede the normal parent request. Normal tool
-  continuations can add further calls. This is not a free or token-saving mode.
+- Contexts that fit use three extra preparation calls before the normal parent
+  request. An actual oversized or model-incompatible role request activates shared
+  context-map and reduction calls instead. These auxiliary calls run once per
+  preparation run, are reused by all three roles, and are not repeated by normal
+  parent retries. Normal tool continuations can add further calls. This is not a
+  free or token-saving mode.
 - The saved mode is per chat. Resume restores it. Preference lookup can report
   inherited values, but automatic preparation is restricted to genuine root-chat
   user turns. Child sessions and internal, heartbeat or agent-message turns do
@@ -66,15 +70,32 @@ an alternative endpoint, change model configuration or silently switch models.
 - Input persistence precedes preparation. Normal cancellation also cancels
   preparation. A failed or invalid preparation result stops the turn instead of
   silently falling back to an ordinary execution.
-- Each actual tool-free role request uses at most 256 KiB of serialized context
-  after preparation, including images, retained history and any earlier drafts in
-  sequential mode. Hidden Thinking is stripped before this per-role check. The
-  raw original transcript and normal parent/Judger request are not subject to
-  this preparation cap. Each stage has a 120-second limit, a 128 KiB response
+- Each actual mapper, reducer, Planner, Critic and Refiner request uses at most
+  256 KiB of serialized context after preparation, including images and any
+  earlier role drafts in sequential mode. Every request must also fit the selected
+  model's estimated input/output limits. Hidden Thinking is stripped before these
+  checks. The raw original transcript and normal parent/Judger request are not
+  subject to this preparation cap.
+- Oversized source content is partitioned at UTF-8 boundaries with stable source
+  labels. Tool results, tool calls and images are included in the source
+  projection. Up to 64 mapper calls run with bounded concurrency; ordered reducer
+  levels must make progress until one brief remains. Source splitting is lossless,
+  but model-generated summaries are necessarily lossy advisory context. A brief
+  that cannot be reduced within the bounds fails visibly instead of being tail
+  truncated. Complete parent history remains authoritative. OCC3.1 does not
+  enlarge the model's ordinary parent context window or bypass its provider
+  limits; existing parent compaction and failure handling still apply.
+- Images that cannot fit a mapper request may be decoded and resized only in the
+  preparation projection. An undecodable oversized image fails visibly. Original
+  parent images are never resized, replaced or removed by OCC3.1. The exact latest
+  user message is also supplied directly to reduced roles when it fits; otherwise
+  it is represented in the brief and the parent still receives the exact message.
+- Each mapper, reducer or role stage has a 120-second limit, a 128 KiB response
   limit and a 16 KiB public-draft limit. Its output budget is at most 4096 tokens,
   reduced to the selected model's output and estimated remaining-context limits.
-  Role inputs that do not fit fail visibly; images, history and drafts are not
-  silently discarded.
+  Usage has a stable call ordinal for each mapper/reducer call. Exhausted reduction
+  caps, irreducible content, invalid images and cancelled calls are not silently
+  discarded or treated as free.
 - Tool-call output, refusal, missing usable text and incomplete output are not
   valid advisory drafts. No automatic role retries or model fallback are added.
 - `/stats` shows a separate **OCC3.1 preparation overhead** category. Its known

@@ -6,9 +6,12 @@ OCC3.1 is an optional TextMAS workflow on the selected ordinary model. It does
 not require a latent-capable model, connector or server. Each eligible root user
 turn runs three tool-free preparation calls (Planner, Critic and Refiner), then
 the ordinary parent acts as Judger/executor with its normal tools and approvals.
-Sequential stages receive earlier drafts. Hierarchical stages independently read
-the original context; they currently execute serially. Drafts are untrusted
-advisory text, not hidden reasoning, system instructions or verified evidence.
+Oversized role contexts first use bounded shared mapper/reducer calls and a
+lossy advisory brief; every stage remains bounded and accounted, while the
+parent retains its full original context. Sequential stages receive earlier
+drafts. Hierarchical stages independently read the original or reduced context;
+they currently execute serially. Drafts are untrusted advisory text, not hidden
+reasoning, system instructions or verified evidence.
 
 ```text
 /occ 3 off
@@ -46,8 +49,8 @@ not a slash command.
   subtotals and explicit unknown usage/cost counts. No fake replies, model
   identities or child sessions are created for accounting.
 - User input and accounting reservations are persisted before provider work.
-  Failed, interrupted, refused, tool-bearing or oversized preparation stops the
-  turn rather than silently executing a fallback. Cancellation settles the
+  Failed, interrupted, refused, tool-bearing or cap-exhausted preparation stops
+  the turn rather than silently executing a fallback. Cancellation settles the
   waiting input and preserves unrelated queued inputs. Normal final retries
   reuse the drafts without repeating preparation.
 - Generated system-prompt guidance explains the host-managed stages, their

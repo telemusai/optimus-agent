@@ -1,6 +1,8 @@
 //! One-shot, session-owned TextMAS preparation. Advisory calls have no Agent/tool loop.
 use super::*;
 use crate::core::occ::textmas::{self as contract, TextMasCallStatus, TextMasMode, TextMasRole, TextMasUsageRecord};
+use crate::core::occ::textmas_context as context_contract;
+use futures::{stream, StreamExt, TryStreamExt};
 use pi_ai::types::{AssistantMessageEvent, Context, SimpleStreamOptions};
 use pi_ai::utils::event_stream::StreamTaskReceipt;
 
@@ -70,6 +72,7 @@ struct CallGuard {
     session: Weak<AgentSession>,
     action_id: String,
     role: TextMasRole,
+    call_index: Option<u32>,
     signal: CancellationToken,
     receipt: StreamTaskReceipt,
     usage: Option<Usage>,
@@ -81,7 +84,7 @@ impl Drop for CallGuard {
         self.receipt.request_cancel();
         if !self.settled {
             if let Some(session) = self.session.upgrade() {
-                let record = TextMasUsageRecord::new(&self.action_id, self.role, TextMasCallStatus::Cancelled, self.usage.clone());
+                let record = TextMasUsageRecord::new_indexed(&self.action_id, self.role, self.call_index, TextMasCallStatus::Cancelled, self.usage.clone());
                 if session.persist_textmas_usage(&record).is_err() {
                     session.fail_textmas(&self.action_id, "OCC3.1 usage could not be saved; no automatic replay".into());
                 }
@@ -141,7 +144,7 @@ impl AgentSession {
                     if run.signal.is_cancelled() { return None; }
                     match &mut run.phase {
                         Phase::Ready { snapshot, .. } if snapshot.as_ref().is_some_and(|snapshot| snapshot.source == messages) =>
-                            snapshot.take().map(|snapshot| snapshot.transformed),
+                            snapshot.as_ref().map(|snapshot| snapshot.transformed.clone()),
                         _ => None,
                     }
                 });
@@ -268,14 +271,27 @@ impl AgentSession {
         }
     }
 
-    async fn run_textmas_preparation(self: &Arc<Self>, run: &TextMasRun, parent_signal: Option<CancellationToken>) -> Result<(UserMessage, PreparedSnapshot), String> {
-        let durable = run.input_ids.iter().all(|id| self.action_by_id(id).as_ref()
-            .and_then(|action| primary_delivery_record(action).ok()).is_some_and(|record| record.durable));
+    async fn run_textmas_preparation(
+        self: &Arc<Self>,
+        run: &TextMasRun,
+        parent_signal: Option<CancellationToken>,
+    ) -> Result<(UserMessage, PreparedSnapshot), String> {
+        let durable = run.input_ids.iter().all(|id| {
+            self.action_by_id(id)
+                .as_ref()
+                .and_then(|action| primary_delivery_record(action).ok())
+                .is_some_and(|record| record.durable)
+        });
         if !durable || self.has_failed_dispatch_persistence() {
             return Err("OCC3.1 requires a durably saved user request before preparation".into());
         }
-        let options = self.agent.side_question_options().ok_or("OCC3.1 provider interface is unavailable")?;
-        let convert = options.convert_to_llm.ok_or("OCC3.1 provider context conversion is unavailable")?;
+        let options = self
+            .agent
+            .side_question_options()
+            .ok_or("OCC3.1 provider interface is unavailable")?;
+        let convert = options
+            .convert_to_llm
+            .ok_or("OCC3.1 provider context conversion is unavailable")?;
         let source = self.agent.messages();
         let transform = self.textmas.lock().unwrap().original_transform.clone();
         // Prepare the transformed snapshot used by tool-free roles and reused by the normal parent.
@@ -292,41 +308,197 @@ impl AgentSession {
         let original = Context::new(Some(self.agent.system_prompt()), messages, None);
         // Only the tool-free role requests are subject to the preparation context bound.
         // The normal parent keeps this full history and appends advice in its own context hook.
+        let mut active_original = original.clone();
+        let mut preparation_note = None;
+        if run.mode == TextMasMode::Hierarchical {
+            let mut needs_reduction = false;
+            for role in TextMasRole::ALL {
+                match role_request(&run.model, &original, run.mode, role, &[]) {
+                    Ok(_) => {}
+                    Err(error) if error.reducible => needs_reduction = true,
+                    Err(error) => return Err(error.message),
+                }
+            }
+            if needs_reduction {
+                let reduction = self
+                    .reduce_textmas_context(run, &original, parent_signal.as_ref())
+                    .await?;
+                active_original = reduction.original;
+                preparation_note = Some(reduction.note);
+            }
+        }
         let mut drafts = Vec::new();
         for role in TextMasRole::ALL {
-            if run.signal.is_cancelled() || parent_signal.as_ref().is_some_and(CancellationToken::is_cancelled) || self.agent.model() != run.model {
-                return Err("OCC3.1 preparation was cancelled or its model changed".into());
-            }
-            let context = contract::role_context(&original, run.mode, role, &drafts)?;
-            let draft = self.run_textmas_role(run, role, context, parent_signal.as_ref()).await?;
+            ensure_textmas_current(self, run, parent_signal.as_ref())?;
+            let context = match role_request(&run.model, &active_original, run.mode, role, &drafts)
+            {
+                Ok(context) => context,
+                Err(error) if error.reducible && preparation_note.is_none() => {
+                    let reduction = self
+                        .reduce_textmas_context(run, &original, parent_signal.as_ref())
+                        .await?;
+                    active_original = reduction.original;
+                    preparation_note = Some(reduction.note);
+                    role_request(&run.model, &active_original, run.mode, role, &drafts)
+                        .map_err(|error| error.message)?
+                }
+                Err(error) => return Err(error.message),
+            };
+            let draft = self
+                .run_textmas_role(run, role, None, context, parent_signal.as_ref())
+                .await?;
             drafts.push((role, draft));
         }
-        let advisory = contract::advisory_message(&drafts);
-        Ok((advisory, PreparedSnapshot { source, transformed }))
+        let advisory = contract::advisory_message_with_note(&drafts, preparation_note.as_deref());
+        Ok((
+            advisory,
+            PreparedSnapshot {
+                source,
+                transformed,
+            },
+        ))
     }
 
-    async fn run_textmas_role(self: &Arc<Self>, run: &TextMasRun, role: TextMasRole, context: Context, parent_signal: Option<&CancellationToken>) -> Result<String, String> {
+    async fn reduce_textmas_context(
+        self: &Arc<Self>,
+        run: &TextMasRun,
+        original: &Context,
+        parent_signal: Option<&CancellationToken>,
+    ) -> Result<TextMasReduction, String> {
+        ensure_textmas_current(self, run, parent_signal)?;
+        let (prepared, resized_images) = resize_textmas_images(
+            self, original, run, parent_signal,
+        ).await?;
+        ensure_textmas_current(self, run, parent_signal)?;
+        // Planning validates every static envelope and final role capacity before auxiliary spend.
+        let plan = context_contract::TextMasPreparationPlan::new_with_control(
+            &prepared,
+            run.mode,
+            &run.model,
+            || ensure_textmas_current(self, run, parent_signal),
+        )?;
+        let map_count = plan.map_contexts.len();
+        let map_calls = stream::iter(plan.map_contexts.iter().cloned().enumerate().map(
+            |(index, context)| async move {
+                let call_index = u32::try_from(index)
+                    .map_err(|_| "OCC3.1 mapper call index overflow".to_string())?;
+                self.run_textmas_role(
+                    run,
+                    TextMasRole::Mapper,
+                    Some(call_index),
+                    context,
+                    parent_signal,
+                )
+                .await
+            },
+        ))
+        .buffered(3)
+        .try_collect::<Vec<_>>()
+        .await?;
+        let mut briefs = map_calls;
+        let mut reduce_count = 0usize;
+        while briefs.len() > 1 {
+            ensure_textmas_current(self, run, parent_signal)?;
+            let contexts = plan.reduction_contexts_with_control(
+                &run.model,
+                &briefs,
+                || ensure_textmas_current(self, run, parent_signal),
+            )?;
+            let first_index = reduce_count;
+            let context_count = contexts.len();
+            briefs = stream::iter(contexts.into_iter().enumerate().map(
+                |(offset, context)| async move {
+                    let call_index = u32::try_from(first_index + offset)
+                        .map_err(|_| "OCC3.1 reducer call index overflow".to_string())?;
+                    self.run_textmas_role(
+                        run,
+                        TextMasRole::Reducer,
+                        Some(call_index),
+                        context,
+                        parent_signal,
+                    )
+                    .await
+                },
+            ))
+            .buffered(3)
+            .try_collect::<Vec<_>>()
+            .await?;
+            reduce_count = first_index + context_count;
+        }
+        let brief = briefs
+            .pop()
+            .ok_or_else(|| "OCC3.1 reduction returned no brief".to_string())?;
+        let original = plan.reduced_original(&brief);
+        let latest = if plan.include_latest_user() {
+            "included exactly"
+        } else {
+            "represented in the brief"
+        };
+        let note = format!(
+            "Used {map_count} shared context-map and {reduce_count} context-reduction calls because an actual role request exceeded its bound; resized {resized_images} preparation-only image(s); latest user message {latest}. Summaries are lossy advisory context, and the complete parent history remains authoritative."
+        );
+        Ok(TextMasReduction { original, note })
+    }
+
+    async fn run_textmas_role(
+        self: &Arc<Self>,
+        run: &TextMasRun,
+        role: TextMasRole,
+        call_index: Option<u32>,
+        context: Context,
+        parent_signal: Option<&CancellationToken>,
+    ) -> Result<String, String> {
+        ensure_textmas_current(self, run, parent_signal)?;
         let output_budget = contract::output_budget(&run.model, &context)?;
-        let started = TextMasUsageRecord::new(&run.action_id, role, TextMasCallStatus::Started, None);
+        let started = TextMasUsageRecord::new_indexed(
+            &run.action_id,
+            role,
+            call_index,
+            TextMasCallStatus::Started,
+            None,
+        );
         self.persist_textmas_usage(&started)?;
         let receipt = StreamTaskReceipt::new_unsupported();
         if let Some(scope) = self.agent.execution_scope() {
-            scope.register_stream(receipt.clone()).map_err(|_| "OCC3.1 execution scope was stopped")?;
+            scope
+                .register_stream(receipt.clone())
+                .map_err(|_| "OCC3.1 execution scope was stopped")?;
         }
-        let mut guard = CallGuard { session: Arc::downgrade(self), action_id: run.action_id.clone(), role, signal: run.signal.child_token(), receipt: receipt.clone(), usage: None, settled: false };
-        let options = self.agent.side_question_options().ok_or("OCC3.1 provider interface is unavailable")?;
+        let mut guard = CallGuard {
+            session: Arc::downgrade(self),
+            action_id: run.action_id.clone(),
+            role,
+            call_index,
+            signal: run.signal.child_token(),
+            receipt: receipt.clone(),
+            usage: None,
+            settled: false,
+        };
+        let options = self
+            .agent
+            .side_question_options()
+            .ok_or("OCC3.1 provider interface is unavailable")?;
         let mut request = SimpleStreamOptions::default();
         request.stream.signal = Some(guard.signal.clone());
         request.stream.timeout_ms = Some(contract::STAGE_TIMEOUT_SECONDS as f64 * 1000.0);
         request.stream.max_tokens = Some(output_budget);
         request.stream.service_tier = self.agent.service_tier();
         request.stream.transport = Some(self.settings_manager.lock().unwrap().get_transport());
-        request.stream.session_id = Some(format!("{}:occ31:{}:{}", self.session_id(), run.action_id, role.as_str()));
+        let call_suffix = call_index
+            .map(|index| format!(":{index}"))
+            .unwrap_or_default();
+        request.stream.session_id = Some(format!(
+            "{}:occ31:{}:{}{call_suffix}",
+            self.session_id(),
+            run.action_id,
+            role.as_str()
+        ));
         request.reasoning = Some(self.agent.thinking_level().as_str().into());
         request.thinking_budgets = options.thinking_budgets;
         // Use the real selected provider closure: registry auth, headers, and custom APIs all remain intact.
         // No on_payload extension, latent lease, source capture, or tools are installed on advisory requests.
-        let stream_fn = crate::core::semantic_edges::unwrap_semantic_edge_stream_fn(&self.agent.stream_fn());
+        let stream_fn =
+            crate::core::semantic_edges::unwrap_semantic_edge_stream_fn(&self.agent.stream_fn());
         let result = tokio::select! {
             biased;
             _ = run.signal.cancelled() => Err((TextMasCallStatus::Cancelled, "preparation was cancelled".to_string())),
@@ -357,12 +529,26 @@ impl AgentSession {
                 } else { Err((TextMasCallStatus::Failed, "provider ended without a result".into())) }
             }) => result.unwrap_or_else(|_| Err((TextMasCallStatus::TimedOut, "preparation timed out".into()))),
         };
-        let status = match &result { Ok(_) => TextMasCallStatus::Completed, Err((status, _)) => *status };
-        let terminal = TextMasUsageRecord::new(&run.action_id, role, status, guard.usage.clone());
+        let status = match &result {
+            Ok(_) => TextMasCallStatus::Completed,
+            Err((status, _)) => *status,
+        };
+        let terminal = TextMasUsageRecord::new_indexed(
+            &run.action_id,
+            role,
+            call_index,
+            status,
+            guard.usage.clone(),
+        );
         // No second write on a failed terminal persist: the reservation remains unknown and replay stays blocked.
         guard.settled = true;
         self.persist_textmas_usage(&terminal)?;
-        result.map_err(|(_, error)| format!("OCC3.1 {}: {error}. No final execution or automatic preparation retry.", role.as_str()))
+        result.map_err(|(_, error)| {
+            format!(
+                "OCC3.1 {}: {error}. No final execution or automatic preparation retry.",
+                role.as_str()
+            )
+        })
     }
 
     fn persist_textmas_usage(&self, record: &TextMasUsageRecord) -> Result<(), String> {
@@ -373,6 +559,166 @@ impl AgentSession {
         *self.own_usage_memo.lock().unwrap() = None;
         Ok(())
     }
+}
+
+struct RoleRequestError {
+    message: String,
+    reducible: bool,
+}
+struct TextMasReduction {
+    original: Context,
+    note: String,
+}
+
+fn role_request(
+    model: &Model,
+    original: &Context,
+    mode: TextMasMode,
+    role: TextMasRole,
+    drafts: &[(TextMasRole, String)],
+) -> Result<Context, RoleRequestError> {
+    let context = match contract::try_role_context(original, mode, role, drafts) {
+        Ok(context) => context,
+        Err(contract::TextMasRoleContextError::TooLarge) => {
+            return Err(RoleRequestError {
+                message: "OCC3.1 role context exceeds its serialized bound".into(),
+                reducible: true,
+            });
+        }
+        Err(error) => {
+            return Err(RoleRequestError {
+                message: error.to_string(),
+                reducible: false,
+            });
+        }
+    };
+    if let Err(message) = contract::output_budget(model, &context) {
+        return Err(RoleRequestError {
+            message,
+            reducible: true,
+        });
+    }
+    Ok(context)
+}
+
+fn ensure_textmas_current(
+    session: &Arc<AgentSession>,
+    run: &TextMasRun,
+    parent_signal: Option<&CancellationToken>,
+) -> Result<(), String> {
+    if run.signal.is_cancelled()
+        || parent_signal.is_some_and(CancellationToken::is_cancelled)
+        || session.agent.model() != run.model
+    {
+        Err("OCC3.1 preparation was cancelled or its model changed".into())
+    } else {
+        Ok(())
+    }
+}
+
+async fn resize_textmas_images(
+    session: &Arc<AgentSession>,
+    original: &Context,
+    run: &TextMasRun,
+    parent_signal: Option<&CancellationToken>,
+) -> Result<(Context, usize), String> {
+    use crate::utils::image_resize::{
+        ImageContent as ResizeImage, ImageResizeOptions, resize_image,
+    };
+
+    let mut sources = Vec::new();
+    for (message_index, message) in original.messages.iter().enumerate() {
+        ensure_textmas_current(session, run, parent_signal)?;
+        match message {
+            Message::User(user) => {
+                if let UserContent::Blocks(blocks) = &user.content {
+                    for (block_index, block) in blocks.iter().enumerate() {
+                        ensure_textmas_current(session, run, parent_signal)?;
+                        if let pi_ai::types::ImageOrTextContent::Image(image) = block {
+                            sources.push((
+                                message_index,
+                                block_index,
+                                format!(
+                                    "message {} user image {}",
+                                    message_index + 1,
+                                    block_index + 1
+                                ),
+                                image.clone(),
+                            ));
+                        }
+                    }
+                }
+            }
+            Message::ToolResult(result) => {
+                for (block_index, block) in result.content.iter().enumerate() {
+                    ensure_textmas_current(session, run, parent_signal)?;
+                    if let pi_ai::types::ImageOrTextContent::Image(image) = block {
+                        sources.push((
+                            message_index,
+                            block_index,
+                            format!(
+                                "message {} tool result {} image {}",
+                                message_index + 1,
+                                result.tool_name,
+                                block_index + 1
+                            ),
+                            image.clone(),
+                        ));
+                    }
+                }
+            }
+            Message::Assistant(_) => {}
+        }
+    }
+    let mut prepared = original.clone();
+    let mut resized_count = 0usize;
+    for (message_index, block_index, label, image) in sources {
+        ensure_textmas_current(session, run, parent_signal)?;
+        let limit = context_contract::preparation_image_limit(original, &run.model, &label, &image)?;
+        if image.data.len() <= limit {
+            continue;
+        }
+        if limit < 2 {
+            return Err(format!("OCC3.1 has no image byte budget for {label}"));
+        }
+        let source = ResizeImage {
+            kind: image.type_.clone(),
+            data: image.data.clone(),
+            mime_type: image.mime_type.clone(),
+        };
+        let resized = resize_image(
+            &source,
+            Some(ImageResizeOptions {
+                max_bytes: Some(limit as f64),
+                ..Default::default()
+            }),
+        )
+        .await
+        .ok_or_else(|| format!("OCC3.1 could not decode or resize {label} for preparation"))?;
+        ensure_textmas_current(session, run, parent_signal)?;
+        if resized.data.len() > limit {
+            return Err(format!(
+                "OCC3.1 resized {label} still exceeds its preparation budget"
+            ));
+        }
+        let replacement = pi_ai::types::ImageContent::new(resized.data, resized.mime_type);
+        match &mut prepared.messages[message_index] {
+            Message::User(user) => {
+                let UserContent::Blocks(blocks) = &mut user.content else {
+                    return Err("OCC3.1 image projection changed unexpectedly".into());
+                };
+                blocks[block_index] = pi_ai::types::ImageOrTextContent::Image(replacement);
+            }
+            Message::ToolResult(result) => {
+                result.content[block_index] = pi_ai::types::ImageOrTextContent::Image(replacement);
+            }
+            Message::Assistant(_) => {
+                return Err("OCC3.1 image projection changed unexpectedly".into());
+            }
+        }
+        resized_count += 1;
+    }
+    Ok((prepared, resized_count))
 }
 
 async fn cancelled(signal: Option<&CancellationToken>) {

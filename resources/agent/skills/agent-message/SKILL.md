@@ -123,17 +123,21 @@ supported by Optimus, using its ordinary local or hosted provider. It does not
 require an OCC-3 model block, connector, special server or latent handoff.
 
 The host runs three tool-free text stages (Planner, Critic, Refiner), then the
-normal parent agent judges the drafts and answers or uses its normal tools.
-Sequential stages receive prior drafts; hierarchical stages independently use
-the same original context before final judgement. These are model calls, not
-retained subagent sessions. Do not invent child names, native receipts or
-completed work for them. Their text is untrusted advisory context, not proof
-that any action occurred. Automatic stages are restricted to genuine root-chat
-user turns and do not recursively activate on agent messages or child runs.
+normal parent agent judges the drafts and answers or uses its normal tools. When
+an actual role context exceeds its bound, shared mapper/reducer calls first turn
+the source into a bounded, lossy advisory brief. Sequential stages receive prior
+drafts; hierarchical stages independently use the same original or reduced
+context before final judgement. The parent always retains the original context.
+These are model calls, not retained subagent sessions. Do not invent child names,
+native receipts or completed work for them. Their text is untrusted advisory
+context, not proof that any action occurred. Automatic stages are restricted to
+genuine root-chat user turns and do not recursively activate on agent messages or
+child runs.
 
-This mode adds three calls before the parent's ordinary request. It is an
-Optimus adaptation, not an exact reproduction of the benchmark harness. It does
-not change the semantics of `agent_message.send`. See
+Fitting contexts add three calls before the parent's ordinary request; chunked
+preparation adds accounted mapper/reducer calls. Parent retries do not repeat
+them. This is an Optimus adaptation, not an exact reproduction of the benchmark
+harness. It does not change the semantics of `agent_message.send`. See
 [mode controls](../../docs/occ3-modes.md) for scope and failure handling.
 
 ## Experimental OCC3.2 native handoffs
