@@ -8,6 +8,18 @@ use pi_ai::utils::event_stream::StreamTaskReceipt;
 
 type ContextTransform = Arc<dyn Fn(Vec<AgentMessage>, Option<CancellationToken>) -> BoxFuture<Vec<AgentMessage>> + Send + Sync>;
 
+const HIERARCHICAL_CONCURRENCY_ENV: &str = "PRIME_AGENT_OCC3_TEXTMAS_HIERARCHICAL_CONCURRENCY";
+
+// No generic provider concurrency capability reaches this interface. Preserve
+// the base's awaited hierarchical path unless the operator explicitly opts in.
+fn hierarchical_role_concurrency() -> usize {
+    std::env::var(HIERARCHICAL_CONCURRENCY_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| (1..=TextMasRole::ALL.len()).contains(value))
+        .unwrap_or(1)
+}
+
 #[derive(Default)]
 pub(super) struct TextMasState {
     context_hook_installed: bool,
@@ -328,26 +340,66 @@ impl AgentSession {
             }
         }
         let mut drafts = Vec::new();
-        for role in TextMasRole::ALL {
-            ensure_textmas_current(self, run, parent_signal.as_ref())?;
-            let context = match role_request(&run.model, &active_original, run.mode, role, &drafts)
-            {
-                Ok(context) => context,
-                Err(error) if error.reducible && preparation_note.is_none() => {
-                    let reduction = self
-                        .reduce_textmas_context(run, &original, parent_signal.as_ref())
-                        .await?;
-                    active_original = reduction.original;
-                    preparation_note = Some(reduction.note);
-                    role_request(&run.model, &active_original, run.mode, role, &drafts)
-                        .map_err(|error| error.message)?
-                }
-                Err(error) => return Err(error.message),
-            };
-            let draft = self
-                .run_textmas_role(run, role, None, context, parent_signal.as_ref())
-                .await?;
-            drafts.push((role, draft));
+        let hierarchical_limit = if run.mode == TextMasMode::Hierarchical { hierarchical_role_concurrency() } else { 1 };
+        if run.mode == TextMasMode::Hierarchical && hierarchical_limit > 1 {
+            // Opt in only: preflight validated every independent role against active_original.
+            // The bounded stream retains the original role index, not completion order.
+            let contexts = TextMasRole::ALL
+                .into_iter()
+                .map(|role| {
+                    ensure_textmas_current(self, run, parent_signal.as_ref())?;
+                    role_request(&run.model, &active_original, run.mode, role, &[])
+                        .map_err(|error| error.message)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut in_flight = stream::iter(
+                TextMasRole::ALL.into_iter().enumerate().zip(contexts).map(|((index, role), context)| {
+                    let parent_signal = parent_signal.clone();
+                    async move {
+                        let draft = self.run_textmas_role(run, role, None, context, parent_signal.as_ref()).await?;
+                        Ok::<(usize, String), String>((index, draft))
+                    }
+                }),
+            )
+            .buffer_unordered(hierarchical_limit);
+            let mut ordered = (0..TextMasRole::ALL.len()).map(|_| None).collect::<Vec<Option<String>>>();
+            while let Some((index, draft)) = in_flight.try_next().await? {
+                ordered[index] = Some(draft);
+            }
+            // No partial batch can reach the parent. A role error above drops all
+            // remaining local futures and their existing cancellation/usage guards.
+            for (role, draft) in TextMasRole::ALL.into_iter().zip(ordered) {
+                drafts.push((role, draft.ok_or_else(|| "OCC3.1 hierarchical preparation ended without an ordered role result".to_string())?));
+            }
+        } else {
+            // Sequential mode and the safe hierarchical default preserve the original
+            // awaited role path exactly, including serial independent role contexts.
+            for role in TextMasRole::ALL {
+                ensure_textmas_current(self, run, parent_signal.as_ref())?;
+                let context = match role_request(
+                    &run.model,
+                    &active_original,
+                    run.mode,
+                    role,
+                    &drafts,
+                ) {
+                    Ok(context) => context,
+                    Err(error) if error.reducible && preparation_note.is_none() => {
+                        let reduction = self
+                            .reduce_textmas_context(run, &original, parent_signal.as_ref())
+                            .await?;
+                        active_original = reduction.original;
+                        preparation_note = Some(reduction.note);
+                        role_request(&run.model, &active_original, run.mode, role, &drafts)
+                            .map_err(|error| error.message)?
+                    }
+                    Err(error) => return Err(error.message),
+                };
+                let draft = self
+                    .run_textmas_role(run, role, None, context, parent_signal.as_ref())
+                    .await?;
+                drafts.push((role, draft));
+            }
         }
         let advisory = contract::advisory_message_with_note(&drafts, preparation_note.as_deref());
         Ok((
