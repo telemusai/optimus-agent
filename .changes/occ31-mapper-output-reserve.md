@@ -1,0 +1,1 @@
+- Fixed OCC3.1 mapper planning near model context limits so it preserves a usable output allowance, capped by smaller provider output limits, and splits source losslessly instead of dispatching a mapper with only one output token. The 256 KiB auxiliary context and 16 KiB public-draft bounds are unchanged.
