@@ -194,8 +194,29 @@ pub fn role_context(
     try_role_context(original, mode, role, drafts).map_err(|error| error.to_string())
 }
 
+pub(crate) struct PublicDraftError {
+    pub(crate) message: String,
+    pub(crate) terminal_length: bool,
+}
+impl From<&str> for PublicDraftError {
+    fn from(message: &str) -> Self {
+        Self { message: message.into(), terminal_length: false }
+    }
+}
+impl From<String> for PublicDraftError {
+    fn from(message: String) -> Self {
+        Self { message, terminal_length: false }
+    }
+}
+
 /// Only explicit public text can cross the role boundary; refusal/tool/partial outcomes stop the run.
 pub fn public_draft(message: &AssistantMessage) -> Result<String, String> {
+    public_draft_detailed(message).map_err(|error| error.message)
+}
+
+/// Preserve the exact rejected terminal class for the one bounded mapper retry.
+/// Callers must not infer eligibility from formatted error strings.
+pub(crate) fn public_draft_detailed(message: &AssistantMessage) -> Result<String, PublicDraftError> {
     if serde_json::to_vec(message).map_or(true, |bytes| bytes.len() > MAX_STAGE_RESPONSE_BYTES) {
         return Err("preparation response exceeded its bound".into());
     }
@@ -216,7 +237,11 @@ pub fn public_draft(message: &AssistantMessage) -> Result<String, String> {
             // Do not echo an untrusted provider error or partial draft into the parent context.
             error.push_str("; provider error");
         }
-        return Err(error);
+        return Err(PublicDraftError {
+            message: error,
+            terminal_length: message.stop_reason == pi_ai::types::STOP_REASON_LENGTH
+                && message.error_message.is_none(),
+        });
     }
     let text = message.content.iter().filter_map(|block| match block { ContentBlock::Text(text) => Some(text.text.as_str()), _ => None }).collect::<Vec<_>>().join("\n");
     let text = text.trim();
