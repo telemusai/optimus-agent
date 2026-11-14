@@ -107,6 +107,9 @@ const SCHEDULED_WAKE_CLIENT_ID: &str = "scheduled-wake";
 /// recovery ladder in this file needs its own copy.
 const WORKER_RETRY_DELAYS_MS: [u64; 3] = [250, 1000, 5000];
 
+// Internal queue records only. The writer consumes these markers without socket writes.
+const SNAPSHOT_DEQUEUE_MARKER_PREFIX: &[u8] = b"\x00optimus-snapshot-dequeue:";
+
 struct PublicClient {
     connection_id: String,
     id: Mutex<String>,
@@ -115,6 +118,7 @@ struct PublicClient {
     supports_extension_ui: AtomicBool,
     pause_epoch: AtomicU64,
     output: mpsc::Sender<Vec<u8>>,
+    snapshot_dequeue: tokio::sync::broadcast::Sender<Vec<u8>>,
     stopped: CancellationToken,
     /// `client.rosterSubscribed` / `client.rosterResyncPending`.
     roster_subscribed: AtomicBool,
@@ -4072,11 +4076,12 @@ fn spawn_connection<S>(supervisor: Arc<Supervisor>, stream: S) where S: AsyncRea
     tokio::spawn(async move {
         let (mut input, mut output) = tokio::io::split(stream);
         let (sender, mut receiver) = mpsc::channel::<Vec<u8>>(1024);
+        let (snapshot_dequeue, _) = tokio::sync::broadcast::channel::<Vec<u8>>(1024);
         let identity = create_active_session_id(None);
         let public = Arc::new(PublicClient {
             connection_id: identity.clone(), id: Mutex::new(identity.clone()), protocol_id: Mutex::new(None),
             subscriptions: Mutex::new(HashSet::new()), supports_extension_ui: AtomicBool::new(false), pause_epoch: AtomicU64::new(0),
-            output: sender, stopped: CancellationToken::new(), roster_subscribed: AtomicBool::new(false),
+            output: sender, snapshot_dequeue, stopped: CancellationToken::new(), roster_subscribed: AtomicBool::new(false),
             roster_resync_pending: AtomicBool::new(false), backpressured: AtomicBool::new(false),
         });
         supervisor.clients.lock().unwrap().insert(identity, public.clone());
@@ -4089,6 +4094,13 @@ fn spawn_connection<S>(supervisor: Arc<Supervisor>, stream: S) where S: AsyncRea
                 tokio::select! { biased;
                     bytes = receiver.recv() => match bytes {
                         Some(bytes) => {
+                            if bytes.starts_with(SNAPSHOT_DEQUEUE_MARKER_PREFIX) {
+                                // FIFO receipt here is the socket-drain boundary: this
+                                // serial loop already completed the preceding chunk's
+                                // write_all before receiving its private marker.
+                                let _ = writer_public.snapshot_dequeue.send(bytes);
+                                continue;
+                            }
                             if output.write_all(&bytes).await.is_err() { break; }
                             // The socket drained: a resync deferred under backpressure
                             // is written once, covering the whole loss gap.

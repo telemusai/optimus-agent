@@ -115,6 +115,7 @@ impl SupervisorFixture {
         });
         supervisor.init_roster();
         let (sender, outbound) = mpsc::channel::<Vec<u8>>(1024);
+        let (snapshot_dequeue, _) = tokio::sync::broadcast::channel::<Vec<u8>>(1024);
         let identity = create_active_session_id(None);
         let client = Arc::new(PublicClient {
             connection_id: identity.clone(),
@@ -124,6 +125,7 @@ impl SupervisorFixture {
             supports_extension_ui: AtomicBool::new(false),
             pause_epoch: AtomicU64::new(0),
             output: sender,
+            snapshot_dequeue,
             stopped: CancellationToken::new(),
             roster_subscribed: AtomicBool::new(false),
             roster_resync_pending: AtomicBool::new(false),
@@ -135,6 +137,14 @@ impl SupervisorFixture {
             .unwrap()
             .insert(identity, Arc::clone(&client));
         Self { root, supervisor, client, outbound }
+    }
+
+    fn parse_output_frame(&self, frame: Vec<u8>) -> Option<Value> {
+        if frame.starts_with(SNAPSHOT_DEQUEUE_MARKER_PREFIX) {
+            let _ = self.client.snapshot_dequeue.send(frame);
+            return None;
+        }
+        serde_json::from_slice::<Value>(&frame).ok()
     }
 
     /// Drive one raw command line through the real supervisor `handle_line`.
@@ -150,7 +160,7 @@ impl SupervisorFixture {
         self.supervisor.clone().handle_line(Arc::clone(&self.client), line).await;
         let mut frames = Vec::new();
         while let Ok(frame) = self.outbound.try_recv() {
-            if let Ok(value) = serde_json::from_slice::<Value>(&frame) {
+            if let Some(value) = self.parse_output_frame(frame) {
                 frames.push(value);
             }
         }
@@ -161,7 +171,7 @@ impl SupervisorFixture {
     pub fn last_frame(&mut self) -> Value {
         let mut last = Value::Null;
         while let Ok(frame) = self.outbound.try_recv() {
-            if let Ok(value) = serde_json::from_slice::<Value>(&frame) {
+            if let Some(value) = self.parse_output_frame(frame) {
                 last = value;
             }
         }
@@ -170,9 +180,13 @@ impl SupervisorFixture {
 
     /// Wait for the next frame and parse it.
     pub async fn next_frame(&mut self, timeout: Duration) -> Option<Value> {
-        match tokio::time::timeout(timeout, self.outbound.recv()).await {
-            Ok(Some(frame)) => serde_json::from_slice::<Value>(&frame).ok(),
-            _ => None,
+        loop {
+            match tokio::time::timeout(timeout, self.outbound.recv()).await {
+                Ok(Some(frame)) => {
+                    if let Some(value) = self.parse_output_frame(frame) { return Some(value); }
+                }
+                _ => return None,
+            }
         }
     }
 

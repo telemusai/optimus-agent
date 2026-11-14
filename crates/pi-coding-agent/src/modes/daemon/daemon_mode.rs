@@ -4867,6 +4867,7 @@ impl AgentDaemon {
                 }
                 self.publish_jev_attach_footer(client, &state);
                 if streams_snapshot {
+                    let (release_snapshot_stream, start_after_response) = tokio::sync::oneshot::channel();
                     let snapshot_id = snapshot_transfer_id(&result.snapshot);
                     let snapshot_messages = result
                         .snapshot
@@ -4881,15 +4882,23 @@ impl AgentDaemon {
                         &snapshot_id,
                         &snapshot_messages,
                         &result.snapshot,
+                        start_after_response,
                     ) {
                         return Err(error);
                     }
                     let streamed = result.with_messages_cleared(snapshot_id);
-                    return Ok(Some(DaemonResponse::success(
+                    let response = DaemonResponse::success(
                         id,
                         "attach",
                         Some(serde_json::to_value(streamed).unwrap_or(Value::Null)),
-                    )));
+                    );
+                    let response_written = self.write(client, &DaemonOutbound::Raw(serde_json::to_value(response).unwrap_or(Value::Null)));
+                    if response_written {
+                        let _ = release_snapshot_stream.send(());
+                    }
+                    // On failure the sender drops here. The task that owns the other end
+                    // performs cleanup once; never force a response through backpressure.
+                    return Ok(None);
                 }
                 // Slim clients consume only the command response; legacy clients (e.g.
                 // the plain daemon attach REPL) read state/messages off this event.
@@ -9728,6 +9737,7 @@ impl AgentDaemon {
         snapshot_id: &str,
         snapshot_messages: &[Value],
         snapshot: &Value,
+        start_after_response: tokio::sync::oneshot::Receiver<()>,
     ) -> Result<(), String> {
         let active_session_id = state
             .lock()
@@ -9766,6 +9776,10 @@ impl AgentDaemon {
         let message_count = snapshot_messages.len();
         let snapshot_id = snapshot_id.to_string();
         tokio::spawn(async move {
+            if start_after_response.await.is_err() {
+                daemon.detach_failed_stream(&client, &state);
+                return;
+            }
             if let Err(error) = daemon
                 .stream_worker_snapshot(
                     &client,
@@ -9813,6 +9827,13 @@ impl AgentDaemon {
         remove_daemon_client_session_capabilities(client, &active_session_id);
         let mut client_mut = Arc::clone(client);
         finish_client_snapshot_streaming(&mut client_mut, &active_session_id);
+        // Clear after streaming stops: defer_snapshot_frame holds this lock while
+        // checking the active stream, so no abandoned replay entry can be recreated.
+        client
+            .deferred_snapshot_frames
+            .lock()
+            .expect("deferred frames poisoned")
+            .remove(&active_session_id);
     }
 
     /// `streamWorkerSnapshot(client, result, transcript, purpose, signal, snapshotAlreadyMarked)`.
@@ -12483,6 +12504,11 @@ impl AgentDaemon {
             .cloned()
             .unwrap_or_default();
         for edge in edges {
+            // Known residents have live transcripts and do not need passive display,
+            // registry, or saved-transcript reads. Keep the later check for aliases/races.
+            if !include_resident && self.find_session_by_session_file(Some(&edge.child)).is_some() {
+                continue;
+            }
             self.record_input_stat(
                 input_stats,
                 &rlm_subagent_display_path(&dirname(&edge.child)),
