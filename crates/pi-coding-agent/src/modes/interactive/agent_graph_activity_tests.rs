@@ -149,6 +149,128 @@ fn hierarchical_render_does_not_imply_a_critic_refiner_dependency() {
     }
 }
 
+fn root_only_graph(snapshot: &TextMasActivitySnapshot) -> (Graph, Instant) {
+    let now = Instant::now();
+    let mut graph = Graph::default();
+    let rows = vec![row("root", None, false)];
+    graph.observe(&rows, &parent("root"), false, now);
+    graph.observe_activity(Some(snapshot), now);
+    (graph, now)
+}
+
+fn constrained_reducer_fixture() -> TextMasActivitySnapshot {
+    let mut snapshot = fixture(
+        Some(TextMasMode::Hierarchical),
+        2,
+        1,
+        TextMasActivityStatus::Completed,
+    );
+    let reducer = textmas_call_id("action-1", TextMasRole::Reducer, Some(0));
+    for call in &mut snapshot.calls {
+        if matches!(
+            call.role,
+            TextMasRole::Planner | TextMasRole::Critic | TextMasRole::Refiner
+        ) {
+            call.depends_on = vec![reducer.clone()];
+        } else if call.role == TextMasRole::Mapper {
+            call.depends_on.clear();
+        }
+        call.status = match call.role {
+            TextMasRole::Mapper if call.call_index == Some(0) => TextMasActivityStatus::Running,
+            TextMasRole::Reducer => TextMasActivityStatus::Queued,
+            _ => TextMasActivityStatus::Completed,
+        };
+    }
+    snapshot.active = true;
+    assert!(snapshot.is_valid());
+    snapshot
+}
+
+#[test]
+fn constrained_sigma_critic_route_does_not_read_as_critic_refiner() {
+    let snapshot = constrained_reducer_fixture();
+    let (mut graph, now) = root_only_graph(&snapshot);
+    let nodes = graph.textmas.nodes();
+    let critic = nodes.iter().find(|node| node.glyph == 'C').unwrap();
+    let refiner = nodes.iter().find(|node| node.glyph == 'R').unwrap();
+    let reducer = nodes.iter().find(|node| node.glyph == 'Σ').unwrap();
+    let mappers = nodes
+        .iter()
+        .filter(|node| node.glyph == 'M')
+        .collect::<Vec<_>>();
+    assert_eq!(mappers.len(), 2);
+    assert_eq!(mappers[0].index_range, Some((0, 0)));
+    assert_eq!(mappers[1].index_range, Some((1, 1)));
+    assert!(critic.dependencies.contains(&reducer.id));
+    assert!(!refiner.dependencies.contains(&critic.id));
+    assert_eq!(reducer.dependencies.len(), 2);
+    assert!(mappers
+        .iter()
+        .all(|mapper| reducer.dependencies.contains(&mapper.id)));
+    assert!(!reducer.dependencies.contains(&critic.id));
+
+    let graph_rows = graph.render("root", 24, 2, now + Duration::from_millis(1200));
+    let plain = strip_ansi(&graph_rows.join("\n"));
+    let rendered = plain.lines().collect::<Vec<_>>();
+    assert_eq!(
+        rendered,
+        vec![
+            "    P       C       R   ",
+            "    M      ◆M⠤⠤⠤⠤⠤⠤⠤Σ   ",
+        ],
+        "constrained routing must keep the real M1-to-Sigma stroke without an ambiguous C-to-R presentation"
+    );
+    assert_hierarchical_roles_have_no_rendered_critic_refiner_link(rendered[0]);
+
+    let detailed = graph.render("root", 40, 6, now + Duration::from_millis(1200));
+    assert_eq!(detailed.len(), 6);
+    assert!(detailed.iter().all(|line| visible_width(line) == 40));
+    let details = strip_ansi(&detailed.join("\n"));
+    assert!(details.contains("4/6"), "{details}");
+    assert!(details.contains("M0-0 q0r1 ✓0"), "{details}");
+    assert!(details.contains("M1-1 q0r0 ✓1"), "{details}");
+    assert!(details.contains("Σ[L1]:1 q1r0 ✓0"), "{details}");
+    assert!(graph.textmas.is_active());
+
+    let recovered_snapshot = fixture(None, 2, 1, TextMasActivityStatus::Completed);
+    let (mut recovered, recovered_now) = root_only_graph(&recovered_snapshot);
+    assert_eq!(recovered.textmas.nodes().len(), 1);
+    assert!(recovered.textmas.nodes()[0].dependencies.is_empty());
+    let recovered_frame = strip_ansi(
+        &recovered
+            .render("root", 40, 3, recovered_now + Duration::from_millis(1200))
+            .join("\n"),
+    );
+    assert!(
+        recovered_frame.contains("T? unknown 6/6"),
+        "{recovered_frame}"
+    );
+}
+
+#[test]
+fn genuine_adjacent_primary_dependencies_remain_visible() {
+    let (planner, critic, refiner) = ((8, 2), (24, 2), (40, 2));
+    let mut canvas = Canvas::new(24, 1);
+    canvas.activity_dependency(planner, critic, &BTreeSet::from([(20, 0)]));
+    canvas.activity_dependency(critic, refiner, &BTreeSet::from([(4, 0)]));
+    for (point, glyph) in [(planner, 'P'), (critic, 'C'), (refiner, 'R')] {
+        canvas.marker_green(point.0, point.1, glyph, 2);
+    }
+    let rendered = strip_ansi(&canvas.render().join("\n"));
+    let row = rendered.lines().next().unwrap();
+    for (from, to) in [('P', 'C'), ('C', 'R')] {
+        let start = row.find(from).unwrap();
+        let end = row.find(to).unwrap();
+        assert!(start < end, "{row}");
+        assert!(
+            row[start + 1..end]
+                .chars()
+                .all(|glyph| ('\u{2800}'..='\u{28ff}').contains(&glyph)),
+            "genuine {from}-to-{to} adjacency was suppressed: {row}"
+        );
+    }
+}
+
 #[test]
 fn roles_and_recorded_edges_distinguish_sequential_from_hierarchical_runs() {
     for (mode, sequential) in [

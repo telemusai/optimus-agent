@@ -493,14 +493,53 @@ impl Canvas {
             vec![start, (end.0, start.1), end],
         ];
         'candidate: for candidate in candidates {
+            let mut candidate_cells = BTreeSet::new();
             for segment in candidate.windows(2) {
                 let (a, b) = (segment[0], segment[1]);
                 let steps = (b.0 - a.0).abs().max((b.1 - a.1).abs()).max(1);
                 for i in 0..=steps {
                     let point = (a.0 + (b.0 - a.0) * i / steps, a.1 + (b.1 - a.1) * i / steps);
-                    if unrelated_role_cells.contains(&cell(point)) {
+                    let role_cell = cell(point);
+                    if unrelated_role_cells.contains(&role_cell) {
                         continue 'candidate;
                     }
+                    candidate_cells.insert(role_cell);
+                }
+            }
+            // A real diagonal can leave pixels on an endpoint's row. Do not let
+            // the first role along those pixels be an unrelated apparent target.
+            for (endpoint, toward, other) in [
+                (start, candidate[1], end),
+                (end, candidate[candidate.len() - 2], start),
+            ] {
+                let direction = toward.0 - endpoint.0;
+                if direction == 0 {
+                    continue;
+                }
+                let endpoint_cell = cell(endpoint);
+                let in_direction = |role_cell: &(usize, usize)| {
+                    role_cell.1 == endpoint_cell.1
+                        && if direction > 0 {
+                            role_cell.0 > endpoint_cell.0
+                        } else {
+                            role_cell.0 < endpoint_cell.0
+                        }
+                };
+                if !candidate_cells.iter().any(|role_cell| in_direction(role_cell)) {
+                    continue;
+                }
+                let other_cell = cell(other);
+                let other_distance = in_direction(&other_cell)
+                    .then(|| other_cell.0.abs_diff(endpoint_cell.0))
+                    .unwrap_or(usize::MAX);
+                let unrelated_distance = unrelated_role_cells
+                    .iter()
+                    .filter(|role_cell| in_direction(*role_cell))
+                    .map(|role_cell| role_cell.0.abs_diff(endpoint_cell.0))
+                    .min()
+                    .unwrap_or(usize::MAX);
+                if unrelated_distance < other_distance {
+                    continue 'candidate;
                 }
             }
             for segment in candidate.windows(2) {
