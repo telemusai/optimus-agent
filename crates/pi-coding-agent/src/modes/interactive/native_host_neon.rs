@@ -405,7 +405,7 @@ fn paired(left: &str, right: &str, width: usize) -> String {
     format!("{}  {}", fit(left, width - right_width - 2), right)
 }
 
-fn graph_space(width: usize, budget: usize) -> usize {
+pub(super) fn graph_space(width: usize, budget: usize) -> usize {
     if width >= 110 && budget >= 7 { 24 } else { 0 }
 }
 

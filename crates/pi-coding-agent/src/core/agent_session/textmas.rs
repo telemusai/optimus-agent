@@ -4,6 +4,8 @@ use crate::core::occ::textmas::{self as contract, TextMasCallStatus, TextMasMode
 use crate::core::occ::textmas_context as context_contract;
 use futures::{stream, StreamExt, TryStreamExt};
 use pi_ai::types::{AssistantMessageEvent, Context, SimpleStreamOptions};
+use crate::core::occ::textmas_activity::{self as activity, TextMasActivityCall, TextMasActivitySnapshot};
+use std::collections::BTreeMap;
 use pi_ai::utils::event_stream::StreamTaskReceipt;
 
 type ContextTransform = Arc<dyn Fn(Vec<AgentMessage>, Option<CancellationToken>) -> BoxFuture<Vec<AgentMessage>> + Send + Sync>;
@@ -25,6 +27,20 @@ pub(super) struct TextMasState {
     context_hook_installed: bool,
     original_transform: Option<ContextTransform>,
     run: Option<TextMasRun>,
+    /// In-memory history only. Restart recovery deliberately falls back to disk.
+    history: Option<TextMasHistory>,
+}
+
+#[derive(Clone, Default)]
+struct TextMasActivityPlan {
+    calls: BTreeMap<String, TextMasActivityCall>,
+}
+
+#[derive(Clone)]
+struct TextMasHistory {
+    action_id: String,
+    mode: TextMasMode,
+    activity: TextMasActivityPlan,
 }
 
 #[derive(Clone)]
@@ -36,6 +52,7 @@ struct TextMasRun {
     model: Model,
     signal: CancellationToken,
     phase: Phase,
+    activity: TextMasActivityPlan,
 }
 
 #[derive(Clone)]
@@ -61,7 +78,19 @@ impl TurnGuard {
 impl Drop for TurnGuard {
     fn drop(&mut self) {
         if let Some(session) = self.0.upgrade() {
-            if let Some(run) = session.textmas.lock().unwrap().run.take() { run.signal.cancel(); }
+            let removed = {
+                let mut state = session.textmas.lock().unwrap();
+                if let Some(run) = state.run.take() {
+                    run.signal.cancel();
+                    state.history = Some(TextMasHistory {
+                        action_id: run.action_id,
+                        mode: run.mode,
+                        activity: run.activity,
+                    });
+                    true
+                } else { false }
+            };
+            if removed { session.publish_textmas_activity(); }
         }
     }
 }
@@ -134,7 +163,10 @@ impl AgentSession {
         self.install_textmas_context_hook()?;
         let mut state = self.textmas.lock().unwrap();
         if state.run.is_some() { return Err("OCC3.1 already owns an active turn".into()); }
-        state.run = Some(TextMasRun { action_id: action.id.clone(), input_ids: turns.iter().map(|action| action.id.clone()).collect(), last_user, mode, model: self.agent.model(), signal: CancellationToken::new(), phase: Phase::Armed });
+        state.run = Some(TextMasRun { action_id: action.id.clone(), input_ids: turns.iter().map(|action| action.id.clone()).collect(), last_user, mode, model: self.agent.model(), signal: CancellationToken::new(), phase: Phase::Armed, activity: Default::default() });
+        state.history = None;
+        drop(state);
+        self.publish_textmas_activity();
         Ok(())
     }
 
@@ -192,6 +224,97 @@ impl AgentSession {
             .is_some_and(|run| !matches!(run.phase, Phase::Failed(_)))
     }
 
+
+    /// One bounded, content-free run projection. Usage and provider content remain
+    /// in their existing authoritative stores and are not copied into this value.
+    pub fn textmas_activity_snapshot(&self) -> Option<TextMasActivitySnapshot> {
+        let current = {
+            let state = self.textmas.lock().unwrap();
+            state.run.as_ref().map(|run| (
+                run.action_id.clone(),
+                Some(run.mode),
+                !matches!(run.phase, Phase::Failed(_)),
+                run.activity.clone(),
+            )).or_else(|| state.history.as_ref().map(|history| (
+                history.action_id.clone(),
+                Some(history.mode),
+                false,
+                history.activity.clone(),
+            )))
+        };
+        let records: Vec<TextMasUsageRecord> = self.session_manager.lock().unwrap().get_entries()
+            .iter().filter_map(contract::usage_record).collect();
+        let (action_id, mode, active, planned, records) = if let Some((action_id, mode, active, plan)) = current {
+            let records = records.into_iter().filter(|record| record.action_id == action_id).collect();
+            (action_id, mode, active, plan.calls.into_values().collect(), records)
+        } else {
+            let action_id = records.last()?.action_id.clone();
+            let records = records.into_iter().filter(|record| record.action_id == action_id).collect();
+            // After process recovery the old preference is not evidence of the
+            // interrupted run's actual mode or its former in-memory plan.
+            (action_id, None, false, Vec::new(), records)
+        };
+        let activity = activity::project_textmas_activity(
+            &self.session_id(), &action_id, mode, active, planned, records,
+        );
+        debug_assert!(activity.is_valid(), "invalid internally constructed TextMAS activity");
+        activity.is_valid().then_some(activity)
+    }
+
+    fn publish_textmas_activity(&self) {
+        if let Some(activity) = self.textmas_activity_snapshot() {
+            self.emit(AgentSessionEvent::TextMasActivity { activity });
+        }
+    }
+
+    fn plan_textmas_role_pipeline(self: &Arc<Self>, action_id: &str) {
+        let Some(mode) = self.textmas.lock().unwrap().run.as_ref()
+            .filter(|run| run.action_id == action_id).map(|run| run.mode) else { return; };
+        let calls = TextMasRole::ALL.into_iter().enumerate().map(|(index, role)| {
+            let depends_on = if mode == TextMasMode::Sequential && index > 0 {
+                vec![activity::textmas_call_id(action_id, TextMasRole::ALL[index - 1], None)]
+            } else { Vec::new() };
+            TextMasActivityCall::queued(action_id, role, None, None, depends_on)
+        }).collect();
+        self.plan_textmas_calls(action_id, calls);
+    }
+
+    fn plan_textmas_role_context(self: &Arc<Self>, action_id: &str, role: TextMasRole, brief_call_id: Option<&str>) {
+        let changed = {
+            let mut state = self.textmas.lock().unwrap();
+            let Some(run) = state.run.as_mut().filter(|run| run.action_id == action_id) else { return; };
+            let call_id = activity::textmas_call_id(action_id, role, None);
+            let call = run.activity.calls.entry(call_id.clone()).or_insert_with(|| {
+                TextMasActivityCall::queued(action_id, role, None, None, Vec::new())
+            });
+            if let Some(brief) = brief_call_id {
+                if !call.depends_on.iter().any(|dependency| dependency == brief) {
+                    call.depends_on.push(brief.to_string());
+                    call.depends_on.sort();
+                    call.depends_on.dedup();
+                    true
+                } else { false }
+            } else { false }
+        };
+        if changed { self.publish_textmas_activity(); }
+    }
+
+    fn plan_textmas_calls(self: &Arc<Self>, action_id: &str, calls: Vec<TextMasActivityCall>) {
+        let changed = {
+            let mut state = self.textmas.lock().unwrap();
+            let Some(run) = state.run.as_mut().filter(|run| run.action_id == action_id) else { return; };
+            let mut changed = false;
+            for call in calls {
+                if !run.activity.calls.contains_key(&call.call_id) {
+                    run.activity.calls.insert(call.call_id.clone(), call);
+                    changed = true;
+                }
+            }
+            changed
+        };
+        if changed { self.publish_textmas_activity(); }
+    }
+
     pub(super) fn textmas_failure(&self) -> Option<String> {
         self.textmas.lock().unwrap().run.as_ref().and_then(|run| match &run.phase {
             Phase::Failed(error) => Some(error.clone()), _ => None,
@@ -232,10 +355,15 @@ impl AgentSession {
     }
 
     fn fail_textmas(&self, action_id: &str, error: String) {
-        if let Some(run) = self.textmas.lock().unwrap().run.as_mut().filter(|run| run.action_id == action_id) {
-            run.signal.cancel();
-            run.phase = Phase::Failed(error);
-        }
+        let changed = {
+            let mut state = self.textmas.lock().unwrap();
+            if let Some(run) = state.run.as_mut().filter(|run| run.action_id == action_id) {
+                run.signal.cancel();
+                run.phase = Phase::Failed(error);
+                true
+            } else { false }
+        };
+        if changed { self.publish_textmas_activity(); }
     }
 
     /// A model switch cannot reinterpret drafts or leave their original provider running.
@@ -262,6 +390,7 @@ impl AgentSession {
             run.clone()
         };
         let mut guard = PreparationGuard { session: Arc::downgrade(self), action_id: run.action_id.clone(), completed: false };
+        self.publish_textmas_activity();
         let result = self.run_textmas_preparation(&run, signal).await;
         match result {
             Ok((advisory, snapshot)) => {
@@ -272,7 +401,9 @@ impl AgentSession {
                     return Err("OCC3.1 preparation was cancelled".into());
                 }
                 current.phase = Phase::Ready { advisory, snapshot: Some(snapshot) };
+                drop(state);
                 guard.completed = true;
+                self.publish_textmas_activity();
                 Ok(())
             }
             Err(error) => {
@@ -322,6 +453,7 @@ impl AgentSession {
         // The normal parent keeps this full history and appends advice in its own context hook.
         let mut active_original = original.clone();
         let mut preparation_note = None;
+        let mut preparation_brief: Option<String> = None;
         if run.mode == TextMasMode::Hierarchical {
             let mut needs_reduction = false;
             for role in TextMasRole::ALL {
@@ -335,11 +467,13 @@ impl AgentSession {
                 let reduction = self
                     .reduce_textmas_context(run, &original, parent_signal.as_ref())
                     .await?;
+                preparation_brief = Some(reduction.brief_call_id.clone());
                 active_original = reduction.original;
                 preparation_note = Some(reduction.note);
             }
         }
         let mut drafts = Vec::new();
+        self.plan_textmas_role_pipeline(&run.action_id);
         let hierarchical_limit = if run.mode == TextMasMode::Hierarchical { hierarchical_role_concurrency() } else { 1 };
         if run.mode == TextMasMode::Hierarchical && hierarchical_limit > 1 {
             // Opt in only: preflight validated every independent role against active_original.
@@ -352,6 +486,9 @@ impl AgentSession {
                         .map_err(|error| error.message)
                 })
                 .collect::<Result<Vec<_>, _>>()?;
+            for role in TextMasRole::ALL {
+                self.plan_textmas_role_context(&run.action_id, role, preparation_brief.as_deref());
+            }
             let mut in_flight = stream::iter(
                 TextMasRole::ALL.into_iter().enumerate().zip(contexts).map(|((index, role), context)| {
                     let parent_signal = parent_signal.clone();
@@ -388,6 +525,7 @@ impl AgentSession {
                         let reduction = self
                             .reduce_textmas_context(run, &original, parent_signal.as_ref())
                             .await?;
+                        preparation_brief = Some(reduction.brief_call_id.clone());
                         active_original = reduction.original;
                         preparation_note = Some(reduction.note);
                         role_request(&run.model, &active_original, run.mode, role, &drafts)
@@ -395,6 +533,7 @@ impl AgentSession {
                     }
                     Err(error) => return Err(error.message),
                 };
+                self.plan_textmas_role_context(&run.action_id, role, preparation_brief.as_deref());
                 let draft = self
                     .run_textmas_role(run, role, None, context, parent_signal.as_ref())
                     .await?;
@@ -429,7 +568,21 @@ impl AgentSession {
             &run.model,
             || ensure_textmas_current(self, run, parent_signal),
         )?;
+        self.plan_textmas_role_pipeline(&run.action_id);
         let map_count = plan.map_contexts.len();
+        let planned_mappers = (0..map_count).map(|index| {
+            let call_index = u32::try_from(index)
+                .map_err(|_| "OCC3.1 mapper call index overflow".to_string())?;
+            Ok(TextMasActivityCall::queued(
+                &run.action_id,
+                TextMasRole::Mapper,
+                Some(call_index),
+                Some(0),
+                Vec::new(),
+            ))
+        }).collect::<Result<Vec<_>, String>>()?;
+        let map_call_ids = planned_mappers.iter().map(|call| call.call_id.clone()).collect::<Vec<_>>();
+        self.plan_textmas_calls(&run.action_id, planned_mappers);
         let map_calls = collect_indexed_textmas_calls(stream::iter(
             plan.map_contexts
                 .iter()
@@ -451,17 +604,34 @@ impl AgentSession {
         ))
         .await?;
         let mut briefs = map_calls;
+        let mut brief_ids = map_call_ids;
         let mut reduce_count = 0usize;
+        let mut reduction_level = 1u32;
         while briefs.len() > 1 {
             ensure_textmas_current(self, run, parent_signal)?;
-            let contexts = plan.reduction_contexts_with_control(&run.model, &briefs, || {
-                ensure_textmas_current(self, run, parent_signal)
-            })?;
+            let contexts = plan.reduction_contexts_with_dependencies_with_control(
+                &run.model,
+                &briefs,
+                || ensure_textmas_current(self, run, parent_signal),
+            )?;
             let first_index = reduce_count;
             let context_count = contexts.len();
+            let planned_reducers = contexts.iter().enumerate().map(|(offset, (_, start, end))| {
+                let call_index = u32::try_from(first_index + offset)
+                    .map_err(|_| "OCC3.1 reducer call index overflow".to_string())?;
+                Ok(TextMasActivityCall::queued(
+                    &run.action_id,
+                    TextMasRole::Reducer,
+                    Some(call_index),
+                    Some(reduction_level),
+                    brief_ids[*start..*end].to_vec(),
+                ))
+            }).collect::<Result<Vec<_>, String>>()?;
+            let next_brief_ids = planned_reducers.iter().map(|call| call.call_id.clone()).collect::<Vec<_>>();
+            self.plan_textmas_calls(&run.action_id, planned_reducers);
             briefs =
                 collect_indexed_textmas_calls(stream::iter(contexts.into_iter().enumerate().map(
-                    |(offset, context)| async move {
+                    |(offset, (context, _, _))| async move {
                         let source_index = first_index + offset;
                         let call_index = u32::try_from(source_index)
                             .map_err(|_| "OCC3.1 reducer call index overflow".to_string())?;
@@ -478,10 +648,15 @@ impl AgentSession {
                 )))
                 .await?;
             reduce_count = first_index + context_count;
+            brief_ids = next_brief_ids;
+            reduction_level = reduction_level.checked_add(1)
+                .ok_or_else(|| "OCC3.1 reduction level overflow".to_string())?;
         }
         let brief = briefs
             .pop()
             .ok_or_else(|| "OCC3.1 reduction returned no brief".to_string())?;
+        let brief_call_id = brief_ids.pop()
+            .ok_or_else(|| "OCC3.1 reduction returned no call identity".to_string())?;
         let original = plan.reduced_original(&brief);
         let latest = if plan.include_latest_user() {
             "included exactly"
@@ -496,7 +671,7 @@ impl AgentSession {
         let note = format!(
             "Used {map_count} shared context-map and {reduce_count} context-reduction calls because an actual role request exceeded its bound; {system_source}resized {resized_images} preparation-only image(s); latest user message {latest}. Summaries are lossy advisory context, and the complete parent history remains authoritative."
         );
-        Ok(TextMasReduction { original, note })
+        Ok(TextMasReduction { original, note, brief_call_id })
     }
 
     async fn run_textmas_role(
@@ -616,11 +791,14 @@ impl AgentSession {
     }
 
     fn persist_textmas_usage(&self, record: &TextMasUsageRecord) -> Result<(), String> {
-        let mut manager = self.session_manager.lock().unwrap();
-        manager.append_custom_entry_with_rollback(contract::USAGE_CUSTOM_TYPE, Some(serde_json::to_value(record).map_err(|_| "OCC3.1 usage encoding failed")?))
-            .and_then(|_| manager.flush_now())
-            .map_err(|_| "OCC3.1 usage could not be saved; no final execution or automatic replay".to_string())?;
+        {
+            let mut manager = self.session_manager.lock().unwrap();
+            manager.append_custom_entry_with_rollback(contract::USAGE_CUSTOM_TYPE, Some(serde_json::to_value(record).map_err(|_| "OCC3.1 usage encoding failed")?))
+                .and_then(|_| manager.flush_now())
+                .map_err(|_| "OCC3.1 usage could not be saved; no final execution or automatic replay".to_string())?;
+        }
         *self.own_usage_memo.lock().unwrap() = None;
+        self.publish_textmas_activity();
         Ok(())
     }
 }
@@ -700,6 +878,7 @@ struct RoleRequestError {
 struct TextMasReduction {
     original: Context,
     note: String,
+    brief_call_id: String,
 }
 
 fn role_request(

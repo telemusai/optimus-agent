@@ -2337,3 +2337,64 @@ async fn b1_aborted_snapshot_transfer_never_publishes_a_premature_footer() {
         "a cancelled transfer must not strand a catch-up"
     );
 }
+
+
+#[cfg(test)]
+mod textmas_activity_compatibility_tests {
+    use super::*;
+
+    #[test]
+    fn live_and_shared_writer_gate_activity_by_session_without_changing_old_events() {
+        let root = state_root("textmas-activity-gating");
+        let daemon = AgentDaemon::new(
+            root.join("daemon.sock").to_string_lossy().into_owned(),
+            DaemonModeOptions {
+                socket_path: None,
+                default_session_config: AgentSessionRuntimeConfig {
+                    cwd: Some(root.join("workspace").to_string_lossy().into_owned()),
+                    agent_dir: Some(root.join("agent").to_string_lossy().into_owned()),
+                    ..Default::default()
+                },
+                create_runtime: Arc::new(|_| Box::pin(async { panic!("no runtime is needed for transport gating") })),
+                worker: None,
+            },
+        );
+        let (sender, mut outbound) = mpsc::unbounded_channel();
+        let client = Arc::new(DaemonClientHandle::new(
+            "activity-client", Arc::new(DaemonClientWriter::new(sender)), Arc::new(|| {}),
+        ));
+        client.state.lock().unwrap().capabilities = normalize_client_capabilities(None, None);
+        let live = DaemonOutbound::SessionEvent {
+            active_session_id: "root".into(), event: serde_json::json!({"type":"textmas_activity"}),
+        };
+        // Raw session_event is the envelope accepted by the deferred-replay writer.
+        let replay = DaemonOutbound::Raw(serde_json::json!({
+            "type":"session_event", "activeSessionId":"root", "event":{"type":"textmas_activity"}
+        }));
+        assert!(!should_send_daemon_outbound_to_client(&client, &live));
+        assert!(!should_send_daemon_outbound_to_client(&client, &replay));
+        assert!(daemon.write(&client, &replay));
+        assert!(daemon.write_serialized(&client, &serialize_json_line(&replay.to_value()), Some(&replay)));
+        assert!(daemon.write_serialized(&client, &serialize_json_line(&live.to_value()), Some(&live)));
+        assert!(outbound.try_recv().is_err(), "an old client received an unknown live or replayed event");
+        let old_heartbeat = DaemonOutbound::Raw(serde_json::json!({"type":"heartbeats_changed"}));
+        assert!(should_send_daemon_outbound_to_client(&client, &old_heartbeat));
+        assert!(daemon.write(&client, &old_heartbeat));
+        assert!(outbound.try_recv().is_ok(), "legacy traffic stays observable");
+
+        set_daemon_client_session_capabilities(&client, "root", normalize_client_capabilities(Some(&std::collections::HashSet::from([
+            "attach_snapshot".into(), "event_sequence".into(), "occ31_textmas_activity".into(),
+        ])), None));
+        assert!(should_send_daemon_outbound_to_client(&client, &live));
+        assert!(should_send_daemon_outbound_to_client(&client, &replay));
+        assert!(daemon.write(&client, &replay));
+        assert!(daemon.write_serialized(&client, &serialize_json_line(&replay.to_value()), Some(&replay)));
+        assert!(daemon.write_serialized(&client, &serialize_json_line(&live.to_value()), Some(&live)));
+        for _ in 0..3 {
+            let delivered = outbound.try_recv().unwrap();
+            assert_eq!(serde_json::from_slice::<Value>(&delivered).unwrap()["event"]["type"], "textmas_activity");
+        }
+        assert!(!client.supports_capability_for_session("occ31_textmas_activity", "other-session"),
+            "capability for one attached session cannot authorize another session's activity");
+    }
+}

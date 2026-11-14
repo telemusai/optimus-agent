@@ -255,8 +255,21 @@ impl TextMasPreparationPlan {
         &self,
         model: &Model,
         briefs: &[String],
-        mut check: impl FnMut() -> Result<(), String>,
+        check: impl FnMut() -> Result<(), String>,
     ) -> Result<Vec<Context>, String> {
+        self.reduction_contexts_with_dependencies_with_control(model, briefs, check)
+            .map(|contexts| contexts.into_iter().map(|(context, _, _)| context).collect())
+    }
+
+    /// The same validated contexts plus their exact half-open input ranges.
+    /// Original call IDs stay outside this context contract and are attached by
+    /// the session's activity projection, never inferred from rendered output.
+    pub fn reduction_contexts_with_dependencies_with_control(
+        &self,
+        model: &Model,
+        briefs: &[String],
+        mut check: impl FnMut() -> Result<(), String>,
+    ) -> Result<Vec<(Context, usize, usize)>, String> {
         check()?;
         if briefs.len() < 2 {
             return Err("OCC3.1 reduction needs at least two briefs".into());
@@ -312,7 +325,7 @@ impl TextMasPreparationPlan {
                 &[],
             )?;
             output_budget(model, &context)?;
-            contexts.push(context);
+            contexts.push((context, start, end));
             start = end;
         }
         if contexts.len() >= briefs.len() {

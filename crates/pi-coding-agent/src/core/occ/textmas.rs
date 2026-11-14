@@ -303,10 +303,7 @@ impl TextMasUsageRecord {
         }
     }
     pub fn call_id(&self) -> String {
-        match self.call_index {
-            Some(index) => format!("{}:{}:{index}", self.action_id, self.role.as_str()),
-            None => format!("{}:{}", self.action_id, self.role.as_str()),
-        }
+        super::textmas_activity::textmas_call_id(&self.action_id, self.role, self.call_index)
     }
 }
 

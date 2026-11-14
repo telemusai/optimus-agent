@@ -129,6 +129,12 @@ impl Bar {
         let now = Instant::now();
         self.graph.observe(&rows, &parent,
             mode.is_agent_streaming() || mode.is_bash_running() || mode.is_agent_compacting(), now);
+        let (textmas_activity, textmas_owner_active) = mode.connection_state.as_ref()
+            .filter(|state| Some(state.session_id.as_str()) == parent.session_id.as_deref())
+            .and_then(|state| state.occ3_modes.as_ref())
+            .map(|modes| (modes.textmas_activity.as_ref(), modes.textmas_active))
+            .unwrap_or((None, false));
+        self.graph.observe_activity_state(textmas_activity, textmas_owner_active, now);
         let lines = self.graph.render(parent.session_id.as_deref().unwrap_or(""), width, height, now);
         let deadline = self.graph.next_frame(now);
         // Keep an already scheduled frame; frequent input must not postpone it.

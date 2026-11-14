@@ -1273,6 +1273,8 @@ impl DaemonAgentConnection {
     fn filter_occ3_modes(&self, state: &mut AgentConnectionState) {
         if !self.client.supports_server_capability("occ31_textmas") {
             state.occ3_modes = None;
+        } else if !self.client.supports_server_capability("occ31_textmas_activity") {
+            if let Some(modes) = state.occ3_modes.as_mut() { modes.textmas_activity = None; }
         }
     }
 
@@ -1389,6 +1391,9 @@ impl DaemonAgentConnection {
         }
         if owned_session {
             capabilities.push(json!("client_owned_sessions"));
+        }
+        if self.client.supports_server_capability("occ31_textmas_activity") {
+            capabilities.push(json!("occ31_textmas_activity"));
         }
         let mut fields: Vec<(&str, Value)> = vec![
             ("activeSessionId", Value::String(self.active_session_id())),
