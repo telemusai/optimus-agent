@@ -117,10 +117,10 @@ fn occ31_schema47_is_optional_and_keeps_old_startup_and_occ2_contracts() {
         DaemonCompatibilityHello, daemon_outbound_compatibility, meets_daemon_command_compatibility,
     };
     use pi_coding_agent::modes::daemon::daemon_supervisor;
-    assert_eq!(DAEMON_SCHEMA_REVISION, 47);
+    assert_eq!(DAEMON_SCHEMA_REVISION, 48);
     assert!(DAEMON_DEFAULT_SERVER_CAPABILITIES.contains(&DaemonServerCapability::Occ31Textmas));
     let current = DaemonCompatibilityHello {
-        protocol: daemon_protocol_info(), schema_revision: Some(47),
+        protocol: daemon_protocol_info(), schema_revision: Some(DAEMON_SCHEMA_REVISION),
         server_capabilities: Some(DAEMON_DEFAULT_SERVER_CAPABILITIES.into_iter().chain([DaemonServerCapability::AgentRoster]).collect()),
     };
     let mut old = current.clone();
@@ -150,7 +150,11 @@ fn occ31_schema47_is_optional_and_keeps_old_startup_and_occ2_contracts() {
         let hello = DaemonHello::from_value(&json!({"type":"daemon_hello", "protocol":daemon_protocol_info(),
             "schemaRevision":revision,"serverCapabilities":["occ31_textmas","occ_session_preferences"]})).unwrap();
         assert_eq!(hello.supports("occ31_textmas"), revision == Some(47));
+        assert!(!hello.supports("occ31_textmas_activity"));
         assert!(hello.supports("occ_session_preferences"));
+        let activity = DaemonHello::from_value(&json!({"type":"daemon_hello", "protocol":daemon_protocol_info(),
+            "schemaRevision":revision,"serverCapabilities":["occ31_textmas_activity"]})).unwrap();
+        assert_eq!(activity.supports("occ31_textmas_activity"), revision.is_some_and(|value| value >= 48));
     }
     // Old clients use string capabilities and ignore added optional greeting fields.
     #[derive(serde::Deserialize)]
@@ -734,15 +738,35 @@ fn daemon_owns_independent_occ31_and_occ32_preferences_without_latent_model_supp
     let file = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
         let client = Arc::new(DaemonClient::create(&fixture.socket));
         client.connect(1000).await.unwrap();
-        assert!(client.wait_for_hello(1000).await.unwrap().supports("occ31_textmas"));
+        let hello = client.wait_for_hello(1000).await.unwrap();
+        assert!(hello.supports("occ31_textmas"));
+        assert!(hello.supports("occ31_textmas_activity"));
         let id = create_session(&client, &fixture, None).await;
         let other = create_session(&client, &fixture, None).await;
         let state = request(&client, json!({"type":"get_connection_state","activeSessionId":id})).await;
         assert_eq!(state["model"]["provider"], "local-cli-fixture");
-        assert_eq!(state["occ3Modes"], json!({"textmasMode":"off","latentEnabled":false,"latentActive":false,"latentAvailable":false}));
-        let file = state["sessionFile"].as_str().unwrap().to_string();
+        // PR #290 added this existing flag; absent activity must stay absent.
+        assert_eq!(state["occ3Modes"], json!({"textmasMode":"off","textmasActive":false,"latentEnabled":false,"latentActive":false,"latentAvailable":false}));
+        let file = std::fs::canonicalize(state["sessionFile"].as_str().unwrap())
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
         let pref = pi_coding_agent::core::occ::textmas_settings::preference_path(&file);
-        assert!(pref.starts_with(fixture.root.path()));
+        let isolated_root = fixture.root.path().canonicalize().unwrap();
+        // The artifact directory may not exist before its first preference write.
+        // Normalize an existing ancestor, then require ordinary path components
+        // for the suffix that the preference writer may create.
+        let existing_ancestor = pref
+            .ancestors()
+            .find(|path| path.exists())
+            .expect("TextMAS preference path has an existing ancestor");
+        let suffix = pref.strip_prefix(existing_ancestor).expect("preference path has its own ancestor prefix");
+        let suffix_is_safe = suffix.components().all(|component| {
+            matches!(component, std::path::Component::Normal(_) | std::path::Component::CurDir)
+        });
+        assert!(suffix_is_safe, "session preference path contains traversal: {pref:?}");
+        let existing_ancestor = existing_ancestor.canonicalize().expect("existing preference ancestor is readable");
+        assert!(existing_ancestor.starts_with(&isolated_root), "session preference path left the isolated fixture: {pref:?} not under {isolated_root:?}");
         assert!(!pref.exists());
         assert_eq!(request(&client, json!({"type":"occ31_get_preferences","activeSessionId":id})).await,
             json!({"occ31Mode":"off","inherited":false,"sourceSessionId":null}));
@@ -759,7 +783,7 @@ fn daemon_owns_independent_occ31_and_occ32_preferences_without_latent_model_supp
             assert_eq!(fs::read(session_settings::preference_path(&file)).unwrap(), old_lane_bytes);
         }
         let state = request(&client, json!({"type":"get_connection_state","activeSessionId":id})).await;
-        assert_eq!(state["occ3Modes"], json!({"textmasMode":"hierarchical","latentEnabled":true,"latentActive":false,"latentAvailable":false}));
+        assert_eq!(state["occ3Modes"], json!({"textmasMode":"hierarchical","textmasActive":false,"latentEnabled":true,"latentActive":false,"latentAvailable":false}));
         assert_eq!(request(&client, json!({"type":"occ31_get_preferences","activeSessionId":other})).await["occ31Mode"], "off");
         for mode in [Value::Null, json!("on"), json!(true), json!("hierarchal")] {
             assert!(request_result(&client, json!({"type":"occ31_set_mode","activeSessionId":id,"mode":mode})).await.is_err());

@@ -187,6 +187,7 @@ impl Serialize for AgentSessionEvent {
                 message,
             } => json!({"toolCallId":tool_call_id,"message":message}),
             SessionActionUpdate { actions } => json!({"actions":actions}),
+            TextMasActivity { activity } => json!({"activity":activity}),
             CompactionStart {
                 reason,
                 custom_instructions,
