@@ -214,6 +214,239 @@ fn transcript_rows_after_uncacheable_rows_reuse_lines_and_refresh_on_changes() {
     assert_eq!(first[0].as_str(), "original at 80", "retained frames stay immutable");
 }
 
+fn assert_same_lines(first: &[RenderedLine], second: &[RenderedLine]) {
+    assert_eq!(first.len(), second.len());
+    for (before, after) in first.iter().zip(second) {
+        assert_eq!(before.as_str(), after.as_str(), "cached output must be byte-identical");
+        assert!(before.ptr_eq(after), "cached output must retain its allocation");
+    }
+}
+
+fn test_image_result() -> ToolExecutionResult {
+    use base64::Engine;
+    let mut png = std::io::Cursor::new(Vec::new());
+    image::RgbImage::from_pixel(72, 144, image::Rgb([0, 244, 119]))
+        .write_to(&mut png, image::ImageFormat::Png)
+        .unwrap();
+    ToolExecutionResult {
+        content: vec![crate::core::tools::render_utils::RenderContentBlock {
+            r#type: "image".into(),
+            text: None,
+            data: Some(base64::engine::general_purpose::STANDARD.encode(png.into_inner())),
+            mime_type: Some("image/png".into()),
+        }],
+        is_error: false,
+        details: None,
+    }
+}
+
+fn settled_image_tool(tool_name: &str) -> Rc<RefCell<ToolExecutionComponent>> {
+    let mut component = ToolExecutionComponent::new(
+        tool_name,
+        "image-cache",
+        serde_json::json!({"code": "print(image)", "command": "print-image"}),
+        ToolExecutionOptions::default(),
+        None,
+        "/cwd",
+    );
+    component.mark_execution_started();
+    component.update_result(test_image_result(), false);
+    Rc::new(RefCell::new(component))
+}
+
+#[test]
+fn tool_render_cache_image_rows_revalidate_ambient_terminal_state() {
+    crate::modes::interactive::theme::theme::init_theme(Some("neon"), false);
+    use pi_tui::components::image::with_image_height_limit;
+    use pi_tui::terminal_image::{
+        reset_capabilities_cache, set_capabilities, set_cell_dimensions, CellDimensions,
+        ImageProtocol, TerminalCapabilities,
+    };
+    let capabilities = |images, true_color| TerminalCapabilities {
+        images,
+        true_color,
+        hyperlinks: true,
+    };
+    set_capabilities(capabilities(None, true));
+    set_cell_dimensions(CellDimensions { width_px: 9, height_px: 18 });
+    let component = settled_image_tool("bash");
+    let mut row: Box<dyn TuiComponent> = Box::new(ToolRow(component));
+    let mut cache = Vec::new();
+    assert_eq!(row.render_revision(), None);
+
+    let ansi = render_row_cached(&mut cache, 0, &mut row, 40.0, 1);
+    assert!(ansi.iter().any(|line| line.contains('▀')));
+    set_capabilities(capabilities(None, false));
+    let fallback = render_row_cached(&mut cache, 0, &mut row, 40.0, 1);
+    assert!(fallback.iter().any(|line| line.contains("Cannot display image")));
+    assert_ne!(ansi, fallback, "capability changes must reach Image::render");
+
+    set_capabilities(capabilities(Some(ImageProtocol::Sixel), true));
+    let three_rows = with_image_height_limit(3, || render_row_cached(&mut cache, 0, &mut row, 40.0, 1));
+    let two_rows = with_image_height_limit(2, || render_row_cached(&mut cache, 0, &mut row, 40.0, 1));
+    assert_ne!(three_rows, two_rows, "terminal height must reach Image::render");
+    set_cell_dimensions(CellDimensions { width_px: 8, height_px: 12 });
+    let changed_cells = with_image_height_limit(2, || render_row_cached(&mut cache, 0, &mut row, 40.0, 1));
+    assert_ne!(two_rows, changed_cells, "cell geometry must reach Image::render");
+    let repeated = with_image_height_limit(2, || render_row_cached(&mut cache, 0, &mut row, 40.0, 1));
+    assert!(!changed_cells[0].ptr_eq(&repeated[0]), "image rows must not use the outer row cache");
+
+    set_cell_dimensions(CellDimensions { width_px: 9, height_px: 18 });
+    reset_capabilities_cache();
+}
+
+#[test]
+fn tool_render_cache_nested_ipython_images_and_setting_transitions_bypass_cache() {
+    crate::modes::interactive::theme::theme::init_theme(Some("neon"), false);
+    use pi_tui::terminal_image::{
+        reset_capabilities_cache, set_capabilities, TerminalCapabilities,
+    };
+    set_capabilities(TerminalCapabilities { images: None, true_color: false, hyperlinks: true });
+    let component = settled_image_tool("ipython");
+    let mut row: Box<dyn TuiComponent> = Box::new(ToolRow(component.clone()));
+    let mut cache = Vec::new();
+    assert_eq!(row.render_revision(), None, "nested IPython image content is uncacheable");
+
+    let visible = render_row_cached(&mut cache, 0, &mut row, 40.0, 1);
+    assert!(visible.iter().any(|line| line.contains("Cannot display image")));
+    component.borrow_mut().set_show_images(false);
+    assert_eq!(row.render_revision(), None, "hidden image content remains uncacheable");
+    let hidden = render_row_cached(&mut cache, 0, &mut row, 40.0, 1);
+    assert!(!hidden.iter().any(|line| line.contains("Cannot display image")));
+    assert_ne!(visible, hidden, "show_images must rebuild the row");
+
+    component.borrow_mut().set_include_image_dimensions(false);
+    assert_eq!(row.render_revision(), None);
+    let hidden_with_new_metadata_setting = render_row_cached(&mut cache, 0, &mut row, 40.0, 1);
+    assert!(!hidden[0].ptr_eq(&hidden_with_new_metadata_setting[0]));
+    component.borrow_mut().set_show_images(true);
+    assert_eq!(row.render_revision(), None);
+
+    component.borrow_mut().update_result(
+        ToolExecutionResult {
+            content: vec![crate::core::tools::render_utils::RenderContentBlock::from_text("text only")],
+            is_error: false,
+            details: None,
+        },
+        false,
+    );
+    assert!(row.render_revision().is_some(), "replacing the image with text restores caching");
+    let text = render_row_cached(&mut cache, 0, &mut row, 40.0, 1);
+    let text_again = render_row_cached(&mut cache, 0, &mut row, 40.0, 1);
+    assert_same_lines(&text, &text_again);
+    reset_capabilities_cache();
+}
+
+#[test]
+fn tool_render_cache_bypasses_running_and_partial_rows_then_tracks_width_and_style() {
+    crate::modes::interactive::theme::theme::init_theme(Some("neon"), false);
+    let mut component = ToolExecutionComponent::new(
+        "bash",
+        "cache-states",
+        serde_json::json!({"command": "printf cached"}),
+        ToolExecutionOptions::default(),
+        None,
+        "/cwd",
+    );
+    component.mark_execution_started();
+    let component = Rc::new(RefCell::new(component));
+    let mut row: Box<dyn TuiComponent> = Box::new(ToolRow(component.clone()));
+    let mut cache = Vec::new();
+
+    assert_eq!(row.render_revision(), None);
+    let running = render_row_cached(&mut cache, 0, &mut row, 80.0, 1);
+    let running_again = render_row_cached(&mut cache, 0, &mut row, 80.0, 1);
+    assert!(!running[0].ptr_eq(&running_again[0]), "running rows must re-render");
+
+    component.borrow_mut().update_result(
+        ToolExecutionResult {
+            content: vec![crate::core::tools::render_utils::RenderContentBlock::from_text("partial")],
+            is_error: false,
+            details: None,
+        },
+        true,
+    );
+    assert_eq!(row.render_revision(), None);
+    let partial = render_row_cached(&mut cache, 0, &mut row, 80.0, 1);
+    let partial_again = render_row_cached(&mut cache, 0, &mut row, 80.0, 1);
+    assert!(!partial[0].ptr_eq(&partial_again[0]), "partial rows must re-render");
+
+    component.borrow_mut().update_result(
+        ToolExecutionResult {
+            content: vec![crate::core::tools::render_utils::RenderContentBlock::from_text("final")],
+            is_error: false,
+            details: None,
+        },
+        false,
+    );
+    assert!(row.render_revision().is_some());
+    let settled = render_row_cached(&mut cache, 0, &mut row, 80.0, 1);
+    let settled_again = render_row_cached(&mut cache, 0, &mut row, 80.0, 1);
+    assert_same_lines(&settled, &settled_again);
+
+    let resized = render_row_cached(&mut cache, 0, &mut row, 40.0, 1);
+    assert!(!resized[0].ptr_eq(&settled[0]), "width must invalidate the row");
+    let resized_again = render_row_cached(&mut cache, 0, &mut row, 40.0, 1);
+    assert_same_lines(&resized, &resized_again);
+    let restyled = render_row_cached(&mut cache, 0, &mut row, 40.0, 2);
+    assert!(!restyled[0].ptr_eq(&resized[0]), "style must invalidate the row");
+}
+
+#[test]
+fn tool_render_cache_reuses_ipython_rows_across_loader_only_frames() {
+    crate::modes::interactive::theme::theme::init_theme(Some("neon"), false);
+    let h = FrameHarness::new("tool-cache-ipython");
+    h.mode.borrow_mut().set_working_visible(true);
+    h.mode.borrow_mut().working_message = Some("loader one".into());
+    h.transcript.borrow_mut().tool_start(
+        "cell-1",
+        "ipython",
+        serde_json::json!({"code": "print('cached')"}),
+    );
+    h.transcript.borrow_mut().tool_result(
+        "cell-1",
+        &serde_json::json!({"content": [{"type": "text", "text": "CACHED_OUTPUT"}]}),
+        false,
+        false,
+    );
+
+    let collapsed = h.transcript.borrow_mut().render_shared(80.0);
+    assert!(!collapsed.iter().any(|line| line.contains("CACHED_OUTPUT")));
+    h.transcript.borrow().tools["cell-1"].borrow_mut().set_expanded(true);
+    let first = h.transcript.borrow_mut().render_shared(80.0);
+    let first_output = first.iter().find(|line| line.contains("CACHED_OUTPUT")).unwrap().clone();
+    assert!(first.len() > collapsed.len(), "expansion must rebuild the settled cell");
+    h.mode.borrow_mut().working_message = Some("loader two".into());
+    let second = h.transcript.borrow_mut().render_shared(80.0);
+    let second_output = second.iter().find(|line| line.contains("CACHED_OUTPUT")).unwrap().clone();
+    assert_eq!(first_output.as_str(), second_output.as_str());
+    assert!(first_output.ptr_eq(&second_output), "loader-only paint reused the settled cell");
+
+    let revision_before_invalidate = h.transcript.borrow().tools["cell-1"].borrow().render_revision().unwrap();
+    h.transcript.borrow_mut().invalidate();
+    assert!(h.transcript.borrow().row_cache.is_empty(), "Transcript::invalidate must clear row renders");
+    assert!(h.transcript.borrow().tools["cell-1"].borrow().render_revision().unwrap() > revision_before_invalidate);
+    let invalidated = h.transcript.borrow_mut().render_shared(80.0);
+    let invalidated_output = invalidated.iter().find(|line| line.contains("CACHED_OUTPUT")).unwrap();
+    assert_eq!(invalidated_output.as_str(), second_output.as_str(), "invalidation must preserve unchanged bytes");
+
+    let revision_before_args = h.transcript.borrow().tools["cell-1"].borrow().render_revision().unwrap();
+    h.transcript.borrow_mut().tool_start("cell-1", "ipython", serde_json::json!({"code": "print('updated')"}));
+    assert!(h.transcript.borrow().tools["cell-1"].borrow().render_revision().unwrap() > revision_before_args);
+    let args_updated = h.transcript.borrow_mut().render_shared(80.0);
+    assert!(args_updated.iter().any(|line| line.contains("print('updated')")), "argument changes must re-render the cell");
+
+    h.transcript.borrow_mut().tool_result(
+        "cell-1",
+        &serde_json::json!({"content": [{"type": "text", "text": "UPDATED_OUTPUT"}]}),
+        false,
+        false,
+    );
+    let result_updated = h.transcript.borrow_mut().render_shared(80.0);
+    assert!(!result_updated.iter().any(|line| line.contains("CACHED_OUTPUT")));
+    assert!(result_updated.iter().any(|line| line.contains("UPDATED_OUTPUT")));
+}
+
 fn user(text: &str) -> AgentMessage {
     AgentMessage::Message(Message::User(UserMessage::new(UserContent::Text(text.into()), 1)))
 }
