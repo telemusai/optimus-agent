@@ -39,8 +39,30 @@ three tool-free model calls before the normal parent agent answers or acts:
 In **sequential** mode, each preparation stage receives the earlier drafts.
 In **hierarchical** mode, the three preparation stages independently receive the
 same original context, without each other's drafts. The final parent receives
-all three. The independent stages currently run serially; hierarchical describes
-the flow of information, not a promise of parallel execution.
+all three in Planner/Critic/Refiner order regardless of completion order.
+
+Hierarchical role calls run **serially by default**, preserving compatibility
+with providers that accept only one in-flight request. There is no generic
+provider-capacity discovery in this interface. `PRIME_AGENT_OCC3_TEXTMAS_HIERARCHICAL_CONCURRENCY=1`
+keeps that safe behavior. An operator can explicitly set the environment variable
+to `2` or `3` before launching Optimus to enable work-conserving ordered overlap
+up to that per-preparation limit. Unset, zero, non-numeric or larger values use
+the serial default. This setting does not change information flow into the
+separate **sequential** mode or its prior-draft dependencies.
+
+For a DGX-backed or other compatible ordinary provider, first confirm the number
+of concurrent auxiliary model requests allowed by the selected upstream and
+account. For example, in PowerShell, set
+`$env:PRIME_AGENT_OCC3_TEXTMAS_HIERARCHICAL_CONCURRENCY = "3"` before starting
+or restarting Optimus from that environment when three concurrent role calls are
+supported. Do not use this override with a capacity-one provider. The setting
+limits only the three role calls in one preparation. It neither coordinates other
+sessions nor reconfigures the existing mapper/reducer, provider or parent limits.
+
+All three valid ordered drafts are still required before the parent can act.
+An admitted provider request that is refused or fails is not retried or replayed
+through a serial fallback: sibling work is cancelled and preparation fails, so
+an ambiguous request is never generically replayed.
 
 The preparation stages are native-host model calls, not retained subagent
 sessions. They cannot invoke tools, edit files or start more agents. Their text

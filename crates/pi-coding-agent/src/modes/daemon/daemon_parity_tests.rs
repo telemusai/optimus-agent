@@ -631,6 +631,8 @@ pub(super) struct ReportingSession {
     pub session_active: bool,
     /// Overrides `has_running_rlm_children` for the recovery-busy predicate test.
     pub running_children: bool,
+    /// Live child snapshots exposed by resident-child projection tests.
+    pub child_snapshots: Vec<Value>,
     /// `(reportSucceeded, reportQueued)` - what the session reports at its own preflight.
     pub report: Option<(bool, bool)>,
     /// The admission call's own outcome (a thrown admission error when `Some`).
@@ -714,6 +716,7 @@ impl ReportingSession {
             session_file: session_file.to_string(),
             session_active: true,
             running_children: false,
+            child_snapshots: Vec::new(),
             report,
             error,
             calls: Arc::new(AtomicU64::new(0)),
@@ -1004,7 +1007,7 @@ impl DaemonSession for ReportingSession {
         self.inner.get_context_tree()
     }
     fn get_rlm_child_snapshots(&self) -> Vec<Value> {
-        self.inner.get_rlm_child_snapshots()
+        self.child_snapshots.clone()
     }
     fn export_to_html(&self, output_path: Option<&str>) -> BoxFuture<'static, Result<String, String>> {
         self.inner.export_to_html(output_path)
@@ -1588,6 +1591,7 @@ fn recovery_busy_matches_the_typescript_predicate() {
             session_file: file.to_string(),
             session_active: false,
             running_children: true,
+            child_snapshots: Vec::new(),
             report: None,
             error: None,
             calls: Arc::new(AtomicU64::new(0)),
@@ -1615,6 +1619,7 @@ fn recovery_busy_matches_the_typescript_predicate() {
             session_file: file.to_string(),
             session_active: false,
             running_children: false,
+            child_snapshots: Vec::new(),
             report: None,
             error: None,
             calls: Arc::new(AtomicU64::new(0)),

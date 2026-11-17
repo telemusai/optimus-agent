@@ -1156,6 +1156,30 @@ mod tests {
     }
 
     #[test]
+    fn native_host_measurements_are_registered_and_round_trip() {
+        let registered = [
+            (PerformanceMetricMeasurement::RenderMs, "render_ms", 1.25),
+            (PerformanceMetricMeasurement::DiffMs, "diff_ms", 2.5),
+            (PerformanceMetricMeasurement::UiTickFallbackSkipped, "ui_tick_fallback_skipped", 9.0),
+        ];
+        let mut measurements = PerformanceMetricMeasurements::new();
+        for (measurement, wire_name, value) in registered {
+            assert_eq!(measurement.as_str(), wire_name);
+            let encoded = serde_json::to_string(&measurement).unwrap();
+            assert_eq!(encoded, format!(r#""{wire_name}""#));
+            assert_eq!(serde_json::from_str::<PerformanceMetricMeasurement>(&encoded).unwrap(), measurement);
+            measurements.insert(measurement, Some(value));
+        }
+        let encoded = serde_json::to_value(&measurements).unwrap();
+        assert_eq!(encoded, serde_json::json!({
+            "render_ms": 1.25,
+            "diff_ms": 2.5,
+            "ui_tick_fallback_skipped": 9.0,
+        }));
+        assert_eq!(serde_json::from_value::<PerformanceMetricMeasurements>(encoded).unwrap(), measurements);
+    }
+
+    #[test]
     fn measurements_keep_explicit_null_distinct_from_absent() {
         let mut measurements = PerformanceMetricMeasurements::new();
         measurements.insert(PerformanceMetricMeasurement::TotalMs, Some(5.0));

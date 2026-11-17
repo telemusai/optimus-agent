@@ -1,0 +1,1 @@
+- Fixed OCC3.1 auxiliary model-stage ready-event floods starving the shared role deadline and cancellation. Provider and stream waits now observe one original 120-second deadline without per-event renewal, while draft validation and durable streamed-call usage statuses stay unchanged.

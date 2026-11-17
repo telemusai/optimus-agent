@@ -3,6 +3,7 @@ use super::*;
 use super::daemon_supervisor_parity_tests::{add_descriptor_only_worker, SupervisorFixture};
 use crate::core::cron_jobs::{AgentCronJobStore, CreateAgentCronJobInput, STATUS_CANCELLED, SESSION_SCHEDULED_JOBS_FILENAME};
 use crate::modes::daemon::worker_recovery_journal::{WorkerRecoveryJournal, WorkerRecoveryRecordInput};
+use crate::modes::daemon::snapshot_transcript_cache::{SnapshotTranscriptCache, SnapshotTranscriptCacheOptions, SNAPSHOT_TARGET_CHUNK_BYTES};
 
 fn dead_worker(fixture: &SupervisorFixture, name: &str) -> Arc<Worker> {
     let worker = add_descriptor_only_worker(fixture, name, name, "token", DAEMON_WORKER_LIFECYCLE_FAILED);
@@ -742,4 +743,200 @@ async fn nine_supervisor_disconnected_snapshot_releases_disk_cache() {
     let mut response = DaemonResponse::success(None, "attach", Some(json!({"snapshot":{"messages":[{"role":"user","content":"x".repeat(5 * 1024 * 1024)}],"lastEventSequence":0}})));
     fixture.supervisor.stream_cached_attach(&fixture.client, "active", &mut response).await.unwrap();
     assert_eq!(std::fs::read_dir(fixture.supervisor.descriptor_dir.join("snapshot-cache")).unwrap().count(), 0);
+}
+
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nine_supervisor_busy_attach_response_stream_and_memory_make_progress() {
+    let mut fixture = SupervisorFixture::new("nine-busy-attach").await;
+    const PRELOAD: usize = 6;
+    let noise = |index: usize| json!({"type":"session_event","activeSessionId":"active","event":{"type":"test_noise","index":index}});
+    for index in 0..PRELOAD {
+        assert!(fixture.client.write(&noise(index)));
+    }
+    let messages: Vec<Value> = (0..220).map(|index| json!({"role":"user","content":format!("{index}:{}", "x".repeat(24_000)),"timestamp":index})).collect();
+    let expected = messages.clone();
+    let summary = SessionSummary { id: "active".into(), session_id: "saved".into(), ..Default::default() };
+    let state = crate::modes::agent_connection::types::AgentConnectionState::default();
+    let mut response = DaemonResponse::success(Some("busy-attach"), "attach", Some(json!({"activeSessionId":"active","snapshot":{"activeSessionId":"active","messages":messages,"summary":summary,"state":state,"lastEventSequence":7,"lastEventCursor":{"generation":"generation","sequence":7}}})));
+    let supervisor = fixture.supervisor.clone();
+    let client = fixture.client.clone();
+    let task = tokio::spawn(async move { supervisor.stream_cached_attach(&client, "active", &mut response).await });
+    tokio::task::yield_now().await;
+
+    let mut next_noise = PRELOAD;
+    // Keep traffic nonempty while allowing cache construction to finish. A
+    // completely-empty-queue gate cannot reach its response before this deadline.
+    let first = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let frame = fixture.next_frame(Duration::from_secs(10)).await.expect("preloaded traffic must drain");
+            assert!(frame["event"]["type"] == "test_noise" || (frame["type"] == "response" && frame["id"] == "busy-attach"), "unexpected frame before attach response: {frame}");
+            assert!(fixture.client.output.capacity() < fixture.client.output.max_capacity());
+            let is_response = frame["type"] == "response";
+            if !is_response {
+                assert!(fixture.client.write(&noise(next_noise)));
+                next_noise += 1;
+            }
+            assert!(fixture.client.output.max_capacity() - fixture.client.output.capacity() <= PRELOAD + 8, "transcript chunks accumulated in the output queue");
+            if is_response { break frame; }
+        }
+    }).await.expect("attach response did not make progress while output stayed nonempty");
+
+    let snapshot_id = first["data"]["snapshotStream"]["id"].as_str().unwrap().to_string();
+    let mut attach_frames = vec![first];
+    let _ = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let frame = fixture.next_frame(Duration::from_secs(10)).await.expect("snapshot starved behind continuous traffic");
+            let is_end = frame["type"] == "session_snapshot_end";
+            if frame["type"] == "response" || frame["type"].as_str().is_some_and(|kind| kind.starts_with("session_snapshot_")) {
+                attach_frames.push(frame.clone());
+            }
+            assert!(fixture.client.output.capacity() < fixture.client.output.max_capacity());
+            if frame["event"]["type"] == "test_noise" {
+                assert!(fixture.client.write(&noise(next_noise)));
+                next_noise += 1;
+            }
+            assert!(fixture.client.output.max_capacity() - fixture.client.output.capacity() <= PRELOAD + 8, "transcript chunks accumulated in the output queue");
+            if is_end { break true; }
+        }
+    }).await.unwrap_or_else(|_| panic!("snapshot end was not delivered; task finished={}; snapshot frames={:?}", task.is_finished(), attach_frames.iter().map(|frame| frame["type"].as_str()).collect::<Vec<_>>()));
+    task.await.unwrap().unwrap();
+    let decoded = crate::modes::agent_connection::daemon_agent_connection::test_decode_cached_attach_frames(&attach_frames).await;
+    let expected_messages: Vec<pi_agent_core::types::AgentMessage> = serde_json::from_value(json!(expected)).unwrap();
+    assert_eq!(decoded, expected_messages);
+    assert!(!fixture.supervisor.descriptor_dir.join("snapshot-cache").join(snapshot_id).exists());
+}
+
+
+#[cfg(test)]
+async fn read_real_socket_line(socket: &mut tokio::io::DuplexStream) -> Vec<u8> {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let mut bytes = Vec::new();
+        loop {
+            let byte = tokio::io::AsyncReadExt::read_u8(socket).await.expect("real client socket read");
+            if byte == b'\n' { break bytes; }
+            bytes.push(byte);
+        }
+    }).await.expect("real client socket JSON line")
+}
+
+#[cfg(test)]
+async fn real_public_connection(case: &str, capacity: usize) -> (SupervisorFixture, Arc<PublicClient>, tokio::io::DuplexStream, Vec<u8>) {
+    let fixture = SupervisorFixture::new(case).await;
+    let supervisor = Arc::clone(&fixture.supervisor);
+    let existing = fixture.client.connection_id.clone();
+    let (socket, mut raw) = tokio::io::duplex(capacity);
+    spawn_connection(Arc::clone(&supervisor), socket);
+    let client = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let candidate = supervisor.clients.lock().unwrap().values()
+                .find(|candidate| candidate.connection_id != existing).cloned();
+            if let Some(candidate) = candidate { break candidate; }
+            tokio::task::yield_now().await;
+        }
+    }).await.expect("spawn_connection did not register its public client");
+    let hello = read_real_socket_line(&mut raw).await;
+    let value: Value = serde_json::from_slice(&hello).expect("hello must be valid JSON");
+    assert!(value.is_object());
+    assert!(!hello.contains(&0));
+    (fixture, client, raw, hello)
+}
+
+#[tokio::test]
+async fn nine_supervisor_real_writer_never_exposes_snapshot_markers() {
+    let (fixture, client, mut raw, hello) = real_public_connection("nine-real-writer-markers", 16 * 1024).await;
+    let mut marker = SNAPSHOT_DEQUEUE_MARKER_PREFIX.to_vec();
+    marker.extend_from_slice(b"direct-marker-test:0");
+    client.output.send(marker.clone()).await.unwrap();
+    let notice = json!({"type":"test_notice","value":42});
+    let mut expected = serde_json::to_vec(&notice).unwrap();
+    expected.push(b'\n');
+    client.output.send(expected.clone()).await.unwrap();
+    let mut wire = vec![0; expected.len()];
+    tokio::time::timeout(Duration::from_secs(10), tokio::io::AsyncReadExt::read_exact(&mut raw, &mut wire)).await.unwrap().unwrap();
+    assert_eq!(wire, expected);
+    for line in [hello, wire] {
+        assert!(!line.windows(marker.len()).any(|window| window == marker));
+        assert!(!line.contains(&0));
+        let value: Value = serde_json::from_slice(&line).expect("raw socket bytes must only contain JSON");
+        assert!(value.is_object());
+    }
+    client.stopped.cancel();
+    drop(raw);
+    drop(fixture);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nine_supervisor_real_writer_acks_snapshot_after_socket_write() {
+    let (fixture, client, mut raw, _hello) = real_public_connection("nine-real-writer-held-read", 16 * 1024).await;
+    let mut dequeued = client.snapshot_dequeue.subscribe();
+    let active = "held-read";
+    let messages: Vec<Value> = (0..130).map(|index| json!({"role":"user","content":format!("{index}:{}", "h".repeat(4 * 1024)),"timestamp":index})).collect();
+    let expected_messages = messages.clone();
+    let mut response = DaemonResponse::success(Some("held-read"), "attach", Some(json!({
+        "activeSessionId":active,
+        "snapshot":{"activeSessionId":active,"messages":messages,"summary":SessionSummary { id: active.into(), session_id: "saved".into(), ..Default::default() },"state":crate::modes::agent_connection::types::AgentConnectionState::default(),"lastEventSequence":7,"lastEventCursor":{"generation":"generation","sequence":7}}
+    })));
+    let mut expected_response = serde_json::to_value(&response).unwrap();
+    let fixed_id_length = "supervisor-".len() + 36;
+    expected_response["data"]["snapshot"]["messages"] = json!([]);
+    expected_response["data"]["snapshotStream"] = json!({"id":"x".repeat(fixed_id_length)});
+    let mut response_wire = serde_json::to_vec(&expected_response).unwrap();
+    response_wire.push(b'\n');
+    let supervisor = Arc::clone(&fixture.supervisor);
+    let task_client = Arc::clone(&client);
+    let stream = tokio::spawn(async move { supervisor.stream_cached_attach(&task_client, active, &mut response).await });
+
+    let mut actual_response_wire = vec![0; response_wire.len()];
+    tokio::time::timeout(Duration::from_secs(10), tokio::io::AsyncReadExt::read_exact(&mut raw, &mut actual_response_wire)).await.unwrap().unwrap();
+    let actual_response: Value = serde_json::from_slice(&actual_response_wire).unwrap();
+    let snapshot_id = actual_response["data"]["snapshotStream"]["id"].as_str().unwrap().to_string();
+    assert_eq!(snapshot_id.len(), fixed_id_length);
+    expected_response["data"]["snapshotStream"]["id"] = json!(snapshot_id);
+    assert_eq!(actual_response, expected_response);
+    let expected_begin = json!({
+        "type":"session_snapshot_begin", "activeSessionId":active, "snapshotId":snapshot_id,
+        "snapshot":actual_response["data"]["snapshot"], "messageCount":130,
+        "targetChunkBytes":SNAPSHOT_TARGET_CHUNK_BYTES, "purpose":"attach"
+    });
+    let begin = read_real_socket_line(&mut raw).await;
+    assert_eq!(serde_json::from_slice::<Value>(&begin).unwrap(), expected_begin);
+
+    // Use the same raw-Value cache splitter as stream_cached_attach. Its byte
+    // boundary need not match the separate AgentMessage iterator implementation.
+    let expected_cache = SnapshotTranscriptCache::new(SnapshotTranscriptCacheOptions {
+        active_session_id: active.into(), snapshot_id: snapshot_id.clone(), messages: None,
+        cache_root: fixture.root.join("expected-socket-cache").to_string_lossy().into_owned(),
+        target_chunk_bytes: None, memory_cache_bytes: None,
+    });
+    expected_cache.append_messages(expected_messages).unwrap();
+    assert_eq!(expected_cache.chunk_count(), 2, "the held-read fixture must have a following chunk");
+    let chunks: Vec<Vec<u8>> = (0..2).map(|index| expected_cache.read_chunk(index).unwrap()).collect();
+    expected_cache.dispose();
+    let mut first_chunk = vec![0; chunks[0].len()];
+    tokio::time::timeout(Duration::from_secs(10), tokio::io::AsyncReadExt::read_exact(&mut raw, &mut first_chunk[..1])).await.unwrap().unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let queued = client.output.max_capacity() - client.output.capacity();
+            assert!(queued <= 1, "a later chunk accumulated while the socket write was held: {queued}");
+            if queued == 1 { break; }
+            tokio::task::yield_now().await;
+        }
+    }).await.expect("the current chunk's dequeue marker was not queued");
+    assert!(matches!(dequeued.try_recv(), Err(tokio::sync::broadcast::error::TryRecvError::Empty)), "marker acknowledged before the chunk's socket write completed");
+    assert_eq!(client.output.max_capacity() - client.output.capacity(), 1, "only the private marker may wait while the real writer is blocked");
+
+    tokio::time::timeout(Duration::from_secs(10), tokio::io::AsyncReadExt::read_exact(&mut raw, &mut first_chunk[1..])).await.unwrap().unwrap();
+    assert_eq!(first_chunk, chunks[0]);
+    let mut expected_marker = SNAPSHOT_DEQUEUE_MARKER_PREFIX.to_vec();
+    expected_marker.extend_from_slice(format!("{snapshot_id}:0").as_bytes());
+    let acknowledgement = tokio::time::timeout(Duration::from_secs(10), dequeued.recv()).await.unwrap().unwrap();
+    assert_eq!(acknowledgement, expected_marker, "the socket writer must acknowledge its own completed chunk");
+    let mut next_chunk_prefix = [0; 1];
+    tokio::time::timeout(Duration::from_secs(10), tokio::io::AsyncReadExt::read_exact(&mut raw, &mut next_chunk_prefix)).await.unwrap().unwrap();
+    assert_eq!(next_chunk_prefix[0], chunks[1][0], "the next chunk was not admitted after acknowledgement");
+    assert!(!next_chunk_prefix.contains(&0));
+    client.stopped.cancel();
+    drop(raw);
+    tokio::time::timeout(Duration::from_secs(10), stream).await.unwrap().unwrap().unwrap();
 }

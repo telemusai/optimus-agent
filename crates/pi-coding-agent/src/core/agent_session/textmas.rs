@@ -8,6 +8,18 @@ use pi_ai::utils::event_stream::StreamTaskReceipt;
 
 type ContextTransform = Arc<dyn Fn(Vec<AgentMessage>, Option<CancellationToken>) -> BoxFuture<Vec<AgentMessage>> + Send + Sync>;
 
+const HIERARCHICAL_CONCURRENCY_ENV: &str = "PRIME_AGENT_OCC3_TEXTMAS_HIERARCHICAL_CONCURRENCY";
+
+// No generic provider concurrency capability reaches this interface. Preserve
+// the base's awaited hierarchical path unless the operator explicitly opts in.
+fn hierarchical_role_concurrency() -> usize {
+    std::env::var(HIERARCHICAL_CONCURRENCY_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| (1..=TextMasRole::ALL.len()).contains(value))
+        .unwrap_or(1)
+}
+
 #[derive(Default)]
 pub(super) struct TextMasState {
     context_hook_installed: bool,
@@ -328,26 +340,66 @@ impl AgentSession {
             }
         }
         let mut drafts = Vec::new();
-        for role in TextMasRole::ALL {
-            ensure_textmas_current(self, run, parent_signal.as_ref())?;
-            let context = match role_request(&run.model, &active_original, run.mode, role, &drafts)
-            {
-                Ok(context) => context,
-                Err(error) if error.reducible && preparation_note.is_none() => {
-                    let reduction = self
-                        .reduce_textmas_context(run, &original, parent_signal.as_ref())
-                        .await?;
-                    active_original = reduction.original;
-                    preparation_note = Some(reduction.note);
-                    role_request(&run.model, &active_original, run.mode, role, &drafts)
-                        .map_err(|error| error.message)?
-                }
-                Err(error) => return Err(error.message),
-            };
-            let draft = self
-                .run_textmas_role(run, role, None, context, parent_signal.as_ref())
-                .await?;
-            drafts.push((role, draft));
+        let hierarchical_limit = if run.mode == TextMasMode::Hierarchical { hierarchical_role_concurrency() } else { 1 };
+        if run.mode == TextMasMode::Hierarchical && hierarchical_limit > 1 {
+            // Opt in only: preflight validated every independent role against active_original.
+            // The bounded stream retains the original role index, not completion order.
+            let contexts = TextMasRole::ALL
+                .into_iter()
+                .map(|role| {
+                    ensure_textmas_current(self, run, parent_signal.as_ref())?;
+                    role_request(&run.model, &active_original, run.mode, role, &[])
+                        .map_err(|error| error.message)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut in_flight = stream::iter(
+                TextMasRole::ALL.into_iter().enumerate().zip(contexts).map(|((index, role), context)| {
+                    let parent_signal = parent_signal.clone();
+                    async move {
+                        let draft = self.run_textmas_role(run, role, None, context, parent_signal.as_ref()).await?;
+                        Ok::<(usize, String), String>((index, draft))
+                    }
+                }),
+            )
+            .buffer_unordered(hierarchical_limit);
+            let mut ordered = (0..TextMasRole::ALL.len()).map(|_| None).collect::<Vec<Option<String>>>();
+            while let Some((index, draft)) = in_flight.try_next().await? {
+                ordered[index] = Some(draft);
+            }
+            // No partial batch can reach the parent. A role error above drops all
+            // remaining local futures and their existing cancellation/usage guards.
+            for (role, draft) in TextMasRole::ALL.into_iter().zip(ordered) {
+                drafts.push((role, draft.ok_or_else(|| "OCC3.1 hierarchical preparation ended without an ordered role result".to_string())?));
+            }
+        } else {
+            // Sequential mode and the safe hierarchical default preserve the original
+            // awaited role path exactly, including serial independent role contexts.
+            for role in TextMasRole::ALL {
+                ensure_textmas_current(self, run, parent_signal.as_ref())?;
+                let context = match role_request(
+                    &run.model,
+                    &active_original,
+                    run.mode,
+                    role,
+                    &drafts,
+                ) {
+                    Ok(context) => context,
+                    Err(error) if error.reducible && preparation_note.is_none() => {
+                        let reduction = self
+                            .reduce_textmas_context(run, &original, parent_signal.as_ref())
+                            .await?;
+                        active_original = reduction.original;
+                        preparation_note = Some(reduction.note);
+                        role_request(&run.model, &active_original, run.mode, role, &drafts)
+                            .map_err(|error| error.message)?
+                    }
+                    Err(error) => return Err(error.message),
+                };
+                let draft = self
+                    .run_textmas_role(run, role, None, context, parent_signal.as_ref())
+                    .await?;
+                drafts.push((role, draft));
+            }
         }
         let advisory = contract::advisory_message_with_note(&drafts, preparation_note.as_deref());
         Ok((
@@ -378,51 +430,53 @@ impl AgentSession {
             || ensure_textmas_current(self, run, parent_signal),
         )?;
         let map_count = plan.map_contexts.len();
-        let map_calls = stream::iter(plan.map_contexts.iter().cloned().enumerate().map(
-            |(index, context)| async move {
-                let call_index = u32::try_from(index)
-                    .map_err(|_| "OCC3.1 mapper call index overflow".to_string())?;
-                self.run_textmas_role(
-                    run,
-                    TextMasRole::Mapper,
-                    Some(call_index),
-                    context,
-                    parent_signal,
-                )
-                .await
-            },
-        ))
-        .buffered(3)
-        .try_collect::<Vec<_>>()
-        .await?;
-        let mut briefs = map_calls;
-        let mut reduce_count = 0usize;
-        while briefs.len() > 1 {
-            ensure_textmas_current(self, run, parent_signal)?;
-            let contexts = plan.reduction_contexts_with_control(
-                &run.model,
-                &briefs,
-                || ensure_textmas_current(self, run, parent_signal),
-            )?;
-            let first_index = reduce_count;
-            let context_count = contexts.len();
-            briefs = stream::iter(contexts.into_iter().enumerate().map(
-                |(offset, context)| async move {
-                    let call_index = u32::try_from(first_index + offset)
-                        .map_err(|_| "OCC3.1 reducer call index overflow".to_string())?;
+        let map_calls = collect_indexed_textmas_calls(stream::iter(
+            plan.map_contexts
+                .iter()
+                .cloned()
+                .enumerate()
+                .map(|(index, context)| async move {
+                    let call_index = u32::try_from(index)
+                        .map_err(|_| "OCC3.1 mapper call index overflow".to_string())?;
                     self.run_textmas_role(
                         run,
-                        TextMasRole::Reducer,
+                        TextMasRole::Mapper,
                         Some(call_index),
                         context,
                         parent_signal,
                     )
                     .await
-                },
-            ))
-            .buffered(3)
-            .try_collect::<Vec<_>>()
-            .await?;
+                    .map(|text| (index, text))
+                }),
+        ))
+        .await?;
+        let mut briefs = map_calls;
+        let mut reduce_count = 0usize;
+        while briefs.len() > 1 {
+            ensure_textmas_current(self, run, parent_signal)?;
+            let contexts = plan.reduction_contexts_with_control(&run.model, &briefs, || {
+                ensure_textmas_current(self, run, parent_signal)
+            })?;
+            let first_index = reduce_count;
+            let context_count = contexts.len();
+            briefs =
+                collect_indexed_textmas_calls(stream::iter(contexts.into_iter().enumerate().map(
+                    |(offset, context)| async move {
+                        let source_index = first_index + offset;
+                        let call_index = u32::try_from(source_index)
+                            .map_err(|_| "OCC3.1 reducer call index overflow".to_string())?;
+                        self.run_textmas_role(
+                            run,
+                            TextMasRole::Reducer,
+                            Some(call_index),
+                            context,
+                            parent_signal,
+                        )
+                        .await
+                        .map(|text| (source_index, text))
+                    },
+                )))
+                .await?;
             reduce_count = first_index + context_count;
         }
         let brief = briefs
@@ -452,6 +506,26 @@ impl AgentSession {
         call_index: Option<u32>,
         context: Context,
         parent_signal: Option<&CancellationToken>,
+    ) -> Result<String, String> {
+        self.run_textmas_role_with_timeout(
+            run,
+            role,
+            call_index,
+            context,
+            parent_signal,
+            std::time::Duration::from_secs(contract::STAGE_TIMEOUT_SECONDS),
+        )
+        .await
+    }
+
+    async fn run_textmas_role_with_timeout(
+        self: &Arc<Self>,
+        run: &TextMasRun,
+        role: TextMasRole,
+        call_index: Option<u32>,
+        context: Context,
+        parent_signal: Option<&CancellationToken>,
+        stage_timeout: std::time::Duration,
     ) -> Result<String, String> {
         ensure_textmas_current(self, run, parent_signal)?;
         let output_budget = contract::output_budget(&run.model, &context)?;
@@ -504,36 +578,21 @@ impl AgentSession {
         // No on_payload extension, latent lease, source capture, or tools are installed on advisory requests.
         let stream_fn =
             crate::core::semantic_edges::unwrap_semantic_edge_stream_fn(&self.agent.stream_fn());
-        let result = tokio::select! {
-            biased;
-            _ = run.signal.cancelled() => Err((TextMasCallStatus::Cancelled, "preparation was cancelled".to_string())),
-            _ = cancelled(parent_signal) => Err((TextMasCallStatus::Cancelled, "preparation was cancelled".to_string())),
-            result = tokio::time::timeout(std::time::Duration::from_secs(contract::STAGE_TIMEOUT_SECONDS), async {
-                if let Some(get_key) = options.get_api_key { request.stream.api_key = get_key(run.model.provider.clone()).await; }
-                let stream = receipt.scope(async { stream_fn(run.model.clone(), context, request).await }).await;
-                while let Some(event) = stream.next().await {
-                    if let Some(partial) = event.partial() {
-                        guard.usage = Some(partial.usage.clone());
-                        if serde_json::to_vec(partial).map_or(true, |bytes| bytes.len() > contract::MAX_STAGE_RESPONSE_BYTES) {
-                            return Err((TextMasCallStatus::Failed, "preparation response exceeded its bound".into()));
-                        }
-                        if partial.content.iter().any(|block| matches!(block, pi_ai::types::ContentBlock::ToolCall(_))) {
-                            return Err((TextMasCallStatus::Failed, "preparation returned a tool call; no tool was executed".into()));
-                        }
-                    }
-                    let terminal = match event { AssistantMessageEvent::Done { message, .. } => Some(message), AssistantMessageEvent::Error { error, .. } => Some(error), _ => None };
-                    if let Some(message) = terminal {
-                        guard.usage = Some(message.usage.clone());
-                        return contract::public_draft(&message).map_err(|error| (TextMasCallStatus::Failed, error));
-                    }
-                }
-                // Some injected/native adapters end directly with a terminal result.
-                if let Some(message) = stream.result_if_ready() {
-                    guard.usage = Some(message.usage.clone());
-                    contract::public_draft(&message).map_err(|error| (TextMasCallStatus::Failed, error))
-                } else { Err((TextMasCallStatus::Failed, "provider ended without a result".into())) }
-            }) => result.unwrap_or_else(|_| Err((TextMasCallStatus::TimedOut, "preparation timed out".into()))),
-        };
+        let request_receipt = receipt.clone();
+        let model = run.model.clone();
+        let result = run_textmas_provider_request(
+            &run.signal,
+            parent_signal,
+            stage_timeout,
+            &mut guard.usage,
+            async move {
+                if let Some(get_key) = options.get_api_key { request.stream.api_key = get_key(model.provider.clone()).await; }
+                let stream = request_receipt.scope(async { stream_fn(model, context, request).await }).await;
+                let result_stream = stream.clone();
+                (Box::pin(stream.into_stream()), move || result_stream.result_if_ready())
+            },
+        )
+        .await;
         let status = match &result {
             Ok(_) => TextMasCallStatus::Completed,
             Err((status, _)) => *status,
@@ -563,6 +622,74 @@ impl AgentSession {
             .map_err(|_| "OCC3.1 usage could not be saved; no final execution or automatic replay".to_string())?;
         *self.own_usage_memo.lock().unwrap() = None;
         Ok(())
+    }
+}
+
+type TextMasProviderResult = Result<String, (TextMasCallStatus, String)>;
+
+async fn run_textmas_provider_request<S, R, F>(
+    run_signal: &CancellationToken,
+    parent_signal: Option<&CancellationToken>,
+    stage_timeout: std::time::Duration,
+    usage: &mut Option<Usage>,
+    open_stream: F,
+) -> TextMasProviderResult
+where
+    S: futures::Stream<Item = AssistantMessageEvent> + Unpin,
+    R: Fn() -> Option<AssistantMessage>,
+    F: std::future::Future<Output = (S, R)>,
+{
+    let deadline = tokio::time::Instant::now() + stage_timeout;
+    if tokio::time::Instant::now() >= deadline {
+        return Err((TextMasCallStatus::TimedOut, "preparation timed out".into()));
+    }
+    let (mut stream, result_if_ready) = tokio::select! {
+        biased;
+        _ = run_signal.cancelled() => return Err((TextMasCallStatus::Cancelled, "preparation was cancelled".to_string())),
+        _ = cancelled(parent_signal) => return Err((TextMasCallStatus::Cancelled, "preparation was cancelled".to_string())),
+        result = tokio::time::timeout_at(deadline, open_stream) => {
+            result.map_err(|_| (TextMasCallStatus::TimedOut, "preparation timed out".to_string()))?
+        },
+    };
+    loop {
+        // Check before every select: a continuously ready stream must not starve either signal.
+        if run_signal.is_cancelled() || parent_signal.is_some_and(CancellationToken::is_cancelled) {
+            return Err((TextMasCallStatus::Cancelled, "preparation was cancelled".to_string()));
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err((TextMasCallStatus::TimedOut, "preparation timed out".into()));
+        }
+        let next = tokio::select! {
+            biased;
+            _ = run_signal.cancelled() => return Err((TextMasCallStatus::Cancelled, "preparation was cancelled".to_string())),
+            _ = cancelled(parent_signal) => return Err((TextMasCallStatus::Cancelled, "preparation was cancelled".to_string())),
+            result = tokio::time::timeout_at(deadline, stream.next()) => match result {
+                Ok(next) => next,
+                Err(_) => return Err((TextMasCallStatus::TimedOut, "preparation timed out".into())),
+            },
+        };
+        let Some(event) = next else { break };
+        if let Some(partial) = event.partial() {
+            *usage = Some(partial.usage.clone());
+            if serde_json::to_vec(partial).map_or(true, |bytes| bytes.len() > contract::MAX_STAGE_RESPONSE_BYTES) {
+                return Err((TextMasCallStatus::Failed, "preparation response exceeded its bound".into()));
+            }
+            if partial.content.iter().any(|block| matches!(block, pi_ai::types::ContentBlock::ToolCall(_))) {
+                return Err((TextMasCallStatus::Failed, "preparation returned a tool call; no tool was executed".into()));
+            }
+        }
+        let terminal = match event { AssistantMessageEvent::Done { message, .. } => Some(message), AssistantMessageEvent::Error { error, .. } => Some(error), _ => None };
+        if let Some(message) = terminal {
+            *usage = Some(message.usage.clone());
+            return contract::public_draft(&message).map_err(|error| (TextMasCallStatus::Failed, error));
+        }
+    }
+    // Some injected/native adapters end directly with a terminal result.
+    if let Some(message) = result_if_ready() {
+        *usage = Some(message.usage.clone());
+        contract::public_draft(&message).map_err(|error| (TextMasCallStatus::Failed, error))
+    } else {
+        Err((TextMasCallStatus::Failed, "provider ended without a result".into()))
     }
 }
 
@@ -620,6 +747,21 @@ fn ensure_textmas_current(
         Ok(())
     }
 }
+
+/// Keep at most three role calls in flight and restore source indices before a next level.
+/// Return the first observed error immediately, sorting only after complete success.
+async fn collect_indexed_textmas_calls<S, F>(calls: S) -> Result<Vec<String>, String>
+where
+    S: futures::Stream<Item = F>,
+    F: std::future::Future<Output = Result<(usize, String), String>>,
+{
+    let mut indexed = calls.buffer_unordered(3).try_collect::<Vec<_>>().await?;
+    indexed.sort_by_key(|(index, _)| *index);
+    Ok(indexed.into_iter().map(|(_, text)| text).collect())
+}
+#[cfg(test)]
+#[path = "textmas_indexed_tests.rs"]
+mod indexed_tests;
 
 async fn resize_textmas_images(
     session: &Arc<AgentSession>,
@@ -735,3 +877,7 @@ async fn resize_textmas_images(
 async fn cancelled(signal: Option<&CancellationToken>) {
     match signal { Some(signal) => signal.cancelled().await, None => std::future::pending::<()>().await }
 }
+
+#[cfg(test)]
+#[path = "textmas_deadline_tests.rs"]
+mod deadline_tests;

@@ -1,0 +1,1 @@
+- Fixed busy-session daemon attaches starving behind supervisor output traffic or racing snapshot frames ahead of their response, while bounding queued transcript chunks and skipping passive transcript discovery for already-resident children.

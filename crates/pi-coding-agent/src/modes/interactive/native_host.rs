@@ -45,6 +45,10 @@ use std::time::{Duration, Instant};
 const MAX_HOST_EVENTS_PER_FRAME: usize = 64;
 const MAX_HOST_EVENT_TIME_PER_FRAME: Duration = Duration::from_millis(8);
 
+fn fallback_repaint_due(tick_index: u64, animation_live: bool, idle_paint_enabled: bool) -> bool {
+    idle_paint_enabled || animation_live || tick_index % 10 == 0
+}
+
 struct HostEventBudget {
     started: Instant,
     remaining: usize,
@@ -301,8 +305,11 @@ impl TuiComponent for ToolRow {
     fn render(&mut self, width: f64) -> Vec<String> {
         self.0.borrow_mut().render_lines(width)
     }
+    fn render_revision(&self) -> Option<u64> {
+        self.0.borrow().render_revision()
+    }
     fn invalidate(&mut self) {
-        self.0.borrow_mut().content_panel().invalidate();
+        self.0.borrow_mut().invalidate();
     }
 }
 impl Transcript {
@@ -3322,17 +3329,18 @@ async fn run_terminal(
             // A12: the fallback repaint used to fire unconditionally, which
             // kept every idle session painting 4 frames/s - in multi-MB
             // transcripts that alone cost ~15% of a core (monitor 01a0d88d).
-            // With `OPTIMUS_UI_IDLE_TICK_PAINT=0` it fires only while an
-            // animation is live (streaming/compaction/bash, covered anyway by
-            // the 80ms loader tick) or every 10th tick as a safety net for
-            // custom components without a dirty contract. Real events keep
-            // repainting immediately. Defaults to the old unconditional paint.
+            // It now fires only while an animation is live
+            // (streaming/compaction/bash, covered anyway by the 80ms loader
+            // tick) or every 10th tick as a safety net for custom components
+            // without a dirty contract. Real events keep repainting
+            // immediately. `OPTIMUS_UI_IDLE_TICK_PAINT=1` restores the legacy
+            // unconditional paint.
             fallback_tick_index = fallback_tick_index.wrapping_add(1);
             let animation_live = {
                 let mode = mode.borrow();
                 mode.is_agent_streaming() || mode.is_agent_compacting() || mode.is_bash_running()
             };
-            if idle_fallback_paint_enabled() || animation_live || fallback_tick_index % 10 == 0 {
+            if fallback_repaint_due(fallback_tick_index, animation_live, idle_fallback_paint_enabled()) {
                 ui.borrow_mut().request_render();
             } else {
                 ui_metrics.fallback_tick_skipped();
@@ -6210,6 +6218,51 @@ fn apply_event_legacy_for_speed(
             vec![format!("CUSTOM_REV_{}", self.revision.get())]
         }
         fn invalidate(&mut self) {}
+    }
+
+    #[test]
+    fn fallback_repaint_idle_skips_nine_ticks_and_paints_the_tenth() {
+        let due: Vec<bool> = (1..=10)
+            .map(|tick| fallback_repaint_due(tick, false, false))
+            .collect();
+        assert_eq!(due, vec![false, false, false, false, false, false, false, false, false, true]);
+    }
+
+    #[test]
+    fn fallback_repaint_live_animation_paints_every_tick() {
+        for tick in 1..=10 {
+            assert!(fallback_repaint_due(tick, true, false));
+        }
+    }
+
+    #[test]
+    fn fallback_repaint_explicit_opt_in_preserves_legacy() {
+        for tick in 1..=10 {
+            assert!(fallback_repaint_due(tick, false, true));
+        }
+    }
+
+    #[test]
+    fn fallback_repaint_leaves_explicit_render_requests_immediate() {
+        let h = ui_tests::FrameHarness::new("idle-fallback-explicit-render");
+        h.mode.borrow_mut().set_working_visible(false);
+        let revision = Rc::new(Cell::new(0));
+        let renders = Rc::new(Cell::new(0));
+        let surfaces = Rc::new(RefCell::new(native_extensions::Surfaces::default()));
+        surfaces.borrow_mut().header = Some(Box::new(SpeedSurface {
+            revision: revision.clone(),
+            renders: renders.clone(),
+        }));
+        h.transcript.borrow_mut().extension_surfaces = Some(surfaces);
+        assert!(h.paint().join("\n").contains("CUSTOM_REV_0"));
+        let before = renders.get();
+
+        revision.set(1);
+        h.ui.borrow_mut().request_render();
+        h.ui.borrow_mut().run_pending_render(now_ms());
+
+        assert!(renders.get() > before);
+        assert!(h.paint().join("\n").contains("CUSTOM_REV_1"));
     }
 
     #[test]

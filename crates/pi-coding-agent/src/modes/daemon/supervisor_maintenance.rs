@@ -469,22 +469,40 @@ impl Supervisor {
         snapshot.insert("messages".into(), json!([]));
         let metadata = Value::Object(snapshot.clone());
         data.insert("snapshotStream".into(), json!({"id": snapshot_id}));
-        let send = |mut bytes: Vec<u8>| async move {
+        let send = |mut bytes: Vec<u8>, dequeue_marker: Option<Vec<u8>>| async move {
             if bytes.last() != Some(&b'\n') { bytes.push(b'\n'); }
-            // Drain before each chunk; otherwise a 1024-entry event queue retains
-            // hundreds of MiB of encoded transcript despite the disk cache.
+            // One free slot is enough for control frames. Snapshot chunks also wait
+            // for their own dequeue marker, bounding queued transcript memory while
+            // unrelated events continue through the same FIFO.
             tokio::time::timeout(Duration::from_secs(30), async {
-                while public.output.capacity() < public.output.max_capacity() {
-                    tokio::select! { _ = public.stopped.cancelled() => return Err("Snapshot client disconnected".to_string()), _ = tokio::time::sleep(Duration::from_millis(1)) => {} }
+                tokio::select! { _ = public.stopped.cancelled() => return Err("Snapshot client disconnected".to_string()), sent = public.output.send(bytes) => sent.map_err(|_| "Snapshot client disconnected".to_string())? }
+                if let Some(marker) = dequeue_marker {
+                    let mut dequeued = public.snapshot_dequeue.subscribe();
+                    tokio::select! { _ = public.stopped.cancelled() => return Err("Snapshot client disconnected".to_string()), sent = public.output.send(marker.clone()) => sent.map_err(|_| "Snapshot client disconnected".to_string())? }
+                    loop {
+                        tokio::select! {
+                            _ = public.stopped.cancelled() => return Err("Snapshot client disconnected".to_string()),
+                            received = dequeued.recv() => match received {
+                                Ok(received) if received == marker => break,
+                                Ok(_) => {}
+                                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => return Err("Snapshot client output acknowledgements lagged".to_string()),
+                                Err(tokio::sync::broadcast::error::RecvError::Closed) => return Err("Snapshot client disconnected".to_string()),
+                            }
+                        }
+                    }
                 }
-                tokio::select! { _ = public.stopped.cancelled() => Err("Snapshot client disconnected".to_string()), sent = public.output.send(bytes) => sent.map_err(|_| "Snapshot client disconnected".to_string()) }
+                Ok(())
             }).await.map_err(|_| "Snapshot client did not drain within 30 seconds".to_string())?
         };
         let result: Result<(), String> = async {
-        send(serde_json::to_vec(response).map_err(|error| error.to_string())?).await?;
-        send(serde_json::to_vec(&json!({"type":"session_snapshot_begin","activeSessionId":active,"snapshotId":snapshot_id,"snapshot":metadata,"messageCount":count,"targetChunkBytes":SNAPSHOT_TARGET_CHUNK_BYTES,"purpose":"attach"})).unwrap()).await?;
-        for index in 0..cache.chunk_count() { send(cache.read_chunk(index)?).await?; }
-        send(serde_json::to_vec(&json!({"type":"session_snapshot_end","activeSessionId":active,"snapshotId":snapshot_id,"chunkCount":cache.chunk_count(),"lastEventSequence":metadata["lastEventSequence"],"lastEventCursor":metadata["lastEventCursor"]})).unwrap()).await?;
+        send(serde_json::to_vec(response).map_err(|error| error.to_string())?, None).await?;
+        send(serde_json::to_vec(&json!({"type":"session_snapshot_begin","activeSessionId":active,"snapshotId":snapshot_id,"snapshot":metadata,"messageCount":count,"targetChunkBytes":SNAPSHOT_TARGET_CHUNK_BYTES,"purpose":"attach"})).unwrap(), None).await?;
+        for index in 0..cache.chunk_count() {
+            let mut marker = SNAPSHOT_DEQUEUE_MARKER_PREFIX.to_vec();
+            marker.extend_from_slice(format!("{snapshot_id}:{index}").as_bytes());
+            send(cache.read_chunk(index)?, Some(marker)).await?;
+        }
+        send(serde_json::to_vec(&json!({"type":"session_snapshot_end","activeSessionId":active,"snapshotId":snapshot_id,"chunkCount":cache.chunk_count(),"lastEventSequence":metadata["lastEventSequence"],"lastEventCursor":metadata["lastEventCursor"]})).unwrap(), None).await?;
         Ok(())
         }.await;
         if let Err(error) = result {

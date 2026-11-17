@@ -59,4 +59,5 @@ name = "compaction-harness"
 path = "src/bin/compaction_harness.rs"
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 rusqlite = { version = "=0.40.2", features = ["bundled"] }

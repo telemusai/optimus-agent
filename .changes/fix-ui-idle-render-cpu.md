@@ -1,0 +1,2 @@
+- Fixed idle terminal sessions repainting four times per second by default. Live activity, event-driven updates, and the periodic safety-net repaint still render; `OPTIMUS_UI_IDLE_TICK_PAINT=1` restores the previous fallback behavior.
+- Reduced repaint work during active sessions by reusing rendered output for settled text-only tool and IPython rows. Running tools, partial results, images, and display changes still re-render immediately.
