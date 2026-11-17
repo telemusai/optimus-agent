@@ -237,6 +237,9 @@ pub struct ToolExecutionComponent {
     pending_sent_agent_messages: Vec<KernelSentAgentMessage>,
     pub result: Option<ToolExecutionResult>,
     hide_component: bool,
+    /// A11: bumped whenever `update_display` rebuilds output or an external
+    /// invalidation requires a fresh render. Only settled rows expose it.
+    revision: u64,
 }
 
 impl ToolExecutionComponent {
@@ -277,6 +280,7 @@ impl ToolExecutionComponent {
             pending_sent_agent_messages: Vec::new(),
             result: None,
             hide_component: false,
+            revision: 0,
         };
         component.update_display();
         component
@@ -513,6 +517,45 @@ impl ToolExecutionComponent {
         true
     }
 
+    fn has_image_content(&self) -> bool {
+        !self.image_components.is_empty()
+            || self.result.as_ref().is_some_and(|result| {
+                result.content.iter().any(|block| {
+                    block.r#type == "image" && block.data.is_some() && block.mime_type.is_some()
+                })
+            })
+    }
+
+    /// A11: only a final, non-animated, text-only result has a stable render
+    /// contract. Image rendering also depends on ambient protocol, cell geometry
+    /// and viewport height, none of which belongs in this row's revision.
+    /// Queued, running and partial rows must still refresh every frame.
+    pub fn render_revision(&self) -> Option<u64> {
+        (self.result.is_some()
+            && !self.is_partial
+            && !self.is_status_animating()
+            && !self.has_image_content())
+            .then_some(self.revision)
+    }
+
+    /// Invalidate both supported shells and any image/cache state they own.
+    pub fn invalidate(&mut self) {
+        self.content_panel.invalidate();
+        for child in &mut self.self_render_children {
+            child.invalidate();
+        }
+        if let Some(component) = &mut self.call_renderer_component {
+            component.invalidate();
+        }
+        if let Some(component) = &mut self.result_renderer_component {
+            component.invalidate();
+        }
+        for image in &mut self.image_components {
+            image.invalidate();
+        }
+        self.revision = self.revision.wrapping_add(1);
+    }
+
     /// Port of `panelHeader`.
     pub fn panel_header(&self) -> String {
         let label = self
@@ -617,6 +660,7 @@ impl ToolExecutionComponent {
 
     /// Port of `updateDisplay`.
     pub fn update_display(&mut self) {
+        self.revision = self.revision.wrapping_add(1);
         let mut has_content = false;
         self.hide_component = false;
         if self.has_renderer_definition() && self.get_render_shell() == "self" {
@@ -933,6 +977,77 @@ mod tests {
         component.set_show_images(false);
         assert!(component.render_lines(60.0).iter().all(|line| !is_image_line(line)));
         reset_capabilities_cache();
+    }
+
+    fn assert_revision_bumps(
+        component: &mut ToolExecutionComponent,
+        mutation: impl FnOnce(&mut ToolExecutionComponent),
+    ) {
+        let before = component.revision;
+        mutation(component);
+        assert!(component.revision > before);
+    }
+
+    #[test]
+    fn tool_render_cache_revision_covers_display_mutations_and_settling() {
+        let mut component = ToolExecutionComponent::new(
+            "ipython",
+            "revision",
+            serde_json::json!({"code": "print('old')"}),
+            options(),
+            None,
+            "/cwd",
+        );
+        assert_eq!(component.render_revision(), None, "queued rows are not cacheable");
+        assert_revision_bumps(&mut component, |component| component.mark_execution_started());
+        assert_eq!(component.render_revision(), None, "running rows are not cacheable");
+        assert_revision_bumps(&mut component, |component| component.set_args_complete());
+        assert_revision_bumps(&mut component, |component| {
+            component.update_result(
+                ToolExecutionResult {
+                    content: vec![ResultContentBlock::from_text("partial")],
+                    is_error: false,
+                    details: None,
+                },
+                true,
+            );
+        });
+        assert_eq!(component.render_revision(), None, "partial rows are not cacheable");
+        assert_revision_bumps(&mut component, |component| {
+            component.update_result(
+                ToolExecutionResult {
+                    content: vec![ResultContentBlock::from_text("final")],
+                    is_error: false,
+                    details: None,
+                },
+                false,
+            );
+        });
+        assert!(component.render_revision().is_some(), "final rows are cacheable");
+
+        for mutation in [
+            (|component: &mut ToolExecutionComponent| component.update_args(serde_json::json!({"code": "print('new')"}))) as fn(&mut ToolExecutionComponent),
+            |component| component.set_expanded(true),
+            |component| component.set_agent_messages_expanded(true),
+            |component| component.set_edit_diffs_expanded(true),
+            |component| component.set_show_expand_hint(false),
+            |component| component.set_show_images(false),
+            |component| component.set_include_image_dimensions(false),
+        ] {
+            assert_revision_bumps(&mut component, mutation);
+            assert!(component.render_revision().is_some());
+        }
+        assert_revision_bumps(&mut component, |component| component.invalidate());
+        assert!(component.render_revision().is_some());
+
+        assert_revision_bumps(&mut component, |component| {
+            component.update_result(component.result.clone().unwrap(), true);
+        });
+        assert_eq!(component.render_revision(), None, "a later partial invalidates the settled cache");
+        assert_revision_bumps(&mut component, |component| {
+            component.update_result(component.result.clone().unwrap(), false);
+        });
+        assert!(component.render_revision().is_some());
     }
 
     fn options() -> ToolExecutionOptions {

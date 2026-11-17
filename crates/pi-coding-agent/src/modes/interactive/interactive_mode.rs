@@ -60,18 +60,20 @@ pub fn app_name() -> String {
     crate::utils::tools_manager::app_name()
 }
 
-/// A12: when true (default, the current behavior) the host's 250ms fallback
-/// tick always repaints. Setting `OPTIMUS_UI_IDLE_TICK_PAINT=0` gates that
-/// repaint: it fires only while an animation is live (streaming, compaction,
-/// bash) or on every 10th tick as a safety net for custom components without
-/// a dirty contract. Read once per process.
+fn idle_fallback_paint_setting(value: Option<String>) -> bool {
+    value
+        .map(|value| !matches!(value.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off" | "no"))
+        .unwrap_or(false)
+}
+
+/// The host's 250ms fallback repaints only while an animation is live
+/// (streaming, compaction, bash) or on every 10th tick as a safety net for
+/// custom components without a dirty contract. Setting
+/// `OPTIMUS_UI_IDLE_TICK_PAINT=1` restores the legacy paint-every-tick behavior.
+/// Read once per process.
 pub fn idle_fallback_paint_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("OPTIMUS_UI_IDLE_TICK_PAINT")
-            .map(|value| !matches!(value.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off" | "no"))
-            .unwrap_or(true)
-    })
+    *ENABLED.get_or_init(|| idle_fallback_paint_setting(std::env::var("OPTIMUS_UI_IDLE_TICK_PAINT").ok()))
 }
 
 const HEARTBEAT_LEGACY_PROMPT_MIN_TOLERANCE_MS: f64 = 15_000.0;
@@ -4465,6 +4467,16 @@ mod tests {
             terminal_title_text("Optimus - Assistant", Some("resume"), "profile"),
             "Optimus - Assistant - resume - profile"
         );
+    }
+
+    #[test]
+    fn fallback_repaint_defaults_off_and_honours_explicit_overrides() {
+        assert!(!idle_fallback_paint_setting(None));
+        assert!(idle_fallback_paint_setting(Some("1".into())));
+        assert!(idle_fallback_paint_setting(Some("true".into())));
+        for value in ["0", "false", "off", "no"] {
+            assert!(!idle_fallback_paint_setting(Some(value.into())));
+        }
     }
 
     fn user_message(text: &str) -> AgentMessage {
