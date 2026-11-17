@@ -34,10 +34,12 @@ fn codex_sol_luna_catalog_preserves_reviewed_metadata() {
 }
 
 #[test]
-fn codex_sol_luna_requests_keep_ids_reasoning_and_existing_auth_shape() {
-    for id in ["gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna"] {
+fn codex_subscription_requests_keep_ids_reasoning_and_existing_auth_shape() {
+    for id in ["gpt-6.2-astra", "gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna"] {
         let model = get_model("openai-codex", id).unwrap();
-        for effort in ["low", "medium", "high", "xhigh", "max"] {
+        let efforts = ["low", "medium", "high", "xhigh", "max"];
+        assert_eq!(get_supported_thinking_levels(model), efforts);
+        for effort in efforts {
             let options = OpenAICodexResponsesOptions {
                 reasoning_effort: Some(effort.to_string()),
                 ..Default::default()

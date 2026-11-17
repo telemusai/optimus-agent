@@ -4,6 +4,20 @@
 catalog. It does not change sign-in, select a model automatically, or grant an
 account access. Explicit user model definitions still override built-in entries.
 
+## GPT-6.2 Astra on Codex
+
+Use your Codex sign-in and select High reasoning with:
+
+```sh
+optimus-agent --provider openai-codex --model gpt-6.2-astra --thinking high
+```
+
+The account catalog returned this model for client version 0.169.0 on
+2026-11-18. It reported a default context window of 272,000 tokens and
+text/image input. Optimus exposes the supported levels from `low` through
+`max`. The output limit and standard cost estimates come from the
+[OpenAI model card](https://developers.openai.com/api/docs/models/gpt-6.2-astra).
+
 ## GPT-6.1 Sol
 
 Selectors: `openai-codex/gpt-6.1-sol` with your existing Codex sign-in, or
@@ -44,7 +58,7 @@ Reviewed sources:
   cache read $0.01/cache write $0.125. These estimates do not measure subscription
   credits, account charges, or long-context pricing tiers.
 
-The discovery client version is 0.159.1, verified against the account catalog
+Discovery client version 0.159.1 was verified against the account catalog
 on 2026-09-30 to include GPT-6.1 Sol as well as Sol and Luna. The existing
 account-scoped Codex catalog filter is retained. Missing IDs or failed catalog
 reads do not trigger a substitute model. Static registration and offline fixtures
