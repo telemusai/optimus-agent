@@ -1157,6 +1157,12 @@ impl TreeList {
     /// Port of `handleInput(keyData)`.
     pub fn handle_input(&mut self, key_data: &str) {
         let kb = get_keybindings();
+        if self.filtered_nodes.is_empty()
+            && (kb.matches(key_data, "tui.select.up")
+                || kb.matches(key_data, "tui.select.down"))
+        {
+            return;
+        }
         if kb.matches(key_data, "tui.select.up") {
             self.selected_index = if self.selected_index == 0 {
                 self.filtered_nodes.len() - 1
@@ -2155,6 +2161,47 @@ fn get_searchable_text(node: &AgentConnectionSessionTreeNode) -> String {
 #[cfg(test)]
 mod linear_storage_tests {
     use super::*;
+
+    fn custom_node(id: &str) -> AgentConnectionSessionTreeNode {
+        AgentConnectionSessionTreeNode {
+            entry: AgentConnectionSessionEntry::CustomMessage {
+                id: id.to_string(),
+                parent_id: None,
+                timestamp: "2026-09-18T00:00:00Z".into(),
+                custom_type: "test".into(),
+                content: serde_json::Value::String("payload".into()),
+                details: None,
+                display: true,
+            },
+            label: None,
+            label_timestamp: None,
+            children: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn empty_tree_up_and_down_keep_zero_selection_and_render_no_entries() {
+        crate::modes::interactive::theme::theme::init_theme(Some("prime"), false);
+        let mut list = TreeList::new(&[], None, 5, None, None);
+        for key in ["\u{1b}[A", "\u{1b}[B"] {
+            list.handle_input(key);
+            assert_eq!(list.selected_index(), 0);
+            assert!(list.render(40.0).iter().any(|line| line.contains("No entries found")));
+        }
+    }
+
+    #[test]
+    fn search_empty_tree_up_and_down_keep_zero_selection_and_render_no_entries() {
+        crate::modes::interactive::theme::theme::init_theme(Some("prime"), false);
+        let mut list = TreeList::new(&[custom_node("node")], None, 5, None, None);
+        list.handle_input("no-match");
+        assert!(list.filtered_nodes.is_empty());
+        for key in ["\u{1b}[A", "\u{1b}[B"] {
+            list.handle_input(key);
+            assert_eq!(list.selected_index(), 0);
+            assert!(list.render(40.0).iter().any(|line| line.contains("No entries found")));
+        }
+    }
 
     #[test]
     fn long_chain_flat_rows_remain_shallow_through_label_fold_and_search() {

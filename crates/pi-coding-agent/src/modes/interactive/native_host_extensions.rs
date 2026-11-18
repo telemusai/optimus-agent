@@ -1,13 +1,12 @@
 //! UI state owned by the terminal thread. Daemon notifications carry data;
 //! components and their lifetime stay here, as in the TypeScript interactive host.
+use super::native_commands::jev_menu::{JEV_COMPACT_STATUS_KEY, JEV_STATUS_KEY};
 use super::*;
 use crate::core::messages::{bash_output_to_text, BashExecutionMessage};
-use crate::core::tools::truncate::{truncate_tail, TruncationOptions};
 use crate::modes::interactive::components::bash_execution::{
     BashExecutionComponent, BashExecutionOptions,
 };
 use crate::modes::interactive::components::side_question::SideQuestionComponent;
-use super::native_commands::jev_menu::{JEV_COMPACT_STATUS_KEY, JEV_STATUS_KEY};
 
 /// One extension status entry.
 ///
@@ -90,7 +89,8 @@ impl Surfaces {
             self.statuses.insert(JEV_STATUS_KEY.to_string(), decision);
         }
         if let Some(compaction) = keep_compaction {
-            self.statuses.insert(JEV_COMPACT_STATUS_KEY.to_string(), compaction);
+            self.statuses
+                .insert(JEV_COMPACT_STATUS_KEY.to_string(), compaction);
         }
     }
 }
@@ -491,8 +491,7 @@ impl SidePane {
                 }
                 if let Some(component) = bash.component {
                     let mut component = component.borrow_mut();
-                    let mut truncation =
-                        truncate_tail(&component.get_output(), TruncationOptions::default());
+                    let mut truncation = component.output_truncation();
                     truncation.truncated |= truncated;
                     if let Some(error) = error_message {
                         component.set_failed(error);

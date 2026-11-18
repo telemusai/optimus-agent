@@ -863,6 +863,15 @@ impl Component for ResourceList {
     fn handle_input(&mut self, data: &str) {
         let kb = get_keybindings();
 
+        if self.filtered_items.is_empty()
+            && (kb.matches(data, "tui.select.up")
+                || kb.matches(data, "tui.select.down")
+                || kb.matches(data, "tui.select.pageUp")
+                || kb.matches(data, "tui.select.pageDown"))
+        {
+            return;
+        }
+
         if kb.matches(data, "tui.select.up") {
             self.selected_index = self.find_next_item(self.selected_index, -1);
             return;
@@ -888,7 +897,13 @@ impl Component for ResourceList {
             let mut target = (self.selected_index + self.max_visible)
                 .min(self.filtered_items.len().saturating_sub(1))
                 as i64;
-            while target >= 0 && !entry_is_item(&self.filtered_items[target as usize]) {
+            while target >= 0
+                && !self
+                    .filtered_items
+                    .get(target as usize)
+                    .map(entry_is_item)
+                    .unwrap_or(false)
+            {
                 target -= 1;
             }
             if target >= 0 {
@@ -1258,6 +1273,44 @@ mod tests {
         }
     }
 
+    fn empty_resource_list() -> ResourceList {
+        ResourceList::new(
+            Vec::new(),
+            SettingsManager::in_memory(Default::default()),
+            "/work".to_string(),
+            "/agent".to_string(),
+        )
+    }
+
+    #[test]
+    fn empty_resource_navigation_is_a_noop_and_still_renders() {
+        crate::modes::interactive::theme::theme::init_theme(Some("prime"), false);
+        let mut list = empty_resource_list();
+        for key in ["\u{1b}[A", "\u{1b}[B", "\u{1b}[5~", "\u{1b}[6~"] {
+            list.handle_input(key);
+            assert_eq!(list.selected_index, 0);
+            assert!(list.render(60.0).iter().any(|line| line.contains("No resources found")));
+        }
+    }
+
+    #[test]
+    fn filtered_empty_resource_navigation_is_a_noop_and_still_renders() {
+        crate::modes::interactive::theme::theme::init_theme(Some("prime"), false);
+        let groups = build_groups(&paths());
+        let mut list = ResourceList::new(
+            groups,
+            SettingsManager::in_memory(Default::default()),
+            "/work".to_string(),
+            "/agent".to_string(),
+        );
+        list.filter_items("nothing-matches-this");
+        for key in ["\u{1b}[A", "\u{1b}[B", "\u{1b}[5~", "\u{1b}[6~"] {
+            list.handle_input(key);
+            assert_eq!(list.selected_index, 0);
+            assert!(list.render(60.0).iter().any(|line| line.contains("No resources found")));
+        }
+    }
+
     #[test]
     fn cancellation_precedes_ctrl_c_exit_unless_rebound() {
         let previous = pi_tui::keybindings::get_keybindings();
@@ -1339,6 +1392,7 @@ mod tests {
 
     #[test]
     fn the_selector_forwards_focus_and_input_to_its_resource_list() {
+        crate::modes::interactive::theme::theme::init_theme(Some("prime"), false);
         let mut selector = ConfigSelectorComponent::new(
             &paths(),
             SettingsManager::in_memory(Default::default()),
@@ -1361,6 +1415,7 @@ mod tests {
 
     #[test]
     fn the_header_truncates_to_the_viewport() {
+        crate::modes::interactive::theme::theme::init_theme(Some("prime"), false);
         let mut header = ConfigSelectorHeader;
         let lines = header.render(10.0);
         assert_eq!(visible_width(&lines[0]), 10);
