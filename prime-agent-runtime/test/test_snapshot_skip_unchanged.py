@@ -267,6 +267,25 @@ class CasSkipUnchangedTest(SkipUnchangedTestCase):
         self.assertIn("error", second)
         self.assertEqual(Path(self.cas_root, "CURRENT.json").read_bytes(), pointer_before)
 
+    def test_same_size_blob_corruption_is_rewritten_and_restores(self) -> None:
+        first = self.cas_snapshot({"value": {"nested": [1, 2, 3]}})
+        self.assertNotIn("error", first)
+        generation = first["generation"]
+        entry = json.loads(Path(self.cas_root, "generations", f"{generation}.json").read_text())["entries"][0]
+        blob = Path(self.cas_root, "blobs", f"{entry['sha256']}.blob")
+        original = blob.read_bytes()
+        blob.write_bytes(bytes([original[0] ^ 0xFF]) + original[1:])
+        self.assertEqual(blob.stat().st_size, len(original))
+
+        second = self.cas_snapshot({"value": {"nested": [1, 2, 3]}})
+        self.assertNotIn("error", second)
+        self.assertNotIn("skipped_unchanged", second)
+        self.assertGreater(second["written_bytes"], 0)
+        self.assertEqual(blob.read_bytes(), original)
+        restored, result = self.restore()
+        self.assertNotIn("error", result)
+        self.assertEqual(restored, {"value": {"nested": [1, 2, 3]}})
+
     def test_prune_side_effect_still_runs_on_a_skipped_save(self) -> None:
         namespace: dict[str, object] = {"small": 1, "big": b"x" * 4096}
         first = self.cas_snapshot(namespace, max_variable_bytes=512, prune_oversized=True)

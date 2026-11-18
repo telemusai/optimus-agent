@@ -113,7 +113,7 @@ async fn core_supervisor_permanent_stop_failure_parks_and_survives_adoption() {
     WorkerRecoveryJournal::new(&journal).record(WorkerRecoveryRecordInput {
         active_session_id: "missing-child".into(), session_id: "missing-child".into(),
         session_file: None, busy: true, operation: "tool_call".into(),
-    });
+    }).unwrap();
     let before = std::fs::read(&journal).unwrap();
     let descriptor = worker.descriptor.lock().unwrap().clone();
     stop_finalizations().lock().unwrap().insert(descriptor.worker_id.clone());

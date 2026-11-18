@@ -452,46 +452,45 @@ impl DaemonWorkerClient {
         Ok(())
     }
 
-    pub async fn close(&self) {
-        self.close_now();
+    pub async fn close(self: &Arc<Self>) {
+        self.transition_closed();
+        self.abort_reader();
+        self.finish_close(DaemonClientError::Message("Daemon worker client closed".to_string())).await;
     }
 
-    /// Synchronous close: `fallbackToSupervisor()` calls `direct.close()` from a
-    /// sync context, so the socket teardown must not require an await.
-    pub fn close_now(&self) {
-        {
-            let mut pending = self.pending.try_lock();
-            if let Ok(pending) = pending.as_mut() {
-                let keys: Vec<String> = pending.keys().cloned().collect();
-                let entries: Vec<PendingWorkerRequest> = keys
-                    .into_iter()
-                    .filter_map(|key| pending.remove(&key))
-                    .collect();
-                for entry in entries {
-                    entry.settle(Err(DaemonClientError::Message(
-                        "Daemon worker client closed".to_string(),
-                    )));
-                }
-            }
+    /// Synchronous close performs the visible state transition immediately and
+    /// schedules the lock-owned teardown. Unlike `try_lock`, no cleanup phase is
+    /// skipped when a request or writer is busy.
+    pub fn close_now(self: &Arc<Self>) {
+        self.transition_closed();
+        self.abort_reader();
+        let this = Arc::clone(self);
+        let close = async move {
+            this.finish_close(DaemonClientError::Message("Daemon worker client closed".to_string())).await;
+        };
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(close);
+        } else {
+            futures::executor::block_on(close);
         }
-        if let Ok(mut waiters) = self.hello_waiters.try_lock() {
-            let entries: Vec<WorkerHelloWaiter> = std::mem::take(&mut *waiters);
-            for waiter in entries {
-                let _ = waiter.sender.send(Err(DaemonClientError::Message(
-                    "Daemon worker client closed".to_string(),
-                )));
-            }
-        }
-        if let Ok(mut writer) = self.writer.try_lock() {
-            *writer = None;
-        }
-        let task = self.reader_task.lock().expect("worker reader slot poisoned").take();
-        if let Some(task) = task {
-            task.abort();
-        }
-        self.connected.store(false, Ordering::SeqCst);
+    }
+
+    fn transition_closed(&self) -> bool {
+        let was_connected = self.connected.swap(false, Ordering::SeqCst);
         self.direct_peer.store(false, Ordering::SeqCst);
         *self.direct_closing_reason.lock().expect("closing reason poisoned") = None;
+        was_connected
+    }
+
+    fn abort_reader(&self) {
+        if let Some(task) = self.reader_task.lock().expect("worker reader slot poisoned").take() {
+            task.abort();
+        }
+    }
+
+    async fn finish_close(&self, error: DaemonClientError) {
+        *self.writer.lock().await = None;
+        self.reject_all(error).await;
     }
 
     async fn request_wire(&self, command: DaemonCommandBody, timeout_ms: u64) -> DaemonClientResult<DaemonResponse> {
@@ -718,13 +717,11 @@ impl DaemonWorkerClient {
     }
 
     async fn close_with_error(self: &Arc<Self>, error: DaemonClientError) {
-        if !self.connected.swap(false, Ordering::SeqCst) {
+        let was_connected = self.transition_closed();
+        self.finish_close(error.clone()).await;
+        if !was_connected {
             return;
         }
-        *self.writer.lock().await = None;
-        self.direct_peer.store(false, Ordering::SeqCst);
-        *self.direct_closing_reason.lock().expect("closing reason poisoned") = None;
-        self.reject_all(error.clone()).await;
         let listeners: Vec<DaemonWorkerCloseListener> = {
             let registry = self.close_listeners.lock().expect("close listeners poisoned");
             registry.values().cloned().collect()
@@ -780,6 +777,63 @@ impl WorkerReadHalf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn close_waiters(client: &DaemonWorkerClient) -> (
+        Arc<StdMutex<Option<DaemonClientResult<DaemonResponse>>>>,
+        oneshot::Receiver<DaemonClientResult<DaemonHello>>,
+    ) {
+        let result = Arc::new(StdMutex::new(None));
+        let wake = Arc::new(tokio::sync::Notify::new());
+        client.pending.try_lock().unwrap().insert(
+            "request".into(),
+            PendingWorkerRequest { result: Arc::clone(&result), wake },
+        );
+        let (sender, receiver) = oneshot::channel();
+        client.hello_waiters.try_lock().unwrap().push(WorkerHelloWaiter { sender });
+        (result, receiver)
+    }
+
+    #[tokio::test]
+    async fn async_close_waits_for_pending_and_hello_cleanup() {
+        let client = Arc::new(DaemonWorkerClient::new("unused"));
+        client.connected.store(true, Ordering::SeqCst);
+        let (result, receiver) = close_waiters(&client);
+        let pending = client.pending.lock().await;
+        let hello = client.hello_waiters.lock().await;
+        let closing = tokio::spawn({
+            let client = Arc::clone(&client);
+            async move { client.close().await }
+        });
+        tokio::task::yield_now().await;
+        assert!(!closing.is_finished());
+        drop(pending);
+        drop(hello);
+        tokio::time::timeout(Duration::from_secs(1), closing).await.expect("close must finish").unwrap();
+        assert!(result.lock().unwrap().take().unwrap().is_err());
+        assert!(receiver.await.unwrap().is_err());
+        assert!(client.pending.lock().await.is_empty());
+        assert!(client.hello_waiters.lock().await.is_empty());
+        assert!(client.writer.lock().await.is_none());
+        assert!(!client.is_connected());
+    }
+
+    #[tokio::test]
+    async fn synchronous_close_completes_deferred_pending_and_hello_cleanup() {
+        let client = Arc::new(DaemonWorkerClient::new("unused"));
+        client.connected.store(true, Ordering::SeqCst);
+        let (result, receiver) = close_waiters(&client);
+        let pending = client.pending.lock().await;
+        let hello = client.hello_waiters.lock().await;
+        client.close_now();
+        assert!(!client.is_connected());
+        drop(pending);
+        drop(hello);
+        tokio::time::timeout(Duration::from_secs(1), receiver).await.expect("deferred close must finish").unwrap().unwrap_err();
+        assert!(result.lock().unwrap().take().unwrap().is_err());
+        assert!(client.pending.lock().await.is_empty());
+        assert!(client.hello_waiters.lock().await.is_empty());
+        assert!(client.writer.lock().await.is_none());
+    }
 
     #[tokio::test]
     async fn a_response_before_waiting_keeps_its_notification() {

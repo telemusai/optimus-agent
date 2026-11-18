@@ -257,7 +257,7 @@ impl Supervisor {
             journal.record(WorkerRecoveryRecordInput {
                 active_session_id: record.active_session_id.clone(), session_id: record.session_id.clone(),
                 session_file: record.session_file.clone(), busy: false, operation: "recovery_hold".into(),
-            });
+            }).map_err(|error| format!("Could not persist worker recovery state: {error}"))?;
         }
         if WorkerRecoveryJournal::read_latest(&descriptor.recovery_journal_path).iter().any(|record| record.busy) {
             return Err("Could not persist uncertain-operation recovery; journal retained".into());
