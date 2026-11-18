@@ -37,7 +37,7 @@ pub(super) enum Event {
 pub(super) struct Bridge {
     rpc: RpcExtensionUiBridge,
     delegate: Arc<dyn ext::ExtensionUiContext>,
-    send: mpsc::Sender<HostEvent>,
+    send: HostEventSender,
     pub editor_text: Mutex<String>,
     pub tools_expanded: AtomicBool,
     pub footer_data: Arc<crate::core::footer_data_provider::FooterDataProvider>,
@@ -46,7 +46,7 @@ pub(super) struct Bridge {
 }
 
 impl Bridge {
-    pub fn new(send: mpsc::Sender<HostEvent>, cwd: &str) -> Arc<Self> {
+    pub fn new(send: HostEventSender, cwd: &str) -> Arc<Self> {
         let output = send.clone();
         let rpc = create_rpc_extension_ui_bridge(Arc::new(move |request| {
             let method = if request.method == "set_editor_text" {
@@ -149,7 +149,7 @@ impl Bridge {
         Arc::new(RenderProxy(self.send.clone()))
     }
 }
-struct RenderProxy(mpsc::Sender<HostEvent>);
+struct RenderProxy(HostEventSender);
 impl ext::Tui for RenderProxy {
     fn request_render(&self) {
         let _ = self.0.send(HostEvent::Render);

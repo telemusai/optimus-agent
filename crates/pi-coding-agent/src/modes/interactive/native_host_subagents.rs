@@ -69,7 +69,7 @@ pub(super) struct Bar {
     graph_deadline: Option<Instant>,
     pulse_task: Option<tokio::task::JoinHandle<()>>,
     pulse_deadline: Option<std::time::Instant>,
-    render_send: RefCell<Option<mpsc::Sender<HostEvent>>>,
+    render_send: RefCell<Option<HostEventSender>>,
 }
 
 impl Bar {
@@ -148,7 +148,7 @@ impl Bar {
     pub(super) fn subscribe(
         &self,
         connection: Arc<dyn wire::AgentConnection>,
-        send: mpsc::Sender<HostEvent>,
+        send: HostEventSender,
     ) {
         let resource_send = send.clone();
         self.resources.start(crate::config::get_agent_dir(), Arc::new(move || {

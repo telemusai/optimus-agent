@@ -26,7 +26,7 @@ use crate::core::tools::render_utils::{
     get_text_output, RenderContentBlock, RenderResultLike, TextOutputOptions,
 };
 use crate::modes::agent_connection::types::AgentConnectionToolDefinition;
-use crate::modes::interactive::theme::theme::theme;
+use crate::modes::interactive::theme::theme::{render_style_revision, theme};
 use crate::modes::interactive::theme::working_icon::{get_working_pulse_frame, working_icon_frame};
 
 use super::tool_panel::ToolPanel;
@@ -770,6 +770,7 @@ impl ToolExecutionComponent {
                     ImageOptions {
                         fallback_only: false,
                         fallback_prefix: Some("    \u{2570}\u{2500} ".to_string()),
+                        style_revision: Some(render_style_revision),
                         ..Default::default()
                     },
                     None,

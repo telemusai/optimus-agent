@@ -317,6 +317,12 @@ fn format_inline_login_recovery_message(message: &str) -> Option<String> {
     Some(format!("{base} \u{b7} {LOGIN_RECOVERY_MESSAGE}"))
 }
 
+struct CachedThinkingRecap {
+    source: String,
+    fallback: String,
+    recap: String,
+}
+
 /// Port of `AssistantMessageComponent`.
 pub struct AssistantMessageComponent {
     content_container: Rc<RefCell<Container>>,
@@ -330,6 +336,11 @@ pub struct AssistantMessageComponent {
     last_signature: Option<String>,
     block_markdowns: HashMap<usize, Rc<RefCell<Markdown>>>,
     last_block_texts: HashMap<usize, String>,
+    thinking_recaps: HashMap<usize, CachedThinkingRecap>,
+    #[cfg(test)]
+    recap_evaluations: usize,
+    #[cfg(test)]
+    reconciled_block_allocations: usize,
     preceded_by_tool_activity: bool,
     mermaid_transform: Option<Rc<MermaidMarkdownTransform>>,
     base_url: Option<String>,
@@ -376,6 +387,11 @@ impl AssistantMessageComponent {
             last_signature: None,
             block_markdowns: HashMap::new(),
             last_block_texts: HashMap::new(),
+            thinking_recaps: HashMap::new(),
+            #[cfg(test)]
+            recap_evaluations: 0,
+            #[cfg(test)]
+            reconciled_block_allocations: 0,
             preceded_by_tool_activity: options.preceded_by_tool_activity,
             mermaid_transform: options.mermaid_transform,
             base_url,
@@ -436,11 +452,34 @@ impl AssistantMessageComponent {
         true
     }
 
+    fn cached_thinking_recap(&mut self, index: usize, thinking: &str) -> String {
+        let fallback = &self.hidden_thinking_label;
+        if let Some(cached) = self.thinking_recaps.get(&index) {
+            if cached.source == thinking && cached.fallback == *fallback {
+                return cached.recap.clone();
+            }
+        }
+        #[cfg(test)]
+        {
+            self.recap_evaluations += 1;
+        }
+        let recap = thinking_recap(thinking, fallback, None);
+        self.thinking_recaps.insert(
+            index,
+            CachedThinkingRecap {
+                source: thinking.to_string(),
+                fallback: fallback.clone(),
+                recap: recap.clone(),
+            },
+        );
+        recap
+    }
+
     /// Port of `computeSignature`.
     ///
     /// The TypeScript JSON-encodes the recap so free text cannot forge part
     /// boundaries; the port uses `serde_json::to_string` for the same reason.
-    fn compute_signature(&self, message: &AssistantMessage) -> String {
+    fn compute_signature(&mut self, message: &AssistantMessage) -> String {
         let mut parts: Vec<String> = Vec::new();
         for (index, content) in message.content.iter().enumerate() {
             match content {
@@ -462,8 +501,7 @@ impl AssistantMessageComponent {
                     if self.hide_thinking_block && !thinking.thinking.trim().is_empty() {
                         // The collapsed row bakes the recap into a static line, so a
                         // recap change must count as a structural change during streaming.
-                        let recap =
-                            thinking_recap(&thinking.thinking, &self.hidden_thinking_label, None);
+                        let recap = self.cached_thinking_recap(index, &thinking.thinking);
                         parts.push(format!(
                             "{index}:recap:{}",
                             serde_json::to_string(&recap).unwrap_or_default()
@@ -504,11 +542,16 @@ impl AssistantMessageComponent {
                 continue;
             };
             let text = match content {
-                ContentBlock::Text(text) => text.text.trim().to_string(),
-                ContentBlock::Thinking(thinking) => thinking.thinking.trim().to_string(),
-                ContentBlock::ToolCall(_) => String::new(),
+                ContentBlock::Text(text) => text.text.trim(),
+                ContentBlock::Thinking(thinking) => thinking.thinking.trim(),
+                ContentBlock::ToolCall(_) => continue,
             };
-            if self.last_block_texts.get(&index) != Some(&text) {
+            if self.last_block_texts.get(&index).map(String::as_str) != Some(text) {
+                let text = text.to_string();
+                #[cfg(test)]
+                {
+                    self.reconciled_block_allocations += 1;
+                }
                 markdown.borrow_mut().set_text(text.clone());
                 self.last_block_texts.insert(index, text);
             }
@@ -585,8 +628,7 @@ impl AssistantMessageComponent {
                         // Collapsed row: bold label, a one-line recap of the trace, and
                         // the hint. The row truncates the recap to the render width so it
                         // never wraps onto a second line on narrow terminals.
-                        let recap =
-                            thinking_recap(&thinking.thinking, &self.hidden_thinking_label, None);
+                        let recap = self.cached_thinking_recap(index, &thinking.thinking);
                         self.content_container
                             .borrow_mut()
                             .add_child(Rc::new(RefCell::new(CollapsedThinkingRow {
@@ -791,9 +833,13 @@ impl Component for AssistantMessageComponent {
     /// Port of the `render` override.
     fn render(&mut self, width: f64) -> Vec<String> {
         if self.dirty {
-            if let Some(message) = self.last_message.clone() {
-                self.reconcile(&message);
+            // Reconcile against the owned snapshot without cloning every unchanged
+            // content block on each streaming frame.
+            let message = self.last_message.take();
+            if let Some(message) = &message {
+                self.reconcile(message);
             }
+            self.last_message = message;
             self.dirty = false;
         }
         let mut lines = self.container.render(width);
@@ -913,6 +959,63 @@ mod tests {
             }
         }
         result
+    }
+
+    #[test]
+    fn reconcile_reuses_unchanged_prefix_text_and_cached_thinking_recaps() {
+        init();
+        let original = assistant(
+            vec![
+                text("VERBATIM_PREFIX"),
+                thinking("**Stable plan**
+unchanged reasoning"),
+                text("draft one"),
+            ],
+            "stop",
+        );
+        let mut component = AssistantMessageComponent::new(
+            None,
+            true,
+            get_markdown_theme(),
+            "Thinking...",
+            Default::default(),
+        );
+        component.update_content(original.clone(), true);
+        component.render(80.0);
+        assert_eq!(component.recap_evaluations, 1);
+
+        component.recap_evaluations = 0;
+        component.reconciled_block_allocations = 0;
+        let prefix_allocation = component.last_block_texts[&0].as_ptr();
+        component.update_content(original, true);
+        component.render(80.0);
+        assert_eq!(component.recap_evaluations, 0, "unchanged source must not be recapped");
+        assert_eq!(component.reconciled_block_allocations, 0);
+        assert_eq!(component.last_block_texts[&0].as_ptr(), prefix_allocation);
+
+        let mut changed = assistant(
+            vec![
+                text("VERBATIM_PREFIX"),
+                thinking("**Stable plan**
+unchanged reasoning"),
+                text("draft two final"),
+            ],
+            "stop",
+        );
+        component.update_content(changed.clone(), true);
+        let rendered = plain(&component.render(80.0));
+        assert!(rendered.contains("draft two final"));
+        assert!(rendered.contains("Stable plan"));
+        assert_eq!(component.recap_evaluations, 0, "the unchanged thinking prefix stays cached");
+        assert_eq!(component.reconciled_block_allocations, 1, "only the changed final block is materialized");
+        assert_eq!(component.last_block_texts[&0].as_ptr(), prefix_allocation);
+        assert_eq!(component.last_block_texts[&2], "draft two final");
+
+        changed.content[2] = text("draft three");
+        component.update_content(changed, true);
+        assert!(plain(&component.render(80.0)).contains("draft three"));
+        assert_eq!(component.reconciled_block_allocations, 2);
+        assert_eq!(component.recap_evaluations, 0);
     }
 
     #[test]

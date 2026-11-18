@@ -54,6 +54,9 @@ pub struct ImageOptions {
     pub fallback_prefix: Option<String>,
     /// Kitty image ID to reuse across updates or animations.
     pub image_id: Option<u32>,
+    /// Live style epoch for textual fallback colours. `None` disables this
+    /// optional cache input for callers without themed fallback text.
+    pub style_revision: Option<fn() -> u64>,
 }
 
 pub struct Image {
@@ -67,6 +70,7 @@ pub struct Image {
     cached_lines: Option<Vec<String>>,
     cached_width: Option<usize>,
     cached_fullscreen_fallback: Option<bool>,
+    cached_style_revision: Option<u64>,
     cached_geometry: Option<(TerminalCapabilities, CellDimensions, bool, usize, SixelLimits, bool)>,
 }
 
@@ -95,6 +99,7 @@ impl Image {
             cached_lines: None,
             cached_width: None,
             cached_fullscreen_fallback: None,
+            cached_style_revision: None,
             cached_geometry: None,
         }
     }
@@ -124,6 +129,7 @@ impl Component for Image {
     fn render(&mut self, width: f64) -> Vec<String> {
         let width = width.max(0.0).floor() as usize;
         let fallback_flag = fullscreen_fallback();
+        let style_revision = self.options.style_revision.map_or(0, |revision| revision());
         let caps = get_capabilities();
         let height = HEIGHT_LIMIT.with(|limit| limit.get())
             .min(self.options.max_height_cells.unwrap_or(MAX_IMAGE_ROWS));
@@ -134,7 +140,11 @@ impl Component for Image {
             self.cached_width,
             self.cached_fullscreen_fallback,
         ) {
-            if cached_width == width && cached_fallback == fallback_flag && self.cached_geometry == Some(geometry) {
+            if cached_width == width
+                && cached_fallback == fallback_flag
+                && self.cached_style_revision == Some(style_revision)
+                && self.cached_geometry == Some(geometry)
+            {
                 return lines.clone();
             }
         }
@@ -198,6 +208,7 @@ impl Component for Image {
         self.cached_lines = Some(lines.clone());
         self.cached_width = Some(width);
         self.cached_fullscreen_fallback = Some(fallback_flag);
+        self.cached_style_revision = Some(style_revision);
         self.cached_geometry = Some(geometry);
 
         lines
@@ -207,6 +218,7 @@ impl Component for Image {
         self.cached_lines = None;
         self.cached_width = None;
         self.cached_fullscreen_fallback = None;
+        self.cached_style_revision = None;
         self.cached_geometry = None;
     }
 }

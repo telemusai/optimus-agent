@@ -142,7 +142,7 @@ async fn write_preference(
 
 pub(super) async fn run(
     connection: &Arc<dyn wire::AgentConnection>,
-    send: &mpsc::Sender<HostEvent>,
+    send: &HostEventSender,
     args: &str,
 ) -> Result<CommandOutput, String> {
     let choice = parse(args)?;

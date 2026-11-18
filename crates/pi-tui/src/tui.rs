@@ -385,6 +385,26 @@ impl Container {
         lines
     }
 
+    pub fn render_shared(&mut self, width: f64) -> Vec<RenderedLine> {
+        let mut lines: Vec<RenderedLine> = Vec::new();
+        let mut selection_regions: Vec<TableCellSelectionRegion> = Vec::new();
+        for child in self.children.iter() {
+            let line_offset = lines.len();
+            let child_lines = child.borrow_mut().render_shared(width);
+            for region in child.borrow().get_selection_regions() {
+                selection_regions.push(TableCellSelectionRegion {
+                    line: region.line + line_offset,
+                    table_top: region.table_top + line_offset,
+                    table_bottom: region.table_bottom + line_offset,
+                    ..region
+                });
+            }
+            lines.extend(child_lines);
+        }
+        self.selection_regions = selection_regions;
+        lines
+    }
+
     pub fn get_selection_regions(&self) -> Vec<TableCellSelectionRegion> {
         self.selection_regions.clone()
     }
@@ -393,6 +413,10 @@ impl Container {
 impl Component for Container {
     fn render(&mut self, width: f64) -> Vec<String> {
         Container::render(self, width)
+    }
+
+    fn render_shared(&mut self, width: f64) -> Vec<RenderedLine> {
+        Container::render_shared(self, width)
     }
 
     fn get_selection_regions(&self) -> Vec<TableCellSelectionRegion> {
@@ -467,7 +491,7 @@ struct OverlayEntry {
 
 /// Snapshot of the inline differ's bookkeeping, frozen while fullscreen is active.
 struct InlineState {
-    previous_lines: Vec<String>,
+    previous_lines: Vec<RenderedLine>,
     previous_kitty_image_ids: HashSet<u32>,
     previous_width: i64,
     previous_height: usize,
@@ -517,7 +541,7 @@ struct OverlayLayout {
 pub struct TUI {
     container: Container,
     pub terminal: Box<dyn Terminal>,
-    previous_lines: Vec<String>,
+    previous_lines: Vec<RenderedLine>,
     previous_kitty_image_ids: HashSet<u32>,
     previous_width: i64,
     previous_height: usize,
@@ -1866,16 +1890,16 @@ impl TUI {
     }
 
     /// Composite all overlays into content lines (sorted by focusOrder, higher = on top).
-    fn composite_overlays(
-        &mut self,
-        lines: &[String],
-        term_width: usize,
-        term_height: usize,
-    ) -> Vec<String> {
+    fn composite_overlays<T>(&mut self, lines: &[T], term_width: usize, term_height: usize) -> Vec<T>
+    where
+        T: AsRef<str> + Clone + From<String>,
+    {
+        // Shared transcript lines are cheap clones. Allocate text only for rows
+        // whose marker or overlay pixels actually change.
+        let mut result: Vec<T> = lines.to_vec();
         if self.overlay_stack.is_empty() {
-            return lines.to_vec();
+            return result;
         }
-        let mut result: Vec<String> = lines.to_vec();
         let mut overlay_selection_regions: Vec<FrameSelectionRegion> =
             self.overlay_selection_regions.clone();
 
@@ -1900,18 +1924,19 @@ impl TUI {
                     // split is always safe. Split on a byte offset that is derived
                     // from `char_indices` so multi-byte text before the marker is
                     // neither leaked nor dropped.
-                    let marker_index = match result[line].find(&marker) {
+                    let base = result[line].as_ref();
+                    let marker_index = match base.find(&marker) {
                         Some(marker_index) => marker_index,
                         None => continue,
                     };
-                    let prefix = &result[line][..marker_index];
+                    let prefix = &base[..marker_index];
                     above_marker = Some(AboveMarker {
                         line,
                         col: visible_width(prefix),
                         offset_y: options.as_ref().and_then(|o| o.offset_y).unwrap_or(0),
                     });
-                    let suffix = &result[line][marker_index + marker.len()..];
-                    result[line] = format!("{prefix}{suffix}");
+                    let suffix = &base[marker_index + marker.len()..];
+                    result[line] = format!("{prefix}{suffix}").into();
                     break;
                 }
                 if above_marker.is_none() {
@@ -1971,7 +1996,7 @@ impl TUI {
         // Extend result with empty lines if content is too short for overlay
         // placement or working area
         while result.len() < working_height {
-            result.push(String::new());
+            result.push(String::new().into());
         }
 
         let viewport_start = working_height.saturating_sub(term_height);
@@ -2027,13 +2052,15 @@ impl TUI {
                         overlay_lines[i].clone()
                     };
                     let base = result[idx as usize].clone();
-                    result[idx as usize] = self.composite_line_at(
-                        &base,
-                        &truncated_overlay_line,
-                        col,
-                        width as i64,
-                        term_width as i64,
-                    );
+                    result[idx as usize] = self
+                        .composite_line_at(
+                            base.as_ref(),
+                            &truncated_overlay_line,
+                            col,
+                            width as i64,
+                            term_width as i64,
+                        )
+                        .into();
                     let idx_usize = idx as usize;
                     let cover_start = col.max(0) as usize;
                     let cover_end = (col + width as i64).max(0) as usize;
@@ -2171,6 +2198,14 @@ impl TUI {
         }
     }
 
+    fn apply_shared_line_resets(&self, lines: &mut [RenderedLine]) {
+        let hyperlinks = get_capabilities().hyperlinks;
+        let reset = Self::segment_reset();
+        for line in lines.iter_mut() {
+            *line = line.terminal_normalized(hyperlinks, reset);
+        }
+    }
+
     /// Splice overlay content into a base line at a specific column. Single-pass optimized.
     fn composite_line_at(
         &self,
@@ -2264,6 +2299,27 @@ impl TUI {
             // Strip marker from the line
             lines[row] = format!("{prefix}{suffix}");
 
+            return Some(CursorPosition { row, col });
+        }
+        None
+    }
+
+    fn extract_shared_cursor_position(
+        &self,
+        lines: &mut [RenderedLine],
+        height: usize,
+    ) -> Option<CursorPosition> {
+        let viewport_top = lines.len().saturating_sub(height);
+        for row in (viewport_top..lines.len()).rev() {
+            let line = lines[row].as_str();
+            let Some(marker_index) = line.find(CURSOR_MARKER) else {
+                continue;
+            };
+            let marker_len = CURSOR_MARKER.len();
+            let (prefix, rest) = line.split_at(marker_index);
+            let suffix = &rest[marker_len.min(rest.len())..];
+            let col = visible_width(prefix);
+            lines[row] = format!("{prefix}{suffix}").into();
             return Some(CursorPosition { row, col });
         }
         None
@@ -2477,20 +2533,22 @@ impl TUI {
         };
 
         // Render all components to get new lines
-        let mut new_lines = with_image_height_limit(height.saturating_sub(1), || self.container.render(width as f64));
+        let mut new_lines = with_image_height_limit(height.saturating_sub(1), || self.container.render_shared(width as f64));
 
         // Composite overlays into the rendered lines (before differential compare)
         if !self.overlay_stack.is_empty() {
             for line in &mut new_lines {
-                if is_image_line(line) { *line = crate::utils::truncate_to_width("[Cannot display image under overlay]", width as f64, "…", false); }
+                if is_image_line(line) { *line = crate::utils::truncate_to_width("[Cannot display image under overlay]", width as f64, "…", false).into(); }
             }
-            new_lines = with_fullscreen_image_fallback(|| self.composite_overlays(&new_lines, width, height));
+            new_lines = with_fullscreen_image_fallback(|| {
+                self.composite_overlays(&new_lines, width, height)
+            });
         }
 
         // Extract cursor position before applying line resets (marker must be found first)
-        let cursor_pos = self.extract_cursor_position(&mut new_lines, height);
+        let cursor_pos = self.extract_shared_cursor_position(&mut new_lines, height);
 
-        self.apply_line_resets(&mut new_lines);
+        self.apply_shared_line_resets(&mut new_lines);
 
         // A15: component rendering is done; the guard below attributes the
         // diff tail (compose + escape buffer) and the terminal writes on every
@@ -2524,7 +2582,7 @@ impl TUI {
         let full_render = |clear: bool,
                            preserve_viewport: bool,
                            terminal: &mut Box<dyn Terminal>,
-                           previous_lines: &mut Vec<String>,
+                           previous_lines: &mut Vec<RenderedLine>,
                            previous_kitty_image_ids: &mut HashSet<u32>,
                            cursor_row: &mut usize,
                            hardware_cursor_row_field: &mut usize,
@@ -2534,7 +2592,7 @@ impl TUI {
                            previous_height: &mut usize,
                            full_redraw_count: &mut usize,
                            prev_viewport_top: usize,
-                           new_lines: &[String],
+                           new_lines: &[RenderedLine],
                            cursor_pos: Option<CursorPosition>| {
             *full_redraw_count += 1;
             let mut buffer = String::from("\x1b[?2026h"); // Begin synchronized output
@@ -2800,9 +2858,14 @@ impl TUI {
         let mut last_changed: i64 = -1;
         let max_lines = new_lines.len().max(previous_lines.len());
         for i in 0..max_lines {
-            let old_line = previous_lines.get(i).map(String::as_str).unwrap_or("");
-            let new_line = new_lines.get(i).map(String::as_str).unwrap_or("");
-            if old_line != new_line {
+            let old_line = previous_lines.get(i).map(RenderedLine::as_str).unwrap_or("");
+            let new_line = new_lines.get(i).map(RenderedLine::as_str).unwrap_or("");
+            let unchanged = match (previous_lines.get(i), new_lines.get(i)) {
+                (Some(old), Some(new)) => old == new,
+                (None, None) => true,
+                _ => old_line == new_line,
+            };
+            if !unchanged {
                 if first_changed == -1 {
                     first_changed = i as i64;
                 }
@@ -3182,6 +3245,24 @@ impl TUI {
 mod tests {
     use super::*;
 
+    struct SharedHistory {
+        lines: Vec<RenderedLine>,
+        shared_renders: usize,
+    }
+
+    impl Component for SharedHistory {
+        fn render(&mut self, _width: f64) -> Vec<String> {
+            panic!("the inline path must retain shared history lines")
+        }
+
+        fn render_shared(&mut self, _width: f64) -> Vec<RenderedLine> {
+            self.shared_renders += 1;
+            self.lines.clone()
+        }
+
+        fn invalidate(&mut self) {}
+    }
+
     struct FakeTerminal {
         written: String,
         columns: usize,
@@ -3301,6 +3382,73 @@ mod tests {
         fn set_focused(&mut self, focused: bool) {
             self.focused = focused;
         }
+    }
+
+    #[test]
+    fn unchanged_inline_history_reuses_normalized_shared_lines() {
+        let history = Rc::new(RefCell::new(SharedHistory {
+            lines: (0..80)
+                .map(|index| RenderedLine::from(format!("history {index}: {}", "x".repeat(2048))))
+                .collect(),
+            shared_renders: 0,
+        }));
+        let mut tui = TUI::new(Box::new(FakeTerminal::new(100, 24)), Some(false));
+        tui.container.add_child(history.clone());
+        tui.do_render();
+        let previous = tui.previous_lines.clone();
+        assert_eq!(history.borrow().shared_renders, 1);
+        assert!(history.borrow().lines.iter().all(|line| line.terminal_normalization_count() == 1));
+        assert_eq!(previous.len(), history.borrow().lines.len());
+
+        tui.do_render();
+        assert_eq!(history.borrow().shared_renders, 2);
+        assert!(previous.iter().all(|line| line.text_comparison_count() == 0));
+        assert!(
+            history.borrow().lines.iter().all(|line| line.terminal_normalization_count() == 1),
+            "an editor-only repaint must not normalize unchanged history again"
+        );
+        assert!(tui.previous_lines.iter().zip(&previous).all(|(line, old)| line.ptr_eq(old)));
+
+        let _overlay = tui.show_overlay(
+            Rc::new(RefCell::new(Line("editor completion"))),
+            OverlayOptions {
+                row: Some(SizeValue::Number(0.0)),
+                col: Some(SizeValue::Number(0.0)),
+                width: Some(SizeValue::Number(17.0)),
+                ..Default::default()
+            },
+        );
+        tui.do_render();
+        let overlaid = tui.previous_lines.clone();
+        let reused = overlaid
+            .iter()
+            .zip(&previous)
+            .filter(|(line, old)| line.ptr_eq(old))
+            .count();
+        assert_eq!(reused, previous.len() - 1, "only the overlaid row is rebuilt");
+        tui.request_render();
+        tui.do_render();
+        // The differ can retain previous_lines wholesale when output is equal.
+        // Measure the second composition itself so that early return does not
+        // hide the one rebuilt overlay row.
+        let mut recomposed = tui.container.render_shared(100.0);
+        recomposed = tui.composite_overlays(&recomposed, 100, 24);
+        tui.apply_shared_line_resets(&mut recomposed);
+        assert_eq!(
+            recomposed
+                .iter()
+                .zip(&overlaid)
+                .filter(|(line, old)| line.ptr_eq(old))
+                .count(),
+            previous.len() - 1,
+            "only the overlaid row is rebuilt on a repeated composition"
+        );
+        assert!(history.borrow().lines.iter().all(|line| line.terminal_normalization_count() == 1));
+        assert_eq!(
+            overlaid.iter().map(RenderedLine::text_comparison_count).sum::<u32>(),
+            1,
+            "only the changed overlay row needs a content comparison"
+        );
     }
 
     #[test]
@@ -4096,7 +4244,7 @@ fn position_hardware_cursor_static(
     }
 }
 
-fn collect_kitty_image_ids_static(lines: &[String]) -> HashSet<u32> {
+fn collect_kitty_image_ids_static(lines: &[RenderedLine]) -> HashSet<u32> {
     let mut ids = HashSet::new();
     for line in lines {
         for id in extract_kitty_image_ids(line) {
@@ -4107,7 +4255,7 @@ fn collect_kitty_image_ids_static(lines: &[String]) -> HashSet<u32> {
 }
 
 fn delete_changed_kitty_images_static(
-    previous_lines: &[String],
+    previous_lines: &[RenderedLine],
     first_changed: i64,
     last_changed: i64,
 ) -> String {
@@ -4118,7 +4266,7 @@ fn delete_changed_kitty_images_static(
     let mut ids: HashSet<u32> = HashSet::new();
     let max_line = (last_changed as usize).min(previous_lines.len().saturating_sub(1));
     for i in first_changed as usize..=max_line {
-        for id in extract_kitty_image_ids(previous_lines.get(i).map(String::as_str).unwrap_or("")) {
+        for id in extract_kitty_image_ids(previous_lines.get(i).map(RenderedLine::as_str).unwrap_or("")) {
             ids.insert(id);
         }
     }
@@ -4131,7 +4279,7 @@ fn delete_changed_kitty_images_static(
 }
 
 fn expand_last_changed_for_kitty_images_static(
-    previous_lines: &[String],
+    previous_lines: &[RenderedLine],
     first_changed: usize,
     last_changed: usize,
 ) -> usize {

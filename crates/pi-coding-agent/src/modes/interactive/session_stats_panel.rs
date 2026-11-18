@@ -9,7 +9,7 @@ use pi_tui::tui::{Component, TUI};
 use pi_tui::utils::{truncate_to_width, visible_width};
 use tokio::sync::Notify;
 
-use super::super::HostEvent;
+use super::super::{HostEvent, HostEventSender};
 use super::stats_data::{Loader, ModelUsage, Snapshot};
 use crate::modes::agent_connection::types as wire;
 use crate::modes::interactive::theme::theme::theme;
@@ -54,7 +54,7 @@ pub(super) struct StatsPanel {
     include_children: Arc<AtomicBool>,
     refresh: Arc<Notify>,
     task: Option<tokio::task::JoinHandle<()>>,
-    send: mpsc::Sender<HostEvent>,
+    send: HostEventSender,
     page: usize,
     scroll: usize,
     rows: usize,
@@ -63,7 +63,7 @@ pub(super) struct StatsPanel {
 impl StatsPanel {
     pub fn new(
         connection: Arc<dyn wire::AgentConnection>,
-        send: mpsc::Sender<HostEvent>,
+        send: HostEventSender,
         ui: Rc<RefCell<TUI>>,
     ) -> Self {
         let data = Arc::new(Mutex::new(LiveData::default()));

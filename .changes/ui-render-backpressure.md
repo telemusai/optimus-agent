@@ -1,0 +1,4 @@
+- Fixed nested IPython cells and image fallbacks retaining stale theme styles or keybinding hints after settled transcript rows were cached.
+- Reused shared rendered transcript lines and terminal normalization across unchanged and editor-only repaints without changing image, wrapping, anchor, or fullscreen output.
+- Bounded native-host event delivery, coalesced adjacent streaming snapshots across repaint bursts, and applied ordered backpressure to non-coalescible events without dropping final content.
+- Reused unchanged assistant block text and thinking recaps during streamed reconciliation while rebuilding a changed final block exactly.

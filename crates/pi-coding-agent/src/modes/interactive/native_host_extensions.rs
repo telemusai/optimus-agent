@@ -187,7 +187,7 @@ impl SidePane {
         mode: &Rc<RefCell<InteractiveMode>>,
         editor: &Rc<RefCell<CustomEditor>>,
         connection: Arc<dyn wire::AgentConnection>,
-        send: mpsc::Sender<HostEvent>,
+        send: HostEventSender,
     ) {
         let text = text.trim();
         if text.is_empty() {
@@ -290,7 +290,7 @@ impl SidePane {
         question: String,
         padding: usize,
         connection: Arc<dyn wire::AgentConnection>,
-        send: mpsc::Sender<HostEvent>,
+        send: HostEventSender,
     ) {
         if question.trim().is_empty() {
             let _ = send.send(HostEvent::Warning("Usage: /btw <question>".into()));

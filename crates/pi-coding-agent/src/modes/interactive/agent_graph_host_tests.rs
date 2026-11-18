@@ -1,4 +1,5 @@
 use super::*;
+use super::native_host::host_event_channel;
 use crate::modes::agent_connection::daemon_agent_connection::DaemonTransportClient;
 use pi_ai::types::BoxFuture;
 use pi_tui::utils::{strip_ansi, visible_width};
@@ -60,7 +61,7 @@ async fn graph_header_reads_roster_pushes_and_stops_its_timer_when_hidden() {
     ])));
     let mut bar = Bar::new(h.mode.clone());
     *bar.roster.lock().unwrap() = Some(roster.clone());
-    let (send, receive) = mpsc::channel();
+    let (send, receive) = host_event_channel(64 * 1024);
     *bar.render_send.borrow_mut() = Some(send);
     let before = bar.graph_rows(24, 4);
     assert_eq!(before.len(), 4);
