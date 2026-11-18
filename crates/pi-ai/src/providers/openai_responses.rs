@@ -273,12 +273,12 @@ pub fn stream_openai_responses(
     context: &Context,
     options: Option<OpenAIResponsesOptions>,
 ) -> AssistantMessageEventStream {
-    let stream = create_assistant_message_event_stream();
-    let out = stream.clone();
+    let stream = AssistantMessageEventStream::new_owned();
+    let out = stream.producer_handle();
     let model = model.clone();
     let context = context.clone();
     let options = options.unwrap_or_default();
-    tokio::spawn(async move {
+    stream.spawn(async move {
         let mut output = AssistantMessage::new(model.api.clone(), model.provider.clone(), model.id.clone(), now_ms());
         output.usage = Usage::zero();
 
@@ -394,6 +394,7 @@ async fn run_openai_responses(
             }
         })),
         on_usage_observation: options.stream.on_usage_observation.clone(),
+        idle_timeout: Some(crate::utils::sse_frames::resolve_sse_idle_timeout()),
     };
 
     let observation_options = options.stream.clone();

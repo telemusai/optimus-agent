@@ -547,6 +547,9 @@ impl AgentSessionRuntime {
         reason: &str,
         target_session_file: Option<String>,
     ) -> Result<(), String> {
+        // Late fallible child cleanup precedes every irreversible old-session effect.
+        self.dispose_hosted_subagent_runtimes().await?;
+
         let runner = self.session_extension_runner();
         if let Some(runner) = runner {
             // `emitSessionShutdownEvent(runner, event)` emits only with handlers.
@@ -572,7 +575,7 @@ impl AgentSessionRuntime {
         }
         // Await the kernel's final snapshot flush before invalidating the session.
         self.session().dispose_async(None).await;
-        self.dispose_hosted_subagent_runtimes().await
+        Ok(())
     }
 
     /// `bindRuntimeHost()`.
@@ -677,6 +680,8 @@ impl AgentSessionRuntime {
         self: &Arc<Self>,
         build: F,
         lease: Option<Arc<Mutex<SessionLease>>>,
+        reason: &str,
+        target_session_file: Option<String>,
     ) -> Result<(), String>
     where
         F: FnOnce() -> Fut,
@@ -689,6 +694,12 @@ impl AgentSessionRuntime {
                 return Err(error);
             }
         };
+        // Building a candidate may fail after allocating services and extensions.
+        // Keep the working session installed until the candidate is complete.
+        if let Err(error) = self.teardown_for_replacement(reason, target_session_file, lease.clone()).await {
+            result.result.session.dispose_async(None).await;
+            return Err(error);
+        }
         self.apply(result);
         self.commit_replacement_lease(lease);
         Ok(())
@@ -989,21 +1000,25 @@ impl AgentSessionRuntime {
         if let Some(rebind_session) = rebind_session {
             rebind_session(self.session()).await;
         }
-        // `for (const listener of this.sessionReplacedListeners)`: the TypeScript
-        // reads the live Set, so listeners added during the loop also run.
-        let mut index = 0usize;
+        // Match JavaScript Set iteration: deleting the current or an earlier entry
+        // does not skip the next one, deleting a later entry suppresses it, and an
+        // entry added during notification is visited once in this same dispatch.
+        let mut visited: Vec<std::sync::Weak<dyn Fn(Arc<AgentSession>) -> BoxFuture<()> + Send + Sync>> = Vec::new();
         loop {
             let listener = self
                 .session_replaced_listeners
                 .lock()
                 .expect("session replaced listeners poisoned")
-                .get(index)
+                .iter()
+                .find(|candidate| {
+                    !visited.iter().any(|seen| {
+                        seen.upgrade().is_some_and(|seen| Arc::ptr_eq(&seen, candidate))
+                    })
+                })
                 .cloned();
-            let Some(listener) = listener else {
-                break;
-            };
+            let Some(listener) = listener else { break; };
+            visited.push(Arc::downgrade(&listener));
             listener(self.session()).await;
-            index += 1;
         }
         if let Some(with_session) = with_session {
             with_session(self.session().create_replaced_session_context()).await;
@@ -1050,8 +1065,6 @@ impl AgentSessionRuntime {
             self.release_uncommitted_lease(lease);
             return Err(error.to_string());
         }
-        self.teardown_for_replacement("resume", session_manager_file, lease.clone())
-            .await?;
         let agent_dir = self.services().agent_dir.clone();
         let session_config = self.session_config.clone();
         let cwd = session_manager.lock().expect("session manager poisoned").get_cwd();
@@ -1090,6 +1103,8 @@ impl AgentSessionRuntime {
                     }
                 },
                 lease,
+                "resume",
+                session_manager_file,
             )
             .await;
         if let Err(error) = built {
@@ -1141,8 +1156,6 @@ impl AgentSessionRuntime {
         let lease = self.acquire_replacement_lease(session_manager_file.as_deref())?;
 
         let new_session_file = session_manager_file.clone();
-        self.teardown_for_replacement("new", session_manager_file, lease.clone())
-            .await?;
         let agent_dir = self.services().agent_dir.clone();
         let session_config = self.session_config.clone();
         let cwd = self.cwd();
@@ -1180,9 +1193,10 @@ impl AgentSessionRuntime {
                     }
                 },
                 lease,
+                "new",
+                new_session_file,
             )
             .await;
-        let _ = new_session_file;
         if let Err(error) = built {
             return Err(error);
         }
@@ -1303,7 +1317,6 @@ impl AgentSessionRuntime {
                     .expect("session manager poisoned")
                     .get_session_file();
                 let lease = self.acquire_replacement_lease(file.as_deref())?;
-                self.teardown_for_replacement("fork", file, lease.clone()).await?;
                 self.rebuild_after_fork(
                     session_manager,
                     "fork",
@@ -1338,7 +1351,6 @@ impl AgentSessionRuntime {
                 .expect("session manager poisoned")
                 .get_session_file();
             let lease = self.acquire_replacement_lease(file.as_deref())?;
-            self.teardown_for_replacement("fork", file, lease.clone()).await?;
             self.rebuild_after_fork(
                 session_manager,
                 "fork",
@@ -1355,7 +1367,14 @@ impl AgentSessionRuntime {
 
         // Non-persisted: the current `SessionManager` is reused, exactly like the
         // TypeScript `const sessionManager = this.session.sessionManager;`.
-        let session_manager = Arc::clone(&self.session().session_manager);
+        let session_manager = {
+            let current = Arc::clone(&self.session().session_manager);
+            let staged = current
+                .lock()
+                .expect("session manager poisoned")
+                .clone_for_nonpersisted_replacement();
+            Arc::new(Mutex::new(staged))
+        };
         match &target_leaf_id {
             None => {
                 let source_header = session_manager
@@ -1384,7 +1403,6 @@ impl AgentSessionRuntime {
             .expect("session manager poisoned")
             .get_session_file();
         let lease = self.acquire_replacement_lease(file.as_deref())?;
-        self.teardown_for_replacement("fork", file, lease.clone()).await?;
         self.rebuild_after_fork(
             session_manager,
             "fork",
@@ -1409,10 +1427,12 @@ impl AgentSessionRuntime {
         lease: Option<Arc<Mutex<SessionLease>>>,
         with_session: Option<WithSessionCallback>,
     ) -> Result<(), String> {
+        let file = session_manager.lock().expect("session manager poisoned").get_session_file();
         let agent_dir = self.services().agent_dir.clone();
         let session_config = self.session_config.clone();
         let cwd = session_manager.lock().expect("session manager poisoned").get_cwd();
         let reason = reason.to_string();
+        let teardown_reason = reason.clone();
         self.build_and_apply_replacement(
             {
                 let this = Arc::clone(self);
@@ -1430,7 +1450,7 @@ impl AgentSessionRuntime {
                                     session_manager,
                                     session_start_event: Some(serde_json::json!({
                                         "type": "session_start",
-                                        "reason": reason,
+                                        "reason": reason.clone(),
                                         "previousSessionFile": previous_session_file,
                                     })),
                                     session_config,
@@ -1446,6 +1466,8 @@ impl AgentSessionRuntime {
                 }
             },
             lease,
+            &teardown_reason,
+            file,
         )
         .await?;
         self.finish_session_replacement(with_session).await
@@ -1518,8 +1540,6 @@ impl AgentSessionRuntime {
             .lock()
             .expect("session manager poisoned")
             .get_session_file();
-        self.teardown_for_replacement("resume", file, lease.clone())
-            .await?;
         let agent_dir = self.services().agent_dir.clone();
         let session_config = self.session_config.clone();
         let cwd = session_manager.lock().expect("session manager poisoned").get_cwd();
@@ -1556,6 +1576,8 @@ impl AgentSessionRuntime {
                 }
             },
             lease,
+            "resume",
+            file,
         )
         .await?;
         // `finishSessionReplacement()` with no `withSession`.

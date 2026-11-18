@@ -3673,6 +3673,31 @@ pub struct SessionManager {
 }
 
 impl SessionManager {
+    /// Snapshot an in-memory manager before a fallible replacement build. The
+    /// candidate owns its mutations and listener list; failure leaves the live
+    /// manager and its observers byte-for-byte untouched.
+    pub fn clone_for_nonpersisted_replacement(&self) -> Self {
+        assert!(!self.persist, "only non-persisted managers can be cloned transactionally");
+        Self {
+            session_id: self.session_id.clone(),
+            session_file: self.session_file.clone(),
+            session_dir: self.session_dir.clone(),
+            cwd: self.cwd.clone(),
+            persist: self.persist,
+            flushed: self.flushed,
+            file_entries: self.file_entries.clone(),
+            by_id: self.by_id.clone(),
+            labels_by_id: self.labels_by_id.clone(),
+            label_timestamps_by_id: self.label_timestamps_by_id.clone(),
+            leaf_id: self.leaf_id.clone(),
+            persist_listeners: Arc::new(Mutex::new(Vec::new())),
+            load_observation: self.load_observation,
+            persist_write_epoch: self.persist_write_epoch,
+            rlm_delivery_synced_epoch: self.rlm_delivery_synced_epoch,
+            write_buffer: None,
+        }
+    }
+
     fn new_internal(
         cwd: String,
         session_dir: String,
