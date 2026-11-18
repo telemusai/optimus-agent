@@ -1,0 +1,1 @@
+- Fixed daemon recovery reliability by making recovery journals durable, repairing snapshot CAS corruption, fencing daemon ownership, completing transport teardown and attach rollback, limiting attach retries, and skipping redundant descriptor writes.

@@ -40,6 +40,7 @@ fn lease(model: &Model) -> SourceCaptureLease {
                 + 300,
             span_policy: SOURCE_SPAN_POLICY.into(),
             capture_mode: String::new(),
+            label_anchor_alpha: None,
         },
         SourceCaptureProfile {
             layer_index: 3,
@@ -179,6 +180,7 @@ async fn server() -> (Model, Arc<Mutex<Vec<Value>>>, tokio::task::JoinHandle<()>
                         ready_ranks: 8,
                         expected_ranks: 8,
                         accepted_sequence_digest: "c".repeat(64),
+                        label_anchor_alpha: Default::default(),
                         output_sha256: sha256(output.as_bytes()),
                         expires_at_epoch: intent.expires_at_epoch,
                         byte_count: 32,

@@ -21,13 +21,24 @@ use crate::core::occ::occ3::connector::{
 use pi_ai::source_capture::SourceSpanArming;
 use crate::core::occ::occ3::types::{
     Occ3ConnectorCapabilities, Occ3Error, Occ3HandleRef, Occ3Method, Occ3ModelIdentity,
-    Occ3TransferMetrics,
+    Occ3TransferMetrics, OCC3_CONTROL_SUMMARY,
 };
 
 pub const CONNECTOR_ID: &str = "sglang-occ3";
 
-const HEALTH_TIMEOUT: Duration = Duration::from_secs(5);
+const HEALTH_TIMEOUT: Duration = Duration::from_secs(15);
 const OP_TIMEOUT: Duration = Duration::from_secs(90);
+/// Bounded send-phase transport retries for the enrollment control call
+/// only. `sessions/enroll` re-enrolls the identical per-session record (the
+/// registry keys its immutable session record on session_id; operation_id is
+/// ignored for the same-session comparison), so a transient send failure - a
+/// pooled connection reset by the gateway between reuse, the live round-1
+/// stability failure on 2026-11-08 - is safely retried with the identical
+/// body instead of aborting the whole armed turn. Timeouts are deliberately
+/// NOT retried: a hanging server must fail at one HEALTH_TIMEOUT, never
+/// multiply it against the turn budget.
+const ENROLL_TRANSPORT_RETRIES: u32 = 2;
+const CONTROL_TRANSPORT_RETRY_DELAY: Duration = Duration::from_millis(250);
 
 /// Construction parameters (from a model's `occ3` block + environment).
 #[derive(Clone)]
@@ -106,6 +117,18 @@ fn native_unsupported() -> Occ3Error {
     }
 }
 
+/// Internal recovery classification; public errors retain their original form.
+struct NativeControlFailure {
+    error: Occ3Error,
+    authority: bool,
+}
+
+impl From<Occ3Error> for NativeControlFailure {
+    fn from(error: Occ3Error) -> Self {
+        Self { error, authority: false }
+    }
+}
+
 /// The live connector. Cheap to clone behind an `Arc` (reqwest keeps an
 /// internal connection pool).
 #[derive(Debug)]
@@ -113,6 +136,8 @@ pub struct SglangOcc3Connector {
     client: reqwest::Client,
     config: SglangOcc3Config,
     native: Option<NativeExperiment>,
+    readiness_instance_id: String,
+    runtime_probe: tokio::sync::Mutex<Option<std::time::Instant>>,
 }
 
 impl SglangOcc3Connector {
@@ -150,6 +175,8 @@ impl SglangOcc3Connector {
             client,
             config,
             native: None,
+            readiness_instance_id: uuid::Uuid::new_v4().to_string(),
+            runtime_probe: tokio::sync::Mutex::new(None),
         })
     }
 
@@ -217,8 +244,10 @@ impl SglangOcc3Connector {
     pub async fn runtime_identity(&self) -> Result<NativeRuntimeIdentity, Occ3Error> {
         let body = serde_json::json!({"schema":"occ3.runtime.identity.request.v1"});
         let identity: NativeRuntimeIdentity = self
-            .control("/occ3/v1/native/runtime/identity", &body)
-            .await?;
+            // Read-only runtime probe: no transport retry (unchanged
+            // behavior; only enroll is idempotent-by-record).
+            .control_raw("/occ3/v1/native/runtime/identity", &body, 0)
+            .await.map_err(|failure| failure.error)?;
         if !identity.is_self_consistent() {
             return Err(native_invalid());
         }
@@ -421,7 +450,42 @@ pub(crate) fn native_digest(value: &str) -> bool {
             .bytes()
             .all(|v| v.is_ascii_digit() || (b'a'..=b'f').contains(&v))
 }
+// Literal-only reason codes preserve short-circuit validation and emit at most
+// one value-free event per failed check group. Diagnostics cannot change errors.
+macro_rules! native_binding_failed {
+    ($stage:literal; $($reason:literal => $failed:expr),+ $(,)?) => {{
+        false $(|| if $failed {
+            native_binding_diagnostic($stage, $reason, None);
+            true
+        } else {
+            false
+        })+
+    }};
+}
+
+fn native_binding_diagnostic(stage: &'static str, reason: &'static str, status: Option<u16>) {
+    // Also protect against a broken console fallback, not only a sink panic.
+    let _ = std::panic::catch_unwind(|| {
+        let mut fields = serde_json::Map::from_iter([
+            ("stage".into(), Value::from(stage)),
+            ("reason".into(), Value::from(reason)),
+        ]);
+        if let Some(status) = status {
+            fields.insert("status".into(), Value::from(status));
+        }
+        pi_ai::log::get_logger("occ3.sglang").warn("native_binding_rejected", Some(fields));
+    });
+}
+
+#[track_caller]
 fn native_invalid() -> Occ3Error {
+    let line = std::panic::Location::caller().line();
+    let _ = std::panic::catch_unwind(|| {
+        pi_ai::log::get_logger("occ3.sglang").warn(
+            "native_binding_invalid_site",
+            Some(serde_json::Map::from_iter([("line".into(), Value::from(line))])),
+        );
+    });
     Occ3Error::TransferFailed {
         reason: "native control binding invalid".into(),
     }
@@ -431,7 +495,7 @@ fn native_invalid() -> Occ3Error {
 /// it from the same server-attested method id, never from a constant.
 fn permit_method(native: &NativeExperiment) -> Result<Occ3Method, Occ3Error> {
     crate::core::occ3_connectors::method_family(&native.permit.identity.latent_method)
-        .ok_or_else(native_invalid)
+        .ok_or_else(|| native_invalid())
 }
 fn native_uncertain(message_id: &str) -> Occ3Error {
     Occ3Error::InferenceOutcomeUncertain {
@@ -496,39 +560,220 @@ impl SglangOcc3Connector {
         }
         Ok(native)
     }
+    /// A refusal alone is not restart evidence. Re-probe the attested identity
+    /// before evicting this connector; existing operations still fail closed.
+    async fn invalidate_ready_if_runtime_changed(&self) {
+        let Some(native) = self.native.as_ref() else { return };
+        // Never queue recovery probes behind one another. The not-before
+        // deadline also bounds repeated failures against an unavailable server.
+        let Ok(mut next_probe) = self.runtime_probe.try_lock() else { return };
+        if next_probe.is_some_and(|deadline| std::time::Instant::now() < deadline) {
+            return;
+        }
+        *next_probe = Some(std::time::Instant::now() + Duration::from_secs(5));
+        let Ok(Some((identity, runtime))) = tokio::time::timeout(
+            Duration::from_millis(1500),
+            async {
+                let identity = self.model_identity().await.ok()?;
+                let runtime = self.runtime_identity().await.ok()?;
+                Some((identity, runtime))
+            },
+        ).await else { return };
+        let identity = Occ3ModelIdentity { latent_method: runtime.method_id.clone(), ..identity };
+        if identity.fingerprint() != runtime.model_fingerprint {
+            return;
+        }
+        let permit = &native.permit;
+        // Server authority is exactly (epoch, generation, fingerprint):
+        // latent_registry.py::_profile. Generation is incarnation-wide, not
+        // per capture (latent_worker.py::load_runtime_profile); use_receipts.py
+        // also requires source enrollment and intent generations to match.
+        // Profile-only drift is not proof that this enrollment was revoked.
+        if runtime.runtime_id != permit.runtime_id
+            || runtime.runtime_generation != permit.runtime_generation
+            || identity != permit.identity
+        {
+            crate::core::occ3_connectors::activation::invalidate_connector_ready(self);
+        } else {
+            // Persistent authority refusals still need a short traffic bound.
+            // A subsequent failure after this window rechecks a fresh restart.
+            *next_probe = Some(std::time::Instant::now() + Duration::from_secs(1));
+        }
+    }
+
+    /// Bounded error-code read from a non-success control response. The
+    /// server's fixed envelope is `{"error":{"code":"..."}}` and never
+    /// carries exception text; a body over 256 bytes, a malformed body or
+    /// an empty/oversized code means the decline is not recognizably one of
+    /// the fixed pre-dispatch busy classes, so it must stay fail-closed.
+    /// Never a replay permit: the code only chooses the error KIND.
+    async fn read_bounded_control_error_code(
+        response: &mut reqwest::Response,
+    ) -> Option<String> {
+        let mut received = Vec::new();
+        while let Some(chunk) = response.chunk().await.ok()? {
+            if received.len().saturating_add(chunk.len()) > 256 {
+                return None;
+            }
+            received.extend_from_slice(&chunk);
+        }
+        #[derive(serde::Deserialize)]
+        struct Envelope {
+            error: Inner,
+        }
+        #[derive(serde::Deserialize)]
+        struct Inner {
+            code: String,
+        }
+        let parsed: Envelope = serde_json::from_slice(&received).ok()?;
+        if parsed.error.code.is_empty() || parsed.error.code.len() > 64 {
+            return None;
+        }
+        Some(parsed.error.code)
+    }
+
     async fn control<T: serde::de::DeserializeOwned>(
         &self,
         path: &str,
         body: &Value,
     ) -> Result<T, Occ3Error> {
+        self.control_with_retries(path, body, 0).await
+    }
+
+    /// Same contract as [`control`](Self::control), plus a bounded retry
+    /// budget for send-phase transport failures. A retried attempt never
+    /// produced any response, and only a control route that is idempotent
+    /// under the identical body (`sessions/enroll` re-enrolls the same
+    /// per-session record) may pass a nonzero budget. Declines that produced
+    /// an HTTP status keep their first-occurrence classification - busy/quota
+    /// refusals and authority failures are semantic, not transient transport
+    /// noise - and timeouts are never retried, so a hanging server still
+    /// fails at exactly one HEALTH_TIMEOUT.
+    async fn control_with_retries<T: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &Value,
+        transport_retries: u32,
+    ) -> Result<T, Occ3Error> {
+        match self.control_raw(path, body, transport_retries).await {
+            Ok(response) => Ok(response),
+            Err(failure) => {
+                if failure.authority {
+                    self.invalidate_ready_if_runtime_changed().await;
+                }
+                Err(failure.error)
+            }
+        }
+    }
+
+    async fn control_raw<T: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &Value,
+        transport_retries: u32,
+    ) -> Result<T, NativeControlFailure> {
         let bytes =
             pi_ai::source_capture::canonical_json_bytes(body).map_err(|_| native_invalid())?;
         if bytes.len() > 16384 {
-            return Err(native_invalid());
+            return Err(native_invalid().into());
         }
-        let mut response = self
-            .request_builder(reqwest::Method::POST, path, HEALTH_TIMEOUT)?
-            .header("accept-encoding", "identity")
-            .body(bytes)
-            .send()
-            .await
-            .map_err(|_| native_invalid())?;
-        if !response.status().is_success()
-            || response
-                .headers()
-                .get("content-encoding")
-                .is_some_and(|v| v != "identity")
-        {
-            return Err(native_invalid());
+        let mut send_retries: u32 = 0;
+        let mut response = loop {
+            let sent = self
+                .request_builder(reqwest::Method::POST, path, HEALTH_TIMEOUT)?
+                .header("accept-encoding", "identity")
+                .body(bytes.clone())
+                .send()
+                .await;
+            match sent {
+                Ok(response) => break response,
+                Err(transport) => {
+                    // A send-phase failure produced no response at all. For
+                    // an idempotent route the identical resend is safe even
+                    // when the first attempt reached the server. Timeouts
+                    // stay excluded: the request may still be in flight and
+                    // a hanging server must fail once, not 1+N times.
+                    if transport.is_timeout() || send_retries >= transport_retries {
+                        return Err(native_invalid().into());
+                    }
+                    send_retries += 1;
+                    native_binding_diagnostic("control", "send_transport_retry", None);
+                    tokio::time::sleep(CONTROL_TRANSPORT_RETRY_DELAY).await;
+                }
+            }
+        };
+        let status = response.status().as_u16();
+        let identity_encoded = response
+            .headers()
+            .get("content-encoding")
+            .map(|v| v == "identity")
+            .unwrap_or(true);
+        if !response.status().is_success() || !identity_encoded {
+            native_binding_diagnostic("control", "http_status", Some(status));
+            // latent_control_api.control_error_response maps both `identity`
+            // and `identity_mismatch` to 401. latent_registry._profile and
+            // _session use `identity` for epoch and absent-enrollment failures.
+            // Busy (409), quota, malformed responses and outages are not proof
+            // of revoked enrollment and must not trigger recovery probes.
+            //
+            // A synchronous `quota` decline of THIS control call surfaces
+            // as the distinct `NativeInferenceBusyRefused` instead of the
+            // generic invalid site. Route coverage today: `sessions/enroll`
+            // maps quota to 429 (session-table capacity, or the 16 KiB
+            // body bound before any parse); its other codes are
+            // identity/invalid/unavailable/409-fallback and can never be
+            // `busy` (registry `busy` exists only on reserve_capture and
+            // reserve_consume). The classification pairs the two codes
+            // anyway so a future control route that reuses the admission
+            // decline's `busy` gets the same contract. For the receiver
+            // retire boundary the proof is narrower than "no server work
+            // happened": `prepare_inference` awaits exactly one control
+            // call (sessions/enroll) before building the receiver
+            // attachment, and only a bound, submitted attachment can ever
+            // reach the provider - so a refusal here proves the attachment
+            // for this consume was never created or submitted. A 429
+            // envelope from the body-size bound also proves the request
+            // never parsed. The envelope otherwise proves nothing about
+            // server state (the worker may have written its session table
+            // before a frontend readiness decline), which is exactly why
+            // the receiver RETIRES the claim terminally and routes the busy
+            // signal to the sender: nothing is marked consumed on this
+            // side, and the sender's fresh-capture re-arm - never a replay
+            // of this handle - is the sole retry path. The classification
+            // itself is the generic control-path rule and is not
+            // operation-scoped; only `prepare_inference`'s enroll error
+            // reaches the resolver's retire arm - publication and
+            // retirement keep their existing status-probe/uncertain paths
+            // (their control errors keep the generic refusal; nothing
+            // matches the busy kind there today). Every other code -
+            // including a 409 `expired` or `replay` - keeps the
+            // fail-closed generic refusal.
+            let code = if identity_encoded {
+                Self::read_bounded_control_error_code(&mut response).await
+            } else {
+                None
+            };
+            let error = match (status, code.as_deref()) {
+                (409, Some("busy")) | (429, Some("quota")) => {
+                    Occ3Error::NativeInferenceBusyRefused {
+                        connector_id: CONNECTOR_ID.into(),
+                    }
+                }
+                _ => native_invalid(),
+            };
+            return Err(NativeControlFailure {
+                error,
+                authority: matches!(status, 401 | 403),
+            });
         }
         let mut received = Vec::new();
         while let Some(chunk) = response.chunk().await.map_err(|_| native_invalid())? {
             if received.len().saturating_add(chunk.len()) > 16384 {
-                return Err(native_invalid());
+                return Err(native_invalid().into());
             }
             received.extend_from_slice(&chunk);
         }
-        serde_json::from_slice(&received).map_err(|_| native_invalid())
+        serde_json::from_slice(&received).map_err(|_| native_invalid().into())
     }
     fn check_enrollment_response(
         permit: &NativeExperimentalPermit,
@@ -539,28 +784,30 @@ impl SglangOcc3Connector {
         use crate::core::occ::occ3::connector::NativeSessionEnrollment;
         let fingerprint = permit.identity.fingerprint();
         let ready = &response.readiness;
-        if response.schema != "occ3.sessions.enrolled.v1"
-            || response.operation_id != operation_id
-            || response.session_id != session_id
-            || !native_digest(&response.principal_digest)
-            || response.runtime_id != permit.runtime_id
-            || response.runtime_generation != permit.runtime_generation
-            || response.model_fingerprint != fingerprint
-            || response.expires_at_epoch != permit.expires_at_epoch
-            || ready.runtime_epoch != permit.runtime_id
-            || ready.runtime_generation != permit.runtime_generation
-            || ready.model_fingerprint != fingerprint
-            || ready.method_id != permit.identity.latent_method
-            || ready.expected_ranks != permit.source_profile.expected_ranks
-            || ready.ready_ranks != ready.expected_ranks
-            || ready.tp_layout_digest != permit.source_profile.layout_digest
-            || ready.hidden_dim != permit.source_profile.hidden_dim
-            || ready.layer_index != permit.source_profile.layer_index
-            || ready.dtype != permit.source_profile.dtype
-            || ready.profile_digest != permit.profile_digest
-            || !ready.source_capture
-            || !ready.continuous_prefix
-            || !ready.terminal_journal
+        if native_binding_failed!("enrollment";
+            "schema" => response.schema != "occ3.sessions.enrolled.v1",
+            "operation_id" => response.operation_id != operation_id,
+            "session_id" => response.session_id != session_id,
+            "principal_digest" => !native_digest(&response.principal_digest),
+            "runtime_id" => response.runtime_id != permit.runtime_id,
+            "runtime_generation" => response.runtime_generation != permit.runtime_generation,
+            "model_fingerprint" => response.model_fingerprint != fingerprint,
+            "expires_at_epoch" => response.expires_at_epoch != permit.expires_at_epoch,
+            "readiness.runtime_epoch" => ready.runtime_epoch != permit.runtime_id,
+            "readiness.runtime_generation" => ready.runtime_generation != permit.runtime_generation,
+            "readiness.model_fingerprint" => ready.model_fingerprint != fingerprint,
+            "readiness.method_id" => ready.method_id != permit.identity.latent_method,
+            "readiness.expected_ranks" => ready.expected_ranks != permit.source_profile.expected_ranks,
+            "readiness.ready_ranks" => ready.ready_ranks != ready.expected_ranks,
+            "readiness.tp_layout_digest" => ready.tp_layout_digest != permit.source_profile.layout_digest,
+            "readiness.hidden_dim" => ready.hidden_dim != permit.source_profile.hidden_dim,
+            "readiness.layer_index" => ready.layer_index != permit.source_profile.layer_index,
+            "readiness.dtype" => ready.dtype != permit.source_profile.dtype,
+            "readiness.profile_digest" => ready.profile_digest != permit.profile_digest,
+            "readiness.source_capture" => !ready.source_capture,
+            "readiness.continuous_prefix" => !ready.continuous_prefix,
+            "readiness.terminal_journal" => !ready.terminal_journal,
+        )
         {
             return Err(native_invalid());
         }
@@ -605,18 +852,45 @@ impl SglangOcc3Connector {
             "session_id":session_id,"model_fingerprint":fingerprint,"runtime_id":permit.runtime_id,
             "runtime_generation":permit.runtime_generation,"access_domain":permit.access_domain,
             "expires_at_epoch":permit.expires_at_epoch});
+        // Enrollment is the one control route that is idempotent under an
+        // identical body, so a send-phase transport failure is retried here
+        // instead of aborting the whole armed turn with the failure text
+        // (the live round-1 stability failure: a pooled connection reset
+        // 0.35s after the armed capture began). A decline that produced a
+        // response keeps its first-occurrence classification above.
         let response: EnrollmentResponse = self
-            .control("/occ3/v1/native/sessions/enroll", &body)
+            .control_with_retries(
+                "/occ3/v1/native/sessions/enroll",
+                &body,
+                ENROLL_TRANSPORT_RETRIES,
+            )
             .await?;
-        let result = Self::check_enrollment_response(permit, response, &operation_id, session_id)?;
+        // Only authority fields in a correctly addressed enrollment response
+        // justify a runtime probe, not malformed schema or capability errors.
+        let authority_mismatch = response.schema == "occ3.sessions.enrolled.v1"
+            && response.operation_id == operation_id
+            && response.session_id == session_id
+            && (response.runtime_id != permit.runtime_id
+                || response.runtime_generation != permit.runtime_generation
+                || response.model_fingerprint != fingerprint
+                || response.readiness.runtime_epoch != permit.runtime_id
+                || response.readiness.runtime_generation != permit.runtime_generation
+                || response.readiness.model_fingerprint != fingerprint);
+        let result = match Self::check_enrollment_response(permit, response, &operation_id, session_id) {
+            Ok(result) => result,
+            Err(error) => {
+                if authority_mismatch {
+                    self.invalidate_ready_if_runtime_changed().await;
+                }
+                return Err(error);
+            }
+        };
         let mut records = native.records.lock().map_err(|_| native_invalid())?;
-        if records.stopped
-            || records
-                .sessions
-                .values()
-                .any(|old| old.principal_digest != result.principal_digest)
-            || (!records.sessions.contains_key(session_id) && records.sessions.len() >= 64)
-        {
+        if native_binding_failed!("enroll_records";
+            "stopped" => records.stopped,
+            "principal_mismatch" => records.sessions.values().any(|old| old.principal_digest != result.principal_digest),
+            "session_capacity" => !records.sessions.contains_key(session_id) && records.sessions.len() >= 64,
+        ) {
             return Err(native_invalid());
         }
         records.sessions.insert(session_id.into(), result.clone());
@@ -722,19 +996,196 @@ fn parse_identity(fields: &Value) -> Result<Occ3ModelIdentity, Occ3Error> {
                 reason: format!("identity field missing: {name}"),
             })
     };
+    // Informational provenance fields: the sglang extension degrades an
+    // unknown checkpoint provenance (a local model path carries no hub
+    // revision) and a chat template kept outside tokenizer_config.json to
+    // an honest empty string (occ3_sglang/identity.py). An empty value is
+    // accepted; an absent field, an oversized value, control characters or
+    // placeholder text is still rejected, so a degraded server can never
+    // smuggle an unverifiable claim as a value.
+    let informational_field = |name: &str| -> Result<String, Occ3Error> {
+        fields
+            .get(name)
+            .and_then(Value::as_str)
+            .filter(|value| {
+                value.len() <= 4096
+                    && !value.chars().any(char::is_control)
+                    && !matches!(
+                        value.trim().to_ascii_lowercase().as_str(),
+                        "unknown" | "unverified"
+                    )
+            })
+            .map(str::to_string)
+            .ok_or_else(|| Occ3Error::TransferFailed {
+                reason: format!("identity field missing: {name}"),
+            })
+    };
     Ok(Occ3ModelIdentity {
         model_id: str_field("model_id")?,
         architecture: str_field("architecture")?,
-        checkpoint_revision: str_field("checkpoint_revision")?,
+        checkpoint_revision: informational_field("checkpoint_revision")?,
         weight_fingerprint: str_field("weight_fingerprint")?,
         tokenizer_fingerprint: str_field("tokenizer_fingerprint")?,
-        chat_template_fingerprint: str_field("chat_template_fingerprint")?,
+        chat_template_fingerprint: informational_field("chat_template_fingerprint")?,
         quantisation: str_field("quantisation")?,
         tensor_geometry: str_field("tensor_geometry")?,
         kv_layout: str_field("kv_layout")?,
         latent_method: str_field("latent_method")?,
         runtime: str_field("runtime")?,
     })
+}
+
+/// Client default when neither the environment nor the alpha file selects a
+/// value: 0.3, the attested hybrid coefficient. Sending `None` instead makes
+/// the server fall back to its profile default, which garbled every
+/// alphanumeric handoff code on one Windows host while 0.3 stayed byte-exact
+/// (2026-11-08 cross-machine finding: profile-default garbled 5/5 codes on
+/// Windows; 0.3 was byte-exact on Linux 6/6 and Windows 5/5).
+const DEFAULT_LABEL_ANCHOR_ALPHA: f64 = 0.3;
+
+/// Resolve each capture afresh; environment selection never reads the file.
+/// A missing file selects the attested client default instead of the server
+/// profile default, so precedence is env > file > client default.
+fn resolve_label_anchor_alpha(
+    env: Result<String, std::env::VarError>,
+    path: impl FnOnce() -> std::path::PathBuf,
+) -> Result<(Option<pi_ai::source_capture::LabelAnchorAlpha>, &'static str), Occ3Error> {
+    use std::io::Read;
+    if !matches!(env, Err(std::env::VarError::NotPresent)) {
+        return parse_label_anchor_alpha_env(env).map(|alpha| (alpha, "env"));
+    }
+    let invalid = || Occ3Error::TransferFailed {
+        reason: "invalid OCC3_LABEL_ANCHOR_ALPHA_FILE: expected readable UTF-8 decimal under 32 bytes (0, 0.3, 0.5, 0.7, or 1)".into(),
+    };
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // Validate the opened handle below; a path swap to a FIFO cannot stall capture.
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = match options.open(path()) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((
+                Some(pi_ai::source_capture::LabelAnchorAlpha::try_from(DEFAULT_LABEL_ANCHOR_ALPHA)
+                    .expect("DEFAULT_LABEL_ANCHOR_ALPHA is an attested alpha")),
+                "client-default",
+            ));
+        }
+        Err(_) => return Err(invalid()),
+    };
+    if !file.metadata().map_err(|_| invalid())?.is_file() { return Err(invalid()); }
+    let mut bytes = Vec::new();
+    file.take(32).read_to_end(&mut bytes).map_err(|_| invalid())?;
+    if bytes.len() >= 32 { return Err(invalid()); }
+    let value = std::str::from_utf8(&bytes).map_err(|_| invalid())?.trim();
+    parse_label_anchor_alpha_env(Ok(value.into()))
+        .map(|alpha| (alpha, "file"))
+        .map_err(|_| invalid())
+}
+
+/// Parse the per-handoff selection before enrollment or capture network traffic.
+fn parse_label_anchor_alpha_env(
+    value: Result<String, std::env::VarError>,
+) -> Result<Option<pi_ai::source_capture::LabelAnchorAlpha>, Occ3Error> {
+    let invalid = || Occ3Error::TransferFailed {
+        reason: "invalid OCC3_LABEL_ANCHOR_ALPHA: expected 0, 0.3, 0.5, 0.7, or 1".into(),
+    };
+    let value = match value {
+        Ok(value) => value,
+        Err(std::env::VarError::NotPresent) => return Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => return Err(invalid()),
+    };
+    let alpha = match value.as_str() {
+        "0" | "0.0" => 0.0,
+        "0.3" | ".3" => 0.3,
+        "0.5" | ".5" => 0.5,
+        "0.7" | ".7" => 0.7,
+        "1" | "1.0" => 1.0,
+        _ => return Err(invalid()),
+    };
+    pi_ai::source_capture::LabelAnchorAlpha::try_from(alpha)
+        .map(Some)
+        .map_err(|_| invalid())
+}
+
+#[cfg(test)]
+mod label_anchor_alpha_tests {
+    use super::{parse_label_anchor_alpha_env, resolve_label_anchor_alpha};
+
+    #[test]
+    fn file_selection_is_fresh_bounded_and_lower_precedence() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("alpha");
+        let resolve = || resolve_label_anchor_alpha(Err(std::env::VarError::NotPresent), || path.clone());
+        let (selected, source) = resolve().unwrap();
+        assert_eq!(f64::from(selected.unwrap()), 0.3);
+        assert_eq!(source, "client-default");
+        for alpha in ["0", "0.3", "0.5", "0.7", "1"] {
+            std::fs::write(&path, format!(" {alpha}\n")).unwrap();
+            let (selected, source) = resolve().unwrap();
+            assert_eq!(f64::from(selected.unwrap()), alpha.parse::<f64>().unwrap());
+            assert_eq!(source, "file");
+        }
+        assert_eq!(resolve_label_anchor_alpha(Ok("0".into()), || panic!("env must win")).unwrap().1, "env");
+        assert!(resolve_label_anchor_alpha(Ok("".into()), || panic!("bad env must fail")).is_err());
+        for bad in [vec![b'0'; 32], vec![0xff], b"0.4".to_vec(), Vec::new()] {
+            std::fs::write(&path, bad).unwrap();
+            assert!(resolve().is_err());
+        }
+        assert!(resolve_label_anchor_alpha(Err(std::env::VarError::NotPresent), || dir.path().into()).is_err());
+    }
+
+
+    #[cfg(unix)]
+    #[test]
+    fn fifo_selection_is_rejected_without_waiting_for_a_writer() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("alpha-fifo");
+        let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // The CString is live and terminated; the private fixture path does not exist yet.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let rejected = resolve_label_anchor_alpha(
+                Err(std::env::VarError::NotPresent), || path).is_err();
+            let _ = sender.send(rejected);
+        });
+        assert!(receiver.recv_timeout(std::time::Duration::from_secs(1))
+            .expect("FIFO selection must not wait for a writer"));
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn explicit_zero_is_never_replaced_by_the_client_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("alpha");
+        std::fs::write(&path, "0.3\n").unwrap();
+        let (selected, source) =
+            resolve_label_anchor_alpha(Ok("0".into()), || path.clone()).unwrap();
+        assert_eq!(f64::from(selected.unwrap()), 0.0);
+        assert_eq!(source, "env");
+        std::fs::write(&path, "0\n").unwrap();
+        let (selected, source) =
+            resolve_label_anchor_alpha(Err(std::env::VarError::NotPresent), || path.clone()).unwrap();
+        assert_eq!(f64::from(selected.unwrap()), 0.0);
+        assert_eq!(source, "file");
+    }
+
+    #[test]
+    fn selection_is_strict_and_absence_is_distinct_from_zero() {
+        assert_eq!(parse_label_anchor_alpha_env(Err(std::env::VarError::NotPresent)).unwrap(), None);
+        for (input, expected) in [("0.0", 0.0), ("1.0", 1.0), ("0", 0.0), (".3", 0.3), ("0.3", 0.3), (".5", 0.5), ("0.5", 0.5), (".7", 0.7), ("0.7", 0.7), ("1", 1.0)] {
+            assert_eq!(f64::from(parse_label_anchor_alpha_env(Ok(input.into())).unwrap().unwrap()), expected);
+        }
+        for input in ["", " ", " 0", "0 ", "NaN", "inf", "0.4", "-0", "1e0"] {
+            assert!(parse_label_anchor_alpha_env(Ok(input.into())).is_err(), "{input}");
+        }
+        assert!(parse_label_anchor_alpha_env(Err(std::env::VarError::NotUnicode(std::ffi::OsString::from("invalid")))).is_err());
+    }
 }
 
 #[cfg(test)]
@@ -752,6 +1203,10 @@ fn parse_method(value: &str) -> Result<Occ3Method, Occ3Error> {
 impl Occ3Connector for SglangOcc3Connector {
     fn connector_id(&self) -> &str {
         CONNECTOR_ID
+    }
+
+    fn readiness_instance_id(&self) -> Option<&str> {
+        Some(&self.readiness_instance_id)
     }
 
     fn protocol_version(&self) -> u32 {
@@ -779,9 +1234,23 @@ impl Occ3Connector for SglangOcc3Connector {
         arming: Option<SourceSpanArming>,
     ) -> Result<pi_ai::source_capture::SourceCaptureLease, Occ3Error> {
         use pi_ai::source_capture::*;
+        let (label_anchor_alpha, alpha_source) = resolve_label_anchor_alpha(
+            std::env::var("OCC3_LABEL_ANCHOR_ALPHA"),
+            || std::env::var_os("OCC3_LABEL_ANCHOR_ALPHA_FILE")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| std::path::PathBuf::from(crate::config::get_agent_dir()).join("occ3_label_anchor_alpha")),
+        )?;
+        crate::config::append_rotating_log_default(
+            &crate::config::get_debug_log_path(),
+            &format!("occ3 capture label_anchor_alpha={} source={alpha_source}",
+                label_anchor_alpha.map(f64::from).map(|v| v.to_string()).unwrap_or_else(|| "profile-default".into())),
+        );
         let enrolled = self.enroll(session_id).await?;
         let permit = &self.experiment()?.permit;
-        if target != permit.target || max_capture_bytes > permit.max_capture_bytes {
+        if native_binding_failed!("capture";
+            "target" => target != permit.target,
+            "capture_budget" => max_capture_bytes > permit.max_capture_bytes,
+        ) {
             return Err(native_invalid());
         }
         // v2 (content_tail_v2) is the default arming: only a v2 capture yields
@@ -815,6 +1284,7 @@ impl Occ3Connector for SglangOcc3Connector {
                 expires_at_epoch: enrolled.expires_at_epoch,
                 span_policy: arming.span_policy.into(),
                 capture_mode: arming.capture_mode.into(),
+                label_anchor_alpha,
             },
             enrolled.source_profile,
             limits,
@@ -830,7 +1300,7 @@ impl Occ3Connector for SglangOcc3Connector {
         use crate::core::occ::occ3::types::Occ3Envelope;
         let native = self.experiment()?;
         let intent = request.source.intent();
-        let receipt = request.source.receipt().ok_or_else(native_invalid)?;
+        let receipt = request.source.receipt().ok_or_else(|| native_invalid())?;
         // Mode-scoped dispatch validation. The legacy protocol requires the
         // captured turn's own exact occ3_handoff tool binding; the retained
         // content-only mode requires zero tool bindings and the v3 intent
@@ -853,22 +1323,29 @@ impl Occ3Connector for SglangOcc3Connector {
                     && request.source.tool_bindings().is_empty()
             }
         };
-        if !native_id(&request.message_id)
-            || request.message_id.len() > 128
-            || !native_id(&request.publication_id)
-            || !dispatch_valid
-            || intent.model_fingerprint != native.permit.identity.fingerprint()
-            || intent.runtime_id != native.permit.runtime_id
-            || intent.runtime_generation != native.permit.runtime_generation
-            || intent.method != native.permit.identity.latent_method
-            || request.source.target() != &native.permit.target
-            || receipt.expires_at_epoch <= native_now()
+        if native_binding_failed!("publish_source";
+            "message_id" => !native_id(&request.message_id),
+            "message_id_length" => request.message_id.len() > 128,
+            "publication_id" => !native_id(&request.publication_id),
+            "dispatch_binding" => !dispatch_valid,
+            "model_fingerprint" => intent.model_fingerprint != native.permit.identity.fingerprint(),
+            "runtime_id" => intent.runtime_id != native.permit.runtime_id,
+            "runtime_generation" => intent.runtime_generation != native.permit.runtime_generation,
+            "method" => intent.method != native.permit.identity.latent_method,
+            "target" => request.source.target() != &native.permit.target,
+            "receipt_expired" => receipt.expires_at_epoch <= native_now(),
+        )
         {
             return Err(native_invalid());
         }
-        // Refresh both memberships/profile before the first publication side effect.
-        let source = self.enroll(&intent.source_session_id).await?;
-        let receiver = self.enroll(&request.receiver_session_id).await?;
+        // Refresh both memberships/profile before the first publication side
+        // effect. The two enrollments are independent control calls (distinct
+        // operation ids, idempotent per session server-side), so they run
+        // concurrently; the first failure cancels the other.
+        let (source, receiver) = tokio::try_join!(
+            self.enroll(&intent.source_session_id),
+            self.enroll(&request.receiver_session_id),
+        )?;
         if source.principal_digest != receiver.principal_digest
             || source.access_domain != receiver.access_domain
             || source.session_id == receiver.session_id
@@ -897,7 +1374,7 @@ impl Occ3Connector for SglangOcc3Connector {
         let mut binding = body.clone();
         binding
             .as_object_mut()
-            .ok_or_else(native_invalid)?
+            .ok_or_else(|| native_invalid())?
             .remove("schema");
         binding["principal_digest"] = serde_json::json!(source.principal_digest);
         let digest = pi_ai::source_capture::sha256(
@@ -976,7 +1453,7 @@ impl Occ3Connector for SglangOcc3Connector {
                 // never copied into the successful receiver message. The
                 // summary is receiver-framed so the receiving model answers
                 // as itself, not in the sender's voice.
-                control_summary: "You are the receiver of this attached native state. It is the sender's context, not your own history. As the receiver, answer your current task using that state.".into(),
+                control_summary: OCC3_CONTROL_SUMMARY.into(),
                 fallback_reference: "text".into(),
             },
         };
@@ -987,7 +1464,7 @@ impl Occ3Connector for SglangOcc3Connector {
         records
             .publications
             .get_mut(&request.publication_id)
-            .ok_or_else(native_invalid)?
+            .ok_or_else(|| native_invalid())?
             .publication = Some(publication.clone());
         Ok(publication)
     }
@@ -998,8 +1475,10 @@ impl Occ3Connector for SglangOcc3Connector {
     ) -> Result<pi_ai::inference_attachment::InferenceStateLease, Occ3Error> {
         use crate::core::occ::occ3::inference::{inference_attachment, VerifiedInferenceRuntime};
         let native = self.experiment()?;
-        if request.target != native.permit.target
-            || request.receiver_identity != native.permit.identity
+        if native_binding_failed!("prepare_inference";
+            "target" => request.target != native.permit.target,
+            "receiver_identity" => request.receiver_identity != native.permit.identity,
+        )
         {
             return Err(native_invalid());
         }
@@ -1041,10 +1520,12 @@ impl Occ3Connector for SglangOcc3Connector {
     ) -> Result<crate::core::occ::occ3::connector::NativeRetirement, Occ3Error> {
         let native = self.native.as_ref().ok_or_else(native_unsupported)?;
         let intent = source.intent();
-        let receipt = source.retirement_receipt().ok_or_else(native_invalid)?;
-        if intent.runtime_id != native.permit.runtime_id
-            || intent.runtime_generation != native.permit.runtime_generation
-            || intent.model_fingerprint != native.permit.identity.fingerprint()
+        let receipt = source.retirement_receipt().ok_or_else(|| native_invalid())?;
+        if native_binding_failed!("retire";
+            "runtime_id" => intent.runtime_id != native.permit.runtime_id,
+            "runtime_generation" => intent.runtime_generation != native.permit.runtime_generation,
+            "model_fingerprint" => intent.model_fingerprint != native.permit.identity.fingerprint(),
+        )
         {
             return Err(native_invalid());
         }
@@ -1196,6 +1677,70 @@ impl Occ3Connector for SglangOcc3Connector {
 mod tests {
     use super::*;
 
+    #[test]
+    fn native_binding_diagnostics_are_fixed_bounded_and_exception_safe() {
+        use std::sync::{Arc, Mutex};
+        struct ResetSink;
+        impl Drop for ResetSink {
+            fn drop(&mut self) {
+                pi_ai::log::set_log_sink(None);
+            }
+        }
+        let _sink_guard = pi_ai::log::test_sink_guard();
+        let _reset = ResetSink;
+        let entries = Arc::new(Mutex::new(Vec::new()));
+        let captured = entries.clone();
+        let me = std::thread::current().id();
+        pi_ai::log::set_log_sink(Some(Box::new(move |entry| {
+            if std::thread::current().id() == me
+                && entry["msg"].as_str().is_some_and(|msg| msg.starts_with("native_binding_"))
+            {
+                captured.lock().unwrap().push(entry.clone());
+            }
+        })));
+        let secret = "synthetic-private-binding-value";
+        assert!(native_binding_failed!("test";
+            "runtime_id" => secret != "expected",
+            "must_not_run" => { assert!(false, "short circuit changed"); false }
+        ));
+        assert!(!native_binding_failed!("test"; "valid" => false));
+        let values = entries.lock().unwrap();
+        assert_eq!(values.len(), 1);
+        assert_eq!(values[0]["stage"], "test");
+        assert_eq!(values[0]["reason"], "runtime_id");
+        assert_eq!(values[0]["msg"], "native_binding_rejected");
+        let encoded = values[0].to_string();
+        assert!(encoded.len() < 256);
+        assert!(!encoded.contains(secret));
+        drop(values);
+        // FnOnce adapters must retain each real call site, not the helper's line.
+        let first_line = line!() + 1;
+        let _ = None::<()>.ok_or_else(|| native_invalid());
+        let second_line = line!() + 1;
+        let _ = None::<()>.ok_or_else(|| native_invalid());
+        let values = entries.lock().unwrap();
+        assert_eq!(values[1]["msg"], "native_binding_invalid_site");
+        assert_eq!(values[1]["line"], first_line);
+        assert_eq!(values[2]["line"], second_line);
+        assert_ne!(first_line, second_line);
+        drop(values);
+        native_binding_diagnostic("control", "http_status", Some(503));
+        let values = entries.lock().unwrap();
+        assert_eq!(values[3]["stage"], "control");
+        assert_eq!(values[3]["reason"], "http_status");
+        assert_eq!(values[3]["status"], 503);
+        drop(values);
+        pi_ai::log::set_log_sink(Some(Box::new(|_| panic!("broken test sink"))));
+        let result = std::panic::catch_unwind(|| {
+            if native_binding_failed!("test"; "runtime_id" => true) {
+                return Err::<(), _>(native_invalid());
+            }
+            Ok(())
+        }).expect("diagnostics must not escape");
+        assert!(matches!(result, Err(Occ3Error::TransferFailed { reason })
+            if reason == "native control binding invalid"));
+    }
+
     // TS12 live regression: the deployed server (PR #200 baseline) carries
     // `max_capture_bytes` in the enrollment readiness payload. Captured
     // verbatim from the live candidate on 2026-10-26T14:12Z (enroll 200).
@@ -1325,6 +1870,53 @@ mod tests {
             parse_identity(&changed).unwrap().fingerprint()
         );
         assert!(parse_identity(&json!({})).is_err());
+    }
+
+    #[test]
+    fn identity_informational_fields_may_degrade_to_empty() {
+        // The deployed extension's identity contract (occ3_sglang/identity.py)
+        // degrades unknown provenance components to empty strings: a
+        // checkpoint served from a local path has no hub revision, and a
+        // runtime that keeps its chat template outside tokenizer_config.json
+        // has no in-config template digest. Those two fields are
+        // informational, so an honestly degraded identity must still parse.
+        let fields = json!({
+            "model_id": "glm-5.3",
+            "architecture": "GlmMoeDsaForCausalLM",
+            "checkpoint_revision": "",
+            "weight_fingerprint": "18ad686accf22269",
+            "tokenizer_fingerprint": "98b1271574f41abf",
+            "chat_template_fingerprint": "",
+            "quantisation": "fp8",
+            "tensor_geometry": "hidden_size=6144;num_hidden_layers=78",
+            "kv_layout": "page_size=;kv_cache_dtype=fp8_e4m3;tp_size=8",
+            "latent_method": "kv-radix-channel-v1",
+            "runtime": "sglang/0.5.21",
+        });
+        let identity = parse_identity(&fields).unwrap();
+        assert_eq!(identity.checkpoint_revision, "");
+        assert_eq!(identity.chat_template_fingerprint, "");
+        // The fingerprint still covers the degraded fields, so two servers
+        // that degrade the same way still compare equal.
+        assert!(identity.fingerprint().starts_with("sha256:"));
+        // Hard identity fields still refuse empty values.
+        let mut missing = fields.clone();
+        missing["weight_fingerprint"] = json!("");
+        assert!(parse_identity(&missing).is_err());
+        let mut missing = fields.clone();
+        missing["model_id"] = json!("");
+        assert!(parse_identity(&missing).is_err());
+        // Placeholder values never pass, even where empty is honest.
+        let mut placeholder = fields.clone();
+        placeholder["checkpoint_revision"] = json!("unknown");
+        assert!(parse_identity(&placeholder).is_err());
+        let mut placeholder = fields.clone();
+        placeholder["chat_template_fingerprint"] = json!("unverified");
+        assert!(parse_identity(&placeholder).is_err());
+        // An absent informational field is still a protocol violation.
+        let mut absent = fields.clone();
+        absent.as_object_mut().unwrap().remove("checkpoint_revision");
+        assert!(parse_identity(&absent).is_err());
     }
 
     #[test]
@@ -1593,5 +2185,290 @@ mod tests {
             assert!(!error.to_string().contains("one"));
             assert!(!error.to_string().contains("two"));
         }
+    }
+
+    // ---- enroll send-phase transport retry regressions ----
+    // Live round-1 stability failure (2026-11-08, client b2ae1805): the
+    // armed capture's enroll control call runs at the start of the facts
+    // turn, and a transient send-phase transport failure - a pooled
+    // connection reset by the gateway between reuse - aborted the whole
+    // turn with the failure text 0.35s after the capture armed. The mock
+    // below reproduces that wire shape on loopback: a dropped connection
+    // is read in full and then closed with no response at all, exactly
+    // like a reset between reuse.
+
+    struct EnrollTransportMock {
+        endpoint: Url,
+        enroll_requests: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        shutdown: Option<tokio::sync::oneshot::Sender<()>>,
+    }
+
+    impl Drop for EnrollTransportMock {
+        fn drop(&mut self) {
+            if let Some(shutdown) = self.shutdown.take() {
+                let _ = shutdown.send(());
+            }
+        }
+    }
+
+    fn find_head_end(buffer: &[u8]) -> Option<usize> {
+        buffer.windows(4).position(|window| window == b"\r\n\r\n")
+    }
+
+    async fn write_mock_response(
+        socket: &mut tokio::net::TcpStream,
+        status_line: &str,
+        body: &str,
+    ) {
+        use tokio::io::AsyncWriteExt;
+        let head = format!(
+            "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        let _ = socket.write_all(head.as_bytes()).await;
+        let _ = socket.write_all(body.as_bytes()).await;
+        let _ = socket.shutdown().await;
+    }
+
+    async fn serve_enroll_transport_connection(
+        mut socket: tokio::net::TcpStream,
+        drop_first: usize,
+        decline: Option<(u16, &'static str)>,
+        enroll_requests: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        use std::sync::atomic::Ordering;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        // Read the full request head + body, bounded like the connector's
+        // own 16 KiB control envelope.
+        let mut received = Vec::new();
+        let mut chunk = [0u8; 4096];
+        let content_length = loop {
+            let n = match socket.read(&mut chunk).await {
+                Ok(n) => n,
+                Err(_) => return,
+            };
+            if n == 0 {
+                return;
+            }
+            received.extend_from_slice(&chunk[..n]);
+            let Some(head_end) = find_head_end(&received) else {
+                if received.len() > 16384 {
+                    return;
+                }
+                continue;
+            };
+            let head = String::from_utf8_lossy(&received[..head_end]).to_string();
+            let content_length = head
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())?
+                })
+                .unwrap_or(0);
+            if received.len() >= head_end + 4 + content_length {
+                break content_length;
+            }
+        };
+        let head_end = find_head_end(&received).expect("head end known");
+        let head = String::from_utf8_lossy(&received[..head_end]).to_string();
+        let path = head
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .unwrap_or_default()
+            .to_string();
+        if path != "/occ3/v1/native/sessions/enroll" {
+            return;
+        }
+        let body: Option<Value> = if content_length == 0 {
+            None
+        } else {
+            serde_json::from_slice(
+                &received[head_end + 4..head_end + 4 + content_length],
+            )
+            .ok()
+        };
+        let Some(body) = body else { return };
+        let seen = enroll_requests.fetch_add(1, Ordering::SeqCst);
+        if seen < drop_first {
+            // The transient failure under test: the request was read in
+            // full, then the connection closes with no response.
+            let _ = socket.shutdown().await;
+            return;
+        }
+        if let Some((status, code)) = decline {
+            let payload = format!("{{\"error\":{{\"code\":\"{code}\"}}}}");
+            write_mock_response(&mut socket, &format!("{status} decline"), &payload).await;
+            return;
+        }
+        let response = serde_json::json!({
+            "schema": "occ3.sessions.enrolled.v1",
+            "operation_id": body["operation_id"],
+            "session_id": body["session_id"],
+            "principal_digest": "a".repeat(64),
+            "runtime_id": body["runtime_id"],
+            "runtime_generation": body["runtime_generation"],
+            "model_fingerprint": body["model_fingerprint"],
+            "expires_at_epoch": body["expires_at_epoch"],
+            "readiness": {
+                "runtime_epoch": body["runtime_id"],
+                "runtime_generation": body["runtime_generation"],
+                "model_fingerprint": body["model_fingerprint"],
+                "method_id": "statebridge.fixture.method.v1",
+                "expected_ranks": 8,
+                "ready_ranks": 8,
+                "tp_layout_digest": "b".repeat(64),
+                "hidden_dim": 6144,
+                "layer_index": 77,
+                "dtype": "bfloat16",
+                "profile_digest": "c".repeat(64),
+                "source_capture": true,
+                "continuous_prefix": true,
+                "terminal_journal": true,
+                "max_capture_bytes": 134217728,
+            },
+        });
+        let payload = response.to_string();
+        write_mock_response(&mut socket, "200 OK", &payload).await;
+    }
+
+    async fn serve_enroll_transport_mock(
+        drop_first: usize,
+        decline: Option<(u16, &'static str)>,
+    ) -> EnrollTransportMock {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let endpoint = Url::parse(&format!(
+            "http://{}",
+            listener.local_addr().expect("local addr")
+        ))
+        .expect("endpoint url");
+        let enroll_requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (shutdown, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let counter = std::sync::Arc::clone(&enroll_requests);
+        tokio::spawn(async move {
+            loop {
+                let socket = tokio::select! {
+                    accepted = listener.accept() => match accepted {
+                        Ok((socket, _)) => socket,
+                        Err(_) => break,
+                    },
+                    _ = &mut shutdown_rx => break,
+                };
+                let counter = std::sync::Arc::clone(&counter);
+                tokio::spawn(async move {
+                    serve_enroll_transport_connection(socket, drop_first, decline, counter)
+                        .await;
+                });
+            }
+        });
+        EnrollTransportMock {
+            endpoint,
+            enroll_requests,
+            shutdown: Some(shutdown),
+        }
+    }
+
+    fn fixture_permit(endpoint: &Url) -> NativeExperimentalPermit {
+        NativeExperimentalPermit {
+            attempt_id: "activation-fixture".into(),
+            identity: Occ3ModelIdentity {
+                model_id: "fixture-model".into(),
+                architecture: "fixture-arch".into(),
+                checkpoint_revision: "fixture-revision".into(),
+                weight_fingerprint: "fixture-weights".into(),
+                tokenizer_fingerprint: "fixture-tokenizer".into(),
+                chat_template_fingerprint: "fixture-template".into(),
+                quantisation: "fixture-bf16".into(),
+                tensor_geometry: "fixture-tp8".into(),
+                kv_layout: "fixture-kv".into(),
+                latent_method: "statebridge.fixture.method.v1".into(),
+                runtime: "fixture-runtime".into(),
+            },
+            target: pi_ai::inference_attachment::InferenceStateTarget {
+                provider: "fixture-provider".into(),
+                model_id: "fixture-model".into(),
+                base_url: endpoint.to_string(),
+            },
+            runtime_id: "fixture-runtime-epoch".into(),
+            runtime_generation: 1,
+            access_domain: "experimental.fixture-runtime-epoch".into(),
+            expires_at_epoch: native_now() + 600,
+            source_profile: pi_ai::source_capture::SourceCaptureProfile {
+                layer_index: 77,
+                hidden_dim: 6144,
+                dtype: "bfloat16".into(),
+                layout_digest: "b".repeat(64),
+                expected_ranks: 8,
+            },
+            profile_digest: "c".repeat(64),
+            max_capture_bytes: 134_217_728,
+        }
+    }
+
+    fn fixture_connector(endpoint: &Url) -> SglangOcc3Connector {
+        SglangOcc3Connector::new_experimental(
+            SglangOcc3Config {
+                endpoint: endpoint.clone(),
+                api_key: None,
+                control_headers: None,
+            },
+            fixture_permit(endpoint),
+        )
+        .expect("fixture connector")
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn enroll_retries_a_transient_send_failure_and_enrolls() {
+        let mock = serve_enroll_transport_mock(1, None).await;
+        let connector = fixture_connector(&mock.endpoint);
+        let result = connector
+            .enroll("fixture-session-a1")
+            .await
+            .expect("enrollment succeeds after one transient send failure");
+        assert_eq!(result.session_id, "fixture-session-a1");
+        assert_eq!(result.identity.model_id, "fixture-model");
+        assert_eq!(result.source_profile.expected_ranks, 8);
+        // One dropped attempt plus one successful resend.
+        assert_eq!(
+            mock.enroll_requests
+                .load(std::sync::atomic::Ordering::SeqCst),
+            2
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn enroll_send_retry_exhaustion_fails_closed() {
+        let mock = serve_enroll_transport_mock(usize::MAX, None).await;
+        let connector = fixture_connector(&mock.endpoint);
+        let result = connector.enroll("fixture-session-b2").await;
+        assert!(matches!(
+            result,
+            Err(Occ3Error::TransferFailed { ref reason })
+                if reason == "native control binding invalid"
+        ));
+        assert_eq!(
+            mock.enroll_requests
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1 + ENROLL_TRANSPORT_RETRIES as usize
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn enroll_never_retries_an_http_decline() {
+        let mock = serve_enroll_transport_mock(0, Some((429, "quota"))).await;
+        let connector = fixture_connector(&mock.endpoint);
+        let result = connector.enroll("fixture-session-c3").await;
+        assert!(matches!(
+            result,
+            Err(Occ3Error::NativeInferenceBusyRefused { .. })
+        ));
+        assert_eq!(
+            mock.enroll_requests
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
     }
 }

@@ -178,7 +178,8 @@ def harness():
     adapter = ChatAttachmentAdapter(backend, authorize=authorize,
                                    profile=BufferProfile(max_buffer_bytes=65536, total_working_bytes=524288,
                                                          max_turn_seconds=60, cleanup_seconds=.1,
-                                                         disconnect_interval=.002))
+                                                         disconnect_interval=.002,
+                                                         capture_busy_wait_seconds=0))
     class HookType:
         AROUND, AFTER, BEFORE, REPLACE = "around", "after", "before", "replace"
     ns = dict(functools=functools, HookType=HookType)

@@ -9,6 +9,7 @@ import hashlib
 import logging
 import os
 import queue
+import re
 import threading
 import time
 from array import array
@@ -20,25 +21,28 @@ from .attachment_contract import (CAPTURE_MODE_CONTENT_ONLY, CaptureWorkerDescri
                                     SPAN_POLICIES_V2, digest)
 from .span_policy import marker_table_from_wire, select_span_v2
 from .latent_registry import LatentRegistry
+from .latent_types import admission_probe
 from .latent_types import (LatentError, UniformRequestCancellation, Publication, RequestSlice, RuntimeProfile, require_members,
-                           SessionEnrollment, decode_descriptor, require,
+                           SessionEnrollment, capture_hold_settings, decode_descriptor, require,
                            validate_control_payload)
 from .prefix_layout import prefix_span
 from .alignment_dispatch import aligner_for, artifact_resident_bytes, load_frozen_artifact
-from .statebridge import (anchor_tiled, mean_embedding_norm, shard_ranges, workspace_bound)
+from .statebridge import (anchor_tiled, anchor_to_labels, mean_embedding_norm, shard_ranges, workspace_bound)
 
 logger = logging.getLogger(__name__)
 
 
-def method_metadata(profile, calibration_digest=""):
+def method_metadata(profile, calibration_digest="", *, label_anchor_alpha=None):
     """Scalar method identity for the capture record: no tensor bytes, no content.
 
     Every capture reports the method id it was aligned under. A calibrated
     capture additionally reports the frozen artifact digest, so a consumer can
     tell which frozen transform produced the prefix; the per-message method has
-    no artifact and therefore no digest key.
+    no artifact and therefore no digest key. Label anchoring is a profile
+    post-transform, so its coefficient is reported alongside the solver identity.
     """
-    metadata = {"method_id": profile.method}
+    alpha = profile.resolve_label_anchor(label_anchor_alpha)
+    metadata = {"method_id": profile.method, "label_anchor_alpha": alpha}
     if calibration_digest:
         metadata["artifact_digest"] = calibration_digest
     return metadata
@@ -442,6 +446,22 @@ class CaptureStage:
     committed: bool = False
 
 
+def _log_poison(runtime, site, code, *, op="none", phase="none"):
+    """Log only the first poison transition; never change the poison latch."""
+    try:
+        if runtime.poisoned:
+            return
+        sites = {"consensus", "preflight", "control", "private_kv_fence", "abort_fence", "bootstrap"}
+        operations = {"health", "status", "publication_status", "enroll_session", "reserve_capture",
+                      "reserve_consume", "publish", "bind_output", "release_lease", "retire", "finish_consume", "none"}
+        from .turn_diagnostics import _FAILURE_CODES
+        logger.error("occ3-bridge: runtime poisoned (site=%s code=%s op=%s phase=%s)",
+                     site if site in sites else "unknown", code if code in _FAILURE_CODES else "unknown",
+                     op if op in operations else "unknown", phase if isinstance(phase, str) and re.fullmatch(r"[a-z_]{1,40}", phase) else "unknown")
+    except Exception:
+        pass
+
+
 class WorkerRuntime:
     def __init__(self, model_runner, tp_group, profile, *, scheduler, artifact=None):
         import torch
@@ -489,8 +509,20 @@ class WorkerRuntime:
         # consume admission, never a decline.
         self.sparse_index_topk = None
         self.sparse_topk_exceeded = 0
+        # True only when the DSA indexer pin (attested dsa-pin manifest plus
+        # producer and graph-runner buffer wiring) is installed on every rank;
+        # set from _dsa_pin_installed after the rank gather. Otherwise an
+        # over-top-k consume declines pre-use; see _sparse_pin_required.
+        self.dsa_pin_active = False
+        self.dsa_pin_hits = 0
+        # Producer threshold margin (2 x draft-token width), also used by the
+        # unpinned admission bound (_sparse_pin_required).
+        self.sparse_pin_margin = 2
         local_error = ""
         local_layout = None
+        local_pin = False
+        pin_margin = 2
+        pin_stage = "init"
         stage = "init"
         try:
             from sglang.srt.mem_cache.radix_cache import RadixCache
@@ -510,6 +542,23 @@ class WorkerRuntime:
             require(config.quantization_config.get("quant_method") == "fp8", "profile")
             topk = getattr(config, "index_topk", None)
             self.sparse_index_topk = topk if type(topk) is int and topk > 0 else None
+            stage = "dsa_pin"
+            local_pin, pin_stage = _dsa_pin_install_stage(
+                self.sparse_index_topk, getattr(args, "speculative_eagle_topk", None),
+                config=config)
+            draft_tokens = getattr(args, "speculative_num_draft_tokens", None)
+            if type(draft_tokens) is int and draft_tokens > 0:
+                pin_margin = 2 * draft_tokens
+            elif local_pin:
+                # Fable F5: no guessed margin. Without a known draft width the
+                # pin threshold could fire late, so the pin is not installed
+                # (static server arg: identical on every rank).
+                local_pin, pin_stage = False, "draft_tokens"
+            if local_pin and _deterministic_mode(torch, args):
+                # Fable F3: scatter_reduce_ (amax) raises on CUDA under
+                # torch deterministic algorithms, so every pinned forward
+                # would fault. Process-wide setting, identical on every rank.
+                local_pin, pin_stage = False, "deterministic"
             stage = "model_class"
             validate_target_model_class(model_runner.model)
             from sglang.srt.runtime_context import get_parallel
@@ -546,7 +595,7 @@ class WorkerRuntime:
             local_layout = {"rank": self.rank, "ranges": shard_ranges(self.embedding),
                             "embedding_tp": self.embedding.tp_size, "dim": profile.hidden_dim,
                             "vocab": self.embedding.num_embeddings, "dtype": self.dtype,
-                            "kv": kv_layout}
+                            "kv": kv_layout, "dsa_pin": local_pin}
         except Exception as error:
             members = getattr(error, "members", None)
             if isinstance(members, str) and members and members.isascii():
@@ -562,6 +611,19 @@ class WorkerRuntime:
         require([x["rank"] for x in layouts] == list(range(profile.expected_ranks)), "ranks")
         require(all(x["dim"] == profile.hidden_dim and x["vocab"] == self.embedding.num_embeddings
                     and x["dtype"] == self.dtype and x["kv"] == local_layout["kv"] for x in layouts), "ranks")
+        # Uniform across ranks or the runtime declines: a mixed install must
+        # never let one rank admit an over-top-k consume another cannot pin.
+        require(all(x["dsa_pin"] is local_layout["dsa_pin"] for x in layouts), "ranks")
+        self.dsa_pin_active = local_layout["dsa_pin"] is True
+        self.sparse_pin_margin = pin_margin
+        from . import dsa_pin as _dsa_pin
+        # The producer pins a row only while it can exceed the top-k; the
+        # inputs are static config, identical on every rank.
+        _dsa_pin.configure(self.sparse_index_topk if self.dsa_pin_active else None, pin_margin)
+        if not self.dsa_pin_active and self.rank == 0:
+            # N3: name the failing stage once so a declined over-top-k consume
+            # (code profile) can be traced to the pin.
+            logger.warning("occ3 dsa pin inactive (stage=%s); over-top-k consumes decline", pin_stage)
         self.layout_digest = digest(layouts)
         self.consensus({"profile": profile.binding_digest, "layout": self.layout_digest})
         self.initialized = True
@@ -581,7 +643,7 @@ class WorkerRuntime:
     def consensus(self, value):
         values = self.gather(value)
         if not all(x == values[0] for x in values):
-            logger.error("occ3-bridge: runtime poisoned (site=consensus code=ranks)")
+            _log_poison(self, "consensus", "ranks")
             self.poisoned = True
             raise LatentError("ranks")
         return value
@@ -595,11 +657,13 @@ class WorkerRuntime:
         try:
             value = check()
         except Exception as exc:
+            from .turn_diagnostics import log_failure
+            log_failure(exc, phase="worker_control")
             declined = exc if isinstance(exc, LatentError) else None
             error = exc.code if isinstance(exc, LatentError) else "latent_failed"
         outcomes = self.gather({"phase": phase, "request": request_binding, "binding": value, "error": error})
         if any(item != outcomes[0] for item in outcomes):
-            logger.error("occ3-bridge: runtime poisoned (site=preflight code=ranks phase=%s)", phase)
+            _log_poison(self, "preflight", "ranks", phase=phase)
             self.poisoned = True
             raise LatentError("ranks")
         if error:
@@ -643,11 +707,11 @@ class WorkerRuntime:
     def capture_budget(self, count, span_policy=SPAN_POLICY_V1):
         # Fixed ring + terminal ordered H/E/Z + stage/safe gather/dtype cast margin.
         # Small alignment solver workspace is separately reserved by profile.
-        require(count in (8, 16, 32, 64, 128) and count <= self.profile.max_prefix_tokens, "profile")
-        require(span_policy in (SPAN_POLICY_V1,) + SPAN_POLICIES_V2, "profile")
+        require(count in (8, 16, 32, 64, 128) and count <= self.profile.max_prefix_tokens, "profile", detail="latent_worker.capture_budget.prefix_count")
+        require(span_policy in (SPAN_POLICY_V1,) + SPAN_POLICIES_V2, "profile", detail="latent_worker.capture_budget.span_policy")
         require(workspace_bound(count, self.profile.hidden_dim, self.profile.expected_ranks,
                                 self.profile.tile_rows, self.profile.anchor_alpha)
-                <= self.profile.workspace_bytes, "quota")
+                <= self.profile.workspace_bytes, "quota", detail="latent_worker.capture_budget.workspace_capacity")
         charge = (5 * count + 32) * self.profile.hidden_dim * self.element_size + (4 * count + 64) * 8
         if span_policy in SPAN_POLICIES_V2:
             # The v2 content buffer stores the same row capacity again (hidden
@@ -656,15 +720,17 @@ class WorkerRuntime:
             charge += count * self.profile.hidden_dim * self.element_size + 2 * count * 8
         return self.profile.expected_ranks * charge
 
+    @admission_probe("worker_control")
     def control(self, envelope):
         command = validate_control_payload(envelope)
         command_id, op, payload = command["command_id"], command["operation"], command["payload"]
         fingerprint = digest(command)
         self.consensus(fingerprint)
+        _prune_commands(self)
         old = self.commands.get(command_id)
         if old is not None:
             require(old[0] == fingerprint, "replay")
-            if op != "retire":
+            if op != "retire" and not (op == "finish_consume" and not old[1]["ok"]):
                 return old[1]
         require(op in ("health", "status", "publication_status") or old is not None
                 or len(self.commands) < self.profile.max_records * 16, "quota")
@@ -706,11 +772,27 @@ class WorkerRuntime:
                           else self.registry.get(payload["source_handle"], allow_retired=True))
                 require(record.descriptor.principal_digest == payload["principal_digest"], "identity")
                 result = record.snapshot()
+            elif op == "finish_consume":
+                require(set(payload) == {"attempt_id", "principal_digest"})
+                result = self.registry.finish_consume(payload["attempt_id"], payload["principal_digest"])
+                record = self.registry.source_for_attempt(payload["attempt_id"])
+                if record.retire_requested:
+                    # result owns a terminal snapshot; subsequent retirement
+                    # cannot invalidate the evidence returned to the frontend.
+                    _release_content_state(record)
+                    self.fence()
+                    self.registry.retire(handle=record.handle)
             elif op == "bind_output":
                 require(set(payload) == {"attempt_id", "principal_digest", "binding"})
                 record = self.registry.source_for_attempt(payload["attempt_id"])
                 require(record.descriptor.principal_digest == payload["principal_digest"], "identity")
                 result = self.registry.bind_output(payload["attempt_id"], payload["binding"])
+            elif op == "release_lease":
+                # Busy-declined consume only: the registry proves the lease was
+                # never admitted (no injection, no inflight work) before it
+                # returns the nonce and the lease to the published state.
+                require(set(payload) == {"attempt_id", "principal_digest"})
+                result = self.registry.release_unused_lease(payload["attempt_id"], payload["principal_digest"])
             elif op == "retire":
                 require(set(payload) in ({"attempt_id", "principal_digest"},
                                         {"source_handle", "source_session_id", "principal_digest"}))
@@ -720,7 +802,17 @@ class WorkerRuntime:
                     require(record.descriptor.principal_digest == payload["principal_digest"], "identity")
                     if "source_session_id" in payload:
                         require(record.descriptor.source_session_id == payload["source_session_id"], "identity")
+                    # Keep admitted-consumer state until its frontend proof
+                    # read, not merely until GPU work or terminal commit ends.
+                    require(not self.registry.defer_client_retire(record), "busy",
+                            detail="latent_registry.retire.consumer_pending")
                     _release_content_state(record)
+                elif handle is not None and self.registry.tombstone(handle) is not None:
+                    # Pruned terminal record: same owner checks as a live one.
+                    tomb = self.registry.tombstone(handle)
+                    require(tomb[2] == payload["principal_digest"], "identity")
+                    if "source_session_id" in payload:
+                        require(tomb[3] == payload["source_session_id"], "identity")
                 # Fence before the retire snapshot: every recorded CUDA
                 # event is complete on every rank, so the snapshot's
                 # gpu_freed verdict is identical across ranks instead of
@@ -730,10 +822,12 @@ class WorkerRuntime:
             else:
                 raise LatentError("invalid")
         except Exception as exc:
+            from .turn_diagnostics import log_failure
+            log_failure(exc, phase="worker_control")
             error = exc.code if isinstance(exc, LatentError) else "latent_failed"
         outcomes = self.gather({"error": error, "result": result})
         if any(item != outcomes[0] for item in outcomes):
-            logger.error("occ3-bridge: runtime poisoned (site=control code=ranks op=%s)", op)
+            _log_poison(self, "control", "ranks", op=op)
             self.poisoned = True
             result, error = {}, "ranks"
         if error:
@@ -743,8 +837,11 @@ class WorkerRuntime:
         validate_control_payload(reply, result=True)
         # Status/health must observe fresh journal/event state, not stale successful snapshots.
         if op not in ("health", "status", "publication_status"):
-            self.commands[command_id] = (fingerprint, reply)
+            stamp = getattr(self, "_agreed_epoch", None)
+            self.commands[command_id] = ((fingerprint, reply) if stamp is None
+                                         else (fingerprint, reply, stamp))
         return reply
+
 
     def resolve(self, descriptor, *, check_deadline=False):
         require(not self.poisoned, "unavailable")
@@ -764,8 +861,13 @@ class WorkerRuntime:
         prepared = {}
         self.preflight("align_begin", lambda: _begin_gpu(self, record))
         def local_prepare():
+            # Include the immutable per-capture coefficient in the existing
+            # prepare handshake. Disagreement declines before solver/broadcast.
+            alpha = self.profile.resolve_label_anchor(record.descriptor.label_anchor_alpha)
+            prepared["label_anchor_alpha"] = alpha
             if record.descriptor.span_policy in SPAN_POLICIES_V2:
-                return _prepare_v2_window(self, record, req, prepared)
+                binding = _prepare_v2_window(self, record, req, prepared)
+                return {**binding, "label_anchor_alpha": alpha}
             n = min(record.accepted_count, record.descriptor.max_prefix_tokens)
             require(n >= 2 and record.retained, "lineage")
             require(workspace_bound(n, self.profile.hidden_dim, self.profile.expected_ranks,
@@ -779,8 +881,10 @@ class WorkerRuntime:
                 order = (torch.arange(n, device=self.device) + cursor) % ring_h.shape[0]
             selected = ring_h.index_select(0, order)
             prepared.update(n=n, h=selected, tokens=ring_t.index_select(0, order), prefix=torch.empty_like(selected))
-            return {"n": n, "count": record.accepted_count, "dtype": self.dtype}
+            return {"n": n, "count": record.accepted_count, "dtype": self.dtype,
+                    "label_anchor_alpha": alpha}
         self.preflight("align_prepare", local_prepare)
+        alpha = prepared["label_anchor_alpha"]
         n, h, tokens = prepared["n"], prepared["h"], prepared["tokens"]
         embeddings = self.embedding(tokens)
         # N0 (the binding's serving config is None) must not renormalise, so
@@ -798,15 +902,34 @@ class WorkerRuntime:
                 # output; any failure stays a uniform numerical decline.
                 aligned, _ = self.aligner(h, embeddings, self.target_norm)
                 prefix.copy_(aligned)
+                from . import token_trace
+                token_trace.alignment_cast(self, h, aligned, prefix)
+                if alpha != 0:
+                    token_trace.alignment_stage(self, aligned, embeddings, tokens, "aligned",
+                                                label_anchor_alpha=alpha)
+                    token_trace.alignment_nearest(self, aligned, tokens, "aligned")
+                    # Blend solver-precision rows, not the already-cast scratch.
+                    prefix.copy_(anchor_to_labels(aligned, embeddings, alpha=alpha))
             except Exception:
                 solver_error = "numerical"
         errors = self.gather(solver_error)
         require(not any(errors), "numerical")
         torch.distributed.broadcast(prefix, src=self.group.ranks[0], group=self.group.device_group)
+        from . import token_trace
+        token_trace.alignment_logit_lens(self, h, tokens)
+        token_trace.alignment_stage(self, h, embeddings, tokens, "raw", label_anchor_alpha=alpha)
+        aligned_stage = "label_anchored" if alpha != 0 else "aligned"
+        token_trace.alignment_stage(self, prefix, embeddings, tokens, aligned_stage, label_anchor_alpha=alpha)
+        token_trace.alignment_nearest(self, prefix, tokens, aligned_stage)
         prefix = anchor_tiled(prefix, self.embedding, alpha=self.profile.anchor_alpha,
                               tp_group=self.group, tile_rows=self.profile.tile_rows)
         if self.rank == 0:
-            _probe_alignment(h, embeddings, prefix, self.profile)
+            _probe_alignment(h, embeddings, prefix, self.profile, label_anchor_alpha=alpha)
+        from . import token_trace
+        token_trace.alignment(self, prefix, embeddings, label_anchor_alpha=alpha)
+        token_trace.alignment_stage(self, prefix, embeddings, tokens, "final", label_anchor_alpha=alpha)
+        token_trace.alignment_nearest(self, prefix, tokens)
+        token_trace.alignment_precision(self, prefix, embeddings)
         event = self.event()
         record.prefix = prefix
         record.events.append(event)
@@ -826,6 +949,8 @@ class WorkerRuntime:
             start = end - n
             sequence_digest = digest(list(req.output_ids[start:end]))
             commit = digest([record.descriptor.reservation_id, start, end, sequence_digest, self.layout_digest])
+        if alpha != 0:
+            commit = digest([commit, {"label_anchor_alpha": alpha}])
         metadata = {"capture_commit_id": commit, "accepted_span_start": start,
                     "accepted_span_end": end, "retained_count": n,
                     "predictor_position_offset": -1, "representation": "final_layer_prenorm_predictor",
@@ -834,7 +959,7 @@ class WorkerRuntime:
                     "ready_ranks": self.profile.expected_ranks, "expected_ranks": self.profile.expected_ranks,
                     "accepted_sequence_digest": sequence_digest, "expires_at_epoch": record.expires_at_epoch,
                     "byte_count": prefix.numel() * prefix.element_size()}
-        metadata.update(method_metadata(self.profile, self.calibration_digest))
+        metadata.update(method_metadata(self.profile, self.calibration_digest, label_anchor_alpha=alpha))
         if "span_selection" in prepared:
             # The bounded occ3.span block rides the same source metadata; the
             # backend projects it into the commit and the receipt carries it.
@@ -843,6 +968,8 @@ class WorkerRuntime:
         self.consensus(metadata)
         self.preflight("align_complete", lambda: _end_gpu(self, record))
         record.capture_commit_id, record.source_metadata, record.state = commit, metadata, "ready"
+        from . import token_trace
+        token_trace.capture(self, record, req, tokens, start, end)
         if "span_selection" in prepared:
             _calibration_handoff(self, record, prepared, embeddings)
             record.occ3_span_markers = None
@@ -872,8 +999,39 @@ def _runtime(scheduler=None):
     return runtime
 
 
+#: Seconds a non-read control reply stays in the idempotency cache. Bounds
+#: the max_records * 16 command table so a long-lived process does not refuse
+#: every control call with "quota" after a few thousand turns.
+COMMAND_CACHE_SECONDS = 600
+
+
+def _prune_commands(runtime):
+    """Drop idempotency entries older than COMMAND_CACHE_SECONDS.
+
+    Every cached operation is also idempotent or replay-refused at the
+    registry (attempt/handle/publication tombstones, expiry checks), so
+    an aged-out command id that is replayed is re-validated, never
+    re-executed against live state. Uses the rank-agreed clock, so every
+    rank drops the same entries. Entries without a timestamp are legacy
+    two-tuples and are kept.
+    """
+    agreed = getattr(runtime, "_agreed_epoch", None)
+    if agreed is None:
+        return
+    cutoff = agreed - COMMAND_CACHE_SECONDS
+    stale = [key for key, entry in runtime.commands.items()
+             if len(entry) > 2 and entry[2] <= cutoff]
+    for key in stale:
+        del runtime.commands[key]
+
+
 def handle_control(scheduler, payload):
-    return _runtime(scheduler).control(payload)
+    try:
+        return _runtime(scheduler).control(payload)
+    except Exception as error:
+        from .turn_diagnostics import log_failure
+        log_failure(error, phase="worker_control")
+        raise
 
 
 def deliver_control(tokenizer_manager, payload):
@@ -897,9 +1055,12 @@ def batch_context(reqs, extend_lens=None, prefix_lens=None, final_chunks=None):
 
 
 def prepare_batch(scheduler, batch):
-    if not any(getattr(req, "occ3_worker_descriptor", None) is not None for req in batch.reqs):
+    # Keyed on the eager cohort flag, not the descriptor: a post-injection
+    # consume keeps its descriptor (attached) but is an ordinary shared row.
+    if not any(getattr(req, "occ3_force_eager", False) for req in batch.reqs):
         batch.occ3_context, batch.occ3_force_eager = None, False
         return
+    require(len(batch.reqs) == 1, "profile")
     runtime = _runtime(scheduler)
     prepared = {}
     def validate():
@@ -918,19 +1079,48 @@ def prepare_batch(scheduler, batch):
 def admit_request(scheduler, req, value):
     if value is None:
         return
+    return _admit_request(scheduler, req, value)
+
+
+@admission_probe("worker_admit")
+def _admit_request(scheduler, req, value):
     runtime = _runtime(scheduler)
     prepared = {}
     def validate():
         descriptor = decode_descriptor(value)
-        require(req.rid == descriptor.native_rid and not req.output_ids, "identity")
+        require(req.rid == descriptor.native_rid and not req.output_ids, "identity", detail="latent_worker.admit_request.request_identity")
         record = runtime.resolve(descriptor, check_deadline=True)
         if type(descriptor) is CaptureWorkerDescriptor:
-            require(record.state == "reserved" and not record.admitted_capture, "replay")
+            require(record.state == "reserved" and not record.admitted_capture, "replay", detail="latent_worker.admit_request.capture_reserved")
         else:
-            require(record.state == "leased" and not record.admitted_consume, "replay")
-        require(getattr(req, "session", None) is None and getattr(req, "multimodal_inputs", None) is None, "profile")
-        require(getattr(req, "positional_embed_overrides", None) is None, "profile")
-        require(getattr(req, "occ3_worker_descriptor", None) is None, "replay")
+            require(record.state == "leased" and not record.admitted_consume, "replay", detail="latent_worker.admit_request.consume_leased")
+        require(getattr(req, "session", None) is None and getattr(req, "multimodal_inputs", None) is None, "profile", detail="latent_worker.admit_request.request_shape")
+        require(getattr(req, "positional_embed_overrides", None) is None, "profile", detail="latent_worker.admit_request.embedding_override")
+        require(getattr(req, "occ3_worker_descriptor", None) is None, "replay", detail="latent_worker.admit_request.already_attached")
+        # Busy-batch admission bound, capture only: a capture turn runs as an
+        # isolated eager cohort for its whole decode (its rows end at the stop
+        # row), so ordinary inflight work must drain first. Parking it would
+        # hold the one-shot attempt behind unrelated decode traffic until the
+        # queue bound aborts it; declining here is rank-uniform, mutates
+        # nothing and leaves the sender free to retry. A consume is admitted
+        # while others decode: its prefill runs as its own one-request extend
+        # batch and it decodes in the shared batch afterwards.
+        # A consume still declines (busy, pre-use) while an eager row is
+        # inflight (a capture turn or another consume's injected prefill):
+        # that cohort drains new prefills, so parking would end in the queue
+        # bound's non-busy admission_timeout instead of a retryable busy.
+        collect = getattr(scheduler, "collect_inflight_reqs", None)
+        inflight = list(collect()) if callable(collect) else []
+        chunked = getattr(scheduler, "chunked_req", None)
+        if chunked is not None:
+            inflight.append(chunked)
+        active = [held for held in inflight
+                  if not (callable(getattr(held, "finished", None))
+                          and held.finished())]
+        if type(descriptor) is CaptureWorkerDescriptor:
+            require(not active, "quota", detail="latent_worker.admit_request.capture_inflight")
+        else:
+            require(not any(getattr(held, "occ3_force_eager", False) for held in active), "quota", detail="latent_worker.admit_request.consume_eager_inflight")
         original = req.origin_input_ids
         new_ids = original
         span_markers, content_state = None, None
@@ -941,7 +1131,7 @@ def admit_request(scheduler, req, value):
             params = getattr(req, "sampling_params", None)
             span_markers = marker_table_from_wire(getattr(params, "custom_params", None))
             require(span_markers[0].profile == descriptor.marker_profile
-                    and span_markers[0].roundtrip_attested, "profile")
+                    and span_markers[0].roundtrip_attested, "profile", detail="latent_worker.admit_request.marker_attestation")
             # Capacity decline ("profile") fires here, inside the preflight, so a
             # marker set that would leave no content slot never enters a turn.
             content_state = _ContentState(span_markers[0], span_markers[1],
@@ -951,18 +1141,35 @@ def admit_request(scheduler, req, value):
         if type(descriptor) is ConsumeWorkerDescriptor:
             count = descriptor.expected_prefix_tokens
             at = descriptor.prefix_offset
-            require(0 <= at <= len(original), "profile")
+            require(0 <= at <= len(original), "profile", detail="latent_worker.admit_request.prefix_offset")
             holes = [0] * count
             if isinstance(original, array):
                 new_ids = original[:at] + array(original.typecode, holes) + original[at:]
             else:
                 new_ids = list(original[:at]) + holes + list(original[at:])
+            # Pre-use capacity floor: a consume that cannot get a request slot
+            # or KV for its rewritten prompt would park until the queue bound
+            # and end in a dispatched, non-releasable admission_timeout.
+            require(_consume_capacity_available(scheduler, len(new_ids)), "quota", detail="latent_worker.admit_request.consume_capacity")
+            # Fail closed before any mutation: without the indexer pin, prefix
+            # rows beyond the sparse top-k may be dropped from attention and a
+            # completed-use receipt would be false. Inputs are rank-uniform
+            # (gathered length, static config, install-time flag).
+            # With the pin inactive the bound also covers the request's
+            # output growth (Fable F1); sampling params and the scheduler's
+            # context bound are identical on every rank.
+            require(not _sparse_pin_required(
+                runtime, len(new_ids),
+                max_new_tokens=getattr(getattr(req, "sampling_params", None), "max_new_tokens", None),
+                max_context=_scheduler_max_context(scheduler)), "profile", detail="latent_worker.admit_request.sparse_pin")
+            if getattr(runtime, "dsa_pin_active", False) is True:
+                _require_pin_fits(runtime, count)
         prepared.update(descriptor=descriptor, record=record, new_ids=new_ids,
                         span_markers=span_markers, content_state=content_state)
         # The continuous-prefix layout is a receiver concept: a capture never
         # rewrites the prompt, so its consensus value carries no offset.
         if type(descriptor) is ConsumeWorkerDescriptor:
-            layout, offset = ("marker" if descriptor.prefix_offset else "prepend"), int(descriptor.prefix_offset)
+            layout, offset = descriptor.prefix_layout, int(descriptor.prefix_offset)
         else:
             layout, offset = "capture", 0
         return {"descriptor": digest(asdict(descriptor)), "tokens": digest(list(original)),
@@ -971,6 +1178,9 @@ def admit_request(scheduler, req, value):
     runtime.preflight("admit", validate)
     descriptor, record, new_ids = prepared["descriptor"], prepared["record"], prepared["new_ids"]
     req.occ3_worker_descriptor, req.occ3_force_eager = descriptor, True
+    req.occ3_attached = True
+    from . import dsa_pin as _dsa_pin
+    req.occ3_dsa_pin_faults0 = _dsa_pin.faults
     if type(descriptor) is ConsumeWorkerDescriptor:
         _flag_sparse_topk(runtime, len(new_ids))
     if type(descriptor) is CaptureWorkerDescriptor:
@@ -987,6 +1197,486 @@ def admit_request(scheduler, req, value):
             if isinstance(new_ids, array) else new_ids + list(req.output_ids))
         req.skip_radix_cache_insert, req.occ3_private_kv = True, True
         req.occ3_private_prefix = True
+        from . import token_trace
+        token_trace.admit(runtime, record, req, scheduler, descriptor)
+
+
+def _consume_capacity_available(scheduler, prompt_tokens):
+    """Conservative pre-use check that a consume prefill can be scheduled now.
+
+    Reads scheduler state that is identical on every rank (request slots,
+    KV allocator and radix evictable sizes), and runs inside
+    the admit preflight, so the verdict is gathered and rank-uniform. It is a
+    floor, not the PrefillAdder's exact budget: a False verdict is a busy
+    decline the sender may retry. A scheduler without these hooks (offline
+    fixtures) is treated as having capacity.
+    """
+    running = getattr(scheduler, "running_batch", None)
+    slots = getattr(scheduler, "get_num_allocatable_reqs", None)
+    if callable(slots) and running is not None:
+        # No waiting-queue term: _occ3_prefill_selection schedules the pending
+        # consume ahead of the waiting queue, so only a free slot matters.
+        if slots(len(running.reqs), running_batch=running) <= 0:
+            return False
+    allocator = getattr(scheduler, "token_to_kv_pool_allocator", None)
+    tree = getattr(scheduler, "tree_cache", None)
+    available = getattr(allocator, "available_size", None)
+    evictable = getattr(tree, "evictable_size", None)
+    if callable(available) and callable(evictable):
+        page = max(int(getattr(scheduler, "page_size", 1) or 1), 1)
+        if available() + evictable() < prompt_tokens + page:
+            return False
+    return True
+
+
+#: abort_message prefix of the leader's resolve signal for a parked capture.
+CAPTURE_HOLD_SIGNAL = "occ3_capture_hold_"
+_CAPTURE_INFLIGHT = "latent_worker.admit_request.capture_inflight"
+
+
+class CaptureHold:
+    """A capture parked before admission: no Req exists, the record is untouched."""
+    __slots__ = ("rid", "recv_req", "seq", "signal", "parked_at", "deadline", "due_at")
+
+    def __init__(self, recv_req, seq, now, drain, deadline):
+        self.rid, self.recv_req, self.seq = recv_req.rid, recv_req, seq
+        self.signal = CAPTURE_HOLD_SIGNAL + str(seq)
+        self.parked_at, self.deadline = now, deadline
+        self.due_at = min(now + drain, deadline)
+
+
+def _capture_hold_settings():
+    """Reservation settings of this rank, or None when it is disabled or
+    misconfigured. The read is rank-local: capture_hold_park gathers it."""
+    try:
+        settings = capture_hold_settings(os.environ)
+    except ValueError:
+        return None
+    return settings if settings.window > 0 else None
+
+
+def _capture_hold_rows(scheduler):
+    """Unfinished in-flight rows: the set the capture admission check reads."""
+    collect = getattr(scheduler, "collect_inflight_reqs", None)
+    rows = list(collect()) if callable(collect) else []
+    chunked = getattr(scheduler, "chunked_req", None)
+    if chunked is not None and not any(row is chunked for row in rows):
+        rows.append(chunked)
+    return [row for row in rows
+            if not (callable(getattr(row, "finished", None)) and row.finished())]
+
+
+def _capture_hold_agree(scheduler, value):
+    """True when every rank gathered the same value. A split only declines."""
+    try:
+        values = _runtime(scheduler).gather(value)
+    except Exception:
+        return False
+    return all(item == values[0] for item in values)
+
+
+def capture_hold_park(scheduler, recv_req, error):
+    """Park a capture that the worker declined only for in-flight work.
+
+    Runs on every rank at the admission seam, after the rank-uniform decline
+    and before any refusal is sent. Nothing is mutated at that point: no Req
+    is queued and the one-shot record is still reserved. True means the raw
+    request is held; the scheduler drains for it and sends nothing now.
+    """
+    try:
+        descriptor = decode_descriptor(getattr(recv_req, "occ3_worker_descriptor", None))
+    except Exception:
+        descriptor = None
+    # Rank-agreed gate: the gathered decline code, the broadcast request and
+    # the replay flag of an agreed resolution. Every rank enters the gather
+    # below, or none does.
+    if (getattr(error, "code", None) != "quota"
+            or type(descriptor) is not CaptureWorkerDescriptor
+            or getattr(scheduler, "occ3_capture_hold_replay", False)):
+        return False
+    # Everything from here is read on this rank only, so it is gathered and
+    # never returns early. One rank that differs makes every rank decline.
+    settings = _capture_hold_settings()
+    eligible = (settings is not None
+                and isinstance(error, LatentError) and error.detail == _CAPTURE_INFLIGHT
+                and getattr(scheduler, "occ3_capture_hold", None) is None
+                and not getattr(scheduler, "_engine_paused", False)
+                # A hold keeps new ordinary requests in the waiting queue. A
+                # queue limit could then reject one and a timeout sweep could
+                # expire one, so those servers keep the immediate decline.
+                and getattr(scheduler, "max_queued_requests", None) is None
+                and not _capture_hold_sla_sweeps()
+                # A receive skipper drops the leader's resolve signal on each
+                # iteration it skips, so a hold could outlast its drain bound.
+                and getattr(scheduler, "recv_skipper", None) is None)
+    agreed = _capture_hold_agree(scheduler, {
+        "hold": "park", "rid": recv_req.rid, "eligible": eligible,
+        "settings": None if settings is None else [settings.window, settings.drain, settings.preempt]})
+    if not agreed:
+        logger.warning("occ3 capture hold not parked rid=%s reason=no_rank_agreement", recv_req.rid)
+    if not (agreed and eligible):
+        return False
+    seq = getattr(scheduler, "occ3_capture_hold_seq", 0) + 1
+    scheduler.occ3_capture_hold_seq = seq
+    hold = CaptureHold(recv_req, seq, time.monotonic(), settings.drain, descriptor.deadline)
+    scheduler.occ3_capture_hold = hold
+    logger.info("occ3 capture hold parked rid=%s seq=%d drain_seconds=%.3f",
+                hold.rid, seq, settings.drain)
+    return True
+
+
+def _capture_hold_sla_sweeps():
+    """True when a stock waiting or running timeout sweep is enabled. A request
+    held in the queue, or a row retracted for a capture turn, could then be
+    aborted by that sweep."""
+    for name in ("SGLANG_REQ_WAITING_TIMEOUT", "SGLANG_REQ_RUNNING_TIMEOUT"):
+        raw = os.environ.get(name)
+        if raw is None:
+            continue
+        try:
+            if float(raw) > 0:
+                return True
+        except ValueError:
+            return True
+    return False
+
+
+def _capture_hold_action(scheduler, hold, settings, rows):
+    """This rank's view of the resolution. The caller gathers it."""
+    if time.monotonic() >= hold.deadline or getattr(scheduler, "_engine_paused", False):
+        return "decline"
+    # The capture and every retracted row need a queue slot. A full queue
+    # would drop one of them after the one-shot record is spent.
+    limit = getattr(scheduler, "max_queued_requests", None)
+    if limit is not None and len(scheduler.waiting_queue) + len(rows) + 1 > limit:
+        return "decline"
+    # An OCC-3 row that is queued runs first. The capture would wait behind
+    # its whole turn and meet the queue bound after admission.
+    grammar = getattr(getattr(scheduler, "grammar_manager", None), "grammar_queue", ())
+    if any(getattr(row, "occ3_attached", False) or getattr(row, "occ3_force_eager", False)
+           for row in (*scheduler.waiting_queue, *grammar)):
+        return "decline"
+    if not rows:
+        return "admit"
+    if settings is None or settings.preempt != "retract" or _capture_hold_sla_sweeps():
+        return "decline"
+    # Only a plain row resumes from the same output position after the stock
+    # retract path. An attached or eager row would be aborted by it, and a row
+    # with input embeddings would restart its output. A session row continues
+    # the history that its session holds; no evidence covers its resume.
+    if any(getattr(row, "occ3_attached", False) or getattr(row, "occ3_force_eager", False)
+           or getattr(row, "input_embeds", None) is not None
+           or getattr(row, "beam_group", None) is not None
+           or getattr(row, "session", None) is not None for row in rows):
+        return "decline"
+    return "retract"
+
+
+def _capture_hold_resolve(scheduler, hold):
+    """Every rank, same iteration: admit, retract then admit, or decline."""
+    action = _capture_hold_action(scheduler, hold, _capture_hold_settings(),
+                                  _capture_hold_rows(scheduler))
+    if not _capture_hold_agree(scheduler, {"hold": hold.seq, "rid": hold.rid, "action": action}):
+        action = "decline"
+    scheduler.occ3_capture_hold = None
+    retracted = 0
+    if action == "retract":
+        retracted = len(scheduler._occ3_capture_hold_retract())
+    if action == "decline":
+        # Still mutation-free: the same refusal the worker decline would have sent.
+        scheduler._occ3_reject_received(hold.recv_req, "occ3_busy_batch")
+    else:
+        # The unchanged admission path decides. A replay is never parked again.
+        scheduler.occ3_capture_hold_replay = True
+        try:
+            scheduler.handle_generate_request(hold.recv_req)
+        finally:
+            scheduler.occ3_capture_hold_replay = False
+    logger.info("occ3 capture hold resolved rid=%s seq=%d action=%s waited_seconds=%.3f retracted=%d",
+                hold.rid, hold.seq, action, time.monotonic() - hold.parked_at, retracted)
+
+
+def capture_hold_abort(scheduler, recv_req):
+    """Route an AbortReq past a capture reservation. True: nothing else to abort."""
+    message = getattr(recv_req, "abort_message", None)
+    hold = getattr(scheduler, "occ3_capture_hold", None)
+    if isinstance(message, str) and message.startswith(CAPTURE_HOLD_SIGNAL):
+        # The leader's resolve signal is never an abort. A stale one is dropped.
+        if hold is not None and message == hold.signal and recv_req.rid == hold.rid:
+            _capture_hold_resolve(scheduler, hold)
+        return True
+    if hold is not None and (getattr(recv_req, "abort_all", False) or recv_req.rid == hold.rid):
+        # Client cancel or disconnect before admission: there is nothing to undo.
+        scheduler.occ3_capture_hold = None
+        scheduler._occ3_reject_received(hold.recv_req, "occ3_cancelled")
+        logger.info("occ3 capture hold released rid=%s seq=%d reason=cancelled", hold.rid, hold.seq)
+    return False
+
+
+def release_consume_cohort(scheduler, req):
+    """Leave the eager cohort after a consume's final injected prefill.
+
+    Called from result settle on every rank with the same request state. The
+    row stays attached (abort, retraction, terminal journal, private KV), but
+    clears occ3_force_eager so it merges into the ordinary running batch and
+    decodes with CUDA graphs. The batch flag is recomputed by filter_batch /
+    merge_batch before the next schedule. No gather; GPU work occurs only for
+    opt-in token tracing. Injection is complete, and the terminal receipt reads
+    only integers and tokens.
+    Returns False (row stays eager, safe) unless injection is complete.
+    """
+    descriptor = getattr(req, "occ3_worker_descriptor", None)
+    if type(descriptor) is not ConsumeWorkerDescriptor or not getattr(req, "occ3_force_eager", False):
+        return False
+    runtime = _runtime(scheduler)
+    record = runtime.registry.source_for_attempt(descriptor.attempt_id)
+    if (record.consumer != descriptor or record.state != "injected"
+            or len(record.injected_positions) != descriptor.expected_prefix_tokens):
+        return False
+    # Result processing has waited for copy_done before reaching this hook.
+    # The opt-in diagnostic adds a local stream fence; disabled means no GPU work.
+    from . import token_trace
+    token_trace.kv_saved(runtime, record, descriptor, "consume_released", fence=True)
+    req.occ3_force_eager = False
+    return True
+
+
+_UNBOUNDED = object()
+
+
+def _sparse_pin_required(runtime, prompt_rows, max_new_tokens=_UNBOUNDED, max_context=None):
+    """True when a consume can exceed the DSA top-k and no indexer pin is active.
+
+    The admit preflight declines such a consume pre-use. With the pin active
+    the consume proceeds (the producer pins it once it can cross the top-k)
+    and _flag_sparse_topk only records the regime.
+
+    With the pin inactive the bound covers the whole sequence, not only the
+    prompt (Fable F1): a prompt at or below the top-k whose output crosses
+    it would otherwise be admitted, never pinned, and still get a receipt.
+    The request's ``max_new_tokens`` (when an int >= 0) plus the producer
+    margin (``runtime.sparse_pin_margin``, 2 x draft tokens) must stay at or
+    below the top-k. When ``max_new_tokens`` is unset (None, which the
+    scheduler treats as unbounded) the conservative choice is used: the
+    sequence may grow to the server's max context (``max_context``,
+    scheduler ``max_req_len``), so the consume declines unless that context
+    fits the top-k; an unknown context also declines. The default
+    ``max_new_tokens`` sentinel keeps the prompt-only check for callers that
+    do not pass output bounds. Bounded integers and one install-time flag.
+    """
+    topk = getattr(runtime, "sparse_index_topk", None)
+    if type(topk) is not int or topk <= 0:
+        return False
+    if getattr(runtime, "dsa_pin_active", False) is True:
+        return False
+    if prompt_rows > topk:
+        return True
+    if max_new_tokens is _UNBOUNDED:
+        return False
+    if type(max_new_tokens) is int and max_new_tokens >= 0:
+        margin = getattr(runtime, "sparse_pin_margin", 2)
+        margin = margin if type(margin) is int and margin > 0 else 2
+        return prompt_rows + max_new_tokens + margin > topk
+    # Unset or not an int: the output is bounded only by the server context.
+    if type(max_context) is int and max_context > 0:
+        return max_context > topk
+    return True
+
+
+def _scheduler_max_context(scheduler):
+    """Server max sequence length (scheduler ``max_req_len``), or None.
+
+    Static scheduler config, identical on every rank. Falls back to the model
+    config ``context_len``; None means unknown (the caller declines).
+    """
+    value = getattr(scheduler, "max_req_len", None)
+    if type(value) is int and value > 0:
+        return value
+    value = getattr(getattr(scheduler, "model_config", None), "context_len", None)
+    return value if type(value) is int and value > 0 else None
+
+
+def _deterministic_mode(torch, args=None):
+    """True when deterministic execution is (or may be) enabled for the pin.
+
+    ``scatter_reduce_`` with ``amax`` (the pin's forced-count reduction)
+    raises on CUDA under ``torch.use_deterministic_algorithms(True)``, so the
+    pin is not installed then. SGLang's ``enable_deterministic_inference``
+    server arg is treated the same way. A torch without the query, or a
+    query that raises, counts as deterministic (pin off, fail closed).
+    """
+    if args is not None and getattr(args, "enable_deterministic_inference", False) is True:
+        return True
+    query = getattr(torch, "are_deterministic_algorithms_enabled", None)
+    if not callable(query):
+        return True
+    try:
+        return bool(query())
+    except Exception:
+        return True
+
+
+def _dsa_pin_headroom_ok(topk, config):
+    """Install-time bounds for the pin lanes inside the indexer selection.
+
+    The init and local tokens are forced to +inf as well, so the pin lanes
+    plus those tokens must fit inside ``index_topk``; otherwise ties among
+    +inf lanes would be broken arbitrarily. When the MTP IndexShare seed is
+    enabled, its buffer width (``get_dsa_mtp_topk_width``) must equal
+    ``index_topk`` so the seeded draft selection is the full pinned target
+    selection. Any miss returns False (pin not installed, consume declines
+    pre-use); nothing raises.
+    """
+    from . import dsa_pin
+
+    if config is None:
+        return True
+    init = getattr(config, "index_init_tokens", 0) or 0
+    local = getattr(config, "index_local_tokens", 0) or 0
+    if type(init) is not int or type(local) is not int or init < 0 or local < 0:
+        return False
+    if init + local + dsa_pin.PIN_LANES > topk:
+        return False
+    if getattr(config, "index_share_for_mtp_iteration", False):
+        try:
+            from sglang.srt.configs.model_config import get_dsa_mtp_topk_width
+            width = get_dsa_mtp_topk_width(config)
+        except Exception:
+            return False
+        if width != topk:
+            return False
+    return True
+
+
+def _dsa_pin_installed(topk, eagle_topk=1, *, config=None):
+    """True only when this rank's attested source carries the DSA indexer pin.
+
+    The pinned source attestation (native_sources.json, verified at install)
+    must list the dsa-pin manifest together with the scheduler and graph
+    manifests that produce and stage ``ForwardBatch.occ3_dsa_pin``, and the
+    imported classes must expose the patched members. Any miss returns False,
+    so fix A (_sparse_pin_required) still fails closed. A model without an
+    integer indexer top-k (not a DSA model) and EAGLE top-k other than 1
+    (the paged row map assumes one draft chain per request) also return
+    False. When present, the pin lane width must be strictly below the
+    indexer top-k, and :func:`_dsa_pin_headroom_ok` must hold.
+    """
+    return _dsa_pin_install_stage(topk, eagle_topk, config=config)[0]
+
+
+def _dsa_pin_install_stage(topk, eagle_topk=1, *, config=None):
+    """(installed, stage) for :func:`_dsa_pin_installed`; stage names the miss.
+
+    The stage is a closed-set ASCII label ("ok" when installed) used only
+    for the one rank-0 deactivation log line (Fable N3).
+    """
+    from . import dsa_pin
+
+    if type(topk) is not int or topk <= 0:
+        return False, "topk"
+    if eagle_topk != 1:
+        return False, "eagle_topk"
+    try:
+        from .native_profile import load_source_attestation
+        names = {entry["name"] for entry in load_source_attestation()["manifests"]}
+    except Exception:
+        return False, "attestation"
+    if not {"dsa-pin.v1.json", "scheduler-cache-ipc.v1.json", "capture-eager-mtp.v1.json"} <= names:
+        return False, "manifests"
+    try:
+        from sglang.srt.layers.attention.dsa.dsa_indexer import Indexer
+        from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+    except Exception:
+        return False, "import"
+    if not (callable(getattr(Indexer, "_occ3_pin_mask", None))
+            and "occ3_dsa_pin" in getattr(ForwardBatch, "__dataclass_fields__", {})):
+        return False, "members"
+    require(type(topk) is int and dsa_pin.PIN_LANES < topk, "profile")
+    if not _dsa_pin_headroom_ok(topk, config):
+        return False, "headroom"
+    return True, "ok"
+
+
+def _require_pin_fits(runtime, count):
+    """Admission bound: the forced span fits the pin lanes below the top-k."""
+    from .dsa_pin import PIN_LANES
+    topk = getattr(runtime, "sparse_index_topk", None)
+    require(type(count) is int and 0 < count <= PIN_LANES
+            and type(topk) is int and PIN_LANES < topk, "profile")
+
+
+def _log_pin_hits(runtime, req, descriptor):
+    """Rank-0 bounded log of the last target forward's forced pin lanes.
+
+    Read after the terminal fence, so the device read cannot race the
+    forward. Informational only; never part of consensus or the receipt.
+    """
+    from .dsa_pin import read_forced
+    # N4: under overlap scheduling the next batch's init_new may already have
+    # replaced req.occ3_dsa_pin_forced with a newer (forced, row) pair before
+    # this settle reads it. The terminal fence synchronized every stream, and
+    # the row's length still covers the span, so the newer forward forced the
+    # same count; either value is valid evidence.
+    try:
+        hits = read_forced(req)
+    except Exception:
+        hits = None
+    req.occ3_dsa_pin_forced = None
+    if hits is None:
+        return None
+    runtime.dsa_pin_hits = getattr(runtime, "dsa_pin_hits", 0) + 1
+    if getattr(runtime, "rank", 0) == 0:
+        logger.info("occ3 dsa pin settle forced=%d expected=%d offset=%d active=%d count=%d",
+                    hits, int(descriptor.expected_prefix_tokens), int(descriptor.prefix_offset),
+                    int(getattr(runtime, "dsa_pin_active", False) is True), runtime.dsa_pin_hits)
+    return hits
+
+
+def _pin_evidence_required(runtime, req):
+    """True when a completed-use receipt depends on the indexer pin.
+
+    Only with the pin active and the sequence (prompt plus visible output)
+    longer than the indexer top-k: then the injected rows are kept in
+    attention only by the pin. Rank-uniform inputs only.
+    """
+    from .dsa_pin import sequence_rows
+
+    topk = getattr(runtime, "sparse_index_topk", None)
+    if getattr(runtime, "dsa_pin_active", False) is not True or type(topk) is not int:
+        return False
+    # Same row count as the producer (dsa_pin.needs_pin). The producer pins
+    # from sequence_rows + margin > topk with margin >= this forward's rows
+    # plus one overlap step, so any request that ends above the top-k was
+    # pinned on its last target forward and recorded forced there.
+    return sequence_rows(req) > topk
+
+
+def _require_pin_evidence(runtime, req, descriptor):
+    """Terminal gate: no completed-use receipt without pin-hit evidence.
+
+    Runs after the terminal fence. Each rank reads its last target forward's
+    forced count (also logged on rank 0) and checks that no pin fault was
+    recorded since admission. The local verdicts are gathered, so every rank
+    takes the same branch. A miss (no record, forced < expected, or a fault)
+    on any rank raises a uniform LatentError; the scheduler settle aborts
+    only this request through the existing commit_failed path (which also
+    clears occ3_force_eager), never the server.
+    """
+    from . import dsa_pin
+    hits = _log_pin_hits(runtime, req, descriptor)
+    if not _pin_evidence_required(runtime, req):
+        return True
+    expected = int(descriptor.expected_prefix_tokens)
+    faulted = dsa_pin.faults != getattr(req, "occ3_dsa_pin_faults0", dsa_pin.faults)
+    local_ok = hits is not None and hits >= expected and not faulted
+    outcomes = runtime.gather({"phase": "pin_evidence", "ok": bool(local_ok)})
+    if not all(item.get("ok") is True for item in outcomes):
+        if getattr(runtime, "rank", 0) == 0:
+            logger.error("occ3 dsa pin evidence missing at settle; request fails "
+                         "(forced=%s expected=%d fault=%d)",
+                         "none" if hits is None else int(hits), expected, int(faulted))
+        raise LatentError("numerical")
+    return True
 
 
 def _flag_sparse_topk(runtime, prompt_rows):
@@ -996,16 +1686,18 @@ def _flag_sparse_topk(runtime, prompt_rows):
     the sequence is longer than that. The injected prefix rows are ordinary
     positions and are not pinned into that selection, so beyond the bound the
     receiver may attend to only some of them (decode rows grow the sequence
-    further). Bounded integers only; this never declines the turn.
+    further). Informational: an unpinned over-top-k consume is already
+    declined in the admit preflight by _sparse_pin_required.
     """
     topk = getattr(runtime, "sparse_index_topk", None)
     if type(topk) is not int or topk <= 0 or prompt_rows <= topk:
         return False
     runtime.sparse_topk_exceeded = getattr(runtime, "sparse_topk_exceeded", 0) + 1
     if getattr(runtime, "rank", 0) == 0:
-        logger.warning("occ3 consume prompt rows=%d exceed the sparse indexer top-k=%d: "
-                       "injected prefix rows are not pinned in DSA selection (count=%d)",
-                       int(prompt_rows), topk, runtime.sparse_topk_exceeded)
+        logger.warning("occ3 consume prompt rows=%d exceed the sparse indexer top-k=%d "
+                       "(dsa_pin_active=%d count=%d)", int(prompt_rows), topk,
+                       int(getattr(runtime, "dsa_pin_active", False) is True),
+                       runtime.sparse_topk_exceeded)
     return True
 
 
@@ -1043,8 +1735,10 @@ def capture_prenorm(forward_batch, hidden_states):
             mode = "prefill"
         else:
             raise LatentError("profile")
-        copied = hidden_states.index_select(0, rows).clone()
-        positions = forward_batch.positions.index_select(0, rows).clone()
+        # index_select always allocates a fresh tensor (never a view), so an
+        # extra clone() would only add a second device copy per forward.
+        copied = hidden_states.index_select(0, rows)
+        positions = forward_batch.positions.index_select(0, rows)
         event = runtime.event()
         record.events.append(event)
         record.live_refs.append((event, (copied, positions)))
@@ -1103,9 +1797,11 @@ def stage_verify(forward_batch, logits_output, predict, accept_lens, accept_inde
         require(bool((((accept_index >= 0) & (accept_index < rows.hidden.shape[0])) | ~valid).all()), "lineage")
         require(bool(((count > 0) & (count <= accept_index.shape[1])).all()), "lineage")
         indices = torch.where(valid, accept_index, torch.zeros_like(accept_index)).reshape(-1).long()
-        hidden = rows.hidden.index_select(0, indices).reshape(1, -1, runtime.profile.hidden_dim).clone()
-        tokens = predict.reshape(-1).index_select(0, indices).reshape(1, -1).clone()
-        selected_positions = positions.reshape(-1).index_select(0, indices).reshape(1, -1).clone()
+        # index_select allocates a fresh contiguous tensor; reshape of it is a
+        # view of that private buffer, so no clone() is needed.
+        hidden = rows.hidden.index_select(0, indices).reshape(1, -1, runtime.profile.hidden_dim)
+        tokens = predict.reshape(-1).index_select(0, indices).reshape(1, -1)
+        selected_positions = positions.reshape(-1).index_select(0, indices).reshape(1, -1)
         event = runtime.event()
         record.events.append(event)
         record.live_refs.append((event, (rows, hidden, tokens, selected_positions)))
@@ -1168,6 +1864,9 @@ def _effective(model_runner, forward_batch, shift):
         return {"count": count, "dtype": str(values.dtype)}
     runtime.preflight("draft_embedding_replace", replace)
     runtime.preflight("draft_embedding_complete", lambda: _end_gpu(runtime, record))
+    from . import token_trace
+    token_trace.draft_chunk(runtime, record, item, forward_batch, values,
+                            prepared["local"], count, prepared["source"])
     # NextN already keeps its normal embedding through the forward. Do not add
     # a second clone, target sidecar or registry reference to this full chunk.
     return values
@@ -1218,6 +1917,8 @@ def inject_target_embeddings(forward_batch, hidden_states):
                 "dtype": str(hidden_states.dtype)}
     runtime.preflight("target_embedding_inplace", validate_and_copy)
     forward_batch.occ3_effective_embeds = prepared["span"]
+    from . import token_trace
+    token_trace.target_chunk(runtime, item, forward_batch, hidden_states)
 
 
 def draft_input_embeds(model_runner, forward_batch, batch, tail_tokens):
@@ -1325,12 +2026,17 @@ def commit_result(scheduler, req, result, request_index, output_start, output_en
         stage.committed = True
         if terminal:
             runtime.align(record, req)
+            from . import token_trace
+            token_trace.capture_text(runtime, record, scheduler)
     elif terminal:
         runtime.preflight("terminal_fence", lambda: runtime.fence())
+        _require_pin_evidence(runtime, req, descriptor)
+        from . import token_trace
+        token_trace.settled(runtime, record, scheduler, req, descriptor)
         metadata = {"native_rid": req.rid, "injection_commit_id": record.injection_commit_id,
                     "injected_prefix_count": len(record.injected_positions),
                     "prefix_offset": descriptor.prefix_offset,
-                    "prefix_layout": "marker" if descriptor.prefix_offset else "prepend",
+                    "prefix_layout": descriptor.prefix_layout,
                     "ready_ranks": runtime.profile.expected_ranks,
                     "expected_ranks": runtime.profile.expected_ranks, "num_retractions": 0,
                     "private_cache_namespace": True, "gpu_resident": bool(record.prefix.is_cuda), "completed": True}
@@ -1357,8 +2063,7 @@ def _poison_unless_uniform(runtime, exc, site):
     """
     uniform = isinstance(exc, LatentError) and exc.code != "ranks"
     if not uniform:
-        logger.error("occ3-bridge: runtime poisoned (site=%s code=%s)",
-                     site, getattr(exc, "code", type(exc).__name__))
+        _log_poison(runtime, site, exc.code if isinstance(exc, LatentError) else "latent_failed")
         runtime.poisoned = True
 
 
@@ -1373,6 +2078,9 @@ def fence_private_kv_release(scheduler, req):
         require(record.consumer == descriptor, "identity")
         prepared["record"] = record
         runtime.fence()
+        # Native release frees the request row only after this hook returns.
+        from . import token_trace
+        token_trace.kv_saved(runtime, record, descriptor, "private_release")
         return {"reservation": descriptor.reservation_id, "rid": req.rid}
     try:
         runtime.preflight("private_kv_fence", fence_owned)
@@ -1384,8 +2092,16 @@ def fence_private_kv_release(scheduler, req):
 
 def abort_request(scheduler, req, reason):
     descriptor = getattr(req, "occ3_worker_descriptor", None)
-    if descriptor is None:
+    if descriptor is None or getattr(req, "occ3_abort_done", False):
+        # Latched: an overlap overshoot tick re-presents an already aborted
+        # row; its record is retired and fenced, so no second gather.
         return
+    return _abort_request(scheduler, req, reason)
+
+
+@admission_probe("worker_abort")
+def _abort_request(scheduler, req, reason):
+    descriptor = req.occ3_worker_descriptor
     runtime = _cleanup_runtime(scheduler)
     prepared = {}
     def fence_owned():
@@ -1400,12 +2116,13 @@ def abort_request(scheduler, req, reason):
         runtime.preflight("abort_fence", fence_owned)
         prepared["record"].inflight = 0
         runtime.registry.retire(attempt_id=descriptor.attempt_id)
+        req.occ3_abort_done = True
     except Exception as exc:
         _poison_unless_uniform(runtime, exc, "abort_fence")
         raise
 
 
-def _probe_alignment(hidden, embeddings, prefix, profile):
+def _probe_alignment(hidden, embeddings, prefix, profile, *, label_anchor_alpha=None):
     """Optional scalar probe of one captured turn. Never fails the turn.
 
     Enabled only by OCC3_ALIGN_PROBE=<path>. Writes one JSON object per line with
@@ -1425,6 +2142,7 @@ def _probe_alignment(hidden, embeddings, prefix, profile):
         result = probe_relation(hidden, embeddings, prefix,
                                 generator=torch.Generator(device=hidden.device).manual_seed(0))
         result["anchor_alpha"] = float(profile.anchor_alpha)
+        result["label_anchor_alpha"] = profile.resolve_label_anchor(label_anchor_alpha)
         result["max_prefix_tokens"] = int(profile.max_prefix_tokens)
         with open(path, "a", encoding="utf-8") as handle:
             handle.write(json.dumps(result, sort_keys=True) + "\n")
@@ -1442,13 +2160,42 @@ def load_runtime_profile():
     expected = set(RuntimeProfile.__dataclass_fields__) - {"runtime_epoch", "runtime_generation"}
     # A pinned profile may omit the frozen-artifact reference: the per-message
     # method names none, so the runtime profile takes its empty default.
-    optional = {"calibration_path", "calibration_digest"}
+    optional = {"calibration_path", "calibration_digest", "label_anchor_alpha",
+                "label_anchor_alpha_allowed", "label_anchor_alpha_default"}
+    # The declared-launch identity block (native_profile.DECLARED_IDENTITY) is
+    # route-served deployment metadata, never worker state: it is dropped
+    # before the RuntimeProfile fieldset is checked or constructed.
+    static = {name: value for name, value in static.items()
+              if name != "declared_identity"}
+    # Operator-selected active-capture admission cap. The pinned file stays
+    # byte-attested (its PROFILE_SHA256 never moves); OCC3_MAX_ACTIVE may
+    # only select 1 or 2, and any other value fails closed so admission
+    # semantics can never silently change. The effective value is attested
+    # to clients through binding_digest (the RuntimeProfile includes
+    # max_active), and a swap that changes it also changes the container
+    # incarnation, so clients re-activate against the new profile through
+    # the existing authority path.
+    override = os.environ.get("OCC3_MAX_ACTIVE")
+    if override is not None:
+        require(override in ("1", "2"), "profile",
+                detail="latent_worker.load_runtime_profile.max_active_env")
+        static = {**static, "max_active": int(override)}
     require(type(static) is dict and expected - optional <= set(static) <= expected, "profile")
     return RuntimeProfile(**static, runtime_epoch=incarnation["runtime_epoch"],
                           runtime_generation=incarnation["runtime_generation"])
 
 
 def bootstrap_worker(scheduler):
+    """Log gates before control admission without changing bootstrap outcomes."""
+    try:
+        return _bootstrap_worker(scheduler)
+    except Exception as error:
+        from .turn_diagnostics import log_failure
+        log_failure(error, phase="worker_control")
+        raise
+
+
+def _bootstrap_worker(scheduler):
     """Only the trusted ordered internal-control path may initialize this worker."""
     import os
     import torch
@@ -1463,6 +2210,7 @@ def bootstrap_worker(scheduler):
     if any(installed):
         if not all(installed) or _RUNTIME is None or _RUNTIME.members != members:
             if _RUNTIME is not None:
+                _log_poison(_RUNTIME, "bootstrap", "ranks")
                 _RUNTIME.poisoned = True
             raise LatentError("ranks")
         require(not _RUNTIME.poisoned and getattr(scheduler, "occ3_runtime", None) is _RUNTIME, "unavailable")
@@ -1487,6 +2235,8 @@ def record_forward_completion(model_runner, forward_batch):
         return
     runtime = _runtime()
     runtime.preflight("forward_complete", lambda: _end_gpu(runtime, runtime.resolve(context[0].descriptor)))
+    from . import token_trace
+    token_trace.kv_forward(model_runner, forward_batch, "prefill_complete")
 
 
 def record_forward_start(model_runner, forward_batch):

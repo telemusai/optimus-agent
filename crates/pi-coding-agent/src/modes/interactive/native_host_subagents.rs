@@ -243,6 +243,16 @@ impl Bar {
         ).ok()).collect::<Vec<_>>();
         let now = std::time::Instant::now();
         self.communication.observe(&rows, &parent, now);
+        // The OCC3.1 light pulses while a TextMAS run is active in this chat.
+        let textmas_active = self.mode.borrow().connection_state.as_ref()
+            .and_then(|state| state.occ3_modes.as_ref())
+            .is_some_and(|modes| modes.textmas_active);
+        if self.communication.pulse_textmas(textmas_active, now) {
+            if let Some(send) = self.render_send.borrow().clone() {
+                let _ = send.send(HostEvent::Render);
+            }
+        }
+        let queue_badge = self.communication.queue_badge(&rows, now);
         let deadline = self.communication.next_deadline(now);
         if self.pulse_deadline != deadline {
             self.pulse_deadline = deadline;
@@ -265,8 +275,12 @@ impl Bar {
             compaction_cycles: mode.connection_state.as_ref().map(|state| state.compaction_count).unwrap_or(0.0),
             is_compacting: mode.is_agent_compacting(),
         };
+        // The advisory queue badge is composed after the pulse indicators:
+        // truncated away first when the line narrows, never displacing the
+        // delivered-message pulses or the health/TPS segments.
         self.line.set_communication_status(Some(context_health_indicator::status_line(
-            &self.communication.indicators(now), &self.throughput.indicator(), &input,
+            &self.communication.indicators(now), &queue_badge,
+            &self.throughput.indicator(), &input,
             width.saturating_sub(2),
         )));
     }
@@ -409,6 +423,10 @@ pub(super) fn project_child(
 #[cfg(test)]
 #[path = "context_health_bar_tests.rs"]
 mod context_health_bar_tests;
+
+#[cfg(test)]
+#[path = "occ3_mode_bar_tests.rs"]
+mod occ3_mode_bar_tests;
 
 #[cfg(test)]
 #[path = "agent_graph_host_tests.rs"]

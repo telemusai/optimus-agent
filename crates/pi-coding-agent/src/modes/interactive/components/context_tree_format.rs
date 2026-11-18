@@ -1,9 +1,10 @@
 //! Port of packages/coding-agent/src/modes/interactive/components/context-tree-format.ts
 
 use pi_ai::types::Usage;
-use pi_tui::utils::{truncate_to_width, visible_width};
+use pi_tui::utils::{truncate_to_width, visible_width, wrap_text_with_ansi};
 
 use crate::core::context_tree::{ContextTreeNode, ContextUsage};
+use crate::core::occ::textmas::TextMasUsageSummary;
 use crate::core::usage::{add_assistant_usage, empty_usage};
 use crate::modes::interactive::agent_activity::format_token_count;
 use crate::modes::interactive::theme::theme::theme;
@@ -102,6 +103,26 @@ fn spent_tokens(usage: &Usage) -> f64 {
 /// Port of `formatCost`.
 fn format_cost(cost: f64) -> String {
     format!("${:.2}", cost)
+}
+
+/// This is each node's own overhead category, already included in its usage totals.
+fn format_textmas_usage(summary: &TextMasUsageSummary, prefix: &str, width: usize) -> Vec<String> {
+    if width == 0 { return Vec::new(); }
+    let indent = " ".repeat((visible_width(prefix) + 2).min(width.saturating_sub(1)));
+    let available = width - indent.len();
+    let mut details = vec![theme().fg("dim", &format!(
+        "OCC3.1 TextMAS overhead: {} calls · known subtotal {} tokens / ${:.4} (included)",
+        summary.calls, format_token_count(summary.known_tokens),
+        summary.known_subtotal.cost.total,
+    ))];
+    if summary.unknown_usage_calls > 0 || summary.unknown_cost_calls > 0 {
+        details.push(theme().fg("warning", &format!(
+            "Unknown usage: {} calls · unknown cost: {} calls",
+            summary.unknown_usage_calls, summary.unknown_cost_calls,
+        )));
+    }
+    details.into_iter().flat_map(|detail| wrap_text_with_ansi(&detail, available))
+        .map(|line| format!("{indent}{line}")).collect()
 }
 
 /// Port of `formatContextColumn`.
@@ -301,6 +322,9 @@ pub fn format_context_tree(root: &ContextTreeNode, width: f64) -> String {
         lines.push(format!(
             "{label_cell}  {token_cell}  {cost_cell}  {context_cell}"
         ));
+        if let Some(summary) = &node.textmas_usage {
+            lines.extend(format_textmas_usage(summary, &row.prefix, width.max(0.0) as usize));
+        }
     }
 
     let totals = sum_own_usage(root);
@@ -419,6 +443,7 @@ mod tests {
             own_usage: usage(1000.0, 500.0, 0.5),
             total_usage: usage(1000.0, 500.0, 0.5),
             context_usage: None,
+            textmas_usage: None,
             children: Vec::new(),
         }
     }
@@ -516,6 +541,110 @@ mod tests {
         let root = node("root", "Session", "done");
         let text = strip_ansi(&format_context_tree(&root, 100.0));
         assert!(!text.contains("across"));
+    }
+
+    fn textmas(calls: usize, unknown_usage_calls: usize, unknown_cost_calls: usize) -> TextMasUsageSummary {
+        TextMasUsageSummary {
+            calls, unknown_usage_calls, unknown_cost_calls,
+            known_tokens: 150.0,
+            known_subtotal: usage(100.0, 50.0, 0.1),
+        }
+    }
+
+    #[test]
+    fn textmas_known_overhead_is_visible_and_not_added_to_totals_twice() {
+        init();
+        let mut root = node("root", "Session", "done");
+        let legacy = strip_ansi(&format_context_tree(&root, 120.0));
+        root.textmas_usage = Some(textmas(3, 0, 0));
+        let text = strip_ansi(&format_context_tree(&root, 120.0));
+        assert!(text.contains("OCC3.1 TextMAS overhead: 3 calls · known subtotal 150 tokens / $0.1000 (included)"));
+        assert!(!text.contains("Unknown usage"));
+        assert_eq!(text.lines().filter(|line| !line.contains("TextMAS")).collect::<Vec<_>>().join("\n"), legacy);
+        assert!(text.contains("Total: 1,500") && text.contains("Total: $0.5000"));
+    }
+
+    #[test]
+    fn textmas_unknown_usage_and_cost_are_explicit_even_with_zero_subtotal() {
+        init();
+        for (unknown_usage, unknown_cost) in [(1, 2), (0, 3), (3, 3)] {
+            let mut root = node("root", "Session", "done");
+            let mut summary = textmas(3, unknown_usage, unknown_cost);
+            summary.known_subtotal = Usage::default();
+            summary.known_tokens = 0.0;
+            root.textmas_usage = Some(summary);
+            let text = strip_ansi(&format_context_tree(&root, 120.0));
+            assert!(text.contains("known subtotal 0 tokens / $0.0000 (included)"));
+            assert!(text.contains(&format!("Unknown usage: {unknown_usage} calls · unknown cost: {unknown_cost} calls")));
+        }
+    }
+
+    #[test]
+    fn textmas_category_preserves_total_only_and_mixed_call_token_counts() {
+        use crate::core::occ::textmas::{TextMasCallStatus, TextMasRole, TextMasUsageLedger, TextMasUsageRecord};
+        init();
+        let mut ledger = TextMasUsageLedger::default();
+        let total_only = Usage { total_tokens: 80.0, ..Usage::default() };
+        ledger.observe(TextMasUsageRecord::new("total-only", TextMasRole::Planner,
+            TextMasCallStatus::Completed, Some(total_only)));
+        let summary = ledger.summary().unwrap();
+        let rows = format_textmas_usage(&summary, "", 120);
+        assert!(strip_ansi(&rows.join("\n")).contains("known subtotal 80 tokens"));
+        let component_only = Usage { input: 100.0, output: 40.0, ..Usage::default() };
+        ledger.observe(TextMasUsageRecord::new("component-only", TextMasRole::Critic,
+            TextMasCallStatus::Completed, Some(component_only)));
+        let summary = ledger.summary().unwrap();
+        let rows = format_textmas_usage(&summary, "", 120);
+        let text = strip_ansi(&rows.join("\n"));
+        assert!(text.contains("2 calls · known subtotal 220 tokens"), "{text}");
+        assert!(text.contains("unknown cost: 2 calls"), "{text}");
+    }
+
+    #[test]
+    fn textmas_nested_categories_stay_own_and_legacy_absence_changes_nothing() {
+        init();
+        let mut root = node("root", "Session", "done");
+        let mut child = node("child", "Child", "done");
+        child.children.push(node("nested", "Nested", "running"));
+        root.children.push(child);
+        let legacy = format_context_tree(&root, 120.0);
+        let mut old_wire = serde_json::to_value(&root).unwrap();
+        old_wire.as_object_mut().unwrap().remove("textmasUsage");
+        let restored: ContextTreeNode = serde_json::from_value(old_wire).unwrap();
+        assert_eq!(format_context_tree(&restored, 120.0), legacy);
+        root.textmas_usage = Some(textmas(3, 0, 0));
+        root.children[0].textmas_usage = Some(textmas(6, 1, 2));
+        let text = strip_ansi(&format_context_tree(&root, 120.0));
+        assert_eq!(text.matches("TextMAS overhead:").count(), 2);
+        assert!(text.contains("TextMAS overhead: 3 calls") && text.contains("TextMAS overhead: 6 calls"));
+        assert!(!text.contains("TextMAS overhead: 9 calls"));
+        let overheads = text.lines().filter(|line| line.contains("TextMAS")).collect::<Vec<_>>();
+        assert!(overheads[0].starts_with("  OCC3.1"));
+        assert!(overheads[1].starts_with("     OCC3.1"));
+        assert!(text.contains("across 3 agents") && text.contains("Total: 4,500"));
+        assert!(text.contains("Total: $1.5000"));
+        let without_categories = text.lines()
+            .filter(|line| !line.contains("TextMAS") && !line.contains("Unknown usage"))
+            .collect::<Vec<_>>().join("\n");
+        assert_eq!(without_categories, strip_ansi(&legacy));
+    }
+
+    #[test]
+    fn textmas_rows_wrap_within_width_without_hiding_unknown_counts() {
+        init();
+        let summary = textmas(123, 12, 34);
+        for width in [0, 1, 2, 8, 20, 40, 80, 110, 160] {
+            for prefix in ["", "└─ ", "│  └─ "] {
+                let rows = format_textmas_usage(&summary, prefix, width);
+                assert!(rows.iter().all(|line| visible_width(line) <= width), "{width}: {rows:?}");
+                if width >= 20 {
+                    let text = strip_ansi(&rows.join(" "));
+                    let words = text.split_whitespace().collect::<Vec<_>>().join(" ");
+                    assert!(words.contains("OCC3.1 TextMAS overhead: 123 calls"), "{width}: {words}");
+                    assert!(words.contains("Unknown usage: 12 calls") && words.contains("unknown cost: 34 calls"), "{width}: {words}");
+                }
+            }
+        }
     }
 
     #[test]

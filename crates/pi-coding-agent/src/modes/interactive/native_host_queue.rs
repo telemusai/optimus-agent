@@ -330,6 +330,8 @@ fn mutation_payload(mutation: &Mutation) -> Value {
     match mutation {
         Mutation::Move(direction) => json!({"type": "move", "direction": direction}),
         Mutation::Edit(text, follow_up) if !text.trim().is_empty() => {
+            // Lane choice mirrors submit semantics: Enter re-files the
+            // edited item as a steer, the follow-up key queues a follow-up.
             let mut value = json!({"type": "replace", "text": text.trim(), "lane": if *follow_up { "followUp" } else { "steering" }});
             // Missing images preserves attachments that this client cannot resolve.
             if crate::modes::interactive::image_markers::image_marker_ids(text).is_empty() {

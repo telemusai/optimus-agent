@@ -32,7 +32,7 @@ from dataclasses import dataclass, field
 
 from . import __version__, metrics
 from .api import _state
-from .identity import compute_identity, fingerprint
+from .identity import IDENTITY_FIELDS, compute_identity, fingerprint
 from .latent_control_api import control_error_response, runtime_identity
 from .latent_types import LatentError
 from .registry import registry
@@ -52,7 +52,9 @@ _ATTEMPT = re.compile(r"[0-9a-f]{8}\Z")
 # Every code the receipts, InstallationError raises and serve-abort paths can
 # emit today. Anything else is dropped rather than surfaced (fail-closed).
 _FIXED_CODES = frozenset({
-    "backend_not_ready", "control_client_occupied", "descriptor_overlay_unavailable",
+    "backend_not_ready", "capture_busy_wait_seconds_invalid", "capture_drain_seconds_invalid",
+    "capture_preempt_invalid", "capture_profile_mismatch", "control_client_occupied",
+    "descriptor_overlay_unavailable",
     "explicit_experimental_opt_in_required", "experimental_startup_not_selected",
     "experimental_startup_prepared", "experimental_startup_refused",
     "factory_cleanup_unconfirmed", "hook_install_unverified",
@@ -60,6 +62,7 @@ _FIXED_CODES = frozenset({
     "installation_busy", "installation_cancelled", "installation_cleanup_unconfirmed",
     "installation_owner_mismatch", "installation_ownership_changed",
     "installation_unavailable", "installed_experimental_not_live_validated",
+    "max_turn_seconds_invalid",
     "native_route_conflict", "native_router_unverified", "native_startup_aborted",
     "native_startup_cleanup_unconfirmed", "original_api_key_required",
     "original_auth_mismatch", "original_auth_registration_required",
@@ -263,9 +266,34 @@ def _native_view():
                 "live_validated": False}
 
 
+def _served_fingerprint():
+    """The identity fingerprint the status/capability routes advertise.
+
+    Diagnostic surfaces only, never a binding contract: the identity route
+    owns the fail-closed declared-identity rule the client binds on. When
+    the installed profile pins a declared-launch identity, both routes
+    advertise exactly that fingerprint so they never contradict the
+    identity route. Without a pinned declared block (pre-install, DECLINED,
+    older profile) they keep the runtime-derived pipe-join: the controller
+    gate reads status precisely in those states, so the route must still
+    answer instead of failing closed.
+    """
+    from .native_profile import DECLARED_IDENTITY, ProfileError, load_pinned_profile
+
+    try:
+        declared = load_pinned_profile().get(DECLARED_IDENTITY)
+    except ProfileError:
+        declared = None
+    if isinstance(declared, dict):
+        return fingerprint({name: declared[name] for name in IDENTITY_FIELDS})
+    return fingerprint(compute_identity(_state().tokenizer_manager))
+
+
 def status_payload():
     """Superset of the old StatusView; old fields verbatim, fixed key set."""
-    identity = compute_identity(_state().tokenizer_manager)
+    from .turn_diagnostics import failure_snapshot
+    from .latent_types import admission_diagnostics_snapshot
+    fingerprint_value = _served_fingerprint()
     machine = current()
     return {
         "schema": STATUS_SCHEMA,
@@ -283,9 +311,11 @@ def status_payload():
         "plugin": "occ3-bridge",
         "version": __version__,
         "enabled": False,
-        "model_fingerprint": fingerprint(identity),
+        "model_fingerprint": fingerprint_value,
         "channels": registry().counts(),
         "metrics": metrics.snapshot(),
+        "parallel_handoff_diagnostics": {**failure_snapshot(),
+            "admission": admission_diagnostics_snapshot()},
     }
 
 
@@ -305,14 +335,14 @@ def _advertised_methods():
 
 def capabilities_payload():
     """Superset of the old advertisement; availability is never advertised."""
-    identity = compute_identity(_state().tokenizer_manager)
+    fingerprint_value = _served_fingerprint()
     machine = current()
     return {
         "schema": CAPABILITY_SCHEMA,
         "supported": False,
         "reason": _reason(machine),
         "experimental_prompt_kv_path": "/occ3/v1/latent/capabilities",
-        "model_fingerprint": fingerprint(identity),
+        "model_fingerprint": fingerprint_value,
         "connector_id": "sglang-occ3",
         "methods": _advertised_methods(),
         "experimental_baselines": ["text-radix", "source-prompt-kv-handle-v1"],

@@ -8,11 +8,11 @@ import time
 import uuid
 from dataclasses import asdict
 
-from .attachment_contract import (AttachmentError, BackendReadiness, CaptureWorkerDescriptor,
+from .attachment_contract import (ActiveSlotBusy, AttachmentError, BackendReadiness, CaptureWorkerDescriptor,
                                   ConsumeWorkerDescriptor, Reservation, SourceEnrollment,
                                   SPAN_POLICIES_V2, digest)
 from .span_policy import resolve_runtime_markers
-from .latent_types import LatentError, control_request, require, validate_control_payload
+from .latent_types import LatentError, admission_probe, control_request, require, validate_control_payload
 from .use_receipts import (SourceCaptureCommit, SourceCaptureEvidence, TerminalUseEvidence,
                            SPAN_BLOCK_FIELDS)
 
@@ -41,24 +41,79 @@ _SOURCE_COMMIT_FIELDS = ("capture_commit_id", "accepted_span_start", "accepted_s
                           "byte_count")
 
 
+#: Seconds past an attempt's native deadline before its frontend state is
+#: pruned. Covers a quarantined retire (control timeout <= 120 s).
+ATTEMPT_PRUNE_GRACE_SECONDS = 150
+
+#: How many dispatch timeouts an unanswered control op may stay in the
+#: bounded pending table before the entry is released. The worker always
+#: replies to Occ3ControlReq, so a reply missing after several dispatch
+#: timeouts is a lost IPC reply, not a slow operation.
+UNCERTAIN_TTL_MULTIPLE = 4
+
+
 class ControlClient:
     def __init__(self, tokenizer_manager, *, timeout_seconds=30, max_pending=64):
         require(0 < timeout_seconds <= 120 and 0 < max_pending <= 256)
         require(getattr(tokenizer_manager, "_occ3_control_client", None) is None, "state")
         self.tm, self.timeout_seconds, self.max_pending = tokenizer_manager, timeout_seconds, max_pending
+        # command_id -> (envelope digest, dispatch monotonic). The digest
+        # identifies the dispatched envelope; the timestamp bounds the entry.
         self.pending = {}
         self._uncertain = {}
+        # command_id -> retirement monotonic. An aged-out (swept) command id
+        # stays unusable for a further sweep window: the operation may still
+        # be running server-side, so a caller reusing the id would let a
+        # merely-delayed reply for the old operation settle the new future
+        # (deliver matches command_id only, and the result envelope carries
+        # no request echo to compare against).
+        self._retired = {}
         self._operations = {}
         self.closed = False
         tokenizer_manager._occ3_control_client = self
 
+    def _sweep_uncertain(self):
+        """Release pending-table slots for replies that can no longer arrive.
+
+        A lost control reply (operation cancelled or timed out after the
+        transport accepted bytes) otherwise leaks its entry forever, and
+        max_pending leaked entries refuse every later control op with
+        "quota" until process restart. Fail-closed on uncertainty: an
+        aged-out entry is released from quota accounting only. It is never
+        treated as proof the operation did not run, and a late reply for it
+        is ignored exactly like any unknown command id (the caller's future
+        is already settled or cancelled by then). The swept id moves to a
+        bounded retirement table for one further sweep window: the operation
+        may still be live server-side, and a reused id would otherwise let a
+        merely-delayed reply for the old operation settle the new future.
+        Entries with a live, cancellation-resistant operation task still
+        hold their quota slot through self._operations, which this sweep
+        never touches.
+        """
+        now = time.monotonic()
+        horizon = self.timeout_seconds * UNCERTAIN_TTL_MULTIPLE
+        cutoff = now - horizon
+        stale = [command_id for command_id, (_, dispatched_at) in self._uncertain.items()
+                 if dispatched_at <= cutoff]
+        for command_id in stale:
+            self._retired[command_id] = now
+            del self._uncertain[command_id]
+        expired = [command_id for command_id, retired_at in self._retired.items()
+                   if retired_at <= cutoff]
+        for command_id in expired:
+            del self._retired[command_id]
+        if stale or expired:
+            self._detach_if_settled()
+
     async def call(self, operation, payload, command_id=None):
+        self._sweep_uncertain()
         require(not self.closed and len(self._uncertain) < self.max_pending
                 and len(self.pending) < self.max_pending and len(self._operations) < self.max_pending, "quota")
         from sglang.srt.managers.io_struct import Occ3ControlReq
         command_id = command_id or uuid.uuid4().hex
         envelope = control_request(command_id, operation, payload)
-        require(command_id not in self.pending and command_id not in self._uncertain, "replay")
+        require(command_id not in self.pending and command_id not in self._uncertain
+                and command_id not in self._retired, "replay")
         future = asyncio.get_running_loop().create_future()
         self.pending[command_id] = future
         try:
@@ -66,7 +121,7 @@ class ControlClient:
             request = Occ3ControlReq(rid=command_id, payload=envelope)
             # Dispatch can fail after transport accepted bytes. Keep ownership
             # until a valid same-command terminal reply is actually observed.
-            self._uncertain[command_id] = digest(envelope)
+            self._uncertain[command_id] = (digest(envelope), time.monotonic())
             async def dispatch_and_wait():
                 await self.tm._async_dispatch_to_scheduler(request)
                 return await asyncio.shield(future)
@@ -170,12 +225,31 @@ class LatentBackend:
         self.authority.check_session(identity.principal_digest, session)
 
     def _slot(self, attempt):
-        require(attempt not in self.attempts and len(self.attempts) < self.profile.max_records, "replay")
+        self._prune()
+        require(attempt not in self.attempts and len(self.attempts) < self.profile.max_records, "replay", detail="latent_backend._slot.attempt_slot")
+
+    def _prune(self):
+        """Drop per-turn frontend state that no caller can use any more.
+
+        An entry is dropped once its retire was acknowledged, or once its
+        native deadline (monotonic) is more than ATTEMPT_PRUNE_GRACE_SECONDS
+        in the past: every reserve/bind/finish/retire for an attempt runs
+        inside its own turn, and a quarantined retire is bounded by the
+        control timeout. Attempt ids are fresh per request, and worker-side
+        replay protection lives in the registry, so pruning never reopens a
+        replay. Without this, max_records (256) armed turns per process
+        exhausted the table and every later turn was refused.
+        """
+        cutoff = time.monotonic() - ATTEMPT_PRUNE_GRACE_SECONDS
+        stale = [key for key, state in self.attempts.items()
+                 if state.get("retired") or state["descriptor"].deadline <= cutoff]
+        for key in stale:
+            del self.attempts[key]
 
     def _reservation(self, descriptor, binding, native):
-        require(native.request.rid == descriptor.native_rid and native.max_new_tokens > 0, "identity")
+        require(native.request.rid == descriptor.native_rid and native.max_new_tokens > 0, "identity", detail="latent_backend._reservation.native_identity")
         require(descriptor.deadline <= native.deadline_monotonic and
-                descriptor.deadline > time.monotonic() + self.required_seconds, "expired")
+                descriptor.deadline > time.monotonic() + self.required_seconds, "expired", detail="latent_backend._reservation.native_bounds")
         # A positive admission floor, NOT a prediction of full inference latency.
         return Reservation(descriptor.attempt_id, binding, descriptor.native_rid,
                            descriptor.principal_digest, self.required_seconds, self.max_output_bytes,
@@ -189,6 +263,9 @@ class LatentBackend:
         require(attachment.expires_at_epoch > time.time(), "expired")
         offset = getattr(native, "prefix_offset", 0)
         require(type(offset) is int and 0 <= offset <= 2**20, "profile")
+        layout = getattr(native, "prefix_layout", "marker" if offset else "prepend")
+        require(layout in ("prepend", "marker", "last_user")
+                and (layout != "prepend") == (offset > 0), "profile")
         self._slot(attempt_id)
         await self.refresh_readiness()
         record = await self.client.call("status", {"source_handle": attachment.state_handle,
@@ -205,12 +282,21 @@ class LatentBackend:
             model_fingerprint=attachment.model_fingerprint, method_id=attachment.method,
             tp_layout_digest=source["layout_digest"], expected_rank_count=source["expected_ranks"],
             expected_prefix_tokens=source["retained_count"], hidden_dim=source["hidden_dim"], dtype=source["dtype"],
-            deadline=native.deadline_monotonic, prefix_offset=offset)
+            deadline=native.deadline_monotonic, prefix_offset=offset,
+            prefix_layout=layout)
         reservation = self._reservation(descriptor, attachment.binding_digest, native)
         self.attempts[attempt_id] = {"descriptor": descriptor, "reservation": reservation,
                                      "principal": identity.principal_digest}
-        await self.client.call("reserve_consume", {"descriptor": asdict(descriptor)},
-                               command_id="reserve-" + descriptor.reservation_id)
+        try:
+            await self.client.call("reserve_consume", {"descriptor": asdict(descriptor)},
+                                   command_id="reserve-" + descriptor.reservation_id)
+        except LatentError as error:
+            if error.code != "busy":
+                raise
+            # Proven non-use, same contract as enroll_source: the registry
+            # declines "busy" before taking the nonce, attempt or lease.
+            self.attempts[attempt_id]["retired"] = True
+            raise AttachmentError("scheduler_busy", 503) from None
         return reservation
 
     def bind(self, reservation, native):
@@ -223,7 +309,11 @@ class LatentBackend:
         state = self.attempts.get(reservation.attempt_id)
         require(state is not None and state["reservation"] == reservation and completion.native_rid == reservation.native_rid, "identity")
         d = state["descriptor"]
-        record = await self.client.call("status", {"attempt_id": d.attempt_id, "principal_digest": d.principal_digest})
+        # Atomically read terminal evidence and release the worker's proof
+        # hold; a deferred source retire may reclaim only after that read.
+        record = await self.client.call("finish_consume", {
+            "attempt_id": d.attempt_id, "principal_digest": d.principal_digest},
+            command_id="finish-" + d.reservation_id)
         require(record["state"] == "terminal" and not record["revoked"], "not_ready")
         t = record["terminal"]
         require(t["native_rid"] == d.native_rid and record["source"]["capture_commit_id"] == d.source_capture_commit_id, "identity")
@@ -235,13 +325,15 @@ class LatentBackend:
             t["injected_prefix_count"], t["ready_ranks"], t["expected_ranks"], True, False, 0, True, True,
             reservation.reservation_id)
 
+    @admission_probe("enroll_source")
     async def enroll_source(self, intent, identity, attempt_id, native_rid, deadline):
         self._identity(identity, intent.source_session_id)
         require(intent.method == self.profile.method and intent.runtime_id == self.profile.runtime_epoch
                 and intent.runtime_generation == self.profile.runtime_generation
-                and intent.model_fingerprint == self.profile.model_fingerprint, "identity")
-        require(intent.retained_count_limit in (8, 16, 32, 64, 128), "profile")
-        require(native_rid != intent.source_request_id, "identity")
+                and intent.model_fingerprint == self.profile.model_fingerprint, "identity", detail="latent_backend.enroll_source.profile_identity")
+        require(intent.retained_count_limit in (8, 16, 32, 64, 128), "profile", detail="latent_backend.enroll_source.retained_limit")
+        require(native_rid != intent.source_request_id, "identity", detail="latent_backend.enroll_source.source_request_identity")
+        alpha = self.profile.resolve_label_anchor(intent.label_anchor_alpha)
         self._slot(attempt_id)
         health = await self.refresh_readiness()
         marker_profile = ""
@@ -271,7 +363,7 @@ class LatentBackend:
             source_turn_nonce=intent.turn_nonce, runtime_generation=intent.runtime_generation,
             span_policy=intent.span_policy, max_prefix_tokens=intent.retained_count_limit,
             max_capture_bytes=intent.max_capture_bytes, marker_profile=marker_profile,
-            capture_mode=intent.capture_mode)
+            capture_mode=intent.capture_mode, label_anchor_alpha=alpha)
         enrollment = SourceEnrollment(attempt_id, intent.binding_digest, native_rid,
             identity.principal_digest, uuid.uuid4().hex, int(uuid.uuid4().hex[:16], 16),
             intent.expires_at_epoch, intent.source_session_id, intent.runtime_id, intent.runtime_generation,
@@ -280,14 +372,34 @@ class LatentBackend:
         # Store before await so cancellation cleanup can find uncertain enrollment.
         self.attempts[attempt_id] = {"descriptor": descriptor, "enrollment": enrollment,
                                     "principal": identity.principal_digest}
-        await self.client.call("reserve_capture", {"descriptor": asdict(descriptor),
-            "source_handle": enrollment.source_handle, "state_generation": enrollment.state_generation,
-            "expires_at_epoch": enrollment.expires_at_epoch}, command_id="reserve-" + descriptor.reservation_id)
+        try:
+            await self.client.call("reserve_capture", {"descriptor": asdict(descriptor),
+                "source_handle": enrollment.source_handle, "state_generation": enrollment.state_generation,
+                "expires_at_epoch": enrollment.expires_at_epoch}, command_id="reserve-" + descriptor.reservation_id)
+        except LatentError as error:
+            if error.code not in ("busy", "quota"):
+                raise
+            # Proven non-use: the registry declines "busy" and every
+            # reserve-capture quota require (byte, record, tombstone or
+            # budget-owner capacity) BEFORE creating any record, attempt or
+            # byte charge, on every rank (a rank mismatch would have come
+            # back as "ranks"). Nothing was dispatched and no receipt can
+            # exist, so this is the same retryable contract as the
+            # scheduler busy-batch refusal: a distinct 503 with Retry-After
+            # instead of a terminal 409 that strands the sender. The local
+            # entry is marked retired so it is pruned. Only "busy" (the
+            # active slot, latent_registry.reserve_capture) clears by waiting
+            # and is typed so the frontend may re-enroll; quota stays generic.
+            self.attempts[attempt_id]["retired"] = True
+            if error.code == "busy":
+                raise ActiveSlotBusy() from None
+            raise AttachmentError("scheduler_busy", 503) from None
         return enrollment
 
+    @admission_probe("prepare_source")
     async def prepare_source(self, enrollment, native):
         state = self.attempts.get(enrollment.attempt_id)
-        require(state is not None and state.get("enrollment") == enrollment and "reservation" not in state, "replay")
+        require(state is not None and state.get("enrollment") == enrollment and "reservation" not in state, "replay", detail="latent_backend.prepare_source.source_reservation")
         reservation = self._reservation(state["descriptor"], enrollment.intent_digest, native)
         state["reservation"] = reservation
         return reservation
@@ -297,6 +409,7 @@ class LatentBackend:
         require(state is not None and state.get("enrollment") == enrollment, "identity")
         self.bind(reservation, native)
 
+    @admission_probe("finish_source")
     async def finish_source(self, enrollment, reservation, completion, provenance):
         state = self.attempts.get(enrollment.attempt_id)
         require(state is not None and state.get("enrollment") == enrollment and state.get("reservation") == reservation, "identity")
@@ -322,14 +435,40 @@ class LatentBackend:
         artifact_digest = source.get("artifact_digest")
         require(artifact_digest is None
                 or (type(artifact_digest) is str and 1 <= len(artifact_digest) <= 64), "identity")
+        require(source.get("label_anchor_alpha", 0.0) == state["descriptor"].label_anchor_alpha, "identity")
         require(all(name in source for name in _SOURCE_COMMIT_FIELDS), "identity")
         block = {name: source.get(name) for name in SPAN_BLOCK_FIELDS}
-        commit = SourceCaptureCommit(**{name: source[name] for name in _SOURCE_COMMIT_FIELDS}, **block)
+        commit = SourceCaptureCommit(**{name: source[name] for name in _SOURCE_COMMIT_FIELDS},
+                                     label_anchor_alpha=source.get("label_anchor_alpha", 0.0), **block)
         require(commit.ready_ranks == commit.expected_ranks == enrollment.expected_ranks
                 and commit.layout_digest == enrollment.layout_digest, "ranks")
         return SourceCaptureEvidence(enrollment, reservation.reservation_id, commit,
             completion.output_sha256, completion.native_rid, provenance.binding_digest, True, True, 0)
 
+    @admission_probe("release_unused")
+    async def release_unused_attempt(self, attempt_id, native_rid):
+        """Worker-side proof that a busy-declined attempt never ran.
+
+        Consume: the worker returns the lease and its nonce to the published
+        state (registry.release_unused_lease re-proves non-admission first).
+        Capture: the record must still be "reserved" (admission flips it to
+        "capturing"); the caller's normal retire then revokes it. Any other
+        state raises, and the caller keeps its replay fence.
+        """
+        state = self.attempts.get(attempt_id)
+        require(state is not None and not state.get("retired"), "state")
+        descriptor = state["descriptor"]
+        require(descriptor.native_rid == native_rid, "identity")
+        if type(descriptor) is ConsumeWorkerDescriptor:
+            await self.client.call("release_lease", {"attempt_id": attempt_id, "principal_digest": state["principal"]},
+                                   command_id="release-" + descriptor.reservation_id)
+            state["retired"] = True
+            return "released"
+        record = await self.client.call("status", {"attempt_id": attempt_id, "principal_digest": state["principal"]})
+        require(record["state"] == "reserved" and not record["revoked"], "state")
+        return "unadmitted"
+
+    @admission_probe("backend_retire")
     async def retire(self, attempt_id, native_rid, dispatched):
         state = self.attempts.get(attempt_id)
         if state is None:

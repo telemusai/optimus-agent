@@ -34,8 +34,21 @@ PROFILE_FIELDS = frozenset({
     "max_prefix_tokens", "max_live_bytes", "workspace_bytes", "max_records",
     "max_active", "max_ttl_seconds", "anchor_alpha", "tile_rows", "method",
 })
+# The declared-launch identity block (the eleven optimus.occ3.identity.v1
+# fields pinned at deploy time) is optional here exactly as it is in the
+# runtime validator (occ3_sglang/native_profile.py): an older pinned input
+# without the block stays valid. The fieldset is a literal in both places;
+# tests pin the two definitions together.
+DECLARED_IDENTITY = "declared_identity"
+_DECLARED_IDENTITY_FIELDS = frozenset({
+    "model_id", "architecture", "checkpoint_revision", "weight_fingerprint",
+    "tokenizer_fingerprint", "chat_template_fingerprint", "quantisation",
+    "tensor_geometry", "kv_layout", "latent_method", "runtime",
+})
 # Frozen-artifact reference: optional, because the per-message method names none.
-OPTIONAL_PROFILE_FIELDS = frozenset({"calibration_path", "calibration_digest"})
+OPTIONAL_PROFILE_FIELDS = frozenset({"calibration_path", "calibration_digest",
+                                     "label_anchor_alpha", "label_anchor_alpha_allowed",
+                                     "label_anchor_alpha_default", DECLARED_IDENTITY})
 OUTPUT_NAMES = ("native_profile.json", "native_sources.json", "_native_profile_digest.py")
 MAX_PROFILE_BYTES = 16384
 MAX_SOURCES_BYTES = 65536
@@ -53,6 +66,10 @@ MAX_SOURCE_TOTAL = 32 * 1024 * 1024
 MAX_TREE_ENTRIES = 8192
 MAX_TREE_BYTES = 512 * 1024 * 1024
 MAX_SOURCE_FILES = 128
+# Bound on reviewed source manifests per prepare(); the image driver pins the
+# exact names (native_image_build.MANIFEST_NAMES). Stays below the loader's
+# 128-entry manifests limit (occ3_sglang/native_profile.py).
+MAX_MANIFESTS = 16
 _HEX = re.compile(r"[a-f0-9]{64}\Z")
 _NAME = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}\Z")
 _IDENTIFIER = re.compile(r"[A-Za-z0-9._:/-]{1,256}\Z")
@@ -434,6 +451,16 @@ def _source(raw, relative, *, attested_sg):
 
 def _profile(value):
     _keys(value, PROFILE_FIELDS, "invalid_profile_fields", OPTIONAL_PROFILE_FIELDS)
+    if DECLARED_IDENTITY in value:
+        # Mirrors occ3_sglang.native_profile._validate_profile: the declared
+        # block, when present, is exactly the eleven non-empty bounded
+        # strings; an explicit null is refused, never treated as absent.
+        declared = value[DECLARED_IDENTITY]
+        _need(type(declared) is dict and set(declared) == _DECLARED_IDENTITY_FIELDS,
+              "invalid_profile_fields")
+        for name in _DECLARED_IDENTITY_FIELDS:
+            _need(type(declared[name]) is str and 0 < len(declared[name]) <= 512,
+                  "invalid_profile_fields")
     path_value = value.get("calibration_path", "")
     digest_value = value.get("calibration_digest", "")
     _need(type(path_value) is str and type(digest_value) is str
@@ -450,6 +477,25 @@ def _profile(value):
               "invalid_profile_integer")
     _need(type(value["anchor_alpha"]) in (int, float) and math.isfinite(value["anchor_alpha"]),
           "invalid_profile_alpha")
+    label_alpha = value.get("label_anchor_alpha", 0.0)
+    _need(type(label_alpha) in (int, float) and math.isfinite(label_alpha)
+          and label_alpha in (0.0, 0.3, 0.5, 0.7, 1.0), "invalid_profile_label_alpha")
+    allowed_present = "label_anchor_alpha_allowed" in value
+    default_present = "label_anchor_alpha_default" in value
+    _need(allowed_present == default_present, "invalid_profile_label_alpha")
+    if allowed_present:
+        allowed = value["label_anchor_alpha_allowed"]
+        default = value["label_anchor_alpha_default"]
+        _need(type(allowed) in (list, tuple) and 0 < len(allowed) <= 5, "invalid_profile_label_alpha")
+        _need(all(type(x) in (int, float) and math.isfinite(x)
+                     and x in (0.0, 0.3, 0.5, 0.7, 1.0) for x in allowed), "invalid_profile_label_alpha")
+        _need(len(set(allowed)) == len(allowed), "invalid_profile_label_alpha")
+        _need(type(default) in (int, float) and math.isfinite(default)
+                     and default in allowed, "invalid_profile_label_alpha")
+        _need(not label_alpha or (len(allowed) == 1 and default == label_alpha), "invalid_profile_label_alpha")
+        label_alpha = default
+    _need(not (value["anchor_alpha"] != 0 and label_alpha != 0),
+          "conflicting_profile_anchors")
     # Current audited RuntimeProfile bounds, not evidence of actual model/TP/GPU state.
     # A packaged profile may only pin a method the installed registry advertises.
     # The registry is parsed, not imported: the build path stays pure-file.
@@ -501,7 +547,11 @@ def _recheck_inputs(plan):
 
 
 def prepare(sglang_srt, occ3_sglang, baseline_path, profile_path, manifest_paths, *, experimental_startup=False):
-    """Validate all inputs, three plans, final bytes and tree identities; no writes."""
+    """Validate all inputs, every manifest plan, final bytes and tree identities; no writes.
+
+    Manifests are prepared and attested in the caller's order. Their file sets
+    must be disjoint, so the merged overlay does not depend on that order; the
+    attestation lists manifests sorted by name."""
     try:
         _need(type(experimental_startup) is bool, "invalid_experimental_startup_flag")
         sg, plugin = _absolute(sglang_srt), _absolute(occ3_sglang)
@@ -509,10 +559,12 @@ def prepare(sglang_srt, occ3_sglang, baseline_path, profile_path, manifest_paths
               "overlapping_package_roots")
         _fresh(plugin)
         trees = (_tree(sg), _tree(plugin))
-        _need(type(manifest_paths) in (list, tuple) and len(manifest_paths) == 3, "exactly_three_manifests_required")
+        _need(type(manifest_paths) in (list, tuple) and 1 <= len(manifest_paths) <= MAX_MANIFESTS,
+              "manifest_count_invalid")
         paths = tuple(_absolute(path) for path in (baseline_path, profile_path, *manifest_paths))
-        _need(len({str(path).casefold() for path in paths}) == 5, "duplicate_input_path")
-        limits = (MAX_BASELINE_BYTES, MAX_PROFILE_BYTES, *([source_patch.MAX_MANIFEST_BYTES] * 3))
+        _need(len({str(path).casefold() for path in paths}) == len(paths), "duplicate_input_path")
+        limits = (MAX_BASELINE_BYTES, MAX_PROFILE_BYTES,
+                  *([source_patch.MAX_MANIFEST_BYTES] * len(manifest_paths)))
         inputs = tuple(_read(path, limit) for path, limit in zip(paths, limits))
         baseline = _baseline(_json(inputs[0].raw))
         profile_raw = _profile(_json(inputs[1].raw))

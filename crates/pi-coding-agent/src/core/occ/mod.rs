@@ -270,6 +270,7 @@
 
 pub mod activity;
 pub mod consolidation;
+pub mod queue;
 pub mod contract;
 pub mod delta;
 pub mod dialect;
@@ -280,6 +281,9 @@ pub mod occ3;
 pub mod prune;
 pub mod selection;
 pub mod session_settings;
+pub mod textmas;
+pub mod textmas_context;
+pub mod textmas_settings;
 
 #[cfg(test)]
 mod codec_tests;

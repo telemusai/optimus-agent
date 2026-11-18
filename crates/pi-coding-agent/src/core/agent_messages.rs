@@ -505,6 +505,23 @@ pub struct AgentSessionMessageReceipt {
     pub queued_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub delivery_mode: Option<String>,
+    /// Present only when the target was not resident and had to be hydrated
+    /// (restored from its saved session artifacts) for this delivery: the
+    /// transport accepted the message, but nothing resident consumed it, so
+    /// callers that need proof of consumption (e.g. the OCC-3 native
+    /// fallback acknowledgment) must not read this as a live delivery.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delivered_to_hydrated: Option<bool>,
+}
+
+impl AgentSessionMessageReceipt {
+    /// Mark this receipt as delivered into a hydrated (non-resident) target.
+    /// Builder-style: applied only by the send path that actually had to
+    /// hydrate the receiver.
+    pub fn with_hydrated_receiver(mut self) -> Self {
+        self.delivered_to_hydrated = Some(true);
+        self
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -2023,6 +2040,7 @@ pub fn create_agent_session_message_receipt(
             Some(at.to_string())
         },
         delivery_mode: Some(DELIVERY_MODE_STEER.to_string()),
+        delivered_to_hydrated: None,
     }
 }
 
@@ -2247,7 +2265,7 @@ impl PreparedNativeHandoff {
         let e = &publication.envelope;
         if e.message_id != authorization.message_id || e.sender_session_id != authorization.from.session_id
             || e.receiver_session_id != authorization.target.session_id
-            || e.control_summary != "You are the receiver of this attached native state. It is the sender's context, not your own history. As the receiver, answer your current task using that state."
+            || e.control_summary != crate::core::occ::occ3::types::OCC3_CONTROL_SUMMARY
         { return Err("Native handoff publication binding rejected".into()); }
         Ok(Self {authorization,publication})
     }
@@ -2329,6 +2347,29 @@ pub trait AgentSessionMessageController: Send + Sync {
     ) -> pi_ai::types::BoxFuture<Occ3SendPolicy> {
         let _ = (target, message);
         Box::pin(async { Occ3SendPolicy::disabled() })
+    }
+
+    /// OCC-3 sender-queue parent notification: one durable queue-level
+    /// event (expiry, refusal, fallback aggregate, uncertain resolution)
+    /// the HOST delivers to the parent session of a native-OCC-3 child.
+    /// Both session ids come from the authenticated spawn relationship
+    /// (`semantic_parent_session_id`), never a model-provided name. The
+    /// payload is the content-free notice details: queueId, state,
+    /// attempts, reason, noticeId - never a dispatch token, capture
+    /// handle or receipt. `Ok` means durably accepted (e.g. written to
+    /// the parent's transcript); the sender removes the outbox record
+    /// only then. The default REFUSES: a controller without a real
+    /// parent surface must never acknowledge - the notice stays pending
+    /// in the durable outbox (bounded, overflow-flagged, never dropped)
+    /// until a real implementation accepts it.
+    fn notify_parent_queue_notice(
+        &self,
+        child_session_id: &str,
+        parent_session_id: &str,
+        details: serde_json::Value,
+    ) -> pi_ai::types::BoxFuture<Result<(), String>> {
+        let _ = (child_session_id, parent_session_id, details);
+        Box::pin(async { Err("Parent queue notification is not installed".into()) })
     }
 }
 
@@ -3172,6 +3213,25 @@ mod tests {
         );
         assert!(delivered.queued_at.is_none());
         assert_eq!(delivered.delivery_mode.as_deref(), Some("steer"));
+        // Default receipts carry no hydration marker.
+        assert!(delivered.delivered_to_hydrated.is_none());
+        assert!(
+            serde_json::to_value(&delivered)
+                .expect("serialize")
+                .get("deliveredToHydrated")
+                .is_none(),
+            "the hydration marker must stay absent for ordinary live deliveries"
+        );
+        let hydrated = delivered.with_hydrated_receiver();
+        assert_eq!(hydrated.delivered_to_hydrated, Some(true));
+        assert_eq!(
+            serde_json::to_value(&hydrated)
+                .expect("serialize")
+                .get("deliveredToHydrated")
+                .and_then(|value| value.as_bool()),
+            Some(true),
+            "the hydration marker must round-trip so the OCC-3 fallback ack can see it"
+        );
         let queued = create_agent_session_message_receipt(
             &payload(),
             &DELIVERY_STATUS_QUEUED.to_string(),
@@ -3601,6 +3661,7 @@ mod tests {
                     delivered_at: None,
                     queued_at: None,
                     delivery_mode: None,
+                    delivered_to_hydrated: None,
                 })
             })
         }
@@ -3806,6 +3867,7 @@ mod agent_message_provenance_gate_tests {
                     delivered_at: None,
                     queued_at: None,
                     delivery_mode: None,
+                    delivered_to_hydrated: None,
                 })
             })
         }
@@ -3921,6 +3983,93 @@ mod agent_message_provenance_gate_tests {
         assert!(error.to_string().contains("did not match"));
         assert_eq!(enrolled.state(), KernelScopeState::Tombstoned);
         assert!(controller.sent.lock().unwrap().is_empty());
+    }
+
+    /// The native handoff publication binding pins the exact receiver framing:
+    /// only the current `OCC3_CONTROL_SUMMARY` const is admitted, and the
+    /// legacy one-liner framing is rejected with the binding error.
+    #[tokio::test]
+    async fn prepared_native_handoff_pins_the_occ3_control_summary_const() {
+        use crate::core::occ::occ3::connector::NativePublication;
+        use crate::core::occ::occ3::types::{
+            Occ3Envelope, Occ3HandleRef, Occ3Method, OCC3_CONTROL_SUMMARY,
+            OCC3_MAX_SUMMARY_CHARS,
+        };
+
+        // Content pin: the framing names the attached state as the primary
+        // information source, requires character-for-character reporting, and
+        // stays inside the summary budget.
+        assert!(OCC3_CONTROL_SUMMARY.contains("primary information source"));
+        assert!(OCC3_CONTROL_SUMMARY.contains("character for character"));
+        assert!(OCC3_CONTROL_SUMMARY.chars().count() < OCC3_MAX_SUMMARY_CHARS);
+
+        let authorization = AuthorizedNativeHandoff::from_catalog(
+            &AgentFamilyCatalogEntry {
+                id: "unit-source".into(),
+                depth: 0.,
+                ..Default::default()
+            },
+            &AgentFamilyCatalogEntry {
+                id: "unit-session".into(),
+                depth: 1.,
+                parent_session_id: Some("unit-source".into()),
+                ..Default::default()
+            },
+            AgentSessionMessageEndpoint {
+                active_session_id: "unit-source-active".into(),
+                session_id: "unit-source".into(),
+                ..Default::default()
+            },
+            AgentSessionMessageEndpoint {
+                active_session_id: "unit-session-active".into(),
+                session_id: "unit-session".into(),
+                ..Default::default()
+            },
+            "child",
+        )
+        .expect("fixture authorization");
+        let message_id = authorization.message_id().to_string();
+        let envelope = |control_summary: String| Occ3Envelope {
+            schema: "optimus.occ3.v1".into(),
+            protocol_version: 1,
+            message_id: message_id.clone(),
+            sender_session_id: "unit-source".into(),
+            receiver_session_id: "unit-session".into(),
+            model_fingerprint: "unit-fixture-fingerprint".into(),
+            runtime_id: "unit-fixture-runtime".into(),
+            connector_id: "unit-fixture-occ3".into(),
+            latent_method: Occ3Method::StatebridgePrefix,
+            state_handle: Occ3HandleRef {
+                handle_id: "unit-fixture-handle".into(),
+                connector_id: "unit-fixture-occ3".into(),
+                model_fingerprint: "unit-fixture-fingerprint".into(),
+                runtime_generation: 7,
+                expires_at_epoch: 4_102_444_800,
+                state_size_bytes: 128,
+            },
+            control_summary,
+            fallback_reference: "occ1".into(),
+        };
+        let publication = |control_summary: String| NativePublication {
+            publication_id: "unit-fixture-publication".into(),
+            binding_digest: "4".repeat(64),
+            envelope: envelope(control_summary),
+        };
+
+        // The current const framing binds.
+        PreparedNativeHandoff::new(
+            authorization.clone(),
+            publication(OCC3_CONTROL_SUMMARY.into()),
+        )
+        .expect("the occ3 const control summary must bind");
+
+        // The legacy one-liner framing is rejected with the binding error.
+        let legacy = "You are the receiver of this attached native state. It is the sender's context, not your own history. As the receiver, answer your current task using that state.";
+        let rejected = match PreparedNativeHandoff::new(authorization, publication(legacy.into())) {
+            Err(error) => error,
+            Ok(_) => panic!("the legacy control summary must be rejected"),
+        };
+        assert_eq!(rejected, "Native handoff publication binding rejected");
     }
 }
 

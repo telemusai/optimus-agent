@@ -1,0 +1,1241 @@
+{
+  "schema": "latents.bench.native_code_attempts.v1",
+  "condition": "occ3_agent_native_v7",
+  "snapshot_utc": "2026-11-12T09:27:35Z",
+  "scope": "Every HumanEval+ and MBPP+ native v7 batch root on the DGX (/home/nvidia/occ3-deploy/native-v7-batch-{humanevalplus,mbppplus}-*). Control metadata only: plan indices, batch-ledger terminal rows, run outcome status, reason and cleanup flag. No question, model output, test or gold content.",
+  "attempt_semantics": "One attempt = one terminal batch-ledger row with attempt_started true. scored = the attempt used in the combined scorer run. Every other attempt is excluded from accuracy and is not counted as a wrong answer.",
+  "reason_semantics": "run_outcome_reason is the native runner outcome; ledger_reason is the serial driver terminal reason. final_format_metadata_mismatch and file_owner_type_or_bound are driver-side failures after a run outcome of complete.",
+  "attempts": [
+    {
+      "task": "humanevalplus",
+      "idx": 0,
+      "run_root": "native-v7-batch-humanevalplus-a-20261111t055343z",
+      "attempt_started": true,
+      "ledger_status": "failed_uncertain",
+      "ledger_reason": "final_format_metadata_mismatch",
+      "run_outcome_status": "complete",
+      "run_outcome_reason": null,
+      "run_cleanup_confirmed": true,
+      "scored": false
+    },
+    {
+      "task": "humanevalplus",
+      "idx": 0,
+      "run_root": "native-v7-batch-humanevalplus-a2-20261112t083213z",
+      "attempt_started": true,
+      "ledger_status": "complete",
+      "ledger_reason": null,
+      "run_outcome_status": "complete",
+      "run_outcome_reason": null,
+      "run_cleanup_confirmed": true,
+      "scored": true
+    },
+    {
+      "task": "humanevalplus",
+      "idx": 1,
+      "run_root": "native-v7-batch-humanevalplus-r1-20261111t071500z",
+      "attempt_started": true,
+      "ledger_status": "complete",
+      "ledger_reason": null,
+      "run_outcome_status": "complete",
+      "run_outcome_reason": null,
+      "run_cleanup_confirmed": true,
+      "scored": true
+    },
+    {
+      "task": "humanevalplus",
+      "idx": 2,
+      "run_root": "native-v7-batch-humanevalplus-r1-20261111t071500z",
+      "attempt_started": true,
+      "ledger_status": "complete",
+      "ledger_reason": null,
+      "run_outcome_status": "complete",
+      "run_outcome_reason": null,
+      "run_cleanup_confirmed": true,
+      "scored": true
+    },
+    {
+      "task": "humanevalplus",
+      "idx": 3,
+      "run_root": "native-v7-batch-humanevalplus-r1-20261111t071500z",
+      "attempt_started": true,
+      "ledger_status": "complete",
+      "ledger_reason": null,
+      "run_outcome_status": "complete",
+      "run_outcome_reason": null,
+      "run_cleanup_confirmed": true,
+      "scored": true
+    },
+    {
+      "task": "humanevalplus",
+      "idx": 4,
+      "run_root": "native-v7-batch-humanevalplus-r1-20261111t071500z",
+      "attempt_started": true,
+      "ledger_status": "complete",
+      "ledger_reason": null,
+      "run_outcome_status": "complete",
+      "run_outcome_reason": null,
+      "run_cleanup_confirmed": true,
+      "scored": true
+    },
+    {
+      "task": "humanevalplus",
+      "idx": 5,
+      "run_root": "native-v7-batch-humanevalplus-r1-20261111t071500z",
+      "attempt_started": true,
+      "ledger_status": "failed_uncertain",
+      "ledger_reason": "item_exit_or_work_cleanup_bound",
+      "run_outcome_status": "blocked",
+      "run_outcome_reason": "role_generation_failed_or_truncated",
+      "run_cleanup_confirmed": true,
+      "scored": false
+    },
+    {
+      "task": "humanevalplus",
+      "idx": 5,
+      "run_root": "native-v7-batch-humanevalplus-r5-20261111t071500z",
+      "attempt_started": true,
+      "ledger_status": "complete",
+      "ledger_reason": null,
+      "run_outcome_status": "complete",
+      "run_outcome_reason": null,
+      "run_cleanup_confirmed": true,
+      "scored": true
+    },
+    {
+      "task": "humanevalplus",
+      "idx": 6,
+      "run_root": "native-v7-batch-humanevalplus-r5-20261111t071500z",
+      "attempt_started": true,
+      "ledger_status": "failed_uncertain",
+      "ledger_reason": "item_exit_or_work_cleanup_bound",
+      "run_outcome_status": "blocked",
+      "run_outcome_reason": "role_reported_failure",
+      "run_cleanup_confirmed": true,
+      "scored": false
+    },
+    {
+      "task": "humanevalplus",
+      "idx": 6,
+      "run_root": "native-v7-batch-humanevalplus-r6-20261111t071500z",
+      "attempt_started": true,
+      "ledger_status": "complete",
+      "ledger_reason": null,
+      "run_outcome_status": "complete",
+      "run_outcome_reason": null,
+      "run_cleanup_confirmed": true,
+      "scored": true
+    },
+    {
+      "task": "humanevalplus",
+      "idx": 7,
+      "run_root": "native-v7-batch-humanevalplus-r6-20261111t071500z",
+      "attempt_started": true,
+      "ledger_status": "complete",
+      "ledger_reason": null,
+      "run_outcome_status": "complete",
+      "run_outcome_reason": null,
+      "run_cleanup_confirmed": true,
+      "scored": true
+    },
+    {
+      "task": "humanevalplus",
+      "idx": 8,
+      "run_root": "native-v7-batch-humanevalplus-r6-20261111t071500z",
+      "attempt_started": true,
+      "ledger_status": "complete",
+      "ledger_reason": null,
+      "run_outcome_status": "complete",
+      "run_outcome_reason": null,
+      "run_cleanup_confirmed": true,
+      "scored": true
+    },
+    {
+      "task": "humanevalplus",
+      "idx": 9,
+      "run_root": "native-v7-batch-humanevalplus-r6-20261111t071500z",
+      "attempt_started": true,
+      "ledger_status": "failed_uncertain",
+      "ledger_reason": "item_exit_or_work_cleanup_bound",
+      "run_outcome_status": "blocked",
+      "run_outcome_reason": "role_reported_failure",
+      "run_cleanup_confirmed": true,
+      "scored": false
+    },
+    {
+      "task": "humanevalplus",
+      "idx": 9,
+      "run_root": "native-v7-batch-humanevalplus-r9-20261111t071500z",
+      "attempt_started": true,
+      "ledger_status": "failed_uncertain",
+      "ledger_reason": "item_exit_or_work_cleanup_bound",
+      "run_outcome_status": "blocked",
+      "run_outcome_reason": "role_reported_failure",
+      "run_cleanup_confirmed": true,
+      "scored": false
+    },
+    {
+      "task": "humanevalplus",
+      "idx": 9,
+      "run_root": "native-v7-batch-humanevalplus-r9-20261111t083000z",
+      "attempt_started": true,
+      "ledger_status": "failed_uncertain",
+      "ledger_reason": "item_exit_or_work_cleanup_bound",
+      "run_outcome_status": "blocked",
+      "run_outcome_reason": "role_generation_failed_or_truncated",
+      "run_cleanup_confirmed": true,
+      "scored": false
+    },
+    {
+      "task": "humanevalplus",
+      "idx": 9,
+      "run_root": "native-v7-batch-humanevalplus-r9-20261111t090000z",
+      "attempt_started": true,
+      "ledger_status": "failed_uncertain",
+      "ledger_reason": "item_exit_or_work_cleanup_bound",
+      "run_outcome_status": "blocked",
+      "run_outcome_reason": "worker_log_changed",
+      "run_cleanup_confirmed": false,
+      "scored": false
+    },
+    {
+      "task": "humanevalplus",
+      "idx": 9,
+      "run_root": "native-v7-batch-humanevalplus-r9-20261112t083827z",
+      "attempt_started": true,
+      "ledger_status": "failed_uncertain",
+      "ledger_reason": "item_exit_or_work_cleanup_bound",
+      "run_outcome_status": "blocked",
+      "run_outcome_reason": "role_reported_failure",
+      "run_cleanup_confirmed": true,
+      "scored": false
+    },
+    {
+      "task": "humanevalplus",
+      "idx": 9,
+      "run_root": "native-v7-batch-humanevalplus-r9-20261112t090338z",
+      "attempt_started": true,
+      "ledger_status": "complete",
+      "ledger_reason": null,
+      "run_outcome_status": "complete",
+      "run_outcome_reason": null,
+      "run_cleanup_confirmed": true,
+      "scored": true
+    },
+    {
+      "task": "humanevalplus",
+      "idx": 10,
+      "run_root": "native-v7-batch-humanevalplus-b-20261112t043223z",
+      "attempt_started": true,
+      "ledger_status": "complete",
+      "ledger_reason": null,
+      "run_outcome_status": "complete",
+      "run_outcome_reason": null,
+      "run_cleanup_confirmed": true,
+      "scored": true
+    },
+    {
+      "task": "humanevalplus",
+      "idx": 11,
+      "run_root": "native-v7-batch-humanevalplus-b-20261112t044052z",
+      "attempt_started": true,
+      "ledger_status": "complete",
+      "ledger_reason": null,
+      "run_outcome_status": "complete",
+      "run_outcome_reason": null,
+      "run_cleanup_confirmed": true,
+      "scored": true
+    },
+    {
+      "task": "humanevalplus",
+      "idx": 12,
+      "run_root": "native-v7-batch-humanevalplus-b-20261112t044550z",
+      "attempt_started": true,
+      "ledger_status": "complete",
+      "ledger_reason": null,
+      "run_outcome_status": "complete",
+      "run_outcome_reason": null,
+      "run_cleanup_confirmed": true,
+      "scored": true
+    },
+    {
+      "task": "humanevalplus",
+      "idx": 13,
+      "run_root": "native-v7-batch-humanevalplus-b-20261112t044926z",
+      "attempt_started": true,
+      "ledger_status": "complete",
+      "ledger_reason": null,
+      "run_outcome_status": "complete",
+      "run_outcome_reason": null,
+      "run_cleanup_confirmed": true,
+      "scored": true
+    },
+    {
+      "task": "humanevalplus",
+      "idx": 14,
+      "run_root": "native-v7-batch-humanevalplus-b-20261112t045324z",
+      "attempt_started": true,
+      "ledger_status": "complete",
+      "ledger_reason": null,
+      "run_outcome_status": "complete",
+      "run_outcome_reason": null,
+      "run_cleanup_confirmed": true,
+      "scored": true
+    },
+    {
+      "task": "humanevalplus",
+      "idx": 15,
+      "run_root": "native-v7-batch-humanevalplus-b-20261112t045914z",
+      "attempt_started": true,
+      "ledger_status": "complete",
+      "ledger_reason": null,
+      "run_outcome_status": "complete",
+      "run_outcome_reason": null,
+      "run_cleanup_confirmed": true,
+      "scored": true
+    },
+    {
+      "task": "humanevalplus",
+      "idx": 16,
+      "run_root": "native-v7-batch-humanevalplus-b-20261112t050432z",
+      "attempt_started": true,
+      "ledger_status": "failed_uncertain",
+      "ledger_reason": "item_exit_or_work_cleanup_bound",
+      "run_outcome_status": "blocked",
+      "run_outcome_reason": "role_reported_failure",
+      "run_cleanup_confirmed": true,
+      "scored": false
+    },
+    {
+      "task": "humanevalplus",
+      "idx": 16,
+      "run_root": "native-v7-batch-humanevalplus-r16-20261112t075624z",
+      "attempt_started": true,
+      "ledger_status": "complete",
+      "ledger_reason": null,
+      "run_outcome_status": "complete",
+      "run_outcome_reason": null,
+      "run_cleanup_confirmed": true,
+      "scored": true
+    },
+    {
+      "task": "humanevalplus",
+      "idx": 17,
+      "run_root": "native-v7-batch-humanevalplus-b-20261112t051009z",
+      "attempt_started": true,
+      "ledger_status": "complete",
+      "ledger_reason": null,
+      "run_outcome_status": "complete",
+      "run_outcome_reason": null,
+      "run_cleanup_confirmed": true,
+      "scored": true
+    },
+    {
+      "task": "humanevalplus",
+      "idx": 18,
+      "run_root": "native-v7-batch-humanevalplus-b-20261112t051534z",
+      "attempt_started": true,
+      "ledger_status": "complete",
+      "ledger_reason": null,
+      "run_outcome_status": "complete",
+      "run_outcome_reason": null,
+      "run_cleanup_confirmed": true,
+      "scored": true
+    },
+    {
+      "task": "humanevalplus",
+      "idx": 19,
+      "run_root": "native-v7-batch-humanevalplus-b-20261112t052002z",
+      "attempt_started": true,
+      "ledger_status": "complete",
+      "ledger_reason": null,
+      "run_outcome_status": "complete",
+      "run_outcome_reason": null,
+      "run_cleanup_confirmed": true,
+      "scored": true
+    },
+    {
+      "task": "mbppplus",
+      "idx": 0,
+      "run_root": "native-v7-batch-mbppplus-a-20261111t071500z",
+      "attempt_started": true,
+      "ledger_status": "complete",
+      "ledger_reason": null,
+      "run_outcome_status": "complete",
+      "run_outcome_reason": null,
+      "run_cleanup_confirmed": true,
+      "scored": true
+    },
+    {
+      "task": "mbppplus",
+      "idx": 1,
+      "run_root": "native-v7-batch-mbppplus-a-20261111t071500z",
+      "attempt_started": true,
+      "ledger_status": "complete",
+      "ledger_reason": null,
+      "run_outcome_status": "complete",
+      "run_outcome_reason": null,
+      "run_cleanup_confirmed": true,
+      "scored": true
+    },
+    {
+      "task": "mbppplus",
+      "idx": 2,
+      "run_root": "native-v7-batch-mbppplus-a-20261111t071500z",
+      "attempt_started": true,
+      "ledger_status": "complete",
+      "ledger_reason": null,
+      "run_outcome_status": "complete",
+      "run_outcome_reason": null,
+      "run_cleanup_confirmed": true,
+      "scored": true
+    },
+    {
+      "task": "mbppplus",
+      "idx": 3,
+      "run_root": "native-v7-batch-mbppplus-a-20261111t071500z",
+      "attempt_started": true,
+      "ledger_status": "failed_uncertain",
+      "ledger_reason": "item_exit_or_work_cleanup_bound",
+      "run_outcome_status": "blocked",
+      "run_outcome_reason": "role_generation_failed_or_truncated",
+      "run_cleanup_confirmed": true,
+      "scored": false
+    },
+    {
+      "task": "mbppplus",
+      "idx": 3,
+      "run_root": "native-v7-batch-mbppplus-r3-20261111t115700z",
+      "attempt_started": true,
+      "ledger_status": "failed_uncertain",
+      "ledger_reason": "item_exit_or_work_cleanup_bound",
+      "run_outcome_status": "blocked",
+      "run_outcome_reason": "role_generation_failed_or_truncated",
+      "run_cleanup_confirmed": true,
+      "scored": false
+    },
+    {
+      "task": "mbppplus",
+      "idx": 3,
+      "run_root": "native-v7-batch-mbppplus-r3-20261111t121500z",
+      "attempt_started": true,
+      "ledger_status": "complete",
+      "ledger_reason": null,
+      "run_outcome_status": "complete",
+      "run_outcome_reason": null,
+      "run_cleanup_confirmed": true,
+      "scored": true
+    },
+    {
+      "task": "mbppplus",
+      "idx": 4,
+      "run_root": "native-v7-batch-mbppplus-r3-20261111t121500z",
+      "attempt_started": true,
+      "ledger_status": "complete",
+      "ledger_reason": null,
+      "run_outcome_status": "complete",
+      "run_outcome_reason": null,
+      "run_cleanup_confirmed": true,
+      "scored": true
+    },
+    {
+      "task": "mbppplus",
+      "idx": 5,
+      "run_root": "native-v7-batch-mbppplus-r3-20261111t121500z",
+      "attempt_started": true,
+      "ledger_status": "complete",
+      "ledger_reason": null,
+      "run_outcome_status": "complete",
+      "run_outcome_reason": null,
+      "run_cleanup_confirmed": true,
+      "scored": true
+    },
+    {
+      "task": "mbppplus",
+      "idx": 6,
+      "run_root": "native-v7-batch-mbppplus-r3-20261111t121500z",
+      "attempt_started": true,
+      "ledger_status": "failed_uncertain",
+      "ledger_reason": "item_exit_or_work_cleanup_bound",
+      "run_outcome_status": "blocked",
+      "run_outcome_reason": "role_generation_failed_or_truncated",
+      "run_cleanup_confirmed": true,
+      "scored": false
+    },
+    {
+      "task": "mbppplus",
+      "idx": 6,
+      "run_root": "native-v7-batch-mbppplus-r6-20261111t124500z",
+      "attempt_started": true,
+      "ledger_status": "failed_uncertain",
+      "ledger_reason": "item_exit_or_work_cleanup_bound",
+      "run_outcome_status": "blocked",
+      "run_outcome_reason": "role_generation_failed_or_truncated",
+      "run_cleanup_confirmed": true,
+      "scored": false
+    },
+    {
+      "task": "mbppplus",
+      "idx": 6,
+      "run_root": "native-v7-batch-mbppplus-r6-20261111t125500z",
+      "attempt_started": true,
+      "ledger_status": "failed_uncertain",
+      "ledger_reason": "item_exit_or_work_cleanup_bound",
+      "run_outcome_status": "blocked",
+      "run_outcome_reason": "role_generation_failed_or_truncated",
+      "run_cleanup_confirmed": true,
+      "scored": false
+    },
+    {
+      "task": "mbppplus",
+      "idx": 6,
+      "run_root": "native-v7-batch-mbppplus-r6-20261111t130500z",
+      "attempt_started": true,
+      "ledger_status": "complete",
+      "ledger_reason": null,
+      "run_outcome_status": "complete",
+      "run_outcome_reason": null,
+      "run_cleanup_confirmed": true,
+      "scored": true
+    },
+    {
+      "task": "mbppplus",
+      "idx": 7,
+      "run_root": "native-v7-batch-mbppplus-r6-20261111t130500z",
+      "attempt_started": true,
+      "ledger_status": "complete",
+      "ledger_reason": null,
+      "run_outcome_status": "complete",
+      "run_outcome_reason": null,
+      "run_cleanup_confirmed": true,
+      "scored": true
+    },
+    {
+      "task": "mbppplus",
+      "idx": 8,
+      "run_root": "native-v7-batch-mbppplus-r6-20261111t130500z",
+      "attempt_started": true,
+      "ledger_status": "complete",
+      "ledger_reason": null,
+      "run_outcome_status": "complete",
+      "run_outcome_reason": null,
+      "run_cleanup_confirmed": true,
+      "scored": true
+    },
+    {
+      "task": "mbppplus",
+      "idx": 9,
+      "run_root": "native-v7-batch-mbppplus-r6-20261111t130500z",
+      "attempt_started": true,
+      "ledger_status": "failed_uncertain",
+      "ledger_reason": "file_owner_type_or_bound",
+      "run_outcome_status": "complete",
+      "run_outcome_reason": null,
+      "run_cleanup_confirmed": true,
+      "scored": false
+    },
+    {
+      "task": "mbppplus",
+      "idx": 9,
+      "run_root": "native-v7-batch-mbppplus-r9-20261111t131248z",
+      "attempt_started": true,
+      "ledger_status": "failed_uncertain",
+      "ledger_reason": "item_exit_or_work_cleanup_bound",
+      "run_outcome_status": "blocked",
+      "run_outcome_reason": "role_generation_failed_or_truncated",
+      "run_cleanup_confirmed": true,
+      "scored": false
+    },
+    {
+      "task": "mbppplus",
+      "idx": 9,
+      "run_root": "native-v7-batch-mbppplus-r9-20261112t085743z",
+      "attempt_started": true,
+      "ledger_status": "failed_uncertain",
+      "ledger_reason": "item_exit_or_work_cleanup_bound",
+      "run_outcome_status": "blocked",
+      "run_outcome_reason": "role_reported_failure",
+      "run_cleanup_confirmed": true,
+      "scored": false
+    },
+    {
+      "task": "mbppplus",
+      "idx": 9,
+      "run_root": "native-v7-batch-mbppplus-r9-20261112t091345z",
+      "attempt_started": true,
+      "ledger_status": "failed_uncertain",
+      "ledger_reason": "item_exit_or_work_cleanup_bound",
+      "run_outcome_status": "blocked",
+      "run_outcome_reason": "role_reported_failure",
+      "run_cleanup_confirmed": true,
+      "scored": false
+    },
+    {
+      "task": "mbppplus",
+      "idx": 9,
+      "run_root": "native-v7-batch-mbppplus-r9-20261112t092029z",
+      "attempt_started": true,
+      "ledger_status": "complete",
+      "ledger_reason": null,
+      "run_outcome_status": "complete",
+      "run_outcome_reason": null,
+      "run_cleanup_confirmed": true,
+      "scored": true
+    },
+    {
+      "task": "mbppplus",
+      "idx": 10,
+      "run_root": "native-v7-batch-mbppplus-b-20261111t131502z",
+      "attempt_started": true,
+      "ledger_status": "failed_uncertain",
+      "ledger_reason": "item_exit_or_work_cleanup_bound",
+      "run_outcome_status": "blocked",
+      "run_outcome_reason": "role_generation_failed_or_truncated",
+      "run_cleanup_confirmed": true,
+      "scored": false
+    },
+    {
+      "task": "mbppplus",
+      "idx": 10,
+      "run_root": "native-v7-batch-mbppplus-b2-20261112t082340z",
+      "attempt_started": true,
+      "ledger_status": "complete",
+      "ledger_reason": null,
+      "run_outcome_status": "complete",
+      "run_outcome_reason": null,
+      "run_cleanup_confirmed": true,
+      "scored": true
+    },
+    {
+      "task": "mbppplus",
+      "idx": 11,
+      "run_root": "native-v7-batch-mbppplus-b-20261112t052425z",
+      "attempt_started": true,
+      "ledger_status": "complete",
+      "ledger_reason": null,
+      "run_outcome_status": "complete",
+      "run_outcome_reason": null,
+      "run_cleanup_confirmed": true,
+      "scored": true
+    },
+    {
+      "task": "mbppplus",
+      "idx": 12,
+      "run_root": "native-v7-batch-mbppplus-b-20261112t052748z",
+      "attempt_started": true,
+      "ledger_status": "complete",
+      "ledger_reason": null,
+      "run_outcome_status": "complete",
+      "run_outcome_reason": null,
+      "run_cleanup_confirmed": true,
+      "scored": true
+    },
+    {
+      "task": "mbppplus",
+      "idx": 13,
+      "run_root": "native-v7-batch-mbppplus-b-20261112t053407z",
+      "attempt_started": true,
+      "ledger_status": "complete",
+      "ledger_reason": null,
+      "run_outcome_status": "complete",
+      "run_outcome_reason": null,
+      "run_cleanup_confirmed": true,
+      "scored": true
+    },
+    {
+      "task": "mbppplus",
+      "idx": 14,
+      "run_root": "native-v7-batch-mbppplus-b-20261112t053941z",
+      "attempt_started": true,
+      "ledger_status": "failed_uncertain",
+      "ledger_reason": "item_exit_or_work_cleanup_bound",
+      "run_outcome_status": "blocked",
+      "run_outcome_reason": "worker_log_changed",
+      "run_cleanup_confirmed": false,
+      "scored": false
+    },
+    {
+      "task": "mbppplus",
+      "idx": 14,
+      "run_root": "native-v7-batch-mbppplus-r14-20261112t065924z",
+      "attempt_started": true,
+      "ledger_status": "failed_uncertain",
+      "ledger_reason": "item_exit_or_work_cleanup_bound",
+      "run_outcome_status": "complete_cleanup_unconfirmed",
+      "run_outcome_reason": "owned_cleanup_unconfirmed",
+      "run_cleanup_confirmed": false,
+      "scored": false
+    },
+    {
+      "task": "mbppplus",
+      "idx": 14,
+      "run_root": "native-v7-batch-mbppplus-r14-20261112t084224z",
+      "attempt_started": true,
+      "ledger_status": "complete",
+      "ledger_reason": null,
+      "run_outcome_status": "complete",
+      "run_outcome_reason": null,
+      "run_cleanup_confirmed": true,
+      "scored": true
+    },
+    {
+      "task": "mbppplus",
+      "idx": 15,
+      "run_root": "native-v7-batch-mbppplus-b-20261112t054124z",
+      "attempt_started": true,
+      "ledger_status": "complete",
+      "ledger_reason": null,
+      "run_outcome_status": "complete",
+      "run_outcome_reason": null,
+      "run_cleanup_confirmed": true,
+      "scored": true
+    },
+    {
+      "task": "mbppplus",
+      "idx": 16,
+      "run_root": "native-v7-batch-mbppplus-b-20261112t054706z",
+      "attempt_started": true,
+      "ledger_status": "complete",
+      "ledger_reason": null,
+      "run_outcome_status": "complete",
+      "run_outcome_reason": null,
+      "run_cleanup_confirmed": true,
+      "scored": true
+    },
+    {
+      "task": "mbppplus",
+      "idx": 17,
+      "run_root": "native-v7-batch-mbppplus-b-20261112t055424z",
+      "attempt_started": true,
+      "ledger_status": "failed_uncertain",
+      "ledger_reason": "item_exit_or_work_cleanup_bound",
+      "run_outcome_status": "blocked",
+      "run_outcome_reason": "role_reported_failure",
+      "run_cleanup_confirmed": true,
+      "scored": false
+    },
+    {
+      "task": "mbppplus",
+      "idx": 17,
+      "run_root": "native-v7-batch-mbppplus-r17-20261112t083016z",
+      "attempt_started": true,
+      "ledger_status": "failed_uncertain",
+      "ledger_reason": "item_exit_or_work_cleanup_bound",
+      "run_outcome_status": "blocked",
+      "run_outcome_reason": "role_reported_failure",
+      "run_cleanup_confirmed": true,
+      "scored": false
+    },
+    {
+      "task": "mbppplus",
+      "idx": 17,
+      "run_root": "native-v7-batch-mbppplus-r17-20261112t085922z",
+      "attempt_started": true,
+      "ledger_status": "complete",
+      "ledger_reason": null,
+      "run_outcome_status": "complete",
+      "run_outcome_reason": null,
+      "run_cleanup_confirmed": true,
+      "scored": true
+    },
+    {
+      "task": "mbppplus",
+      "idx": 18,
+      "run_root": "native-v7-batch-mbppplus-b-20261112t055836z",
+      "attempt_started": true,
+      "ledger_status": "complete",
+      "ledger_reason": null,
+      "run_outcome_status": "complete",
+      "run_outcome_reason": null,
+      "run_cleanup_confirmed": true,
+      "scored": true
+    },
+    {
+      "task": "mbppplus",
+      "idx": 19,
+      "run_root": "native-v7-batch-mbppplus-b-20261112t060140z",
+      "attempt_started": true,
+      "ledger_status": "failed_uncertain",
+      "ledger_reason": "file_owner_type_or_bound",
+      "run_outcome_status": "complete",
+      "run_outcome_reason": null,
+      "run_cleanup_confirmed": true,
+      "scored": false
+    },
+    {
+      "task": "mbppplus",
+      "idx": 19,
+      "run_root": "native-v7-batch-mbppplus-r19-20261112t084918z",
+      "attempt_started": true,
+      "ledger_status": "failed_uncertain",
+      "ledger_reason": "item_exit_or_work_cleanup_bound",
+      "run_outcome_status": "blocked",
+      "run_outcome_reason": "role_generation_failed_or_truncated",
+      "run_cleanup_confirmed": true,
+      "scored": false
+    },
+    {
+      "task": "mbppplus",
+      "idx": 19,
+      "run_root": "native-v7-batch-mbppplus-r19-20261112t090750z",
+      "attempt_started": true,
+      "ledger_status": "complete",
+      "ledger_reason": null,
+      "run_outcome_status": "complete",
+      "run_outcome_reason": null,
+      "run_cleanup_confirmed": true,
+      "scored": true
+    }
+  ],
+  "per_item": [
+    {
+      "task": "humanevalplus",
+      "idx": 0,
+      "attempts": 2,
+      "failed_attempts": 1,
+      "scored": true,
+      "scored_run_root": "native-v7-batch-humanevalplus-a2-20261112t083213z",
+      "failure_reasons": {
+        "final_format_metadata_mismatch": 1
+      },
+      "running_at_snapshot": false
+    },
+    {
+      "task": "humanevalplus",
+      "idx": 1,
+      "attempts": 1,
+      "failed_attempts": 0,
+      "scored": true,
+      "scored_run_root": "native-v7-batch-humanevalplus-r1-20261111t071500z",
+      "failure_reasons": {},
+      "running_at_snapshot": false
+    },
+    {
+      "task": "humanevalplus",
+      "idx": 2,
+      "attempts": 1,
+      "failed_attempts": 0,
+      "scored": true,
+      "scored_run_root": "native-v7-batch-humanevalplus-r1-20261111t071500z",
+      "failure_reasons": {},
+      "running_at_snapshot": false
+    },
+    {
+      "task": "humanevalplus",
+      "idx": 3,
+      "attempts": 1,
+      "failed_attempts": 0,
+      "scored": true,
+      "scored_run_root": "native-v7-batch-humanevalplus-r1-20261111t071500z",
+      "failure_reasons": {},
+      "running_at_snapshot": false
+    },
+    {
+      "task": "humanevalplus",
+      "idx": 4,
+      "attempts": 1,
+      "failed_attempts": 0,
+      "scored": true,
+      "scored_run_root": "native-v7-batch-humanevalplus-r1-20261111t071500z",
+      "failure_reasons": {},
+      "running_at_snapshot": false
+    },
+    {
+      "task": "humanevalplus",
+      "idx": 5,
+      "attempts": 2,
+      "failed_attempts": 1,
+      "scored": true,
+      "scored_run_root": "native-v7-batch-humanevalplus-r5-20261111t071500z",
+      "failure_reasons": {
+        "role_generation_failed_or_truncated": 1
+      },
+      "running_at_snapshot": false
+    },
+    {
+      "task": "humanevalplus",
+      "idx": 6,
+      "attempts": 2,
+      "failed_attempts": 1,
+      "scored": true,
+      "scored_run_root": "native-v7-batch-humanevalplus-r6-20261111t071500z",
+      "failure_reasons": {
+        "role_reported_failure": 1
+      },
+      "running_at_snapshot": false
+    },
+    {
+      "task": "humanevalplus",
+      "idx": 7,
+      "attempts": 1,
+      "failed_attempts": 0,
+      "scored": true,
+      "scored_run_root": "native-v7-batch-humanevalplus-r6-20261111t071500z",
+      "failure_reasons": {},
+      "running_at_snapshot": false
+    },
+    {
+      "task": "humanevalplus",
+      "idx": 8,
+      "attempts": 1,
+      "failed_attempts": 0,
+      "scored": true,
+      "scored_run_root": "native-v7-batch-humanevalplus-r6-20261111t071500z",
+      "failure_reasons": {},
+      "running_at_snapshot": false
+    },
+    {
+      "task": "humanevalplus",
+      "idx": 9,
+      "attempts": 6,
+      "failed_attempts": 5,
+      "scored": true,
+      "scored_run_root": "native-v7-batch-humanevalplus-r9-20261112t090338z",
+      "failure_reasons": {
+        "role_generation_failed_or_truncated": 1,
+        "role_reported_failure": 3,
+        "worker_log_changed": 1
+      },
+      "running_at_snapshot": false
+    },
+    {
+      "task": "humanevalplus",
+      "idx": 10,
+      "attempts": 1,
+      "failed_attempts": 0,
+      "scored": true,
+      "scored_run_root": "native-v7-batch-humanevalplus-b-20261112t043223z",
+      "failure_reasons": {},
+      "running_at_snapshot": false
+    },
+    {
+      "task": "humanevalplus",
+      "idx": 11,
+      "attempts": 1,
+      "failed_attempts": 0,
+      "scored": true,
+      "scored_run_root": "native-v7-batch-humanevalplus-b-20261112t044052z",
+      "failure_reasons": {},
+      "running_at_snapshot": false
+    },
+    {
+      "task": "humanevalplus",
+      "idx": 12,
+      "attempts": 1,
+      "failed_attempts": 0,
+      "scored": true,
+      "scored_run_root": "native-v7-batch-humanevalplus-b-20261112t044550z",
+      "failure_reasons": {},
+      "running_at_snapshot": false
+    },
+    {
+      "task": "humanevalplus",
+      "idx": 13,
+      "attempts": 1,
+      "failed_attempts": 0,
+      "scored": true,
+      "scored_run_root": "native-v7-batch-humanevalplus-b-20261112t044926z",
+      "failure_reasons": {},
+      "running_at_snapshot": false
+    },
+    {
+      "task": "humanevalplus",
+      "idx": 14,
+      "attempts": 1,
+      "failed_attempts": 0,
+      "scored": true,
+      "scored_run_root": "native-v7-batch-humanevalplus-b-20261112t045324z",
+      "failure_reasons": {},
+      "running_at_snapshot": false
+    },
+    {
+      "task": "humanevalplus",
+      "idx": 15,
+      "attempts": 1,
+      "failed_attempts": 0,
+      "scored": true,
+      "scored_run_root": "native-v7-batch-humanevalplus-b-20261112t045914z",
+      "failure_reasons": {},
+      "running_at_snapshot": false
+    },
+    {
+      "task": "humanevalplus",
+      "idx": 16,
+      "attempts": 2,
+      "failed_attempts": 1,
+      "scored": true,
+      "scored_run_root": "native-v7-batch-humanevalplus-r16-20261112t075624z",
+      "failure_reasons": {
+        "role_reported_failure": 1
+      },
+      "running_at_snapshot": false
+    },
+    {
+      "task": "humanevalplus",
+      "idx": 17,
+      "attempts": 1,
+      "failed_attempts": 0,
+      "scored": true,
+      "scored_run_root": "native-v7-batch-humanevalplus-b-20261112t051009z",
+      "failure_reasons": {},
+      "running_at_snapshot": false
+    },
+    {
+      "task": "humanevalplus",
+      "idx": 18,
+      "attempts": 1,
+      "failed_attempts": 0,
+      "scored": true,
+      "scored_run_root": "native-v7-batch-humanevalplus-b-20261112t051534z",
+      "failure_reasons": {},
+      "running_at_snapshot": false
+    },
+    {
+      "task": "humanevalplus",
+      "idx": 19,
+      "attempts": 1,
+      "failed_attempts": 0,
+      "scored": true,
+      "scored_run_root": "native-v7-batch-humanevalplus-b-20261112t052002z",
+      "failure_reasons": {},
+      "running_at_snapshot": false
+    },
+    {
+      "task": "mbppplus",
+      "idx": 0,
+      "attempts": 1,
+      "failed_attempts": 0,
+      "scored": true,
+      "scored_run_root": "native-v7-batch-mbppplus-a-20261111t071500z",
+      "failure_reasons": {},
+      "running_at_snapshot": false
+    },
+    {
+      "task": "mbppplus",
+      "idx": 1,
+      "attempts": 1,
+      "failed_attempts": 0,
+      "scored": true,
+      "scored_run_root": "native-v7-batch-mbppplus-a-20261111t071500z",
+      "failure_reasons": {},
+      "running_at_snapshot": false
+    },
+    {
+      "task": "mbppplus",
+      "idx": 2,
+      "attempts": 1,
+      "failed_attempts": 0,
+      "scored": true,
+      "scored_run_root": "native-v7-batch-mbppplus-a-20261111t071500z",
+      "failure_reasons": {},
+      "running_at_snapshot": false
+    },
+    {
+      "task": "mbppplus",
+      "idx": 3,
+      "attempts": 3,
+      "failed_attempts": 2,
+      "scored": true,
+      "scored_run_root": "native-v7-batch-mbppplus-r3-20261111t121500z",
+      "failure_reasons": {
+        "role_generation_failed_or_truncated": 2
+      },
+      "running_at_snapshot": false
+    },
+    {
+      "task": "mbppplus",
+      "idx": 4,
+      "attempts": 1,
+      "failed_attempts": 0,
+      "scored": true,
+      "scored_run_root": "native-v7-batch-mbppplus-r3-20261111t121500z",
+      "failure_reasons": {},
+      "running_at_snapshot": false
+    },
+    {
+      "task": "mbppplus",
+      "idx": 5,
+      "attempts": 1,
+      "failed_attempts": 0,
+      "scored": true,
+      "scored_run_root": "native-v7-batch-mbppplus-r3-20261111t121500z",
+      "failure_reasons": {},
+      "running_at_snapshot": false
+    },
+    {
+      "task": "mbppplus",
+      "idx": 6,
+      "attempts": 4,
+      "failed_attempts": 3,
+      "scored": true,
+      "scored_run_root": "native-v7-batch-mbppplus-r6-20261111t130500z",
+      "failure_reasons": {
+        "role_generation_failed_or_truncated": 3
+      },
+      "running_at_snapshot": false
+    },
+    {
+      "task": "mbppplus",
+      "idx": 7,
+      "attempts": 1,
+      "failed_attempts": 0,
+      "scored": true,
+      "scored_run_root": "native-v7-batch-mbppplus-r6-20261111t130500z",
+      "failure_reasons": {},
+      "running_at_snapshot": false
+    },
+    {
+      "task": "mbppplus",
+      "idx": 8,
+      "attempts": 1,
+      "failed_attempts": 0,
+      "scored": true,
+      "scored_run_root": "native-v7-batch-mbppplus-r6-20261111t130500z",
+      "failure_reasons": {},
+      "running_at_snapshot": false
+    },
+    {
+      "task": "mbppplus",
+      "idx": 9,
+      "attempts": 5,
+      "failed_attempts": 4,
+      "scored": true,
+      "scored_run_root": "native-v7-batch-mbppplus-r9-20261112t092029z",
+      "failure_reasons": {
+        "file_owner_type_or_bound": 1,
+        "role_generation_failed_or_truncated": 1,
+        "role_reported_failure": 2
+      },
+      "running_at_snapshot": false
+    },
+    {
+      "task": "mbppplus",
+      "idx": 10,
+      "attempts": 2,
+      "failed_attempts": 1,
+      "scored": true,
+      "scored_run_root": "native-v7-batch-mbppplus-b2-20261112t082340z",
+      "failure_reasons": {
+        "role_generation_failed_or_truncated": 1
+      },
+      "running_at_snapshot": false
+    },
+    {
+      "task": "mbppplus",
+      "idx": 11,
+      "attempts": 1,
+      "failed_attempts": 0,
+      "scored": true,
+      "scored_run_root": "native-v7-batch-mbppplus-b-20261112t052425z",
+      "failure_reasons": {},
+      "running_at_snapshot": false
+    },
+    {
+      "task": "mbppplus",
+      "idx": 12,
+      "attempts": 1,
+      "failed_attempts": 0,
+      "scored": true,
+      "scored_run_root": "native-v7-batch-mbppplus-b-20261112t052748z",
+      "failure_reasons": {},
+      "running_at_snapshot": false
+    },
+    {
+      "task": "mbppplus",
+      "idx": 13,
+      "attempts": 1,
+      "failed_attempts": 0,
+      "scored": true,
+      "scored_run_root": "native-v7-batch-mbppplus-b-20261112t053407z",
+      "failure_reasons": {},
+      "running_at_snapshot": false
+    },
+    {
+      "task": "mbppplus",
+      "idx": 14,
+      "attempts": 3,
+      "failed_attempts": 2,
+      "scored": true,
+      "scored_run_root": "native-v7-batch-mbppplus-r14-20261112t084224z",
+      "failure_reasons": {
+        "owned_cleanup_unconfirmed": 1,
+        "worker_log_changed": 1
+      },
+      "running_at_snapshot": false
+    },
+    {
+      "task": "mbppplus",
+      "idx": 15,
+      "attempts": 1,
+      "failed_attempts": 0,
+      "scored": true,
+      "scored_run_root": "native-v7-batch-mbppplus-b-20261112t054124z",
+      "failure_reasons": {},
+      "running_at_snapshot": false
+    },
+    {
+      "task": "mbppplus",
+      "idx": 16,
+      "attempts": 1,
+      "failed_attempts": 0,
+      "scored": true,
+      "scored_run_root": "native-v7-batch-mbppplus-b-20261112t054706z",
+      "failure_reasons": {},
+      "running_at_snapshot": false
+    },
+    {
+      "task": "mbppplus",
+      "idx": 17,
+      "attempts": 3,
+      "failed_attempts": 2,
+      "scored": true,
+      "scored_run_root": "native-v7-batch-mbppplus-r17-20261112t085922z",
+      "failure_reasons": {
+        "role_reported_failure": 2
+      },
+      "running_at_snapshot": false
+    },
+    {
+      "task": "mbppplus",
+      "idx": 18,
+      "attempts": 1,
+      "failed_attempts": 0,
+      "scored": true,
+      "scored_run_root": "native-v7-batch-mbppplus-b-20261112t055836z",
+      "failure_reasons": {},
+      "running_at_snapshot": false
+    },
+    {
+      "task": "mbppplus",
+      "idx": 19,
+      "attempts": 3,
+      "failed_attempts": 2,
+      "scored": true,
+      "scored_run_root": "native-v7-batch-mbppplus-r19-20261112t090750z",
+      "failure_reasons": {
+        "file_owner_type_or_bound": 1,
+        "role_generation_failed_or_truncated": 1
+      },
+      "running_at_snapshot": false
+    }
+  ],
+  "prepared_not_run": [
+    {
+      "task": "humanevalplus",
+      "run_root": "native-v7-batch-humanevalplus-r1-20261111t055343z",
+      "indices": [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9
+      ]
+    }
+  ],
+  "running_at_snapshot": [],
+  "combined_scorer_tag": "pr1-20261112t092735z"
+}

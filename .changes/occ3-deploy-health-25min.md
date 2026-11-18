@@ -1,0 +1,1 @@
+- Changed the OCC-3 SGLang deploy and rollback scripts to wait up to 25 minutes (1500 s) for `/health` by default instead of 15 minutes; the deploy-257 overlay took about 13.5 minutes to become healthy, so the old limit could roll back a working server. `OCC3_HEALTH_TIMEOUT` still overrides it.

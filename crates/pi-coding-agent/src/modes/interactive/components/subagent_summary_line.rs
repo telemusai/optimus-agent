@@ -238,6 +238,18 @@ impl SubagentSummaryLine {
         }
     }
 
+    fn render_status_row(&self, status: &str, inner: usize) -> String {
+        // Optional padding must not hide status text that fits exactly.
+        let inset = if visible_width(status) < inner { " " } else { "" };
+        let text = truncate_to_width(&format!("{inset}{status}"), inner as f64, "…", false);
+        let content = format!("{text}{}", " ".repeat(inner.saturating_sub(visible_width(&text))));
+        let content = if self.focused {
+            content.split("\x1b[0m").map(|part| theme().bg("selectedBg", part))
+                .collect::<Vec<_>>().join("\x1b[0m")
+        } else { content };
+        format!("{}{content}{}", theme().fg("border", "│"), theme().fg("border", "│"))
+    }
+
     fn render_info_line(&self, width: f64) -> Vec<String> {
         let override_label = (self.get_override_label)().map(|label| label.trim().to_string());
         let location_label = (self.get_location_label)().map(|label| label.trim().to_string());
@@ -343,12 +355,6 @@ impl Component for SubagentSummaryLine {
         }
         let available = (inner - 2.0).max(0.0) as usize;
         let right_min = self.right_status.as_ref().map(|status| visible_width(&status.minimal) + 2).unwrap_or(0);
-        let communication_below = self.communication_status.as_ref().is_some_and(|status| {
-            visible_width(&counts) + 3 + visible_width(status) + right_min > available
-        });
-        if !communication_below {
-            if let Some(status) = &self.communication_status { counts.push_str(&format!("   {status}")); }
-        }
         let open_hint = if self.is_selectable() {
             if self.focused {
                 format!(
@@ -361,6 +367,15 @@ impl Component for SubagentSummaryLine {
             }
         } else {
             String::new()
+        };
+        // The open hint shares the counts row, so it participates in the
+        // inline fit: an unfittable hint must never be ellipsized away.
+        let communication_below = self.communication_status.as_ref().is_some_and(|status| {
+            visible_width(&counts) + 3 + visible_width(status) + right_min
+                + visible_width(&open_hint) > available
+        });
+        if !communication_below {
+            if let Some(status) = &self.communication_status { counts.push_str(&format!("   {status}")); }
         };
         let gap = (inner - 2.0 - visible_width(&counts) as f64 - visible_width(&open_hint) as f64)
             .max(1.0);
@@ -411,13 +426,7 @@ impl Component for SubagentSummaryLine {
         ));
         if communication_below {
             if let Some(status) = &self.communication_status {
-                // Keep optional padding from displacing status text that fits.
-                let inset = if visible_width(status) < inner as usize { " " } else { "" };
-                let text = truncate_to_width(&format!("{inset}{status}"), inner, "…", false);
-                let padding = " ".repeat((inner as usize).saturating_sub(visible_width(&text)));
-                let content = format!("{text}{padding}");
-                let content = if self.focused { theme().bg("selectedBg", &content) } else { content };
-                lines.push(format!("{}{content}{}", theme().fg("border", "│"), theme().fg("border", "│")));
+                lines.push(self.render_status_row(status, inner as usize));
             }
         }
         lines.push(theme().fg(
@@ -465,12 +474,12 @@ mod tests {
     /// without the tray right status, and with the selectable open hint.
     ///
     /// Measured bands (see the campaign report): the caller's stages keep
-    /// the slots down to the compact-health stage boundary (width 59);
+    /// the slots down to the compact-health stage boundary (width 71);
     /// below that the status the caller supplies carries no slots at all
     /// (out of this component's ownership). Within this component the rule
-    /// is: whenever the supplied status carries the OCC3 slot and fits one
+    /// is: whenever the supplied status carries the OCC3.2 slot and fits one
     /// row, the render must show it - no ellipsization may eat it - and at
-    /// widths 104-110 the four-segment status renders on one more status
+    /// widths 126-132 the five-segment status renders on one more status
     /// row instead of overflowing or losing the slot.
     /// The production caller's four status stages
     /// (`context_health_indicator::status_line`) at the caller's own budget,
@@ -478,7 +487,7 @@ mod tests {
     /// communication slots, so below the compact-health boundary the caller
     /// supplies a status with no slot in it at all.
     fn caller_status(width: usize) -> String {
-        let indicators = ["TXT", "OCC1", "OCC2", "OCC3"]
+        let indicators = ["TXT", "OCC1", "OCC2", "OCC3.1", "OCC3.2"]
             .iter()
             .map(|label| format!("\x1b[2;38;5;39m\u{25cb} {label}\x1b[22;39m"))
             .collect::<Vec<_>>()
@@ -501,6 +510,8 @@ mod tests {
     #[test]
     fn l1_occ3_slot_never_ellipsized_when_the_caller_status_carries_it() {
         crate::modes::interactive::theme::theme::init_theme(Some("dark"), false);
+        let mut below: std::collections::BTreeMap<usize, usize> = std::collections::BTreeMap::new();
+        let mut inline: Vec<usize> = Vec::new();
         for width in 20..=200usize {
             let status = caller_status(width);
             for with_right in [false, true] {
@@ -528,43 +539,84 @@ mod tests {
                     "width {width} overflows its row"
                 );
                 let text = pi_tui::utils::strip_ansi(&rows.join("\n"));
-                let carried = status.contains("OCC3");
+                let carried = status.contains("OCC3.2");
                 if carried && visible_width(&status) + 2 <= width {
                     assert!(
-                        text.contains("OCC3"),
-                        "width {width} (right={with_right}) ellipsized the OCC3 slot away:\n{text}"
+                        text.contains("OCC3.2"),
+                        "width {width} (right={with_right}) ellipsized the OCC3.2 slot away:\n{text}"
                     );
                 }
-                // The L-1 row rule: at the widths where the four-segment
+                // The L-1 row rule: at the widths where the five-segment
                 // status cannot sit inline with the counts, the summary
-                // renders one more status row and keeps the slot.
-                if (104..=110).contains(&width) && carried {
-                    assert!(
-                        rows.len() >= 4,
-                        "width {width} (right={with_right}) must render one more status row:\n{rows:?}"
-                    );
-                    assert!(text.contains("OCC3"), "width {width} lost OCC3");
+                // renders one more status row and keeps the slot. The band
+                // is collected and pinned after the loop.
+                if carried && visible_width(&status) + 2 <= width {
+                    if rows.len() >= 4 {
+                        below.entry(width).and_modify(|count| *count += 1).or_insert(1);
+                    } else {
+                        inline.push(width);
+                    }
                 }
             }
         }
+        // The measured second-row band: every carried width from the
+        // compact-health boundary up to 132 renders the extra row in both
+        // right-status combos (the with-right combo alone extends to 137);
+        // above that the status sits inline again.
+        let both: std::collections::BTreeSet<usize> = below.into_iter()
+            .filter(|(_, count)| *count == 2).map(|(width, _)| width).collect();
+        let expected_band: std::collections::BTreeSet<usize> = (71..=132).collect();
+        assert_eq!(both, expected_band, "measured five-segment second-row band");
+        assert!(inline.iter().all(|width| *width > 132), "inline widths must start above the band: {inline:?}");
     }
 
     /// The measured band, pinned: the caller's stages first carry the four
     /// slots when the compact-health stage fits its budget, and every width
-    /// from there up renders the OCC3 slot. Below that width the caller
+    /// from there up renders the OCC3.2 slot. Below that width the caller
     /// supplies no slot at all, which this component cannot recover: that
     /// band is the caller's documented stage policy, not ellipsization here.
     #[test]
     fn l1_measured_band_is_where_the_caller_stages_first_carry_the_slots() {
         let first = (2..=200usize)
-            .find(|width| caller_status(*width).contains("OCC3"))
+            .find(|width| caller_status(*width).contains("OCC3.2"))
             .expect("the caller must carry the slots at some width");
-        assert_eq!(first, 59, "measured compact-health stage boundary");
+        assert_eq!(first, 71, "measured compact-health stage boundary");
         for width in first..=200usize {
             assert!(
-                caller_status(width).contains("OCC3"),
+                caller_status(width).contains("OCC3.2"),
                 "width {width} lost the slots above the measured boundary"
             );
+        }
+    }
+
+    /// The tray shows delivery lights only: no steady configuration row and
+    /// no mode labels in the title. Configuration lives in /occ panels.
+    #[test]
+    fn tray_never_renders_a_steady_configuration_row() {
+        crate::modes::interactive::theme::theme::init_theme(Some("dark"), false);
+        for width in 2..=200usize {
+            for focused in [false, true] {
+                let mut line = SubagentSummaryLine::default();
+                line.set_always_visible(true);
+                line.set_focused(focused);
+                line.set_right_status(Some(RightStatus {
+                    full: "Jev C+A · 12 req".into(), compact: "Jev 12r".into(), minimal: "Jev".into(),
+                }));
+                line.set_communication_status(Some(caller_status(width)));
+                let rows = line.render(width as f64);
+                assert!(rows.iter().all(|row| visible_width(row) <= width), "{width}: {rows:?}");
+                let text = pi_tui::utils::strip_ansi(&rows.join("\n"));
+                assert!(!text.contains("CONFIG") && !text.contains("CFG")
+                    && !text.contains("OCC3.1 seq") && !text.contains("OCC3.1 hier") && !text.contains("OCC3.1 off"),
+                    "{width}: configuration leaked into the tray: {text}");
+                if width >= 83 {
+                    assert!(text.contains("STREAM TPS ~50.0  CTX HEALTH GREEN 100"), "{width}: {text}");
+                } else if width >= 80 {
+                    // Five slots push the full-health stage out at 80-83:
+                    // the compact-health stage carries the slots instead.
+                    assert!(text.contains("STREAM TPS ~50.0  CTX G100"), "{width}: {text}");
+                }
+            }
         }
     }
 

@@ -22,7 +22,7 @@
 #   6. mutate: rename neo-glm53 -> neo-glm53-pre-occ3 (preserved, stopped),
 #      then docker run -d a NEW neo-glm53 with the captured configuration
 #      on the derived image;
-#   7. poll GET http://127.0.0.1:30001/health until 200 (timeout 900s;
+#   7. poll GET http://127.0.0.1:30001/health until 200 (timeout 1500s;
 #      B300 weight loading takes minutes);
 #   8. verify the plugin: GET /occ3/v1/status, expecting 200 JSON with the
 #      occ3 version;
@@ -38,7 +38,7 @@
 #   PRE_CONTAINER                default neo-glm53-pre-occ3
 #   HOST_IP / HOST_PORT          health endpoint (default 127.0.0.1:30001,
 #                                otherwise derived from the captured port map)
-#   OCC3_HEALTH_TIMEOUT          seconds to wait for /health (default 900)
+#   OCC3_HEALTH_TIMEOUT          seconds to wait for /health (default 1500)
 #   OCC3_POLL_INTERVAL           seconds between polls (default 5)
 #   OCC3_STOP_TIMEOUT            docker stop timeout in seconds (default 300)
 #   OCC3_GPU_SETTLE              seconds to wait after stopping the old
@@ -71,7 +71,7 @@ export LC_ALL=C
 BASE_CONTAINER="${BASE_CONTAINER:-neo-glm53}"
 PRE_CONTAINER="${PRE_CONTAINER:-neo-glm53-pre-occ3}"
 KEY_FILE="/tmp/.occ3_deploy_key"
-OCC3_HEALTH_TIMEOUT="${OCC3_HEALTH_TIMEOUT:-900}"
+OCC3_HEALTH_TIMEOUT="${OCC3_HEALTH_TIMEOUT:-1500}"
 OCC3_POLL_INTERVAL="${OCC3_POLL_INTERVAL:-5}"
 OCC3_STOP_TIMEOUT="${OCC3_STOP_TIMEOUT:-300}"
 OCC3_GPU_SETTLE="${OCC3_GPU_SETTLE:-15}"

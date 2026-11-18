@@ -1712,7 +1712,7 @@ impl AcpAgentApp {
         json!({
             "protocolVersion": ACP_PROTOCOL_VERSION,
             "agentCapabilities": agent_capabilities,
-            "agentInfo": { "name": "prime-agent", "title": "Prime Agent", "version": VERSION },
+            "agentInfo": { "name": "prime-agent", "title": "Optimus", "version": VERSION },
             // Advertise prime-agent extras under a namespaced key: ACP reserves
             // every object root for future protocol fields.
             "_meta": prime_agent_meta(PrimeAgentSessionMeta::new()),
@@ -1729,8 +1729,8 @@ impl AcpAgentApp {
             || self.state.session_close_in_flight()
         {
             return Err(AcpHandlerError::Thrown(
-                "prime-agent ACP mode hosts one session per connection; \
-                 start another prime-agent process for a second session"
+                "Optimus ACP mode hosts one session per connection; \
+                 start another optimus-agent process for a second session"
                     .to_string(),
             ));
         }
@@ -2236,14 +2236,14 @@ impl AcpAgentApp {
             }
             if let Some(turn_failure) = pending.turn_failure() {
                 return Err(AcpHandlerError::Thrown(format!(
-                    "prime-agent turn failed: {turn_failure}"
+                    "Optimus turn failed: {turn_failure}"
                 )));
             }
             terminal_status = pending.status().unwrap_or(status);
         }
         if let Some(failure) = failure {
             return Err(AcpHandlerError::Thrown(format!(
-                "prime-agent turn failed: {failure}"
+                "Optimus turn failed: {failure}"
             )));
         }
         Ok(json!({

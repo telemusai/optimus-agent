@@ -1,0 +1,14 @@
+2026-11-10 UTC. Selected neo-glm53 docker-log lines, normalized by the parent agent.
+Source: read-only docker logs --since 2026-11-10T10:04:00Z.
+SUMMARY lines select fields from native turn summary JSON. No later traffic is represented.
+
+10:08:50 occ3-bridge: native failure {"detail":null,"code":"unknown","status":409,"origin":[{"module":"chat_adapter.py","function":"_keepalive_race","line":1562}],"phase":"cleanup","dispatched":true}
+10:08:50 SUMMARY {'channel': 'source', 'outcome': 'complete', 'reason': 'complete', 'status': 200, 'elapsed_seconds': 64.30626437626779, 'completion_tokens': 248, 'finish_reason': 'tool_calls', 'content_chars': 639} | **Plan to solve Janet's duck egg problem:**  - **Step 1 — Identify total eggs:** Janet's ducks lay 16 eggs per
+10:08:54 occ3-bridge: native failure {"detail":null,"code":"retired","status":409,"origin":[{"module":"latent_worker.py","function":"validate","line":1767},{"module":"latent_worker.py","function":"resolve","line":835},{"module":"latent_types.py","function":"require","line":253}],"phase":"worker_control","dispatched":false}
+10:08:54 occ3-bridge: capture commit failed (class=UniformRequestCancellation code=retired members=)
+10:08:54 occ3-bridge: native turn aborted (refusal=occ3_commit_failed status=503 detail=)
+10:08:54 occ3-bridge: native failure {"detail":null,"code":"native_completion_failed","status":409,"origin":[{"module":"chat_adapter.py","function":"_keepalive_body","line":1732},{"module":"use_receipts.py","function":"feed","line":202}],"phase":"keepalive","dispatched":true}
+10:08:54 SUMMARY {'channel': 'receiver', 'outcome': 'error', 'reason': 'native_completion_failed', 'status': 409, 'elapsed_seconds': 3.9116544728167355, 'completion_tokens': None, 'finish_reason': None, 'content_chars': 125} | The native state from the Planner has arrived. Let me read the attached latent rows carefully before performin
+10:13:56 occ3-bridge: native failure {"detail":null,"code":"unknown","status":409,"origin":[{"module":"chat_adapter.py","function":"_keepalive_race","line":1562}],"phase":"cleanup","dispatched":true}
+10:13:56 SUMMARY {'channel': 'source', 'outcome': 'complete', 'reason': 'complete', 'status': 200, 'elapsed_seconds': 56.62262297607958, 'completion_tokens': 419, 'finish_reason': 'tool_calls', 'content_chars': 654} | Refined plan for solving Janet's duck-egg problem:  1. Daily supply: Janet's ducks lay 16 eggs per day — this
+10:13:59 SUMMARY {'channel': 'receiver', 'outcome': 'error', 'reason': 'cancelled', 'status': 499, 'elapsed_seconds': 2.000339004676789, 'completion_tokens': None, 'finish_reason': None, 'content_chars': 0} |

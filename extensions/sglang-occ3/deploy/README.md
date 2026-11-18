@@ -98,7 +98,7 @@ Every step is logged to `deploy-occ3.log` with UTC timestamps.
    for GPU memory release, then `docker run -d` starts a NEW `neo-glm53`
    with the captured configuration on the derived image.
 8. **Health wait.** Polls `GET http://127.0.0.1:30001/health` with the
-   Authorization header from the key file until HTTP 200 (timeout 900 s;
+   Authorization header from the key file until HTTP 200 (timeout 1500 s;
    loading the B300 weights takes minutes). Fails fast if the container
    dies.
 9. **Plugin verification.** `GET /occ3/v1/status` with the same
@@ -122,7 +122,7 @@ the server process once:
 - Every in-flight request and every model session powered by this server
   is killed at `docker stop`. Schedule the deploy in a maintenance window.
 - The KV/radix cache starts cold; expect the usual minutes-long weight
-  load before `/health` turns 200 (the script waits up to 900 s).
+  load before `/health` turns 200 (the script waits up to 1500 s).
 - External access through `launchpad-traefik` / Pomerium is interrupted
   for the same interval.
 - Keep `rollback.sh` at hand; the whole restore path is exercised only by
@@ -158,15 +158,29 @@ sudo bash rollback.sh
 
 What it does:
 
-1. Stops and removes the occ3-bridge container currently named
-   `neo-glm53` (only the OCC-3-added container is ever removed).
+1. Verifies the container currently named `neo-glm53` runs the image
+   recorded in `occ3-deploy-state.env`, then stops and removes it. On an
+   image mismatch (an intervening manual deploy replaced the container)
+   rollback refuses instead of destroying the newer container; removing
+   it manually and rerunning remains the explicit operator decision.
 2. Renames `neo-glm53-pre-occ3` back to `neo-glm53`.
 3. Restores the original restart policy from
    `occ3-deploy-state.env` (deploy.sh had set it to `no`).
 4. Starts the restored container.
-5. Polls `GET http://127.0.0.1:30001/health` until 200 (timeout 900 s).
+5. Polls `GET http://127.0.0.1:30001/health` until 200 (timeout 1500 s).
 6. Reports the plugin endpoint status (a 404 there confirms the plugin
    routes are gone) and removes the state file.
+
+One known refusal path: a deploy that fails AFTER renaming the old
+container to `neo-glm53-pre-occ3` and then fails again on a second deploy
+attempt leaves the FIRST deploy's image recorded in the state file while
+`neo-glm53-pre-occ3` is still preserved. The second attempt overwrites
+the state file with its own image tag before `docker run`, so if that
+`docker run` itself fails (for example a name conflict), the failure hint
+points at `rollback.sh`, whose image guard then refuses because the
+recorded tag no longer matches the running base container. Removing the
+stopped container manually (`docker rm neo-glm53`) and rerunning deploy
+is the explicit operator recovery step for that sequence.
 
 The API key is only read from `docker inspect` into memory for the health
 poll; it is never printed, logged, or written to a file. The derived image
@@ -271,6 +285,9 @@ replicated launch command):
 - Any failure after the mutation begins triggers an automatic rollback
   that restores the preserved original and re-verifies it (health,
   authenticated chat, ingress path).
+- The controller's `/health` wait reads the same `OCC3_HEALTH_TIMEOUT`
+  override as `deploy.sh`/`rollback.sh` (default 1500 s), so every deploy
+  lane applies one consistent deployment-health budget.
 - `occ3_watchdog.sh` supervises a deploy with a hard timeout and runs
   the rollback even if the controller itself is killed; it never
   retries the deployment.

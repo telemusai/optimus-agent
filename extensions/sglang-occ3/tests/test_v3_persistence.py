@@ -74,6 +74,47 @@ def run_successful_guardian(tmp_path, api, journal, services, monkeypatch):
     return guardian_process.run(approval(journal))
 
 
+def native_chain_guardian(journal, *, initial=True, final=True, permit=True,
+                          close_window_when=None):
+    """Supervisor stand-in providing only the selected native proof links.
+
+    Receipts are written when their checkpoint appears, the validation restart
+    permit only when selected, and the operator maintenance window closes at a
+    chosen journal state, so an incomplete chain stays incomplete.
+    """
+    closed = []
+    def guardian():
+        state = journal.read()
+        request = state.get("restart_request")
+        if request and not state.get("restart_count") and permit:
+            journal.update(restart_count=1)
+            life.private_json(journal.directory / "restart-permit.json", {
+                "attempt_id": state["attempt_id"], "candidate_id": CANDIDATE,
+                "nonce": request["nonce"], "epoch": request["epoch"],
+                "expires_monotonic": time.monotonic() + 1})
+        for phase, provide in (("initial", initial), ("final", final)):
+            checkpoint = journal.directory / ("checkpoint-" + phase + ".json")
+            receipt = journal.directory / ("native-proof-" + phase + ".json")
+            if provide and checkpoint.exists() and not receipt.exists():
+                life.private_json(receipt, native_receipt(journal, life.read_json(checkpoint)))
+        # One-shot closure only: the real external guard is a liveness check,
+        # so after the single raise this seam must stay a no-op for the rest of
+        # the run (wait_ready calls the guard during persistence verification
+        # and converts any repeated deadline into a readiness failure).
+        if close_window_when is not None and not closed and close_window_when(state):
+            closed.append(True)
+            raise ctl.MaintenanceWindowClosed("operator maintenance window closed")
+    return guardian
+
+
+def guardian_persists_completed_chain(api, journal, services):
+    """A controller that finishes the whole chain, then closes the window."""
+    def close_after_complete(state):
+        return sup.REQUIRED_GATES <= (state.get("gates") or {}).keys()
+    return ctl.Controller(api, journal, services=services,
+                          guard=native_chain_guardian(journal, close_window_when=close_after_complete))
+
+
 # --- (a) success + rollback policy still rolls back (regression) ------------
 
 
@@ -124,43 +165,202 @@ def test_success_with_persist_policy_keeps_the_candidate_running(tmp_path, monke
     assert KEY not in (journal.directory / "journal.json").read_text()
 
 
-# --- (c) proof deadline elapsed + persist policy is not a rollback ----------
+# --- (c) an incomplete native proof chain is a restoration, never retention --
 
 
-@pytest.mark.parametrize("policy,expected", [(ROLLBACK, "RESTORED"), (PERSIST, life.PERSISTED_PHASE)])
-def test_experimental_proof_deadline_is_only_fatal_under_the_rollback_policy(tmp_path, policy, expected):
+@pytest.mark.parametrize("policy", [ROLLBACK, PERSIST])
+def test_missing_initial_native_proof_deadline_restores_under_both_policies(tmp_path, policy):
     changes = persist_plan() if policy == PERSIST else {}
     api, journal, services = authorized(tmp_path, **changes)
-    code = ctl.Controller(api, journal, services=services, guard=lambda: None).run()
+    # No external proof receipts are provided, so the experimental proof deadline
+    # fires while the initial native proof is still missing.
+    assert ctl.Controller(api, journal, services=services, guard=lambda: None).run() == 1
     state = journal.read()
     assert state["plan"]["persistence_policy"] == policy
-    assert state["phase"] == expected
-    if policy == ROLLBACK:
-        # Today's behaviour is preserved exactly: the healthy candidate returns.
-        assert code == 1 and state["recovery"]["reason"] == "controller_ExperimentDeadline"
-        assert_restored(api, journal)
-    else:
-        assert code == 0
-        assert state["persistence_decision"] == life.PERSISTED_CANDIDATE
-        assert state["persistence"]["reason"] == "external native Optimus proof deadline"
-        assert state["gates"][life.PERSISTENCE_GATE]["ok"] is True
-        assert life.READINESS_GATE in state["gates"] and "native_initial" not in state["gates"]
-        assert api.docs[CANDIDATE]["State"]["Running"] is True
-        assert api.docs[ORIGINAL]["State"]["Running"] is False
+    assert state["phase"] == "RESTORED"
+    assert state["recovery"]["reason"] == "controller_ExperimentDeadline"
+    assert life.READINESS_GATE in state["gates"] and "native_initial" not in state["gates"]
+    if policy == PERSIST:
+        assert "persistence" not in state and life.PERSISTENCE_GATE not in state["gates"]
+        assert state.get("persistence_decision") != life.PERSISTED_CANDIDATE
+    assert_restored(api, journal)
+
+
+def test_missing_final_native_proof_restores_under_persist(tmp_path):
+    api, journal, services = persist_authorized(tmp_path, proof_timeout_s=2)
+    services.live_ok = True
+    guardian = native_chain_guardian(journal, initial=True, final=False)
+    assert ctl.Controller(api, journal, services=services, guard=guardian).run() == 1
+    state = journal.read()
+    gates = state["gates"]
+    # Six of the seven chain gates passed; only the final proof link is missing.
+    for name in ("service_initial", "native_initial", "live_before", "restart", "live_after", "service_final"):
+        assert gates[name]["ok"] is True
+    assert "native_final" not in gates
+    assert state["recovery"]["reason"] == "controller_ExperimentDeadline"
+    assert state["phase"] == "RESTORED" and "persistence" not in state
+    assert_restored(api, journal)
+
+
+def test_window_closing_after_live_before_but_before_live_after_restores(tmp_path):
+    api, journal, services = persist_authorized(tmp_path, proof_timeout_s=30)
+    services.live_ok = True
+    # The initial proof is provided and live_before passes, but the restart
+    # permit never arrives and the window closes in the permit wait.
+    guardian = native_chain_guardian(
+        journal, initial=True, final=False, permit=False,
+        close_window_when=lambda state: bool(state.get("restart_request")))
+    assert ctl.Controller(api, journal, services=services, guard=guardian).run() == 1
+    state = journal.read()
+    gates = state["gates"]
+    assert gates["live_before"]["ok"] is True and "live_after" not in gates
+    assert state.get("restart_count") != 1
+    assert state["recovery"]["reason"] == "controller_MaintenanceWindowClosed"
+    assert state["phase"] == "RESTORED" and "persistence" not in state
+    assert_restored(api, journal)
+
+
+def test_deployment_deadline_never_persists_a_candidate(tmp_path):
+    api, journal, services = persist_authorized(tmp_path)
+    def guardian():
+        if life.READINESS_GATE in (journal.read().get("gates") or {}):
+            raise ctl.Deadline("controller deployment deadline")
+    assert ctl.Controller(api, journal, services=services, guard=guardian).run() == 1
+    state = journal.read()
+    assert state["recovery"]["reason"] == "controller_Deadline"
+    assert state["phase"] == "RESTORED" and "persistence" not in state
+    assert_restored(api, journal)
+
+
+def test_persist_applies_requires_every_required_gate(tmp_path):
+    api, journal, services = persist_authorized(tmp_path)
+    runner = ctl.Controller(api, journal, services=services, guard=lambda: None)
+    journal.update(candidate_started=True)
+    chain = sorted(sup.REQUIRED_GATES)
+    for missing in chain:
+        partial = [name for name in chain if name != missing]
+        journal.update(gates={name: {"ok": True} for name in partial})
+        assert runner.persist_applies(ctl.ExperimentDeadline(
+            "external native Optimus proof deadline")) is False
+    journal.update(gates={name: {"ok": True} for name in chain})
+    assert runner.persist_applies(ctl.ExperimentDeadline(
+        "external native Optimus proof deadline")) is True
+    assert runner.persist_applies(ctl.MaintenanceWindowClosed(
+        "operator maintenance window closed")) is True
+    # A failed gate in the chain is also an incomplete chain.
+    journal.update(gates={**{name: {"ok": True} for name in chain}, "native_final": {"ok": False}})
+    assert runner.persist_applies(ctl.ExperimentDeadline(
+        "external native Optimus proof deadline")) is False
+    # A deadline that is not a research proof or window expiry never applies.
+    journal.update(gates={name: {"ok": True} for name in chain})
+    assert runner.persist_applies(ctl.Deadline("controller deployment deadline")) is False
+
+
+def test_persist_candidate_refuses_an_incomplete_chain(tmp_path):
+    api, journal, services = persist_authorized(tmp_path)
+    runner = ctl.Controller(api, journal, services=services, guard=lambda: None)
+    journal.update(candidate_started=True, gates={life.READINESS_GATE: {"ok": True}})
+    with pytest.raises(life.Failure, match="complete native proof chain"):
+        runner.persist_candidate("external native Optimus proof deadline")
+    assert "persistence" not in journal.read()
+
+
+def test_complete_chain_window_closure_retains_the_candidate(tmp_path):
+    api, journal, services = persist_authorized(tmp_path, proof_timeout_s=30)
+    services.live_ok = True
+    runner = guardian_persists_completed_chain(api, journal, services)
+    assert runner.run() == 0
+    state = journal.read()
+    # Every required gate passed before the window closed, so retention applies.
+    assert all(state["gates"][name]["ok"] is True for name in sup.REQUIRED_GATES)
+    assert state["phase"] == life.PERSISTED_PHASE
+    assert state["persistence_decision"] == life.PERSISTED_CANDIDATE
+    assert state["persistence"]["reason"] == "operator maintenance window closed"
+    assert state["gates"][life.PERSISTENCE_GATE]["ok"] is True
+    assert api.docs[CANDIDATE]["State"]["Running"] is True
+    assert api.docs[ORIGINAL]["State"]["Running"] is False
+
+
+# --- (c2) the supervisor independently rejects a partial persistence -------
+
+
+def forged_persistence(api, journal, gates):
+    """A durable PERSISTED_CANDIDATE record with the given proof-chain gates."""
+    if api.docs[CANDIDATE].get("Name") != "/" + journal.read()["original_name"]:
+        swapped(api, journal)
+    life.record_persistence(journal, journal.read(), api.docs[CANDIDATE], journal.original(),
+                            decision=life.PERSISTED_CANDIDATE, reason="forged",
+                            gate=life.PERSISTENCE_GATE)
+    journal.update(phase=life.PERSISTED_PHASE,
+                   gates={name: {"ok": True} for name in gates})
+
+
+def test_persisted_state_requires_the_complete_native_proof_chain(tmp_path):
+    api, journal, services = persist_authorized(tmp_path)
+    complete = sorted(sup.REQUIRED_GATES) + [life.PERSISTENCE_GATE]
+    for missing in sup.REQUIRED_GATES:
+        forged_persistence(api, journal, [name for name in complete if name != missing])
+        assert sup.persisted(journal.read()) is False, missing
+    forged_persistence(api, journal, complete)
+    assert sup.persisted(journal.read()) is True
+    # One failed gate inside the chain also breaks the independent acceptance.
+    journal.update(gates={**{name: {"ok": True} for name in complete}, "restart": {"ok": False}})
+    assert sup.persisted(journal.read()) is False
+
+
+def test_guardian_recovers_a_forged_partial_persisted_state(tmp_path, monkeypatch):
+    api, journal, services = prepared(tmp_path, **persist_plan())
+    def forge_partial():
+        forged_persistence(api, journal, [life.READINESS_GATE, life.PERSISTENCE_GATE,
+                                          "native_initial", "live_before"])
+        return Finished(0)
+    monkeypatch.setattr(sup, "process_identity", lambda pid: {"pid": pid, "start_ticks": "offline"})
+    guardian = sup.Supervisor(api, journal, services=services, process_factory=forge_partial,
+                              lock_root=tmp_path / "locks", fence_root=tmp_path / "fences")
+    assert guardian.run(approval(journal)) == 1
+    state = journal.read()
+    assert state["phase"] == "RESTORED" and state["recovery"]["verified"]
+    assert_restored(api, journal)
+
+
+def test_guardian_commits_a_complete_chain_persisted_state(tmp_path, monkeypatch):
+    api, journal, services = prepared(tmp_path, **persist_plan())
+    def complete_then_persist():
+        verified_success(api, journal)
+        journal.update(gates={**journal.read()["gates"], life.PERSISTENCE_GATE: {"ok": True}})
+        life.record_persistence(journal, journal.read(), api.docs[CANDIDATE], journal.original(),
+                                decision=life.PERSISTED_CANDIDATE,
+                                reason="external native Optimus proof deadline",
+                                gate=life.PERSISTENCE_GATE)
+        journal.update(phase=life.PERSISTED_PHASE)
+        return Finished(0)
+    monkeypatch.setattr(sup, "process_identity", lambda pid: {"pid": pid, "start_ticks": "offline"})
+    guardian = sup.Supervisor(api, journal, services=services, process_factory=complete_then_persist,
+                              lock_root=tmp_path / "locks", fence_root=tmp_path / "fences")
+    assert guardian.run(approval(journal)) == 0
+    state = journal.read()
+    assert state["phase"] == "COMPLETE"
+    assert state["persistence_decision"] == life.PERSISTED_CANDIDATE
+    assert state["persistence"]["reason"] == "supervisor_persist"
+    assert api.docs[CANDIDATE]["State"]["Running"] is True
+    assert api.docs[ORIGINAL]["State"]["Running"] is False
 
 
 def test_research_stage_deadlines_are_recorded_and_never_fatal(tmp_path):
     api, journal, services = persist_authorized(
         tmp_path, source_capture_timeout_s=0.01, receiver_inference_timeout_s=0.01, proof_timeout_s=0.05)
-    assert ctl.Controller(api, journal, services=services, guard=lambda: None).run() == 0
+    # The stage deadlines stay non-fatal records; the restoration comes from the
+    # incomplete proof chain at the experimental deadline, never from the stages.
+    assert ctl.Controller(api, journal, services=services, guard=lambda: None).run() == 1
     state = journal.read()
-    assert state["phase"] == life.PERSISTED_PHASE
+    assert state["phase"] == "RESTORED"
     stages = state["stage_deadlines"]
     assert set(stages) == {"initial: source capture deadline", "initial: receiver inference deadline"}
     assert all(entry["fatal"] is False for entry in stages.values())
     assert {entry["field"] for entry in stages.values()} == {"source_capture_timeout_s",
                                                             "receiver_inference_timeout_s"}
-    assert api.docs[CANDIDATE]["State"]["Running"] is True
+    assert "persistence" not in state
+    assert_restored(api, journal)
 
 
 # --- (d) a failed health check still rolls back under the persist policy -----
@@ -279,10 +479,10 @@ def test_unknown_experiment_code_stays_in_the_non_fatal_class():
 # --- (g) operator-driven manual rollback still works under the persist policy
 
 
-def test_operator_manual_restore_after_persistence(tmp_path):
-    api, journal, services = persist_authorized(tmp_path)
-    assert ctl.Controller(api, journal, services=services, guard=lambda: None).run() == 0
-    assert journal.read()["phase"] == life.PERSISTED_PHASE
+def test_operator_manual_restore_after_persistence(tmp_path, monkeypatch):
+    api, journal, services = prepared(tmp_path, **persist_plan())
+    assert run_successful_guardian(tmp_path, api, journal, services, monkeypatch) == 0
+    assert journal.read()["phase"] == "COMPLETE"
     assert api.docs[CANDIDATE]["State"]["Running"] is True
     result = ctl.restore(api, journal, services=services)
     assert result["verified"] is True and result["result"] == "RESTORED"
@@ -298,9 +498,9 @@ def test_operator_manual_restore_after_persistence(tmp_path):
     assert ctl.main(["restore"]) == 2  # the documented CLI command requires --attempt-dir
 
 
-def test_manual_restore_reports_failure_when_production_cannot_be_reverified(tmp_path):
-    api, journal, services = persist_authorized(tmp_path, rollback_timeout_s=1.5)
-    assert ctl.Controller(api, journal, services=services, guard=lambda: None).run() == 0
+def test_manual_restore_reports_failure_when_production_cannot_be_reverified(tmp_path, monkeypatch):
+    api, journal, services = prepared(tmp_path, rollback_timeout_s=1.5, **persist_plan())
+    assert run_successful_guardian(tmp_path, api, journal, services, monkeypatch) == 0
     services.fail_restore = True
     result = ctl.restore(api, journal, services=services)
     assert result["verified"] is False and result["result"] == "RESTORE_FAILED"
@@ -378,22 +578,25 @@ def test_prepare_records_the_named_deadlines_in_the_journal(tmp_path):
     assert KEY not in (journal.directory / "journal.json").read_text()
 
 
-def test_maintenance_window_only_bounds_the_persist_policy(tmp_path):
+def test_maintenance_window_closing_mid_proof_restores_under_persist(tmp_path):
     api, journal, services = persist_authorized(tmp_path, maintenance_window_s=1.0, proof_timeout_s=5)
-    assert ctl.Controller(api, journal, services=services, guard=lambda: None).run() == 0
+    # The window closes while the initial native proof is still missing, so the
+    # persist policy restores instead of retaining an unproven candidate.
+    assert ctl.Controller(api, journal, services=services, guard=lambda: None).run() == 1
     state = journal.read()
-    assert state["phase"] == life.PERSISTED_PHASE
-    assert state["persistence"]["reason"] == "operator maintenance window closed"
-    assert api.docs[CANDIDATE]["State"]["Running"] is True
+    assert state["phase"] == "RESTORED"
+    assert state["recovery"]["reason"] == "controller_MaintenanceWindowClosed"
+    assert "persistence" not in state
+    assert_restored(api, journal)
 
 
 # --- a persisted candidate can be replaced by a later controlled attempt ----
 
 
-def test_persisted_candidate_can_be_replaced_by_a_later_controlled_attempt(tmp_path):
-    api, journal, services = persist_authorized(tmp_path)
-    assert ctl.Controller(api, journal, services=services, guard=lambda: None).run() == 0
-    assert journal.read()["phase"] == life.PERSISTED_PHASE
+def test_persisted_candidate_can_be_replaced_by_a_later_controlled_attempt(tmp_path, monkeypatch):
+    api, journal, services = prepared(tmp_path, **persist_plan())
+    assert run_successful_guardian(tmp_path, api, journal, services, monkeypatch) == 0
+    assert journal.read()["phase"] == "COMPLETE"
     reference = tmp_path / "later-inspect.json"
     reference.write_text(json.dumps(api.docs[CANDIDATE]), encoding="utf-8")
     later = life.prepare(api, plan(attempt_id="later-upgrade-0001", original_id=CANDIDATE,

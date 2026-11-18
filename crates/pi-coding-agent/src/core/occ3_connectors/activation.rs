@@ -33,7 +33,9 @@ use pi_ai::types::{Model, Occ3Validation};
 
 /// Upper bound on the readiness handshake so activation can never stall a
 /// session start. A timeout is a decline, not an error path.
-pub const ACTIVATION_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+// Four sequential gateway operations (identity, runtime, enrollment and
+// discovery) can exceed five seconds even while each operation is healthy.
+pub const ACTIVATION_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(45);
 
 /// Why OCC-3 is not active for this session. Every variant is a clean
 /// decline: the session keeps its ordinary text/OCC-1/OCC-2 behaviour.
@@ -226,6 +228,50 @@ impl Occ3ActivationRequest {
     ) -> (Option<String>, Option<indexmap::IndexMap<String, String>>) {
         (self.api_key.clone(), self.control_headers.clone())
     }
+}
+
+/// Whether `model` declares an enabled `occ3` block: the model-level half
+/// of the activation gate. Ordinary models (no block, or a disabled one)
+/// return false.
+pub fn model_declares_occ3(model: &Model) -> bool {
+    model.occ3.as_ref().is_some_and(|occ3| occ3.enabled)
+}
+
+/// The settings keys a policy decline needs, named exactly. Value-free, so
+/// it is safe for logs, status panels and warnings.
+pub const OCC3_POLICY_REMEDY: &str = "set agentCommunication.occ3Enabled and agentCommunication.occ3Experimental to true in settings.json";
+
+/// The daemon log line for a decline that happens before the configuration
+/// gate runs - the policy is off, or the activation credentials do not
+/// resolve - or `None` when the decline stays silent.
+///
+/// Sessions on ordinary models keep the off-by-default contract: no log
+/// line. A model that declares an enabled `occ3` block was configured for
+/// native handoff, so its decline is named. Without the line, the missing
+/// `occ3_handoff` tool was the only symptom of a missing opt-in.
+pub fn early_decline_log_line(
+    model: &Model,
+    decline: Occ3Decline,
+    session_id: &str,
+) -> Option<String> {
+    if !model_declares_occ3(model) {
+        return None;
+    }
+    let detail = match decline {
+        Occ3Decline::DisabledByPolicy | Occ3Decline::ExperimentalAckRequired => {
+            format!(
+                "the model declares an enabled occ3 block but the opt-in is off, so no occ3_handoff tool is installed; {OCC3_POLICY_REMEDY}"
+            )
+        }
+        Occ3Decline::ConnectorUnavailable => {
+            "the activation credentials for the model's provider did not resolve, so no occ3_handoff tool is installed".to_string()
+        }
+        other => other.message().to_string(),
+    };
+    Some(format!(
+        "occ3 activation declined reason={} session={session_id} detail=\"{detail}\"",
+        decline.as_str(),
+    ))
 }
 
 /// The configuration-only gate: no network. Returns the connector config a
@@ -510,33 +556,139 @@ pub async fn verify_cached(
 ) -> Result<std::sync::Arc<Occ3Ready>, Occ3Decline> {
     let config = configured_connector(request)?;
     let key = cache_key(request, &config);
-    if let Some(ready) = ready_cache()
-        .lock()
-        .ok()
-        .and_then(|cache| cache.get(&key).cloned())
-    {
-        if ready.expires_at_epoch > now_epoch() {
-            return Ok(ready);
-        }
-        // An expired permit is not a verification: drop that entry so the
-        // handshake below replaces it.
-        if let Ok(mut cache) = ready_cache().lock() {
-            cache.remove(&key);
-        }
+    if let Some(ready) = fresh_ready(&key) {
+        return Ok(ready);
+    }
+    // One cold handshake per key. Two sessions activating concurrently (for
+    // example sibling RLM children spawned milliseconds apart) both miss the
+    // cache above; without serialization each `verify` mints its own
+    // connector instance, and the connector's process-local native records
+    // (publications, retirements) would silently split one cache key across
+    // instances. A sender on one instance and a receiver on another then lose
+    // each other's publications and the receiver's `prepare_inference`
+    // fails closed as Unauthorized. Racers wait here, then reuse the
+    // winner's fresh entry instead of minting a second instance.
+    let _one_handshake = verifying_lock(&key).lock_owned().await;
+    if let Some(ready) = fresh_ready(&key) {
+        return Ok(ready);
     }
     let ready = std::sync::Arc::new(verify(request, handshake_timeout).await?);
     if let Ok(mut cache) = ready_cache().lock() {
-        cache.insert(key, std::sync::Arc::clone(&ready));
+        // Converge on a fresh entry another caller inserted while this
+        // verification ran, so a key never maps to two live instances.
+        let existing_is_fresh = cache
+            .get(&key)
+            .is_some_and(|ready| ready.expires_at_epoch > now_epoch());
+        if !existing_is_fresh {
+            cache.insert(key, std::sync::Arc::clone(&ready));
+        }
     }
     Ok(ready)
 }
 
-/// Drop the cached verification. Called when a runtime restart invalidates
-/// every enrollment, so the next activation re-handshakes.
+/// Cached entry for `key` when its permit is still valid, else `None` (the
+/// stale entry is dropped so a later handshake replaces it).
+fn fresh_ready(key: &str) -> Option<std::sync::Arc<Occ3Ready>> {
+    let ready = ready_cache().lock().ok()?.get(key).cloned()?;
+    if ready.expires_at_epoch > now_epoch() {
+        return Some(ready);
+    }
+    if let Ok(mut cache) = ready_cache().lock() {
+        cache.remove(key);
+    }
+    None
+}
+
+/// Per-key handshake serialization for cold `verify_cached` calls. The map is
+/// bounded by distinct cache keys (endpoint, model, method, artifact digest);
+/// entries are empty mutexes kept for the process lifetime.
+fn verifying_lock(key: &str) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+    static LOCKS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::BTreeMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>,
+    > = std::sync::OnceLock::new();
+    let map = LOCKS.get_or_init(Default::default);
+    let mut map = match map.lock() {
+        Ok(map) => map,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    map.entry(key.to_string()).or_default().clone()
+}
+
+/// Evict only the failed connector instance. A late failure cannot evict a
+/// newer verification for the same key or readiness for another runtime.
+pub(crate) fn invalidate_connector_ready(connector: &dyn Occ3Connector) {
+    let Some(instance_id) = connector.readiness_instance_id() else { return };
+    if let Ok(mut cache) = ready_cache().lock() {
+        cache.retain(|_, ready| ready.connector.readiness_instance_id() != Some(instance_id));
+    }
+}
+
+/// Reset all cached readiness for isolated tests. Production recovery evicts
+/// only the specific connector whose runtime authority was verified changed.
+#[cfg(test)]
 pub fn invalidate_ready_cache() {
     if let Ok(mut cache) = ready_cache().lock() {
         cache.clear();
     }
+}
+
+
+/// Process-wide capture-concurrency limiter for native OCC-3 source
+/// handoffs. The permit covers the WHOLE armed capture lifetime: it is
+/// acquired before `arm_handoff_if_needed` arms the slot and released when
+/// the capture reaches a terminal outcome (completed handoff, capture
+/// failure, cancel or deactivation). Callers must not hold queue or slot
+/// mutexes while awaiting the permit.
+///
+/// Default 1 concurrent armed capture per process. `OCC3_CAPTURE_CONCURRENCY`
+/// clamps the value into 1..=8; the ceiling exists so one process cannot
+/// promise a serving runtime more concurrent armed turns than its protocol
+/// tolerates, and the floor keeps captures serialized by default.
+fn capture_concurrency_permits() -> &'static std::sync::Arc<tokio::sync::Semaphore> {
+    static PERMITS: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> =
+        std::sync::OnceLock::new();
+    PERMITS.get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(env_capture_concurrency())))
+}
+
+fn env_capture_concurrency() -> usize {
+    std::env::var("OCC3_CAPTURE_CONCURRENCY")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .map(|value| value.clamp(1, 8))
+        .unwrap_or(1)
+}
+
+/// Acquire one armed-capture permit for the process. Hold the returned
+/// guard across the armed capture lifetime only; never across other awaits
+/// the capture does not own.
+pub async fn acquire_capture_permit() -> tokio::sync::OwnedSemaphorePermit {
+    // `acquire_owned` takes the `Arc` by value; the static lends a reference.
+    std::sync::Arc::clone(capture_concurrency_permits())
+        .acquire_owned()
+        .await
+        .expect("capture permit semaphore closed")
+}
+
+/// How long a sender may wait for a free armed-capture permit before its
+/// `occ3_handoff` call returns the retryable capacity-wait error. The wait
+/// covers a sibling sender's whole arm->publish window (dominated by that
+/// model's facts turn), so it must exceed one sibling turn, not one network
+/// call. `OCC3_CAPTURE_CAPACITY_WAIT_SECONDS` clamps into 5..=240; default 90.
+pub fn capture_capacity_wait() -> Duration {
+    std::env::var("OCC3_CAPTURE_CAPACITY_WAIT_SECONDS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(|value| Duration::from_secs(value.clamp(5, 240)))
+        .unwrap_or(Duration::from_secs(90))
+}
+
+/// Non-blocking permit take for sync arming paths (orchestrator retained
+/// captures, tests). `None` when every permit is held: the caller must
+/// refuse the concurrent capture, never queue it.
+pub fn try_capture_permit() -> Option<tokio::sync::OwnedSemaphorePermit> {
+    std::sync::Arc::clone(capture_concurrency_permits())
+        .try_acquire_owned()
+        .ok()
 }
 
 #[cfg(test)]
@@ -595,6 +747,10 @@ pub(crate) mod test_support {
     pub(crate) struct ActivationFixture {
         pub endpoint: url::Url,
         pub requests: Arc<AtomicUsize>,
+        /// 0 healthy; 1 generic refusal; 2 epoch mismatch; 3 restart refusal;
+        /// 4 refusal with unavailable identity probe; 5 busy HTTP 409;
+        /// 6 unavailable HTTP 503; 7 HTTP 200 with malformed JSON.
+        pub enrollment_failure: Arc<AtomicUsize>,
         shutdown: Option<tokio::sync::oneshot::Sender<()>>,
     }
 
@@ -624,6 +780,11 @@ pub(crate) mod test_support {
         .expect("endpoint url");
         let requests = Arc::new(AtomicUsize::new(0));
         let requests_outer = Arc::clone(&requests);
+        let enrollment_failure = Arc::new(AtomicUsize::new(0));
+        let enrollment_failure_outer = Arc::clone(&enrollment_failure);
+        let enrollments = Arc::new(std::sync::Mutex::new(
+            std::collections::BTreeMap::<String, serde_json::Value>::new(),
+        ));
         let (shutdown, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
         tokio::spawn(async move {
             loop {
@@ -637,14 +798,17 @@ pub(crate) mod test_support {
                 let identity = identity.clone();
                 let required_bearer = required_bearer.clone();
                 let requests = Arc::clone(&requests);
+                let enrollments = Arc::clone(&enrollments);
+                let enrollment_failure = Arc::clone(&enrollment_failure);
                 tokio::spawn(async move {
-                    serve_connection(socket, identity, required_bearer, requests).await;
+                    serve_connection(socket, identity, required_bearer, requests, enrollments, enrollment_failure).await;
                 });
             }
         });
         ActivationFixture {
             endpoint,
             requests: requests_outer,
+            enrollment_failure: enrollment_failure_outer,
             shutdown: Some(shutdown),
         }
     }
@@ -654,6 +818,8 @@ pub(crate) mod test_support {
         identity: Occ3ModelIdentity,
         required_bearer: Option<String>,
         requests: Arc<AtomicUsize>,
+        enrollments: Arc<std::sync::Mutex<std::collections::BTreeMap<String, serde_json::Value>>>,
+        enrollment_failure: Arc<AtomicUsize>,
     ) {
         use tokio::io::AsyncReadExt;
         let mut bytes = Vec::new();
@@ -735,7 +901,45 @@ pub(crate) mod test_support {
             "terminal_journal": true,
             "max_capture_bytes": MAX_CAPTURE_BYTES,
         });
-        let response = match (path.as_str(), body.as_ref()) {
+        let failure = enrollment_failure.load(Ordering::SeqCst);
+        if path == "/occ3/v1/native/sessions/enroll" {
+            let response = match failure {
+                5 => Some(("409 Conflict", "{}")),
+                6 => Some(("503 Service Unavailable", "{}")),
+                7 => Some(("200 OK", "invalid-json")),
+                _ => None,
+            };
+            if let Some((status, payload)) = response {
+                let _ = write_response(&mut socket, status, payload, &[]).await;
+                return;
+            }
+        }
+        if (path == "/occ3/v1/native/sessions/enroll" && matches!(failure, 1 | 3 | 4))
+            || (path == "/occ3/v1/native/runtime/identity" && failure == 4) {
+            let _ = write_response(&mut socket, "401 Unauthorized", "{}", &[]).await;
+            return;
+        }
+        // Match the runtime's immutable same-session enrollment contract. A
+        // fresh connector must not silently replace a live session's permit.
+        if path == "/occ3/v1/native/sessions/enroll" {
+            if let Some(body) = body.as_ref() {
+                let mut record = body.clone();
+                record.as_object_mut().unwrap().remove("operation_id");
+                let session_id = body["session_id"].as_str().unwrap().to_string();
+                let conflict = {
+                    let mut records = enrollments.lock().unwrap();
+                    match records.get(&session_id) {
+                        Some(existing) => existing != &record,
+                        None => { records.insert(session_id, record); false }
+                    }
+                };
+                if conflict {
+                    let _ = write_response(&mut socket, "401 Unauthorized", "{}", &[]).await;
+                    return;
+                }
+            }
+        }
+        let mut response = match (path.as_str(), body.as_ref()) {
             ("/occ3/v1/identity", _) => serde_json::json!({
                 "schema": "optimus.occ3.identity.v1",
                 "fields": legacy_fields,
@@ -777,6 +981,10 @@ pub(crate) mod test_support {
             }),
             _ => return,
         };
+        if (path == "/occ3/v1/native/sessions/enroll" && failure == 2)
+            || (path == "/occ3/v1/native/runtime/identity" && matches!(failure, 2 | 3)) {
+            response["runtime_id"] = serde_json::json!("restarted-runtime-epoch");
+        }
         let payload = serde_json::to_string(&response).expect("fixture response serializes");
         let _ = write_response(&mut socket, "200 OK", &payload, &[]).await;
     }
@@ -861,6 +1069,7 @@ pub async fn enroll(
         ready.connector.clone(),
     )
     .await?;
+    state.bind_chat_preferences(session.session_file())?;
     session.install_experimental_native_occ3(state, controller)
 }
 
@@ -915,6 +1124,48 @@ mod tests {
         assert_eq!(config.endpoint.as_str(), "http://127.0.0.1:30001/");
         assert!(config.api_key.is_none());
         assert!(config.control_headers.is_none());
+    }
+
+    #[test]
+    fn early_declines_are_logged_only_for_models_that_declare_occ3() {
+        // Ordinary models keep the off-by-default contract: no log line.
+        assert_eq!(
+            early_decline_log_line(&model_with(None), Occ3Decline::DisabledByPolicy, "s-1"),
+            None
+        );
+        let mut disabled = capability();
+        disabled.enabled = false;
+        assert!(!model_declares_occ3(&model_with(Some(disabled.clone()))));
+        assert_eq!(
+            early_decline_log_line(
+                &model_with(Some(disabled)),
+                Occ3Decline::DisabledByPolicy,
+                "s-1"
+            ),
+            None
+        );
+        // A model configured for native handoff names the policy decline and
+        // the exact settings keys, so the missing tool is never the only
+        // symptom.
+        let configured = model_with(Some(capability()));
+        assert!(model_declares_occ3(&configured));
+        let line = early_decline_log_line(&configured, Occ3Decline::DisabledByPolicy, "s-1")
+            .expect("a configured model logs its policy decline");
+        assert!(line.starts_with("occ3 activation declined reason=disabled_by_policy session=s-1 "));
+        assert!(line.contains("agentCommunication.occ3Enabled"));
+        assert!(line.contains("agentCommunication.occ3Experimental"));
+        assert!(line.contains("no occ3_handoff tool is installed"));
+        let line = early_decline_log_line(&configured, Occ3Decline::ExperimentalAckRequired, "s-2")
+            .expect("the acknowledgement decline is logged too");
+        assert!(line.starts_with("occ3 activation declined reason=experimental_ack_required session=s-2 "));
+        assert!(line.contains("agentCommunication.occ3Experimental"));
+        // An unresolvable credential is named, never silent.
+        let line = early_decline_log_line(&configured, Occ3Decline::ConnectorUnavailable, "s-3")
+            .expect("a credential decline is logged");
+        assert!(line.starts_with("occ3 activation declined reason=connector_unavailable session=s-3 "));
+        assert!(line.contains("credentials"));
+        // The line is value-free: no endpoint from the model block leaks.
+        assert!(!line.contains("127.0.0.1"));
     }
 
     #[test]
@@ -1070,6 +1321,37 @@ mod tests {
         request
     }
 
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_cold_verifications_share_one_connector_instance() {
+        let _cache_guard = reset_ready_cache().await;
+        let fixture =
+            serve_activation_fixture(fixture_identity("glm-5.3", METHOD_A), None).await;
+        let request = fixture_request(&fixture, None, None);
+        let before = fixture.requests.load(std::sync::atomic::Ordering::SeqCst);
+        // Two sessions activating at the same instant (the live failure was
+        // two sibling receivers 58 ms apart on a cold daemon). Without
+        // per-key serialization each caller mints a private connector
+        // instance; a sender and a receiver on different instances cannot
+        // see each other's native publication records, and the receiver's
+        // prepare fails closed as Unauthorized.
+        let (first, second) = tokio::join!(
+            verify_cached(&request, Duration::from_secs(5)),
+            verify_cached(&request, Duration::from_secs(5)),
+        );
+        let first = first.expect("first cold verification activates");
+        let second = second.expect("racing cold verification activates");
+        assert!(
+            std::sync::Arc::ptr_eq(&first, &second),
+            "concurrent cold verifications must converge on one connector instance"
+        );
+        let handshakes = fixture.requests.load(std::sync::atomic::Ordering::SeqCst) - before;
+        assert!(
+            handshakes <= 4,
+            "the racing caller must reuse the winner's handshake, not run a second one (requests: {handshakes})"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn production_activation_mints_a_real_permit_from_the_live_handshake() {
         let _cache_guard = reset_ready_cache().await;
@@ -1093,6 +1375,44 @@ mod tests {
         assert!(
             served >= 4,
             "identity + runtime identity + probe enrollment + discovery handshake ({served})"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn activation_accepts_a_server_that_honestly_degrades_informational_fields() {
+        let _cache_guard = reset_ready_cache().await;
+        // The deployed extension degrades two informational provenance
+        // fields to "" (a checkpoint served from a local path carries no
+        // hub revision; a chat template kept outside tokenizer_config.json
+        // yields no in-config digest). A server that still binds its
+        // attested fingerprint over exactly that degraded identity must
+        // activate end to end: the empty fields are honest, not absent.
+        let degraded = Occ3ModelIdentity {
+            checkpoint_revision: String::new(),
+            chat_template_fingerprint: String::new(),
+            ..fixture_identity("glm-5.3", METHOD_A)
+        };
+        let fixture = serve_activation_fixture(degraded.clone(), None).await;
+        let request = fixture_request(&fixture, None, None);
+        let ready = verify(&request, Duration::from_secs(5))
+            .await
+            .expect("honest empty informational fields must not decline activation");
+        assert_eq!(ready.method_id, METHOD_A);
+        assert_eq!(ready.capabilities.model_identity.model_id, "glm-5.3");
+        assert_eq!(ready.capabilities.model_identity.checkpoint_revision, "");
+        assert_eq!(
+            ready.capabilities.model_identity.chat_template_fingerprint,
+            ""
+        );
+        // The binding check still ran: the attested fingerprint is the
+        // digest of exactly the degraded identity the server served.
+        assert_eq!(
+            ready.capabilities.model_identity.fingerprint(),
+            {
+                let mut bound = degraded;
+                bound.latent_method = METHOD_A.into();
+                bound.fingerprint()
+            }
         );
     }
 
@@ -1316,7 +1636,7 @@ mod tests {
         assert_eq!(super::method_family(""), None);
     }
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn invalidating_session_state_drops_the_cached_ready() {
+    async fn runtime_invalidation_after_session_close_drops_the_cached_ready() {
         let _cache_guard = reset_ready_cache().await;
         let fixture =
             serve_activation_fixture(fixture_identity("glm-5.3", METHOD_A), None).await;
@@ -1332,10 +1652,8 @@ mod tests {
             std::sync::Arc::ptr_eq(&primed, &cached),
             "the same ready serves repeated activations"
         );
-        // A real native session enrolled against the verified connector is
-        // the session lifecycle the daemon owns; invalidating its state must
-        // retire the process-wide ready, so the next activation re-handshakes
-        // instead of reusing a ready whose session state no longer exists.
+        // Session teardown preserves runtime-scoped readiness. Explicit
+        // runtime invalidation still forces the next activation to verify.
         let session = crate::core::agent_session::occ3_state::Occ3NativeSession::enroll(
             "session-x",
             &model,
@@ -1344,12 +1662,17 @@ mod tests {
         .await
         .expect("session enrolls against the verified connector");
         session.invalidate();
+        let still_cached = verify_cached(&request, Duration::from_secs(5)).await.unwrap();
+        assert!(std::sync::Arc::ptr_eq(&cached, &still_cached));
+        invalidate_ready_cache();
         let reverified = verify_cached(&request, Duration::from_secs(5))
             .await
             .expect("the next activation re-verifies");
         assert!(
             !std::sync::Arc::ptr_eq(&cached, &reverified),
-            "invalidate() must drop the cached ready"
+            "explicit runtime invalidation must drop the cached ready"
         );
     }
+    include!("activation_close_isolation_tests.rs");
+
 }

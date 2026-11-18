@@ -7,7 +7,8 @@ the unchanged trailing [DONE] frame, byte-exact reconstruction of the inner
 body after comment stripping, bounded post-start failure events and the
 charge/lease settle on completion, failure and client disconnect. Synthetic
 backend fixtures are NOT real device evidence. The ordinary buffered contract
-stays regression-tested by the existing suites (default off).
+stays regression-tested for requests without the negotiation header; the client
+now offers keepalive by default.
 """
 from __future__ import annotations
 
@@ -350,3 +351,97 @@ async def test_keepalive_receive_window_disconnect_settles(harness):
     await spin_until(lambda: harness.adapter._active == 0)
     assert harness.tm.aborts
     assert harness.backend.retires
+
+
+@pytest.mark.asyncio
+async def test_steady_decode_keeps_client_visible_cadence(harness):
+    """Fast inner chunks are buffered, but cannot starve transport comments."""
+    fast_profile(harness, 0.02)
+    harness.adapter.profile = replace(harness.adapter.profile, disconnect_interval=0.05)
+    original = harness.chat._generate_chat_stream
+
+    async def steady_stream(obj, request, raw):
+        async for frame in original(obj, request, raw):
+            yield frame
+            if len(harness.chat.frames) == 1:
+                for _ in range(120):
+                    await asyncio.sleep(0.001)
+                    chunk = "data: " + json.dumps({"id": obj.rid, "choices": [
+                        {"index": 0, "delta": {"content": "x"}, "finish_reason": None}]}) + "\n\n"
+                    harness.chat.frames.append(chunk.encode())
+                    yield chunk
+
+    harness.chat._generate_chat_stream = steady_stream
+    _, events, body = await drive(
+        harness, keepalive_raw(canonical({"occ3": attachment().wire()})))
+    times = [stamp for stamp, event in events if event.get("body") == KEEPALIVE_FRAME]
+    assert len(times) >= 3
+    # Allow scheduler jitter, but not an unbounded client-visible idle gap.
+    visible = [stamp for stamp, event in events
+               if event["type"] == "http.response.start" or event.get("body")]
+    assert all(later - earlier < 0.1 for earlier, later in zip(visible, visible[1:]))
+    assert strip_comments_and_receipt(body) == b"".join(harness.chat.frames)
+    await spin_until(lambda: harness.adapter._active == 0)
+    assert not harness.tm.aborts
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["buffered", "keepalive", "terminal"])
+async def test_task_cancellation_has_distinct_summary(harness, caplog, mode, monkeypatch):
+    """Explicit task cancellation is not evidence of client disconnect."""
+    import logging
+    caplog.set_level(logging.INFO)
+    keepalive = mode == "keepalive"
+    harness.chat.buffer_gate = asyncio.Event()
+    fast_profile(harness, 0.01)
+    streaming = asyncio.Event()
+    raw = keepalive_raw(canonical({"occ3": attachment().wire()}),
+                        header=KEEPALIVE_REQUEST_MODE if keepalive else None)
+
+    if mode == "terminal":
+        from contextvars import ContextVar
+        from test_terminal_receipt import terminal_profile, terminal_call
+        # This lifecycle test does not exercise the optional parser overlay.
+        strict = ContextVar("fixture_terminal_strict", default=False)
+        monkeypatch.setattr(harness.adapter, "_terminal_strict_flag", lambda: strict)
+        monkeypatch.setattr(harness.adapter, "_terminal_tools_admissible", lambda tools: True)
+        harness.adapter.terminal_profile = terminal_profile()
+        raw = terminal_call(harness)
+
+    async def run():
+        response = await harness.chat.handle_request(chat_request(), raw)
+        if mode == "terminal":
+            async def send(event):
+                if event.get("body"):
+                    streaming.set()
+            await response(raw.scope, raw.receive, send)
+        elif keepalive:
+            async for _ in response.body_iterator:
+                streaming.set()
+
+    task = asyncio.create_task(run())
+    # Ensure the streaming owner is inside its body, not at the hand-off seam.
+    await spin_until(lambda: streaming.is_set() if mode != "buffered" else bool(harness.chat.frames))
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    prefix = "occ3-bridge: native turn summary "
+    # Terminal task cancellation retains charges for non-positive ledger ops;
+    # this regression checks the summary, not a successful emission/release.
+    await spin_until(lambda: (mode == "terminal" or harness.adapter._active == 0) and any(
+        record.message.startswith(prefix) for record in caplog.records))
+    row, = [json.loads(record.message[len(prefix):]) for record in caplog.records
+            if record.message.startswith(prefix)]
+    assert row["reason"] == "cancelled"
+    assert row["status"] == 499
+    assert row["keepalive"] is keepalive
+    assert harness.tm.aborts
+    assert harness.backend.retires
+    if mode == "terminal":
+        # Fail-closed retention for a cancelled native op (see
+        # test_terminal_receipt.test_terminal_stalled_native_next_is_deadline_bounded).
+        assert harness.adapter._active == 1 and harness.adapter._terminal_active == 1
+        pending = [t for t in harness.adapter._terminal_tasks if not t.done()]
+        for t in pending:
+            t.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)

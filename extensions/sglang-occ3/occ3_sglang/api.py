@@ -21,7 +21,8 @@ from typing import List, Optional
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
-from .identity import IDENTITY_FIELDS, compute_identity, fingerprint
+from .identity import IDENTITY_FIELDS, fingerprint
+from .native_profile import DECLARED_IDENTITY, ProfileError, load_pinned_profile
 from .security import DEFAULT_TTL_S
 
 router = APIRouter(prefix="/occ3/v1", tags=["occ3"])
@@ -64,7 +65,23 @@ class ReleaseBody(BaseModel):
 
 @router.get("/identity")
 async def identity_route() -> dict:
-    identity = compute_identity(_tm())
+    """The deployment's declared-launch identity, pinned in the profile.
+
+    The fields are the declared values, never runtime-derived: without a
+    pinned declared-identity block the route fails closed rather than serving
+    a computed fallback. The optimus-agent client replaces ``latent_method``
+    with the runtime-attested method id before hashing, so this route serves
+    the legacy label for that field.
+    """
+    try:
+        profile = load_pinned_profile()
+    except ProfileError:
+        raise HTTPException(status_code=503,
+                            detail="declared identity not pinned") from None
+    declared = profile.get(DECLARED_IDENTITY)
+    if not isinstance(declared, dict):
+        raise HTTPException(status_code=503, detail="declared identity not pinned")
+    identity = {name: declared[name] for name in IDENTITY_FIELDS}
     return {
         "schema": "optimus.occ3.identity.v1",
         "fields": identity,

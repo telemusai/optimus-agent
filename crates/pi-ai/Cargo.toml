@@ -45,3 +45,10 @@ bytes = { workspace = true }
 serde_yaml = { workspace = true }
 toml = { workspace = true }
 tracing = { workspace = true }
+
+# Windows: reads the same HKCU Internet Settings values hyper-util's
+# `client-proxy-system` matcher consults, so the guarded pool can fingerprint
+# the OS proxy store instead of falling back to a fresh client per request.
+# Already in the lock via hyper-util 0.1.20 (reqwest system-proxy feature).
+[target.'cfg(windows)'.dependencies]
+windows-registry = "0.6"

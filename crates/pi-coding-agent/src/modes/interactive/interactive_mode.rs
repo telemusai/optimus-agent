@@ -1427,6 +1427,7 @@ pub struct InteractiveMode {
     last_status_spacer_index: Option<usize>,
     last_status_text_index: Option<usize>,
     next_error_expiry: Option<std::time::Instant>,
+    next_transient_status_expiry: Option<std::time::Instant>,
     restored_draft_notice: std::rc::Rc<std::cell::RefCell<Option<String>>>,
     last_goal_announcement: Option<GoalAnnouncementSnapshot>,
 
@@ -1570,6 +1571,7 @@ impl InteractiveMode {
             last_status_spacer_index: None,
             last_status_text_index: None,
             next_error_expiry: None,
+            next_transient_status_expiry: None,
             restored_draft_notice: std::rc::Rc::new(std::cell::RefCell::new(None)),
             last_goal_announcement: None,
             feature_hint_deck: FeatureHintDeck::default(),
@@ -2547,7 +2549,10 @@ impl InteractiveMode {
         if !self.is_agent_streaming() || editor_text.trim().is_empty() {
             return None;
         }
-        Some(format!("{} to queue message", self.key_text("app.message.followUp")))
+        Some(format!(
+            "{} to queue message",
+            self.key_text("app.message.followUp")
+        ))
     }
 
     /// Port of `isCtrlCExitHintVisible`.

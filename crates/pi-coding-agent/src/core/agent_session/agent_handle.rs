@@ -209,6 +209,12 @@ impl AgentHandle for Arc<Agent> {
         true
     }
 
+    fn clear_native_state_hooks(&self) -> bool {
+        self.set_resolve_inference_state(None);
+        self.set_source_capture_hooks(None);
+        true
+    }
+
     fn set_before_request(&self, hook: BeforeRequestHook) {
         *self
             .before_request

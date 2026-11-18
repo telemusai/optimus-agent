@@ -334,6 +334,65 @@ def test_probe_refuses_unaudited_loader_flags(original, extra):
         dc.build_artifact_probe_request(original, IMAGE, "probe")
 
 
+def test_probe_accepts_valueless_enable_http2_without_widening_the_spec(original):
+    plain = deepcopy(original)
+    original["Config"]["Cmd"].append("--enable-http2")
+    probe = dc.build_artifact_probe_request(original, IMAGE, "probe")
+    plain_probe = dc.build_artifact_probe_request(plain, IMAGE, "probe")
+    # Transport-only flag: the probe command and spec are identical to the
+    # launch without it, and the executed command stays the isolated stdlib
+    # preflight, never a serving launch. Structural checks on execution
+    # positions only: the spec payload is data and may legitimately carry
+    # loader names (loader_profile names an sglang profile), so it is compared
+    # parsed, never substring-scanned for serving markers.
+    assert probe["Entrypoint"] == ["python3", "-I", "-S"]
+    assert probe["Cmd"] == plain_probe["Cmd"]
+    assert len(probe["Cmd"]) == 3 and probe["Cmd"][:2] == [dc.PROBE_SCRIPT_PATH, "--spec"]
+    assert "-m" not in probe["Cmd"] and "sglang.launch_server" not in probe["Cmd"]
+    assert "sglang.launch_server" not in probe["Entrypoint"]
+    assert json.loads(probe["Cmd"][-1]) == json.loads(plain_probe["Cmd"][-1])
+    # The independent parity check accepts the real-shaped probe inspect too.
+    proof = dc.assert_artifact_probe_parity(original, actual_probe_from(original), IMAGE)
+    assert proof["result"] == "PASS" and proof["isolated_stdlib_command_exact"] is True
+
+
+def test_candidate_clone_preserves_the_valueless_enable_http2_flag(original):
+    original["Config"]["Cmd"].append("--enable-http2")
+    body = dc.build_create_request(original, IMAGE, "candidate")
+    # The candidate clone carries the exact original launch args, flag included.
+    assert body["Cmd"] == original["Config"]["Cmd"]
+    assert body["Cmd"][-1] == "--enable-http2"
+    original["Path"] = "python3"
+    original["Args"] = deepcopy(original["Config"]["Cmd"])
+    candidate = candidate_from(original)
+    dc.assert_candidate_parity(original, candidate, IMAGE)
+
+
+@pytest.mark.parametrize("flag", ["--enable-otel", "--enable-http2-v2", "--http2", "--enable"])
+def test_probe_still_refuses_unaudited_valueless_flags(original, flag):
+    original["Config"]["Cmd"].append(flag)
+    with pytest.raises(dc.ConfigError):
+        dc.build_artifact_probe_request(original, IMAGE, "probe")
+
+
+def test_framed_enable_http2_is_gate_accepted_and_spec_inert(original):
+    # The allowlist gate is name-based (x.split("=", 1)[0]), so the framed
+    # spelling passes exactly like --model-path=/x always has; no _flag query
+    # reads it, so the spec stays identical. Documents the boundary honestly.
+    plain = deepcopy(original)
+    original["Config"]["Cmd"].append("--enable-http2=off")
+    probe = dc.build_artifact_probe_request(original, IMAGE, "probe")
+    assert probe["Cmd"] == dc.build_artifact_probe_request(plain, IMAGE, "probe")["Cmd"]
+
+
+def test_independent_parity_still_refuses_unaudited_valueless_flags(original, monkeypatch):
+    probe = actual_probe_from(original)
+    original["Config"]["Cmd"].append("--enable-otel")
+    monkeypatch.setattr(dc, "build_artifact_probe_request", lambda *args: probe)
+    with pytest.raises(dc.ConfigError, match="unsupported_external_launch_configuration"):
+        dc.assert_artifact_probe_parity(original, probe, IMAGE)
+
+
 def test_effective_path_and_args_cannot_differ_from_original(original):
     original["Path"] = "python3"
     original["Args"] = deepcopy(original["Config"]["Cmd"])

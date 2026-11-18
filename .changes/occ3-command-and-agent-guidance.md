@@ -1,0 +1,7 @@
+- Added experimental OCC-3 preference controls to `/occ` and its command hints, with selected-model configuration checks that refuse unsupported models.
+- Fixed `/occ status` always showing OCC-3 off instead of the saved or inherited chat preference; native activation requirements and completed-use receipts remain distinct from that preference. Explicit on/off preferences now gate native actions dynamically and propagate to subagents.
+- Changed agent communication guidance to use the native `occ3_handoff` tool when available between compatible OCC-3-configured subagents, such as the explicit DGX MTP (OCC-3) model, and retain ordinary OCC-2/OCC-1/TXT messaging for unsupported pairs.
+- Fixed normal-session native handoffs missing source capture: an authorized first call now arms bounded capture and an explicit second call publishes the captured response to the same receiver. The capture budget includes staging across all tensor-parallel ranks, within the verified server limit.
+- Added OCC-3 hive mind coordination guidance to the system prompt, with exact configured model selection, scoped native context exchange, separate agent permissions, and receipt-backed completion.
+- Changed the workspace, packaged agent, and Python runtime version to 0.1.43.
+- Fixed healthy DGX gateway handshakes timing out by allowing 15 seconds per control request and 45 seconds for the full activation sequence.

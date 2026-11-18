@@ -30,7 +30,7 @@ pub const SOURCE_CAPTURE_MODE_SAME_TURN_TOOL: &str = "same_turn_tool_v1";
 /// controller (orchestrator dispatch), never a forged tool binding.
 pub const SOURCE_CAPTURE_MODE_CONTENT_ONLY: &str = "content_only_orchestrator_v1";
 pub const SOURCE_RECEIPT_SCHEMA: &str = "occ3.source.v1";
-/// Source receipt that carries the 21 v1 fields plus the occ3.span.v1 block.
+/// Source receipt with 21 v1 fields plus the optional label anchor and occ3.span.v1 block.
 pub const SOURCE_RECEIPT_SCHEMA_V2: &str = "occ3.source.v2";
 pub const SOURCE_RECEIPT_HEADER: &str = "x-optimus-occ3-source";
 pub const MAX_SOURCE_RECEIPT_BYTES: usize = 2048;
@@ -172,6 +172,19 @@ pub struct SourceCaptureIntent {
     /// v3 intent may carry it, pinned to `content_only_orchestrator_v1`.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub capture_mode: String,
+    /// None uses the server profile default; explicit zero disables anchoring.
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_selected_label_anchor_alpha")]
+    pub label_anchor_alpha: Option<LabelAnchorAlpha>,
+}
+
+// Absence selects the profile default; a supplied null is not a selection.
+fn deserialize_selected_label_anchor_alpha<'de, D>(
+    deserializer: D,
+) -> Result<Option<LabelAnchorAlpha>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    LabelAnchorAlpha::deserialize(deserializer).map(Some)
 }
 
 impl std::fmt::Debug for SourceCaptureIntent {
@@ -228,7 +241,26 @@ impl SourceCaptureIntent {
     pub fn canonical_bytes(&self) -> Result<Vec<u8>, SourceCaptureError> {
         let value =
             serde_json::to_value(self).map_err(|_| SourceCaptureError::InvalidField("intent"))?;
-        canonical_json_bytes(&value)
+        // Only this bounded intent field admits decimals. Keep the generic
+        // canonical encoder integer-only for all other protocol documents.
+        if self.label_anchor_alpha.is_none() {
+            return canonical_json_bytes(&value);
+        }
+        let fields = value.as_object().ok_or(SourceCaptureError::InvalidField("intent"))?;
+        let sorted: BTreeMap<_, _> = fields.iter().collect();
+        let mut out = vec![b'{'];
+        for (index, (key, value)) in sorted.into_iter().enumerate() {
+            if index > 0 { out.push(b','); }
+            out.extend(canonical_json_bytes(&serde_json::Value::String(key.clone()))?);
+            out.push(b':');
+            if key == "label_anchor_alpha" {
+                out.extend(serde_json::to_vec(value).map_err(|_| SourceCaptureError::InvalidField("intent"))?);
+            } else {
+                out.extend(canonical_json_bytes(value)?);
+            }
+        }
+        out.push(b'}');
+        Ok(out)
     }
 
     pub fn digest(&self) -> Result<String, SourceCaptureError> {
@@ -250,9 +282,10 @@ impl SourceCaptureIntent {
     }
 }
 
-/// The bounded occ3.span.v1 block a v2 receipt carries next to the 21 v1
-/// fields (extension SOURCE-SPAN-SELECTION.md section 6.2). Counts cover the
-/// retained window; the aligned span stays `accepted_span_start/_end`.
+/// The bounded occ3.span.v1 block a v2 receipt carries next to the 21 v1 fields
+/// plus the optional label anchor (extension SOURCE-SPAN-SELECTION.md section
+/// 6.2). Counts cover the retained window; the aligned span stays
+/// `accepted_span_start/_end`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SourceReceiptSpan {
@@ -325,6 +358,35 @@ impl SourceReceiptSpan {
     }
 }
 
+/// Bounded label anchoring coefficient. Old receipts default to disabled.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "f64", into = "f64")]
+pub struct LabelAnchorAlpha(u8);
+
+impl LabelAnchorAlpha {
+    fn is_zero(&self) -> bool {
+        self.0 == 0
+    }
+}
+
+impl TryFrom<f64> for LabelAnchorAlpha {
+    type Error = SourceCaptureError;
+
+    fn try_from(value: f64) -> Result<Self, Self::Error> {
+        [0.0, 0.3, 0.5, 0.7, 1.0]
+            .iter()
+            .position(|allowed| *allowed == value)
+            .map(|index| Self(index as u8))
+            .ok_or(SourceCaptureError::InvalidReceipt)
+    }
+}
+
+impl From<LabelAnchorAlpha> for f64 {
+    fn from(value: LabelAnchorAlpha) -> Self {
+        [0.0, 0.3, 0.5, 0.7, 1.0][usize::from(value.0)]
+    }
+}
+
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "SourceCaptureReceiptWire", into = "SourceCaptureReceiptWire")]
 pub struct SourceCaptureReceipt {
@@ -352,10 +414,12 @@ pub struct SourceCaptureReceipt {
     pub byte_count: u64,
     /// Present exactly on an `occ3.source.v2` wire (the whole block or none).
     pub span: Option<SourceReceiptSpan>,
+    pub label_anchor_alpha: LabelAnchorAlpha,
 }
 
-/// The flat wire shape: the 21 v1 fields and, on v2, the 18 span fields at the
-/// same level. Unknown fields and a partial span block are refused.
+/// The flat wire shape: 21 v1 fields plus the optional label anchor and, on v2,
+/// the 18 span fields at the same level. Unknown fields and a partial span block
+/// are refused.
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SourceCaptureReceiptWire {
@@ -380,6 +444,8 @@ struct SourceCaptureReceiptWire {
     output_sha256: String,
     expires_at_epoch: u64,
     byte_count: u64,
+    #[serde(default, skip_serializing_if = "LabelAnchorAlpha::is_zero")]
+    label_anchor_alpha: LabelAnchorAlpha,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     span_schema: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -447,6 +513,7 @@ impl From<SourceCaptureReceipt> for SourceCaptureReceiptWire {
             output_sha256: receipt.output_sha256,
             expires_at_epoch: receipt.expires_at_epoch,
             byte_count: receipt.byte_count,
+            label_anchor_alpha: receipt.label_anchor_alpha,
             span_schema: field(|s| s.span_schema.clone()),
             span_policy: field(|s| s.span_policy.clone()),
             span_marker_profile: field(|s| s.span_marker_profile.clone()),
@@ -542,6 +609,7 @@ impl TryFrom<SourceCaptureReceiptWire> for SourceCaptureReceipt {
             output_sha256: wire.output_sha256,
             expires_at_epoch: wire.expires_at_epoch,
             byte_count: wire.byte_count,
+            label_anchor_alpha: wire.label_anchor_alpha,
             span,
         })
     }
@@ -630,6 +698,18 @@ struct SourceRecord {
     state: SourceCaptureState,
     receipt: Option<SourceCaptureReceipt>,
     tools: Vec<SourceToolBinding>,
+    busy_refusal: Option<SourceBusyRefusal>,
+}
+
+/// A pre-event busy refusal of an armed source capture: the server refused
+/// admission before generating anything, so nothing was captured. Recorded on
+/// the (now `Cancelled`) lease for the session's busy re-arm budget.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SourceBusyRefusal {
+    /// Epoch second of the refusal.
+    pub refused_at_epoch: u64,
+    /// Bounded server `Retry-After` in seconds, when it was a valid value.
+    pub retry_after_secs: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -675,6 +755,7 @@ impl SourceCaptureLease {
                 state: SourceCaptureState::Prepared,
                 receipt: None,
                 tools: Vec::new(),
+                busy_refusal: None,
             }),
             cancellation: CancellationToken::new(),
         })))
@@ -693,6 +774,14 @@ impl SourceCaptureLease {
     }
     pub fn state(&self) -> SourceCaptureState {
         self.0.state.lock().state
+    }
+    /// The recorded pre-event busy refusal, if the server refused this
+    /// capture as busy before admission (the lease is then `Cancelled`).
+    pub fn busy_refusal(&self) -> Option<SourceBusyRefusal> {
+        let record = self.0.state.lock();
+        (record.state == SourceCaptureState::Cancelled)
+            .then_some(record.busy_refusal)
+            .flatten()
     }
     /// Available only after the exact native response and parser completed.
     pub fn receipt(&self) -> Option<SourceCaptureReceipt> {
@@ -741,6 +830,40 @@ impl SourceCaptureLease {
         }
         Ok(expected)
     }
+    /// Test seam for downstream crates: closes a still-`Prepared` (never
+    /// sent) lease as `Cancelled` with a busy refusal record, the same end
+    /// state a real pre-admission busy refusal produces. `Prepared ->
+    /// Cancelled` is already a public transition ([`Self::cancel`]), so this
+    /// cannot turn a submitted or uncertain lease into proven non-use. The
+    /// only effect a non-test caller could get is to have its own unsent
+    /// capture counted as a busy retry instead of a capture failure, which
+    /// is still bounded by the queue busy budget. Kept public (not behind a
+    /// cargo feature) so test builds share the workspace's pi-ai artifact.
+    #[doc(hidden)]
+    pub fn cancel_unsent_as_busy(&self, refusal: SourceBusyRefusal) -> bool {
+        let mut record = self.0.state.lock();
+        if record.state != SourceCaptureState::Prepared {
+            return false;
+        }
+        record.state = SourceCaptureState::Cancelled;
+        record.busy_refusal = Some(refusal);
+        self.0.cancellation.cancel();
+        true
+    }
+    /// Downstream lifecycle-test seam: simulate submission, then revoke it.
+    /// Only a Prepared lease can enter this path. It produces Uncertain with
+    /// no receipt or publication authority and never sends a network request.
+    /// Like `cancel_unsent_as_busy`, this is public for downstream-crate tests:
+    /// callers can only revoke their own Prepared lease into a conservative
+    /// failure; submitted, captured, and terminal leases cannot be changed.
+    #[doc(hidden)]
+    pub fn cancel_submitted_for_test(&self) -> bool {
+        let Ok(_submission) = self.submit() else {
+            return false;
+        };
+        self.cancel() == SourceCaptureState::Uncertain
+    }
+
     /// Revokes local authority; callers separately retire the runtime resource.
     pub fn cancel(&self) -> SourceCaptureState {
         let mut record = self.0.state.lock();
@@ -792,6 +915,7 @@ impl SourceCaptureLease {
             receipt: None,
             body_verified: false,
             deferred: false,
+            resend_wait: None,
         })
     }
 }
@@ -804,6 +928,13 @@ pub(crate) struct SourceSubmission {
     /// The server accepted the keepalive offer: the receipt arrives as the
     /// terminal `optimus.occ3.receipt` SSE event instead of response headers.
     deferred: bool,
+    /// Set only while waiting out `Retry-After` before a same-request resend:
+    /// the last response was a proven pre-use busy refusal and nothing is in
+    /// flight. Holds that refusal's Retry-After. If the submission is dropped
+    /// in this window (the outer stream guard cancels the body on the signal
+    /// or the deadline), it closes as that busy refusal, not `Uncertain`. An
+    /// explicit `lease.cancel()` keeps its own conservative `Uncertain`.
+    resend_wait: Option<Option<u64>>,
 }
 impl SourceSubmission {
     pub(crate) fn ensure_active(&self) -> Result<(), SourceCaptureError> {
@@ -978,11 +1109,70 @@ impl SourceSubmission {
         Ok(())
     }
 }
+impl SourceSubmission {
+    /// Whether an identical resend after `delay` still fits this lease: the
+    /// submission is still `Submitted` and both the local deadline and the
+    /// intent expiry lie strictly after the delay PLUS `headroom`, the time
+    /// the resent request may need to be admitted and produce its first
+    /// event. Without that headroom a resend started just before the
+    /// deadline would expire in flight as `Uncertain`, although refusing at
+    /// once is proven non-use. Called only after a classified pre-admission
+    /// busy refusal, before any stream event.
+    pub(crate) fn resend_window_allows(&self, delay: std::time::Duration, headroom: std::time::Duration) -> bool {
+        if self.lease.state() != SourceCaptureState::Submitted {
+            return false;
+        }
+        let Some(needed) = delay.checked_add(headroom) else {
+            return false;
+        };
+        let Some(resume) = Instant::now().checked_add(needed) else {
+            return false;
+        };
+        let Ok(now) = epoch_now() else {
+            return false;
+        };
+        resume < self.lease.limits().deadline
+            && now.saturating_add(needed.as_secs()) < self.lease.intent().expires_at_epoch
+    }
+    /// The server refused the armed capture as busy BEFORE any stream event:
+    /// nothing was generated or captured. That is proven non-use, so the
+    /// lease closes as `Cancelled` (never `Uncertain`, never reusable). The
+    /// cancellation token is left for the request guard, as on the receiver
+    /// path, so the provider's biased select keeps this bounded refusal.
+    pub(crate) fn refuse_before_admission(self, retry_after_secs: Option<u64>) {
+        let mut record = self.lease.0.state.lock();
+        if record.state == SourceCaptureState::Submitted {
+            record.state = SourceCaptureState::Cancelled;
+            record.busy_refusal = Some(SourceBusyRefusal {
+                refused_at_epoch: epoch_now().unwrap_or(0),
+                retry_after_secs,
+            });
+        }
+    }
+}
+impl SourceSubmission {
+    /// Enter (`Some(retry_after)`) or leave (`None`) the Retry-After wait
+    /// before a same-request resend. See `resend_wait`.
+    pub(crate) fn set_resend_wait(&mut self, retry_after_secs: Option<Option<u64>>) {
+        self.resend_wait = retry_after_secs;
+    }
+}
 impl Drop for SourceSubmission {
     fn drop(&mut self) {
         let mut record = self.lease.0.state.lock();
         if record.state == SourceCaptureState::Submitted {
-            record.state = SourceCaptureState::Uncertain;
+            match self.resend_wait {
+                // Dropped while waiting to resend: nothing is in flight and the
+                // last refusal was proven pre-use, so close as that refusal.
+                Some(retry_after_secs) => {
+                    record.state = SourceCaptureState::Cancelled;
+                    record.busy_refusal = Some(SourceBusyRefusal {
+                        refused_at_epoch: epoch_now().unwrap_or(0),
+                        retry_after_secs,
+                    });
+                }
+                None => record.state = SourceCaptureState::Uncertain,
+            }
         }
     }
 }
@@ -995,7 +1185,8 @@ pub fn validate_receipt(
 ) -> Result<(), SourceCaptureError> {
     intent.validate(now)?;
     // The receipt schema follows the intent schema: a v1 intent is answered by
-    // the bare 21-field wire, a v2 intent by the wire with the span block.
+    // the 21 v1 fields plus the optional label anchor, a v2 intent by that wire
+    // with the span block.
     let schema_matches = match (&receipt.span, intent.schema.as_str()) {
         (None, SOURCE_CAPTURE_SCHEMA) => receipt.schema == SOURCE_RECEIPT_SCHEMA,
         (Some(_), SOURCE_CAPTURE_SCHEMA_V2) => receipt.schema == SOURCE_RECEIPT_SCHEMA_V2,
@@ -1004,6 +1195,9 @@ pub fn validate_receipt(
         (Some(_), SOURCE_CAPTURE_SCHEMA_V3) => receipt.schema == SOURCE_RECEIPT_SCHEMA_V2,
         _ => false,
     };
+    if intent.label_anchor_alpha.is_some_and(|alpha| alpha != receipt.label_anchor_alpha) {
+        return Err(SourceCaptureError::InvalidReceipt);
+    }
     if !schema_matches
         || receipt.representation != SOURCE_REPRESENTATION
         || receipt.predictor_position_offset != -1
@@ -1243,6 +1437,7 @@ mod span_arming_tests {
             expires_at_epoch: now() + 300,
             span_policy: arming.span_policy.into(),
             capture_mode: arming.capture_mode.into(),
+            label_anchor_alpha: None,
         }
     }
 
@@ -1316,6 +1511,38 @@ mod span_arming_tests {
 
     fn parse(wire: &serde_json::Value) -> Result<SourceCaptureReceipt, serde_json::Error> {
         serde_json::from_value(wire.clone())
+    }
+
+    #[test]
+    fn label_anchor_receipt_defaults_and_bounded_roundtrip() {
+        let intent = intent(SourceSpanArming::resolve(None).unwrap());
+        for mut wire in [v1_wire(&intent), v2_wire(&intent)] {
+            assert_eq!(f64::from(parse(&wire).unwrap().label_anchor_alpha), 0.0);
+            for alpha in [0.0, 0.3, 0.5, 0.7, 1.0] {
+                wire["label_anchor_alpha"] = serde_json::json!(alpha);
+                let receipt = parse(&wire).unwrap();
+                assert_eq!(f64::from(receipt.label_anchor_alpha), alpha);
+                assert_eq!(
+                    serde_json::to_value(receipt)
+                        .unwrap()
+                        .get("label_anchor_alpha")
+                        .and_then(serde_json::Value::as_f64)
+                        .unwrap_or(0.0),
+                    alpha
+                );
+            }
+            for invalid in [
+                serde_json::json!(true),
+                serde_json::json!(null),
+                serde_json::json!("0.3"),
+                serde_json::json!(0.1),
+                serde_json::json!(-0.3),
+                serde_json::json!(1.1),
+            ] {
+                wire["label_anchor_alpha"] = invalid;
+                assert!(parse(&wire).is_err());
+            }
+        }
     }
 
     #[test]

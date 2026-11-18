@@ -248,6 +248,17 @@ def assert_restored(api, journal):
     assert KEY not in (journal.directory / "journal.json").read_text()
 
 
+def test_plan_default_startup_timeout_matches_shell_lanes():
+    """A plan that omits the deployment-health deadline defaults to the
+    same 1500 s wait deploy.sh/rollback.sh/occ3_controller apply (PR #258
+    rationale: a 13.5-minute healthy overlay leaves only ~6.5 min margin
+    at the old 1200 s default)."""
+    value = plan()
+    value.pop("startup_timeout_s")
+    validated = life.validate_plan(value)
+    assert validated["startup_timeout_s"] == 1500
+
+
 def test_prepare_keeps_exact_unstarted_inspected_candidate(tmp_path):
     api, journal, _ = prepared(tmp_path)
     assert journal.read()["candidate_id"] == CANDIDATE
@@ -1528,6 +1539,20 @@ def test_artifact_probe_durable_intent_precedes_create_and_id_precedes_start(tmp
     assert state["probe_id"] == CANDIDATE and state["phase"] == "PREPARED"
     assert sum(op == "remove" for op, _ in api.events) == 1
     assert ("start", CANDIDATE) in api.events
+
+
+def test_artifact_probe_path_accepts_valueless_enable_http2(tmp_path):
+    # Production prepare's normal probe path, offline: the original launch
+    # carries the transport-only valueless flag end to end.
+    api = ArtifactProbeDocker()
+    api.docs[ORIGINAL]["Config"]["Cmd"].append("--enable-http2")
+    journal = probe_prepared(tmp_path, api)
+    state = journal.read()
+    assert state["phase"] == "PREPARED" and state["probe_id"] == CANDIDATE
+    assert state["probe_parity"]["result"] == "PASS"
+    assert state["probe_parity"]["isolated_stdlib_command_exact"] is True
+    assert (journal.directory / "artifact-proof.json").exists()
+    assert ("start", CANDIDATE) in api.events and ("remove", CANDIDATE) in api.events
 
 
 def test_lost_artifact_probe_create_reply_records_cleanup_identity_without_removal(tmp_path):

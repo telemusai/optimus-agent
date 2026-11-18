@@ -955,7 +955,9 @@ impl Agent {
         let error_message = error.to_string();
         let failure_message = AgentMessage::from(AssistantMessage {
             role: pi_ai::types::ROLE_ASSISTANT.to_string(),
-            content: vec![pi_ai::types::ContentBlock::Text(TextContent::new(""))],
+            content: vec![pi_ai::types::ContentBlock::Text(TextContent::new(
+                error_message.clone(),
+            ))],
             api: model.api.clone(),
             provider: model.provider.clone(),
             model: model.id.clone(),

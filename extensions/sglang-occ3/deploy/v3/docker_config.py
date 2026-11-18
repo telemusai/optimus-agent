@@ -1,8 +1,10 @@
 """Secret-safe Docker create bodies and independent inspect parity.
 
-Only Config.Image changes, plus plan-declared pure environment additions. Name
-and immutable container/image IDs are lifecycle metadata, not launch
-configuration. Entrypoint, Cmd (including empty arguments), Env
+Only Config.Image changes, plus plan-declared pure environment additions, plus
+the one plan-declared calibrated-artifact read-only bind appended to
+HostConfig.Mounts (validated by _validated_calibrated_binding; Binds stay
+exact). Name and immutable container/image IDs are lifecycle metadata, not
+launch configuration. Entrypoint, Cmd (including empty arguments), Env
 order/duplicates, all accepted Config fields and HostConfig fields are exact;
 the candidate environment is the original environment plus exactly the declared
 additions (environment_addition_entries), never an override or removal.
@@ -40,9 +42,12 @@ closed. Unsupported Engine Config/HostConfig/endpoint fields fail closed too.
 from __future__ import annotations
 
 from copy import deepcopy
+import hashlib
 import json
+import os
 import posixpath
 import re
+import stat
 
 PROBE_SCRIPT_PATH = "/opt/occ3-bridge/deploy/v3/artifact_preflight.py"
 PROBE_SCHEMA = "occ3-artifact-preflight/v1"
@@ -64,7 +69,9 @@ PYTHON_VERSION PYTHON_SHA256 PYTHON_PIP_VERSION PYTHON_SETUPTOOLS_VERSION
 PYTHON_GET_PIP_URL PYTHON_GET_PIP_SHA256 GPG_KEY
 """.split())
 # Audited original launch profile. New loader-affecting flags require a new
-# source review, not silent best-effort artifact coverage.
+# source review, not silent best-effort artifact coverage. --enable-http2 is
+# transport-only and valueless: it never contributes to the path-only probe
+# spec and no _flag query reads it, so the probe stays path-only.
 _PROBE_FLAGS = frozenset("""
 --model-path --model --tokenizer-path --trust-remote-code --served-model-name
 --tp-size --tp --context-length --reasoning-parser --tool-call-parser --host --port
@@ -73,6 +80,7 @@ _PROBE_FLAGS = frozenset("""
 --speculative-adaptive-config --chunked-prefill-size --max-running-requests
 --cuda-graph-max-bs-decode --mem-fraction-static --kv-cache-dtype --api-key
 --load-format --revision --tokenizer-revision --tokenizer-mode --log-level
+--enable-http2
 """.split())
 
 
@@ -126,6 +134,26 @@ _LIFECYCLE_STAGING_NAME = re.compile(
     r"occ3-v3-(?:rehearsal-[a-f0-9]{16}|[a-z0-9][a-z0-9-]{7,47})"
     r"-(?:candidate|preserved|failed)(?:-(?:artifact-)?n[a-f0-9]{32})?\Z")
 
+# The single approved calibrated-artifact capability: one read-only bind of one
+# profile-named file from the pooled artifact directory into the container
+# calibration namespace. The plan never names arbitrary paths; the basename
+# comes from the verified staged profile's calibration_path, never from a digest.
+CALIBRATION_SOURCE_ROOT = "/data/neo-glm53/p5-artifact-pooled"
+CALIBRATION_DESTINATION_ROOT = "/occ3/calibration"
+_CALIBRATION_BASENAME = re.compile(r"calibrated-[a-z0-9][a-z0-9-]{0,47}\.bin\Z")
+_CALIBRATION_PROFILE_MAX_BYTES = 65536
+CALIBRATION_ARTIFACT_MAX_BYTES = 134217728
+_DIGEST64 = re.compile(r"[0-9a-f]{64}\Z")
+# Defense in depth behind the allowlist above: a calibrated bind may never
+# touch daemon or system namespaces on either side.
+_SYSTEM_PATH_DENYLIST = ("/dev", "/proc", "/sys", "/run", "/var/run", "/etc", "/usr",
+                         "/bin", "/sbin", "/lib", "/lib64", "/var", "/opt")
+# Bounded accepted spellings of the daemon-recorded actual mount record for
+# the read-only addition (mirror of the original's own spelling; anything else
+# fails closed and requires a root-reviewed re-pin, never a dynamic one).
+_CALIBRATION_MOUNT_MODES = frozenset({"", "ro"})
+_CALIBRATION_MOUNT_PROPAGATION = frozenset({"", "private", "rprivate"})
+
 
 def _fail(code: str) -> None:
     raise ConfigError(code)
@@ -150,6 +178,18 @@ def _path(value) -> str:
             or "\\" in value or posixpath.normpath(value) != value or value.startswith("//")):
         _fail("unsupported_mount_path")
     return value
+
+
+# Test-only I/O seam: maps a plan-logical POSIX path to the real host file when
+# the validation host is not the production Linux daemon host. Production leaves
+# this None and every path is used as-is; the map itself never weakens any path
+# rule, digest, stat or symlink check, which all run against the real file.
+_HOST_PATH_RESOLVER = None
+
+
+def _resolve_host_path(path: str) -> str:
+    resolver = _HOST_PATH_RESOLVER
+    return resolver(path) if resolver is not None else path
 
 
 def _inside(path: str, root: str) -> bool:
@@ -382,14 +422,210 @@ def _declared_environment(config_env: list, entries: list) -> list:
     return config_env + entries
 
 
+def calibrated_capability(plan) -> dict | None:
+    """Schema-only validation of the plan's calibrated-artifact capability.
+
+    No host I/O here (validate_plan stays portable); prepare performs the real
+    byte verification on the Docker host. The capability is exactly one file:
+    calibrated_artifact pins whole-file content identity (sha256 + size), and
+    calibrated_profile_evidence names the staged profile whose verified bytes
+    supply the authoritative calibration_path (the destination AND the source
+    basename). The profile digest is additionally pinned three ways against the
+    plan's own static_input.sha256 and native_validator.static_input_sha256,
+    so a wrong staged profile is refused before any DGX mutation.
+    """
+    artifact = plan.get("calibrated_artifact")
+    if artifact is None:
+        return None
+    if not isinstance(artifact, dict) or set(artifact) != {"sha256", "size"}:
+        _fail("invalid_calibrated_artifact")
+    evidence = plan.get("calibrated_profile_evidence")
+    if not isinstance(evidence, dict) or set(evidence) != {"path", "sha256", "bytes"}:
+        _fail("invalid_calibrated_profile_evidence")
+    if (not isinstance(artifact["sha256"], str) or not _DIGEST64.fullmatch(artifact["sha256"])
+            or type(artifact["size"]) is not int or not 1 <= artifact["size"] <= CALIBRATION_ARTIFACT_MAX_BYTES):
+        _fail("invalid_calibrated_artifact")
+    if (not isinstance(evidence["sha256"], str) or not _DIGEST64.fullmatch(evidence["sha256"])
+            or type(evidence["bytes"]) is not int
+            or not 1 <= evidence["bytes"] <= _CALIBRATION_PROFILE_MAX_BYTES):
+        _fail("invalid_calibrated_profile_evidence")
+    _path(evidence["path"])
+    static = plan.get("static_input")
+    native = plan.get("native_validator")
+    if (not isinstance(static, dict) or not isinstance(native, dict)
+            or static.get("sha256") != evidence["sha256"]
+            or native.get("static_input_sha256") != evidence["sha256"]):
+        _fail("calibrated_profile_pin_mismatch")
+    return {"sha256": artifact["sha256"], "size": artifact["size"],
+            "profile_path": evidence["path"], "profile_sha256": evidence["sha256"],
+            "profile_bytes": evidence["bytes"]}
+
+
+def _reject_symlink_ancestors(path: str, code: str) -> None:
+    """Every ancestor directory must be a real directory, never a symlink."""
+    chain, current = [], posixpath.dirname(path)
+    while current not in ("", "/"):
+        chain.append(current)
+        current = posixpath.dirname(current)
+    for directory in reversed(chain):
+        if os.path.islink(directory):
+            _fail(code)
+
+
+def verify_calibrated_profile(capability: dict) -> dict:
+    """Read and verify the staged calibrated profile on the Docker host.
+
+    The pinned digest is over the exact raw fd-read bytes before any decoding.
+    Returns the profile's declared calibration_path and calibration_digest,
+    which are the authoritative names for the artifact binding.
+    """
+    path = _resolve_host_path(capability["profile_path"])
+    _reject_symlink_ancestors(path, "calibrated_profile_symlink_ancestor")
+    if os.path.islink(path):
+        # Pre-check for hosts without O_NOFOLLOW; the atomic gate stays the
+        # O_NOFOLLOW open below on hosts that define it.
+        _fail("calibrated_profile_symlink")
+    fd = None
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0))
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            _fail("calibrated_profile_not_regular")
+        if info.st_size != capability["profile_bytes"]:
+            _fail("calibrated_profile_size_mismatch")
+        with os.fdopen(fd, "rb") as stream:
+            fd = None
+            raw = stream.read(capability["profile_bytes"] + 1)
+        if len(raw) != capability["profile_bytes"]:
+            _fail("calibrated_profile_size_mismatch")
+        if hashlib.sha256(raw).hexdigest() != capability["profile_sha256"]:
+            _fail("calibrated_profile_digest_mismatch")
+    except ConfigError:
+        raise
+    except OSError:
+        _fail("calibrated_profile_unreadable")
+    finally:
+        if fd is not None:
+            os.close(fd)
+    try:
+        profile = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError, RecursionError):
+        _fail("calibrated_profile_malformed")
+    if not isinstance(profile, dict):
+        _fail("calibrated_profile_malformed")
+    calibration_path = profile.get("calibration_path")
+    if (not isinstance(calibration_path, str)
+            or not calibration_path.startswith(CALIBRATION_DESTINATION_ROOT + "/")
+            or not _CALIBRATION_BASENAME.fullmatch(posixpath.basename(calibration_path))):
+        _fail("calibrated_profile_path_invalid")
+    digest = profile.get("calibration_digest")
+    if not isinstance(digest, str) or not _DIGEST64.fullmatch(digest):
+        _fail("calibrated_profile_digest_invalid")
+    return {"calibration_path": calibration_path, "calibration_digest": digest}
+
+
+def verify_calibrated_artifact(source: str, sha256: str, size: int) -> tuple:
+    """Verify the artifact file on the Docker host and return its stat identity.
+
+    Single regular file (no symlink anywhere on the path, no hard links),
+    exact declared size checked before the bounded streamed read, full digest
+    over the fd-read bytes, and a before/after fstat identity check. Docker
+    re-resolves the source path itself, so this proves content at read time
+    only; the residual path race is closed by the in-container runtime digest.
+    """
+    source = _resolve_host_path(source)
+    _reject_symlink_ancestors(source, "calibrated_artifact_symlink_ancestor")
+    if os.path.islink(source):
+        # Pre-check for hosts without O_NOFOLLOW; the atomic gate stays the
+        # O_NOFOLLOW open below on hosts that define it.
+        _fail("calibrated_artifact_symlink")
+    fd = None
+    try:
+        fd = os.open(source, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0))
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+            _fail("calibrated_artifact_not_single_regular_file")
+        if before.st_size != size:
+            _fail("calibrated_artifact_size_mismatch")
+        digest = hashlib.sha256()
+        with os.fdopen(fd, "rb") as stream:
+            fd = None
+            total = 0
+            while True:
+                chunk = stream.read(1048576)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > size:
+                    _fail("calibrated_artifact_size_mismatch")
+                digest.update(chunk)
+            after = os.fstat(stream.fileno())
+        if ((before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+                != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)):
+            _fail("calibrated_artifact_changed_during_read")
+        if total != size or digest.hexdigest() != sha256:
+            _fail("calibrated_artifact_digest_mismatch")
+    except ConfigError:
+        raise
+    except OSError:
+        _fail("calibrated_artifact_unreadable")
+    finally:
+        if fd is not None:
+            os.close(fd)
+    return (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+
+
+def derive_calibrated_binding(verified_profile: dict, original_inspect: dict) -> dict:
+    """Derive the one bind from the verified profile; refuse any shadowing.
+
+    The same basename is used on both sides: the pooled artifact source and
+    the container destination named by the profile's calibration_path. No scan,
+    no hash hunt, and never a filename derived from a digest.
+    """
+    destination = verified_profile["calibration_path"]
+    basename = posixpath.basename(destination)
+    source = CALIBRATION_SOURCE_ROOT + "/" + basename
+    _path(source)
+    for path in (source, destination):
+        if any(_inside(path, denied) for denied in _SYSTEM_PATH_DENYLIST):
+            _fail("calibrated_mount_system_path")
+    actual = _actual_mounts(original_inspect)
+    for existing in actual:
+        if _inside(destination, existing) or _inside(existing, destination):
+            _fail("calibrated_mount_shadows_original")
+    return {"source": source, "destination": destination, "basename": basename}
+
+
+def _validated_calibrated_binding(calibrated_binding) -> dict:
+    """Shared builder/parity validation of the derived binding (no drift)."""
+    if (not isinstance(calibrated_binding, dict)
+            or set(calibrated_binding) != {"source", "destination", "basename"}):
+        _fail("invalid_calibrated_binding")
+    source = _path(calibrated_binding["source"])
+    destination = _path(calibrated_binding["destination"])
+    basename = calibrated_binding["basename"]
+    if (not isinstance(basename, str) or not _CALIBRATION_BASENAME.fullmatch(basename)
+            or not source.startswith(CALIBRATION_SOURCE_ROOT + "/")
+            or not source.endswith("/" + basename)
+            or destination != CALIBRATION_DESTINATION_ROOT + "/" + basename):
+        _fail("invalid_calibrated_binding")
+    for path in (source, destination):
+        if any(_inside(path, denied) for denied in _SYSTEM_PATH_DENYLIST):
+            _fail("calibrated_mount_system_path")
+    return {"source": source, "destination": destination, "basename": basename}
+
+
 def build_create_request(original_inspect: dict, candidate_image: str, candidate_name: str,
-                         environment_additions=None) -> dict:
+                         environment_additions=None, calibrated_binding=None) -> dict:
     """Return the private POST /containers/create body; name is a query parameter.
 
     The result contains the original credential and must not be logged, put in
     process argv, or persisted except in an explicitly private journal.
     Config.Env is the original environment plus the plan-declared additions
     (pure additions, exact order, validated by environment_addition_entries).
+    HostConfig.Mounts is the original declaration plus exactly the one derived
+    calibrated-artifact read-only bind (validated by _validated_calibrated_binding);
+    Binds and every other HostConfig member stay exact.
     """
     if not isinstance(candidate_name, str) or not _NAME.fullmatch(candidate_name):
         _fail("invalid_candidate_name")
@@ -400,6 +636,22 @@ def build_create_request(original_inspect: dict, candidate_image: str, candidate
     body["Env"] = _declared_environment(body["Env"], environment_addition_entries(environment_additions))
     body["Image"] = candidate_image
     host_body = deepcopy(host)
+    if calibrated_binding is not None:
+        checked = _validated_calibrated_binding(calibrated_binding)
+        mounts = host_body.get("Mounts")
+        if mounts is None:
+            mounts = []
+        if not isinstance(mounts, list):
+            _fail("invalid_declared_mounts")
+        for bind in host_body.get("Binds") or []:
+            parts = bind.split(":")
+            if len(parts) >= 2 and parts[1] == checked["destination"]:
+                _fail("calibrated_mount_duplicate_destination")
+        if any(isinstance(entry, dict) and entry.get("Target") == checked["destination"]
+               for entry in mounts):
+            _fail("calibrated_mount_duplicate_destination")
+        host_body["Mounts"] = list(mounts) + [{"Type": "bind", "Source": checked["source"],
+                                               "Target": checked["destination"], "ReadOnly": True}]
     if host_body.get("OomKillDisable") is None:
         # Docker Engine 29.6.2 (API 1.55) coerces an explicitly present null
         # OomKillDisable to false at create while an omitted key inspects as
@@ -421,15 +673,19 @@ def build_create_request(original_inspect: dict, candidate_image: str, candidate
 
 
 def assert_candidate_parity(original_inspect: dict, candidate_inspect: dict,
-                            expected_image_id: str, environment_additions=None) -> dict:
+                            expected_image_id: str, environment_additions=None,
+                            calibrated_binding=None) -> dict:
     """Independent raw-inspect check; never calls the request builder.
 
     Mount records are compared directly BEFORE any source-declaration validation.
     Even a broken/mocked builder or declaration checker cannot hide a missing
     top-level Mounts entry. Errors intentionally contain no captured values.
-    Config.Env is the one field (besides Image) that may differ from the
+    Config.Env is the one Config field (besides Image) that may differ from the
     original: the candidate must carry the original environment plus exactly
-    the declared additions and nothing else.
+    the declared additions and nothing else. HostConfig.Mounts plus the
+    top-level Mount records are the second allowed difference, and only for
+    the one declared calibrated-artifact read-only bind; the daemon-recorded
+    spelling of that addition is accepted only within the fixed bounded set.
     """
     _object(original_inspect, "invalid_original_inspect")
     _object(candidate_inspect, "invalid_candidate_inspect")
@@ -440,10 +696,21 @@ def assert_candidate_parity(original_inspect: dict, candidate_inspect: dict,
     # This raw comparison is separate from build_create_request/_declared_mounts.
     left_raw = _actual_mounts(original_inspect)
     right_raw = _actual_mounts(candidate_inspect)
-    if set(left_raw) != set(right_raw):
+    expected_extra = {}
+    if calibrated_binding is not None:
+        checked = _validated_calibrated_binding(calibrated_binding)
+        expected_extra = {checked["destination"]: checked["source"]}
+    if (set(left_raw) | set(expected_extra)) != set(right_raw):
         _fail("actual_mount_destinations_differ")
     for destination in left_raw:
         if left_raw[destination] != right_raw[destination]:
+            _fail("actual_mount_record_differs")
+    for destination, expected_source in expected_extra.items():
+        record = right_raw[destination]
+        if (record["Type"] != "bind" or record["Source"] != expected_source
+                or record["RW"] is not False
+                or record.get("Mode", "") not in _CALIBRATION_MOUNT_MODES
+                or record.get("Propagation", "") not in _CALIBRATION_MOUNT_PROPAGATION):
             _fail("actual_mount_record_differs")
     left_config, left_host, left_networks = _validate_structure(original_inspect)
     right_config, right_host, right_networks = _validate_structure(candidate_inspect)
@@ -456,7 +723,13 @@ def assert_candidate_parity(original_inspect: dict, candidate_inspect: dict,
             _fail("Config." + field + "_differs")
         if field == "Env" and declared_env != right_config["Env"]:
             _fail("Config.Env_differs")
-    if left_host != right_host:
+    expected_host = deepcopy(left_host)
+    if calibrated_binding is not None:
+        checked = _validated_calibrated_binding(calibrated_binding)
+        expected_host["Mounts"] = list(expected_host.get("Mounts") or []) + [
+            {"Type": "bind", "Source": checked["source"], "Target": checked["destination"],
+             "ReadOnly": True}]
+    if expected_host != right_host:
         # Docker Engine 29.6.2 (API 1.55) coerces an explicitly present null
         # OomKillDisable to false at create while an omitted key inspects as
         # null, so null, false and absent are one effective setting (the OOM
@@ -464,10 +737,10 @@ def assert_candidate_parity(original_inspect: dict, candidate_inspect: dict,
         # direction on that daemon. This field alone tolerates that spelling
         # difference; true must still match true, every other field keeps the
         # exact comparison, and no null is blanket-normalized.
-        if not (left_host.get("OomKillDisable") in (None, False)
+        if not (expected_host.get("OomKillDisable") in (None, False)
                 and right_host.get("OomKillDisable") in (None, False)):
             _fail("HostConfig_differs")
-        if {key: value for key, value in left_host.items() if key != "OomKillDisable"} != \
+        if {key: value for key, value in expected_host.items() if key != "OomKillDisable"} != \
            {key: value for key, value in right_host.items() if key != "OomKillDisable"}:
             _fail("HostConfig_differs")
     for field in ("Path", "Args"):
@@ -529,6 +802,7 @@ def assert_candidate_parity(original_inspect: dict, candidate_inspect: dict,
         "environment_exact": True, "host_config_exact": True,
         "declared_environment_additions": [entry.split("=", 1)[0] for entry in
                                           environment_addition_entries(environment_additions)],
+        "declared_mount_additions": sorted(expected_extra),
         "actual_mounts_exact": True, "actual_mount_count": len(left_raw),
         "network_options_exact": True, "network_count": len(left_networks),
     }

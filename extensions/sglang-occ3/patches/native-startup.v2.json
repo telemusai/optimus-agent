@@ -1,0 +1,42 @@
+{
+  "schema": "optimus.sglang-occ3.source-patch.v1",
+  "source_revision": "e00930c5489053f26d86b179cee0d087f846acbb",
+  "source_version": "0.5.21",
+  "patch_set": "native-startup-v2",
+  "files": [
+    {
+      "path": "entrypoints/http_server.py",
+      "before_sha256": "1fbb46671e86d0ebf23046efa09e8e03d251754e681ba03b818dbb7a75c79c55",
+      "after_sha256": "07838ebd49c9bbfa09369ffc55f001a089699769b0b6df22b96e7ba05863f57c",
+      "replacements": [
+        {
+          "before": "                tokenizer_manager.set_server_stop_hook(\n                    lambda: setattr(server, \"should_exit\", True)\n                )\n                server.run()\n",
+          "after": "                tokenizer_manager.set_server_stop_hook(\n                    lambda: setattr(server, \"should_exit\", True)\n                )\n                # Build-selected OCC3 experimental bootstrap; absent/false is inert.\n                from occ3_sglang.native_install import prepare_selected_native_server\n\n                prepare_selected_native_server(server, app, tokenizer_manager)\n                server.run()\n"
+        },
+        {
+          "before": "            await server.serve()\n\n        uvloop.run(serve())",
+          "after": "            await server.serve()\n\n        # Build-selected OCC3 experimental bootstrap (embedded Granian,\n        # single-tokenizer); absent/false selection is inert.\n        from occ3_sglang.native_install import prepare_selected_native_granian_server\n\n        prepare_selected_native_granian_server(server, app, tokenizer_manager)\n        uvloop.run(serve())"
+        }
+      ]
+    },
+    {
+      "path": "function_call/glm47_moe_detector.py",
+      "before_sha256": "61a62420d07e3986ae36d0f6fa44b9232f4c331ebd8fc3b32ba0889523bdfb0e",
+      "after_sha256": "e09a129d5872c532ccdc085585cfd8fac336c73d13d09fa8c2304a79500be271",
+      "replacements": [
+        {
+          "before": "import json\nimport logging\nimport re\nfrom enum import Enum",
+          "after": "import contextvars\nimport json\nimport logging\nimport re\nfrom enum import Enum"
+        },
+        {
+          "before": "logger = logging.getLogger(__name__)\n",
+          "after": "logger = logging.getLogger(__name__)\n\n# OCC3 terminal-transport strict-stream flag (native-startup-v1 overlay).\n# Default False keeps ordinary serving byte-identical. The terminal adapter\n# sets it around each original-generator step for opted requests only, so a\n# repeated-prefix parser failure fails closed instead of re-emitting the\n# retained buffer.\n_OCC3_STRICT_STREAM = contextvars.ContextVar(\"occ3_strict_stream_parse\", default=False)\n"
+        },
+        {
+          "before": "        except Exception as e:\n            logger.error(f\"Error in parse_streaming_increment: {e}\", exc_info=True)\n            return StreamingParseResult(normal_text=current_text)\n",
+          "after": "        except Exception as e:\n            if _OCC3_STRICT_STREAM.get():\n                raise\n            logger.error(f\"Error in parse_streaming_increment: {e}\", exc_info=True)\n            return StreamingParseResult(normal_text=current_text)\n"
+        }
+      ]
+    }
+  ]
+}

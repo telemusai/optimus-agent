@@ -43,6 +43,17 @@ struct NativeUi {
     started: bool,
 }
 
+/// Queue terminal input for the agents view. Input listeners run before the
+/// TUI key-release filter, so drop Kitty key-release events here. Otherwise
+/// one arrow key press moves the selection two rows.
+fn queue_agents_view_input(queue: &RefCell<Vec<String>>, data: &str) {
+    if pi_tui::keys::is_key_release(data) {
+        return;
+    }
+
+    queue.borrow_mut().push(data.to_string());
+}
+
 impl NativeUi {
     fn new(settings: &SettingsManager) -> Self {
         let tui = Rc::new(RefCell::new(TUI::new(
@@ -71,7 +82,7 @@ impl NativeUi {
         let input = Rc::new(RefCell::new(Vec::new()));
         let queued = input.clone();
         tui.borrow_mut().add_input_listener(Box::new(move |data| {
-            queued.borrow_mut().push(data.to_string());
+            queue_agents_view_input(&queued, data);
             InputListenerResult {
                 consume: true,
                 data: None,
@@ -741,6 +752,16 @@ mod tests {
         assert_eq!(editor.take_submissions(), vec!["hell!o"]);
         assert!(editor.take_submissions().is_empty());
         assert!(editor.get_text().is_empty());
+    }
+
+    #[test]
+    fn input_queue_drops_kitty_key_release_events() {
+        let queue = RefCell::new(Vec::new());
+        queue_agents_view_input(&queue, "\x1b[1;1B");
+        queue_agents_view_input(&queue, "\x1b[1;1:3B");
+        queue_agents_view_input(&queue, "\x1b[1;1:2B");
+        queue_agents_view_input(&queue, "\x1b[B");
+        assert_eq!(*queue.borrow(), vec!["\x1b[1;1B", "\x1b[1;1:2B", "\x1b[B"]);
     }
 
     #[test]

@@ -1,0 +1,3 @@
+- Added a per-handoff OCC-3 label anchor selected from an attested allowed/default policy, with live environment/file controls and receipt metadata.
+- Changed alignment diagnostics to compare pre-label, post-label and final rows with the selected coefficient.
+- Fixed unseen-token alignment drift with an opt-in embedding blend while preserving omitted/default-zero behavior.

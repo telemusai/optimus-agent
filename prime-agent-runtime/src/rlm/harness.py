@@ -1,9 +1,9 @@
-"""Persistent harness-state helpers for Prime Agent's RLM kernel.
+"""Persistent harness-state helpers for Optimus's RLM kernel.
 
 The state model is intentionally small: it records prompt notes, memory,
 skills, subagent specs, and refinement events in the session-local harness
 store by default; pass ``global_=True`` for the cross-session global store.
-Execution still belongs to Prime Agent's TypeScript host and the existing
+Execution still belongs to Optimus's native host and the existing
 ``rlm.run`` recursion bridge.
 """
 

@@ -1,7 +1,7 @@
-"""Prime Agent session-to-session messaging skill.
+"""Optimus session-to-session messaging skill.
 
-All routing and sender identity live in the TypeScript daemon. These functions
-only call the host bridge exposed inside the Prime Agent kernel.
+All routing and sender identity live in the native daemon. These functions
+only call the host bridge exposed inside the Optimus kernel.
 """
 
 from __future__ import annotations

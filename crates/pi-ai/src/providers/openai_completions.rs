@@ -1393,18 +1393,20 @@ const OCC3_CAUSE_HTTP_NON_SUCCESS: &str = "http_non_success";
 const OCC3_CAUSE_RECEIPT_INVALID: &str = "receipt_invalid";
 const OCC3_CAUSE_SSE_IDLE: &str = "sse_idle";
 const OCC3_CAUSE_INCOMPLETE_STREAM: &str = "incomplete_stream";
-/// Environment opt-in for the keepalive stream extension on armed turns. The
-/// buffered armed-turn contract stays the default: fully buffered server-side,
-/// receipt in the response headers. Setting this makes the client offer
-/// `x-optimus-occ3-keepalive: keepalive-v1` on guarded requests so a server
-/// that accepts can emit SSE comment keepalives while the inner stream drains,
-/// defeating intermediary idle timeouts on the public origin.
+/// Offer keepalive streaming by default on armed turns. Servers that do not
+/// accept the offer retain the buffered, header-receipt contract. Set
+/// `OCC3_KEEPALIVE_STREAM=0` (or `false`/`off`) to disable the offer.
 const ENV_OCC3_KEEPALIVE_STREAM: &str = "OCC3_KEEPALIVE_STREAM";
 
 fn occ3_keepalive_stream_enabled() -> bool {
-	match std::env::var(ENV_OCC3_KEEPALIVE_STREAM) {
-		Ok(value) => matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "on"),
-		Err(_) => false,
+	occ3_keepalive_stream_setting(std::env::var(ENV_OCC3_KEEPALIVE_STREAM).ok().as_deref())
+}
+
+// Keep parsing independent of process-global environment mutation in tests.
+fn occ3_keepalive_stream_setting(value: Option<&str>) -> bool {
+	match value {
+		Some(value) => matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "on"),
+		None => true,
 	}
 }
 
@@ -1443,7 +1445,164 @@ impl From<SourceCaptureError> for StreamError {
 	}
 }
 
+/// Admission-unavailability refusal codes the OCC-3 receiver adapter returns
+/// as a pre-event 503 (`extensions/sglang-occ3/occ3_sglang/chat_adapter.py`
+/// `_ADMISSION_REFUSALS`): another request is decoding, nothing was
+/// generated and the attachment was not used.
+const OCC3_RECEIVER_BUSY_CODES: [&str; 3] = ["scheduler_busy", "admission_capacity", "occ3_busy_batch"];
+/// Source-capture busy codes: the receiver set plus `admission_timeout`.
+/// An armed source capture is never published before its stream completes,
+/// so any pre-event admission refusal, including the control-plane
+/// `admission_timeout`, proves that nothing was captured. The receiver set
+/// deliberately omits `admission_timeout`: there the attempt fence may
+/// already have been charged, so non-use of the attachment is not proven.
+const OCC3_SOURCE_BUSY_CODES: [&str; 4] = ["scheduler_busy", "admission_capacity", "occ3_busy_batch", "admission_timeout"];
+/// Public error code of the retryable receiver-busy failure.
+const OCC3_RECEIVER_BUSY: &str = "occ3_receiver_busy";
+/// Public error code of the retryable source-capture-busy failure.
+const OCC3_SOURCE_BUSY: &str = "occ3_source_busy";
+/// Upper bound on an honoured `Retry-After` for a busy refusal, in seconds.
+pub const OCC3_BUSY_RETRY_AFTER_MAX_SECS: u64 = 30;
+/// Same-request resends of an armed source capture after a pre-admission
+/// busy 503, before the lease closes as a busy refusal.
+const OCC3_SOURCE_BUSY_RESENDS: u32 = 2;
+/// Resend delay when a busy refusal carries no usable `Retry-After`.
+const OCC3_SOURCE_BUSY_DEFAULT_DELAY_SECS: u64 = 5;
+/// Time a resent source capture may still need after its delay to be
+/// admitted and send its first event. Matches the server's published
+/// worst-case pre-first-event bound (`x-optimus-occ3-admission-window`,
+/// 7 s control + 10 s capture busy wait + 8 s first event). A resend is
+/// attempted only if the delay plus this headroom fits the lease, so it
+/// never expires in flight.
+const OCC3_SOURCE_BUSY_RESEND_HEADROOM_SECS: u64 = 25;
+
+/// Whether a bounded 503 error code is an admission-busy refusal for the
+/// given request shape (`source` = armed source capture, else attached
+/// receiver). One classifier for both paths.
+fn is_occ3_busy_code(code: &str, source: bool) -> bool {
+	if source {
+		OCC3_SOURCE_BUSY_CODES.contains(&code)
+	} else {
+		OCC3_RECEIVER_BUSY_CODES.contains(&code)
+	}
+}
+
+/// Classify only the first data event of an accepted deferred stream. The
+/// fixed error shape and bounded allowlist prove pre-admission non-use;
+/// arbitrary model errors (or errors after any data) never grant replay.
+fn deferred_busy_payload(payload: &str, source: bool) -> Option<Option<u64>> {
+	if payload.len() > OCC3_BUSY_BODY_LIMIT { return None; }
+	let value: Value = serde_json::from_str(payload).ok()?;
+	let object = value.as_object()?;
+	if object.len() != 1 { return None; }
+	let error = object.get("error")?.as_object()?;
+	if error.keys().any(|key| !matches!(key.as_str(), "type" | "code" | "message" | "retryAfterSeconds")) { return None; }
+	if error.get("type")?.as_str()? != "occ3_attachment_error"
+		|| error.get("code")?.as_u64()? != 503
+		|| !is_occ3_busy_code(error.get("message")?.as_str()?, source) {
+		return None;
+	}
+	let retry = error.get("retryAfterSeconds").and_then(Value::as_u64)
+		.filter(|seconds| (1..=OCC3_BUSY_RETRY_AFTER_MAX_SECS).contains(seconds));
+	Some(retry)
+}
+
+/// Parses a busy refusal's `Retry-After` header: one header, plain ASCII
+/// delta-seconds in `1..=OCC3_BUSY_RETRY_AFTER_MAX_SECS`. Anything else
+/// (missing, repeated, HTTP-date, zero, too large, garbage) is ignored.
+pub fn parse_occ3_busy_retry_after(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+	let mut values = headers.get_all(reqwest::header::RETRY_AFTER).iter();
+	let value = values.next()?;
+	if values.next().is_some() {
+		return None;
+	}
+	let text = value.to_str().ok()?.trim();
+	if text.is_empty() || text.len() > 2 || !text.bytes().all(|byte| byte.is_ascii_digit()) {
+		return None;
+	}
+	let seconds: u64 = text.parse().ok()?;
+	(1..=OCC3_BUSY_RETRY_AFTER_MAX_SECS).contains(&seconds).then_some(seconds)
+}
+/// Upper bound on the error body read to classify a 503.
+const OCC3_BUSY_BODY_LIMIT: usize = 4096;
+
+/// Upper bound on reading a refusal body before classifying it.
+const OCC3_BUSY_BODY_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Reads at most [`OCC3_BUSY_BODY_LIMIT`] bytes of an error body and returns
+/// its bounded error code (`error.message`, falling back to `error.code`).
+/// Only a short identifier-shaped token is returned; any other text yields
+/// `None`, so no free-form body text can leave this function.
+///
+/// The read is bounded in time as well ([`OCC3_BUSY_BODY_READ_TIMEOUT`]): a
+/// refusal body that stalls yields `None`, so the caller keeps the existing
+/// uncertain path instead of holding the turn until the lease deadline.
+async fn read_bounded_error_code(response: &mut reqwest::Response) -> Option<String> {
+	let mut body = Vec::new();
+	let read = async {
+		while body.len() < OCC3_BUSY_BODY_LIMIT {
+			match response.chunk().await {
+				Ok(Some(chunk)) => body.extend_from_slice(&chunk),
+				_ => break,
+			}
+		}
+	};
+	tokio::time::timeout(OCC3_BUSY_BODY_READ_TIMEOUT, read).await.ok()?;
+	body.truncate(OCC3_BUSY_BODY_LIMIT);
+	let value: Value = serde_json::from_slice(&body).ok()?;
+	let error = value.get("error")?;
+	let code = error
+		.get("message")
+		.and_then(Value::as_str)
+		.or_else(|| error.get("code").and_then(Value::as_str))?;
+	(code.len() <= 64 && code.bytes().all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_'))
+		.then(|| code.to_string())
+}
+
 fn record_completions_failure(model: &Model, output: &mut AssistantMessage, error: &StreamError) {
+	if error.value.get("code").and_then(Value::as_str) == Some(OCC3_SOURCE_BUSY) {
+		// Retryable overload with proven non-use of the capture. The session
+		// retry policy re-runs the turn (uncaptured); the native session
+		// re-arms a fresh capture on its own busy budget.
+		let retry_after_ms = error
+			.value
+			.get("retryAfterSecs")
+			.and_then(Value::as_u64)
+			.filter(|seconds| (1..=OCC3_BUSY_RETRY_AFTER_MAX_SECS).contains(seconds))
+			.map(|seconds| (seconds * 1000) as f64);
+		let failure = crate::utils::stream_failure::StreamFailureError::new(
+			error.message.clone(),
+			crate::utils::stream_failure::StreamFailureInfo {
+				kind: crate::utils::stream_failure::KIND_OVERLOADED.into(),
+				provider_error_type: Some(OCC3_SOURCE_BUSY.into()),
+				status: Some(503),
+				retry_after_ms,
+				..Default::default()
+			},
+		);
+		record_stream_failure(model, output, &ThrownStreamError::Failure(&failure));
+		return;
+	}
+	if error.value.get("code").and_then(Value::as_str) == Some(OCC3_RECEIVER_BUSY) {
+		// Retryable overload: the session retry policy re-runs the turn
+		// without the (now cancelled) attachment. Deferred errors may carry
+		// bounded retry timing; otherwise the configured backoff applies.
+		let retry_after_ms = error.value.get("retryAfterSecs").and_then(Value::as_u64)
+			.filter(|seconds| (1..=OCC3_BUSY_RETRY_AFTER_MAX_SECS).contains(seconds))
+			.map(|seconds| (seconds * 1000) as f64);
+		let failure = crate::utils::stream_failure::StreamFailureError::new(
+			error.message.clone(),
+			crate::utils::stream_failure::StreamFailureInfo {
+				kind: crate::utils::stream_failure::KIND_OVERLOADED.into(),
+				provider_error_type: Some(OCC3_RECEIVER_BUSY.into()),
+				status: Some(503),
+				retry_after_ms,
+				..Default::default()
+			},
+		);
+		record_stream_failure(model, output, &ThrownStreamError::Failure(&failure));
+		return;
+	}
 	if error.value.get("code").and_then(Value::as_str) == Some("occ3_inference_uncertain") {
 		// The public shape stays exact; only the allowlisted cause and a valid
 		// HTTP status survive the collapse.
@@ -1519,6 +1678,24 @@ fn allowlisted_occ3_cause(cause: &str) -> &'static str {
 }
 
 impl StreamError {
+	/// The receiver was busy (admission unavailability) before any stream
+	/// event. Retryable; the attachment lease is already closed as non-use.
+	fn occ3_receiver_busy() -> Self {
+		let message = "OCC-3 receiver busy before admission; the turn continues without the native attachment.".to_string();
+		Self { value: json!({"name":"Error", "message":message, "code":OCC3_RECEIVER_BUSY}), message }
+	}
+
+	/// The server refused the armed source capture as busy before any stream
+	/// event. Retryable; the capture lease is already closed as non-use.
+	fn occ3_source_busy(retry_after_secs: Option<u64>) -> Self {
+		let message = "OCC-3 source capture refused: the server was busy before admission; nothing was captured and the handoff was not delivered.".to_string();
+		let mut value = json!({"name":"Error", "message":message, "code":OCC3_SOURCE_BUSY});
+		if let Some(seconds) = retry_after_secs {
+			value["retryAfterSecs"] = json!(seconds);
+		}
+		Self { value, message }
+	}
+
 	fn inference_uncertain() -> Self {
 		let message = "Inference state request did not complete; automatic replay is disabled.".to_string();
 		Self { value: json!({"name":"Error", "message":message, "code":"occ3_inference_uncertain"}), message }
@@ -2158,8 +2335,9 @@ fn strip_occ3_keepalive_transport(bytes: &[u8]) -> Result<(Vec<u8>, String), Sou
 async fn buffer_source_sse(
     mut response: reqwest::Response,
     lease: &SourceCaptureLease,
-    submission: &mut SourceSubmission,
+    source_submission: &mut Option<SourceSubmission>,
 ) -> Result<Vec<String>, StreamError> {
+    let submission = source_submission.as_mut().expect("source submission present");
     let mut bytes = Vec::new();
     while let Some(chunk) = response.chunk().await.map_err(|_| SourceCaptureError::InvalidCompletion)? {
         submission.ensure_active()?;
@@ -2179,6 +2357,16 @@ async fn buffer_source_sse(
     // bytes, so the receipt verifies from the envelope and the hash covers
     // only the reconstructed native bytes.
     let inner: Vec<u8> = if submission.is_deferred() {
+        let mut reader = SseLineReader::new();
+        let mut first_payload = None;
+        reader.push(&bytes, |payload| { first_payload = Some(payload); false });
+        if let Some(payload) = first_payload {
+            if let Some(retry_after) = deferred_busy_payload(&payload, true) {
+                source_submission.take().expect("source submission present")
+                    .refuse_before_admission(retry_after);
+                return Err(StreamError::occ3_source_busy(retry_after));
+            }
+        }
         let (stripped, envelope) = strip_occ3_keepalive_transport(&bytes)?;
         let envelope: Value = serde_json::from_str(&envelope)
             .map_err(|_| SourceCaptureError::InvalidCompletion)?;
@@ -2370,6 +2558,7 @@ async fn post_chat_completions(
 		if is_cancelled(signal) { return Err(abort_error()); }
 		Some(lease.submit()?)
 	} else { None };
+	let mut source_template: Option<reqwest::Request> = None;
 	let mut source_submission = if let Some((lease, model)) = source {
 		lease.validate_target(&model.provider, &model.id, &client.base_url)?;
 		if body.get("model").and_then(Value::as_str) != Some(model.id.as_str())
@@ -2390,7 +2579,9 @@ async fn post_chat_completions(
 				reqwest::header::HeaderValue::from_static(OCC3_KEEPALIVE_REQUEST_MODE),
 			);
 		}
-		builder = reqwest::RequestBuilder::from_parts(http_client, request);
+		// The identical request, kept for a busy pre-admission resend.
+		source_template = Some(request.try_clone().ok_or(SourceCaptureError::InvalidPayload)?);
+		builder = reqwest::RequestBuilder::from_parts(http_client.clone(), request);
 		if is_cancelled(signal) { return Err(abort_error()); }
 		Some(lease.submit()?)
 	} else { None };
@@ -2398,41 +2589,153 @@ async fn post_chat_completions(
 	// Only a guarded native request carries the bounded phase; an ordinary call
 	// keeps its exact thrown value and log.
 	let native = inference.is_some() || source.is_some();
-	let request = builder.send();
-	let response = match signal {
-		Some(signal) => {
-			tokio::select! {
-				result = tokio::time::timeout(header_timeout, request) => result,
-				_ = signal.cancelled() => return Err(abort_error()),
+	// Same-request resend of an armed SOURCE capture after a pre-admission
+	// busy refusal (see `SourceSubmission::resend_window_allows`). Only the source path ever
+	// loops; every other request sends exactly once.
+	let mut first_attempt = Some(builder);
+	let mut source_resends: u32 = 0;
+	let mut last_busy_retry_after: Option<u64> = None;
+	let response = loop {
+		let attempt = match first_attempt.take() {
+			Some(builder) => builder,
+			None => {
+				let template = source_template.as_ref().and_then(reqwest::Request::try_clone)
+					.ok_or_else(|| StreamError::from(SourceCaptureError::InvalidPayload))?;
+				reqwest::RequestBuilder::from_parts(http_client.clone(), template)
+			}
+		};
+		let request = attempt.send();
+		let response = match signal {
+			Some(signal) => {
+				tokio::select! {
+					result = tokio::time::timeout(header_timeout, request) => result,
+					_ = signal.cancelled() => return Err(abort_error()),
+				}
+			}
+			None => tokio::time::timeout(header_timeout, request).await,
+		};
+		let response = match response {
+			Ok(Ok(response)) => response,
+			Ok(Err(error)) => {
+				if is_cancelled(signal) {
+					return Err(abort_error());
+				}
+				if error.is_timeout() {
+					return Err(StreamError::new("Request timed out.")
+						.with_occ3_cause_if(native, OCC3_CAUSE_HEADER_TIMEOUT));
+				}
+				// The transport message may embed the request URL, so only the phase survives.
+				return Err(StreamError::new(format!("Connection error: {error}"))
+					.with_occ3_cause_if(native, OCC3_CAUSE_SEND_TRANSPORT_ERROR));
+			}
+			// `APIConnectionTimeoutError`: `Request timed out.`
+			Err(_elapsed) => {
+				if is_cancelled(signal) {
+					return Err(abort_error());
+				}
+				return Err(StreamError::new("Request timed out.").with_occ3_cause_if(native, OCC3_CAUSE_HEADER_TIMEOUT));
+			}
+		};
+		let status = response.status().as_u16();
+		let resend = source_resends > 0;
+		if source_submission.is_none() || !(status == 503 || (resend && status == 409)) {
+			break response;
+		}
+		// Admission unavailability for an armed source capture: the server
+		// refused before generating anything, so nothing was captured.
+		// `admission_timeout` may follow server-side enroll/reserve/prepare
+		// for this capture_id, but no publication can follow a refused
+		// capture, so non-use holds. Up to OCC3_SOURCE_BUSY_RESENDS times the
+		// IDENTICAL request is resent after Retry-After (the server releases
+		// its replay fence only for this pre-dispatch busy refusal); the
+		// lease stays Submitted meanwhile. After the last refusal the lease
+		// closes as proven non-use with a busy record and the sender re-arms
+		// a FRESH capture on its own busy budget. Unknown codes keep the
+		// uncertain contract.
+		// Accepted deferred streams classify a first-data busy refusal in
+		// buffer_source_sse instead. That closes as proven non-use and lets
+		// the sender re-arm a fresh capture, without replaying this stream.
+		let retry_after = parse_occ3_busy_retry_after(response.headers());
+		let mut response = response;
+		let code = read_bounded_error_code(&mut response).await;
+		let code = code.as_deref();
+		let busy = status == 503 && code.is_some_and(|code| is_occ3_busy_code(code, true));
+		// A 409 replay_forbidden on a resend means the server kept the fence
+		// (no fence release). The FIRST refusal was already proven pre-use,
+		// so this closes exactly like that busy refusal, never as uncertain.
+		let fence_kept = resend && status == 409 && code == Some("replay_forbidden");
+		if !busy && !fence_kept {
+			return Err(StreamError::inference_uncertain().with_occ3_status(OCC3_CAUSE_HTTP_NON_SUCCESS, Some(status)));
+		}
+		let retry_after = if busy { retry_after } else { retry_after.or(last_busy_retry_after) };
+		if busy && source_resends < OCC3_SOURCE_BUSY_RESENDS {
+			let delay = std::time::Duration::from_secs(retry_after.unwrap_or(OCC3_SOURCE_BUSY_DEFAULT_DELAY_SECS));
+			let headroom = std::time::Duration::from_secs(OCC3_SOURCE_BUSY_RESEND_HEADROOM_SECS);
+			let allowed = source_submission
+				.as_ref()
+				.is_some_and(|submission| submission.resend_window_allows(delay, headroom));
+			if allowed {
+				last_busy_retry_after = retry_after;
+				source_resends += 1;
+				drop(response);
+				// The sleep honours cancellation. Nothing is in flight during
+				// the sleep and the last refusal was a proven pre-use busy
+				// refusal, so a cancel here closes the lease as that busy
+				// refusal (Cancelled with a busy record), never Uncertain.
+				// The outer stream guard may also drop this body mid-sleep on
+				// the signal or the deadline; the resend-wait mark makes that
+				// drop close the same way. An explicit `lease.cancel()` revokes
+				// authority first and keeps its own conservative Uncertain.
+				if let Some(submission) = source_submission.as_mut() {
+					submission.set_resend_wait(Some(retry_after));
+				}
+				let cancelled = match signal {
+					Some(signal) => tokio::select! {
+						_ = tokio::time::sleep(delay) => false,
+						_ = signal.cancelled() => true,
+					},
+					None => {
+						tokio::time::sleep(delay).await;
+						false
+					}
+				};
+				if cancelled || is_cancelled(signal) {
+					if let Some(source_submission) = source_submission.take() {
+						source_submission.refuse_before_admission(retry_after);
+					}
+					return Err(abort_error());
+				}
+				if let Some(submission) = source_submission.as_mut() {
+					submission.set_resend_wait(None);
+				}
+				continue;
 			}
 		}
-		None => tokio::time::timeout(header_timeout, request).await,
-	};
-	let response = match response {
-		Ok(Ok(response)) => response,
-		Ok(Err(error)) => {
-			if is_cancelled(signal) {
-				return Err(abort_error());
-			}
-			if error.is_timeout() {
-				return Err(StreamError::new("Request timed out.")
-					.with_occ3_cause_if(native, OCC3_CAUSE_HEADER_TIMEOUT));
-			}
-			// The transport message may embed the request URL, so only the phase survives.
-			return Err(StreamError::new(format!("Connection error: {error}"))
-				.with_occ3_cause_if(native, OCC3_CAUSE_SEND_TRANSPORT_ERROR));
+		if let Some(source_submission) = source_submission.take() {
+			source_submission.refuse_before_admission(retry_after);
 		}
-		// `APIConnectionTimeoutError`: `Request timed out.`
-		Err(_elapsed) => {
-			if is_cancelled(signal) {
-				return Err(abort_error());
-			}
-			return Err(StreamError::new("Request timed out.").with_occ3_cause_if(native, OCC3_CAUSE_HEADER_TIMEOUT));
-		}
+		return Err(StreamError::occ3_source_busy(retry_after));
 	};
 
 	observe_local_phase(observer, "generation_headers_complete");
 	let status = response.status().as_u16();
+	if submission.is_some() && status == 503 {
+		// Admission unavailability (another request is decoding): the
+		// server refused before generating anything, so the attachment was
+		// never used. Close the lease as proven non-use and surface a
+		// distinct retryable error; the retry is an ordinary turn without
+		// the attachment, never a resend of this request.
+		let mut response = response;
+		if let Some(code) = read_bounded_error_code(&mut response).await {
+			if is_occ3_busy_code(&code, false) {
+				if let Some(submission) = submission.take() {
+					submission.refuse_before_admission();
+				}
+				return Err(StreamError::occ3_receiver_busy());
+			}
+		}
+		return Err(StreamError::inference_uncertain().with_occ3_status(OCC3_CAUSE_HTTP_NON_SUCCESS, Some(status)));
+	}
 	if let Some(submission) = submission.as_mut() {
 		if !response.status().is_success() {
 			return Err(StreamError::inference_uncertain().with_occ3_status(OCC3_CAUSE_HTTP_NON_SUCCESS, Some(status)));
@@ -3277,8 +3580,8 @@ async fn run_stream_body(
 	let status = response.status().as_u16();
 	let headers = response.headers().clone();
 	let mut ordinary_response = Some(response);
-	let source_payloads = if let (Some(lease), Some(submission)) = (source, source_submission.as_mut()) {
-		Some(buffer_source_sse(ordinary_response.take().expect("response present"), lease, submission).await?)
+	let source_payloads = if let Some(lease) = source.filter(|_| source_submission.is_some()) {
+		Some(buffer_source_sse(ordinary_response.take().expect("response present"), lease, &mut source_submission).await?)
 	} else { None };
 	if let Some(on_response) = options_ref.and_then(|options| options.stream.on_response.clone()) {
 		let mut response_record = crate::types::ProviderResponse {
@@ -3324,6 +3627,7 @@ async fn run_stream_body(
 	// Set once the deferred terminal receipt event has been verified. A stream
 	// that ends (or errors) before it never reaches `complete()`.
 	let mut deferred_receipt_seen = false;
+	let mut first_data = true;
 	while let Some(payload) = receiver.recv().await {
 		if let Some(submission) = submission.as_ref() { submission.ensure_active()?; }
 		let (payload, parsed) = match payload? {
@@ -3345,6 +3649,15 @@ async fn run_stream_body(
 				break;
 			}
 		};
+		if first_data && submission.as_ref().is_some_and(|submission| submission.is_deferred()) {
+			if let Some(retry_after) = deferred_busy_payload(&payload, false) {
+				submission.take().expect("receiver submission present").refuse_before_admission();
+				let mut error = StreamError::occ3_receiver_busy();
+				if let Some(seconds) = retry_after { error.value["retryAfterSecs"] = json!(seconds); }
+				return Err(error);
+			}
+		}
+		first_data = false;
 		if let Some(submission) = submission.as_mut() {
 			if submission.is_deferred() {
 				if let Some(envelope) = parse_occ3_terminal_envelope(&payload, parsed.as_ref())
@@ -6348,6 +6661,38 @@ mod message_tests {
 	// ------------------------------------------------------------------
 	// OCC3 keepalive stream extension: deferred-receipt transport framing
 	// ------------------------------------------------------------------
+
+	#[test]
+	fn deferred_busy_requires_bounded_typed_admission_error() {
+		let valid = json!({"error":{"type":"occ3_attachment_error","code":503,"message":"scheduler_busy","retryAfterSeconds":5}});
+		assert_eq!(deferred_busy_payload(&valid.to_string(), false), Some(Some(5)));
+		for (key, value) in [("type", json!("other")), ("code", json!(504)), ("code", json!("503")), ("message", json!("native_completion_failed"))] {
+			let mut invalid = valid.clone();
+			invalid["error"][key] = value;
+			assert_eq!(deferred_busy_payload(&invalid.to_string(), true), None);
+		}
+		for seconds in [json!(0), json!(31), json!(-1), json!("5")] {
+			let mut advisory = valid.clone();
+			advisory["error"]["retryAfterSeconds"] = seconds;
+			assert_eq!(deferred_busy_payload(&advisory.to_string(), true), Some(None));
+		}
+		let mut timeout = valid.clone();
+		timeout["error"]["message"] = json!("admission_timeout");
+		assert_eq!(deferred_busy_payload(&timeout.to_string(), false), None);
+		assert_eq!(deferred_busy_payload(&timeout.to_string(), true), Some(Some(5)));
+		assert_eq!(deferred_busy_payload(&"x".repeat(OCC3_BUSY_BODY_LIMIT + 1), true), None);
+	}
+
+	#[test]
+	fn keepalive_stream_defaults_enabled_and_honors_overrides() {
+		assert!(occ3_keepalive_stream_setting(None));
+		for value in ["1", "true", "on", " TRUE ", "On"] {
+			assert!(occ3_keepalive_stream_setting(Some(value)), "{value:?}");
+		}
+		for value in ["0", "false", "off", " FALSE ", "Off", "", "invalid"] {
+			assert!(!occ3_keepalive_stream_setting(Some(value)), "{value:?}");
+		}
+	}
 
 	#[test]
 	fn keepalive_transport_strips_to_the_exact_native_bytes() {

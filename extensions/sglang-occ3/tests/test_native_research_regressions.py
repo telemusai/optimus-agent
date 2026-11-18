@@ -216,7 +216,7 @@ def test_decode_does_not_reinject_prefill_embeddings(mode_name):
                  gather=lambda value: [value] * 8,
                  torch=NS(cuda=NS(current_stream=lambda device: stream)))
     runtime.preflight = types.MethodType(worker.WorkerRuntime.preflight, runtime)
-    scheduled = NS(reqs=[NS(occ3_worker_descriptor=descriptor, output_ids=[1])],
+    scheduled = NS(reqs=[NS(occ3_worker_descriptor=descriptor, occ3_force_eager=True, output_ids=[1])],
                    forward_mode=mode.DECODE, extend_lens=[8], prefix_lens=[0])
     layer_module = types.ModuleType("sglang.srt.layers.layer_boundary")
     layer_module.get_attn_tp_context = lambda: NS(input_scattered=False)

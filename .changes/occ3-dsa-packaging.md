@@ -1,0 +1,1 @@
+- The OCC-3 native image build now applies and attests all five reviewed SGLang source manifests (adding `dsa-mtp-seed.v1.json` and `dsa-pin.v1.json`). The source baseline now covers the five DSA files at their pinned e00930c5 hashes, and `native_package.prepare` accepts any bounded set of disjoint manifests instead of exactly three.

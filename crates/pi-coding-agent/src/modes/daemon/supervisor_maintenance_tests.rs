@@ -297,7 +297,7 @@ async fn stale_owned_resume_rechecks_owner_after_catalog_recovery() {
     WorkerRecoveryJournal::new(&journal).record(WorkerRecoveryRecordInput {
         active_session_id: "owned".into(), session_id: "owned-chat".into(),
         session_file: Some(file), busy: true, operation: "tool_call".into(),
-    });
+    }).unwrap();
     let script = fixture.root.join("held-catalog.py");
     let entered = fixture.root.join("entered");
     let release = fixture.root.join("release");
@@ -352,7 +352,7 @@ async fn nine_supervisor_uncertain_work_is_marked_interrupted_not_replayed() {
     let (file, _) = session(&fixture, &worker, "saved");
     let receipts = catalog_recorder(&fixture).await;
     let path = worker.descriptor.lock().unwrap().recovery_journal_path.clone();
-    WorkerRecoveryJournal::new(&path).record(WorkerRecoveryRecordInput { active_session_id: "dead".into(), session_id: "saved".into(), session_file: Some(file.clone()), busy: true, operation: "tool_call".into() });
+    WorkerRecoveryJournal::new(&path).record(WorkerRecoveryRecordInput { active_session_id: "dead".into(), session_id: "saved".into(), session_file: Some(file.clone()), busy: true, operation: "tool_call".into() }).unwrap();
     fixture.supervisor.recover_uncertain_worker_operations(&worker).await.unwrap();
     let calls: Vec<Value> = std::fs::read_to_string(receipts).unwrap().lines().map(|line| serde_json::from_str(line).unwrap()).collect();
     assert_eq!(calls.len(), 1);

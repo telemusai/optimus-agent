@@ -1,0 +1,22 @@
+{
+  "task": "arc_easy",
+  "condition": "text_mas_sequential",
+  "n": 300,
+  "correct": 290,
+  "accuracy": 0.9666666666666667,
+  "ci_lo": 0.9397375485424309,
+  "ci_hi": 0.9817952501263492,
+  "mcnemar_b": 6,
+  "mcnemar_c": 11,
+  "mcnemar_p": 0.332305908203125,
+  "wall_s": 851.2,
+  "mean_latency_s": 31.316,
+  "median_latency_s": 30.782,
+  "p95_latency_s": 42.049,
+  "prompt_per_item": 4100.59,
+  "completion_per_item": 3833.786666666667,
+  "reasoning_per_item": 1839.2566666666667,
+  "truncation_rate": 0.02,
+  "invalid_answer_rate": 0.016666666666666666,
+  "tasks_per_s": 0.3525
+}

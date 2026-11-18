@@ -6186,6 +6186,7 @@ mod kernel_execution_provenance_tests {
                         delivered_at: None,
                         queued_at: None,
                         delivery_mode: None,
+                        delivered_to_hydrated: None,
                     })
                 })
             }

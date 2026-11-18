@@ -537,6 +537,13 @@ mod tests {
                 timestamp: 2,
             }),
             AgentMessage::Custom(CustomAgentMessage::Custom {
+                custom_type: crate::core::occ::queue::QUEUE_NOTICE_CUSTOM_TYPE.to_string(),
+                content: CustomMessageContent::Text("pending source_busy_retry".to_string()),
+                display: true,
+                details: None,
+                timestamp: 2,
+            }),
+            AgentMessage::Custom(CustomAgentMessage::Custom {
                 custom_type: "other".to_string(),
                 content: CustomMessageContent::Text("keep".to_string()),
                 display: true,
@@ -1385,6 +1392,9 @@ fn convert_single_message(message: &AgentMessage) -> ConvertedItem {
                     || custom_type == SESSION_SLASH_COMMAND_RESULT_CUSTOM_TYPE
                     || custom_type == COMPACTION_OUTCOME_CUSTOM_TYPE
                     || custom_type == REFINEMENT_OUTCOME_CUSTOM_TYPE
+                    // Queue audit/roster history is never model instruction.
+                    // It can arrive while a tool result is still being emitted.
+                    || custom_type == crate::core::occ::queue::QUEUE_NOTICE_CUSTOM_TYPE
                 {
                     ConvertedItem::None
                 } else {

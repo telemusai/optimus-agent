@@ -93,7 +93,7 @@ except Exception as _prime_agent_rlm_error:
         def _raise_missing(self):
             raise RuntimeError(
                 "prime-agent-runtime is not installed in this kernel. "
-                "Remove ~/.prime/agent/kernel-venv so prime-agent can rebuild it, or set "
+                "Remove ~/.prime/agent/kernel-venv so Optimus can rebuild it, or set "
                 "PRIME_AGENT_KERNEL_PYTHON to a kernel environment with prime-agent-runtime installed. "
                 f"Import error: {_PRIME_AGENT_RLM_IMPORT_ERROR}"
             )
@@ -216,7 +216,7 @@ pub const IPYTHON_SCHEMA: &str = r#"{
 pub const BUSY_KERNEL_WAIT_CHOICE: &str = "Wait and preserve state";
 pub const BUSY_KERNEL_KILL_CHOICE: &str = "Kill kernel and restart";
 pub const BUSY_KERNEL_PROMPT: &str = "Python kernel is still busy\n\
-Prime requested an interrupt for the previous Python operation, but the kernel has not yet confirmed completion.\n\
+Optimus requested an interrupt for the previous Python operation, but the kernel has not yet confirmed completion.\n\
 Wait to preserve state, or explicitly kill and restart the kernel. Killing loses in-memory variables, imports, and running tasks.";
 pub const KERNEL_RESTART_NOTICE: &str = "<ipython_kernel_reset>\n\
 The Python kernel was restarted after a previous interrupted cell kept running. Variables, imports, async tasks, and open resources from before the restart are no longer available; recreate them before using them.\n\

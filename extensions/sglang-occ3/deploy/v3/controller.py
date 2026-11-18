@@ -29,9 +29,10 @@ import time
 
 from .docker_api import DockerAPI
 from .lifecycle import (Deadline, Failure, FileLock, Journal, Services,
-                        check_supervisor, checked_inspect, exit_aware, is_running,
-                        prepare, private_json, read_json, recover, refresh_ingress, require_running,
-                        verify_receipt, wait_ready, ExperimentDeadline, MaintenanceWindowClosed,
+                        calibrated_binding_from_state, check_supervisor, checked_inspect,
+                        exit_aware, is_running, prepare, private_json, read_json, recover,
+                        refresh_ingress, require_running, verify_calibrated_source, verify_receipt,
+                        wait_ready, ExperimentDeadline, MaintenanceWindowClosed,
                         PERSIST_CANDIDATE_ON_SUCCESS, PERSISTED_CANDIDATE, PERSISTED_PHASE,
                         PERSISTENCE_GATE, READINESS_GATE, RESEARCH_STAGE_DEADLINES,
                         EXPERIMENT_SERVICE_HEALTH, classify_experiment_signal, record_experiment_signal,
@@ -73,6 +74,19 @@ class Controller:
         evidence = (self.journal.read().get("gates") or {}).get(READINESS_GATE)
         return isinstance(evidence, dict) and evidence.get("ok") is True
 
+    def full_proof_chain_verified(self):
+        """The complete native validation chain, exactly as supervisor.complete() requires.
+
+        Retention may not rest on readiness alone: every required gate of the
+        authoritative supervisor contract must be present and ok, so a missing,
+        failed or still-pending native proof link is a restoration, never a
+        persistence.
+        """
+        from .supervisor import REQUIRED_GATES
+        gates = self.journal.read().get("gates") or {}
+        return REQUIRED_GATES <= gates.keys() and all(
+            isinstance(gates[name], dict) and gates[name].get("ok") is True for name in REQUIRED_GATES)
+
     def guard(self):
         self.external_guard()
         now = time.monotonic()
@@ -87,10 +101,16 @@ class Controller:
         })
 
     def persist_applies(self, error):
-        """Only a research deadline or a closed window can persist a healthy candidate."""
+        """Only a research deadline or a closed window can persist a healthy candidate.
+
+        Fail-safe retention: the deadline or window expiry must arrive after the
+        complete native proof chain, not merely after readiness. An incomplete
+        chain (a missing, failed or still-pending proof link) is a restoration.
+        """
         return (isinstance(error, (ExperimentDeadline, MaintenanceWindowClosed)) and
                 self.persist_mode() and self.readiness_verified() and
-                self.journal.read().get("candidate_started") is True)
+                self.journal.read().get("candidate_started") is True and
+                self.full_proof_chain_verified())
 
     def persist_candidate(self, reason):
         """Declare persistence only after every readiness gate passes again.
@@ -98,12 +118,16 @@ class Controller:
         Health, ordinary inference, authentication, native OCC-3 readiness with
         TP8 ranks/runtime identity, tools and the source/receiver routes all
         repeat here, so an unhealthy candidate is never declared persistent.
+        Retention additionally requires the complete native proof chain, so a
+        failed declaration falls through to restoration, never to retention.
         """
         state = self.journal.read()
         if state["plan"].get("persistence_policy") != PERSIST_CANDIDATE_ON_SUCCESS:
             raise Failure("candidate persistence requires the persist policy")
         if not self.readiness_verified():
             raise Failure("candidate persistence requires the initial readiness gate")
+        if not self.full_proof_chain_verified():
+            raise Failure("candidate persistence requires the complete native proof chain")
         previous = (self.end, self.window_end, self.verifying_persistence)
         self.verifying_persistence = True
         self.end = time.monotonic() + (self.plan["startup_timeout_s"] + self.plan["request_timeout_s"] +
@@ -292,7 +316,11 @@ class Controller:
         if candidate.get("State", {}).get("Status") != "created" or is_running(candidate):
             raise Failure("exact preflight candidate is no longer unstarted")
         assert_candidate_parity(self.original, candidate, self.state["candidate_image_id"],
-                                self.state["plan"].get("environment_additions"))
+                                self.state["plan"].get("environment_additions"),
+                                calibrated_binding_from_state(self.state))
+        # Full profile-pin and artifact re-verification on the Docker host,
+        # before the first production mutation touches the original.
+        verify_calibrated_source(self.state)
         self.rehearsal_pause("before_mutation")
         self.mutate("rename_original", lambda: self.api.rename(self.state["original_id"], self.state["preserved_name"]),
                     mutation_intent=True, phase="MUTATING")
@@ -372,6 +400,7 @@ def main(argv=None):
     parser.add_argument("--approval")
     parser.add_argument("--fixture-base-image")
     parser.add_argument("--output-dir")
+    parser.add_argument("--calibrated-input")
     args = parser.parse_args(argv)
     def interrupted(*_):
         raise SystemExit(1)
@@ -379,10 +408,13 @@ def main(argv=None):
     signal.signal(signal.SIGINT, interrupted)
     try:
         if args.command == "rehearsal":
-            from .rehearsal import run_rehearsals
+            from .rehearsal import load_calibrated_input, run_rehearsals
             if not args.fixture_base_image or not args.output_dir:
                 parser.error("rehearsal requires --fixture-base-image and new --output-dir")
-            result = run_rehearsals(DockerAPI(), args.fixture_base_image, args.output_dir)
+            calibrated = (load_calibrated_input(args.calibrated_input)
+                          if args.calibrated_input is not None else None)
+            result = run_rehearsals(DockerAPI(), args.fixture_base_image, args.output_dir,
+                                    calibrated_input=calibrated)
             print(json.dumps(result))
             return 0 if result.get("result") == "PASS" else 1
         if not args.attempt_dir:

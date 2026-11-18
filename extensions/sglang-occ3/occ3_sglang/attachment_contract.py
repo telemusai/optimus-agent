@@ -48,10 +48,23 @@ class AttachmentError(ValueError):
             "deadline_exceeded", "buffer_limit", "quota_exceeded", "replay_forbidden",
             "invalid_evidence", "native_completion_failed", "client_disconnected",
             "attachment_failed", "capture_transport_unnegotiated", "cleanup_pending",
+            "scheduler_busy", "admission_timeout", "admission_capacity",
+            "client_cancelled",
         }
         self.code = code if code in allowed else "attachment_failed"
         self.status = status if status in (400, 401, 409, 413, 429, 499, 503, 504) else 409
         super().__init__(self.code)
+
+
+class ActiveSlotBusy(AttachmentError):
+    """scheduler_busy 503 for the registry active-slot decline only.
+
+    Raised before any registry mutation; unlike capacity quota it clears once
+    another OCC-3 turn releases its slot, so the frontend may wait for it.
+    """
+
+    def __init__(self):
+        super().__init__("scheduler_busy", 503)
 
 
 def identifier(value: Any) -> str:
@@ -178,11 +191,17 @@ class CaptureIntent:
     #: Retained-capture mode. Empty means the legacy same-turn tool protocol;
     #: only a v3 wire may carry it, and then only as the content-only mode.
     capture_mode: str = ""
+    #: None selects the profile default; explicit zero disables anchoring.
+    label_anchor_alpha: float | None = None
 
     def __post_init__(self):
         for name in ("capture_id", "source_session_id", "source_request_id", "turn_nonce",
                      "model_fingerprint", "runtime_id", "method"):
             identifier(getattr(self, name))
+        if self.label_anchor_alpha is not None:
+            if (type(self.label_anchor_alpha) not in (int, float)
+                    or self.label_anchor_alpha not in (0.0, 0.3, 0.5, 0.7, 1.0)):
+                raise AttachmentError("invalid_attachment", 400)
         uint(self.runtime_generation)
         uint(self.expires_at_epoch)
         if (not 1 <= uint(self.retained_count_limit, 128) <= 128
@@ -212,6 +231,10 @@ class CaptureIntent:
         if not isinstance(value, dict):
             raise AttachmentError("invalid_attachment", 400)
         fields = set(cls.__dataclass_fields__)
+        if "label_anchor_alpha" not in value:
+            fields.discard("label_anchor_alpha")
+        elif value["label_anchor_alpha"] is None:
+            raise AttachmentError("invalid_attachment", 400)
         if value.get("schema") != CAPTURE_SCHEMA_V3:
             # Only a v3 body may carry capture_mode; v1/v2 wires keep their
             # exact historical field sets.
@@ -222,6 +245,8 @@ class CaptureIntent:
 
     def wire(self) -> dict:
         value = asdict(self)
+        if self.label_anchor_alpha is None:
+            value.pop("label_anchor_alpha")
         if self.schema != CAPTURE_SCHEMA_V3:
             # The v1/v2 wire stays byte-identical to its historical shape:
             # parse enforces the same schema gate on the way in.
@@ -369,7 +394,7 @@ _SOURCE_RECEIPT_SPAN_FIELDS = (
 
 @dataclass(frozen=True, repr=False)
 class SourceCaptureReceipt:
-    """Strict 21-field source wire plus the schema-gated v2 span block."""
+    """Source wire with optional label anchoring and the schema-gated v2 span block."""
     intent_digest: str
     source_handle: str
     native_rid: str
@@ -410,7 +435,12 @@ class SourceCaptureReceipt:
     span_contains_tool_call: bool | None = None
     span_message_truncated: bool | None = None
 
+    label_anchor_alpha: float = 0.0
+
     def __post_init__(self):
+        if (type(self.label_anchor_alpha) not in (int, float)
+                or self.label_anchor_alpha not in (0.0, 0.3, 0.5, 0.7, 1.0)):
+            raise AttachmentError("invalid_evidence")
         for name in ("intent_digest", "layout_digest", "accepted_sequence_digest", "output_sha256"):
             sha256_hex(getattr(self, name))
         bounded_identifier(self.source_handle, 128)
@@ -432,7 +462,7 @@ class SourceCaptureReceipt:
             raise AttachmentError("invalid_evidence")
         block = [getattr(self, name) for name in _SOURCE_RECEIPT_SPAN_FIELDS]
         if self.schema == SOURCE_SCHEMA_V1:
-            # A v1 wire carries exactly the 21 fields; any span block is refused.
+            # A v1 wire has no span block; label anchoring is optional.
             if any(value is not None for value in block):
                 raise AttachmentError("invalid_evidence")
         elif self.schema == SOURCE_SCHEMA_V2:
@@ -477,14 +507,19 @@ class SourceCaptureReceipt:
         if not isinstance(value, dict):
             raise AttachmentError("invalid_evidence")
         v1 = set(_SOURCE_RECEIPT_V1_FIELDS)
-        if set(value) not in (v1, v1 | set(_SOURCE_RECEIPT_SPAN_FIELDS)):
+        if set(value) - {"label_anchor_alpha"} not in (v1, v1 | set(_SOURCE_RECEIPT_SPAN_FIELDS)):
             raise AttachmentError("invalid_evidence")
         return cls(**value)
 
     def wire(self):
         value = asdict(self)
         if self.schema == SOURCE_SCHEMA_V1:
-            return {name: value[name] for name in _SOURCE_RECEIPT_V1_FIELDS}
+            value = {name: value[name] for name in _SOURCE_RECEIPT_V1_FIELDS}
+        # Preserve the original wire at zero; omission unambiguously means disabled.
+        if self.label_anchor_alpha:
+            value["label_anchor_alpha"] = self.label_anchor_alpha
+        else:
+            value.pop("label_anchor_alpha", None)
         return value
 
 
@@ -518,6 +553,10 @@ class ConsumeWorkerDescriptor:
     #: sequence. 0 is the legacy prepend layout; a positive value comes from an
     #: attested prompt marker and must stay inside the ordinary prompt.
     prefix_offset: int = 0
+    #: Layout that produced prefix_offset: "prepend" (offset 0), "marker"
+    #: (explicit prompt marker) or "last_user" (extension placement after the
+    #: last user role token). Carried so the terminal record names the layout.
+    prefix_layout: str = "prepend"
 
     def __post_init__(self):
         import math
@@ -531,6 +570,9 @@ class ConsumeWorkerDescriptor:
         uint(self.state_generation)
         uint(self.runtime_generation)
         uint(self.prefix_offset, 2**20)
+        if (self.prefix_layout not in ("prepend", "marker", "last_user")
+                or (self.prefix_layout != "prepend") != (self.prefix_offset > 0)):
+            raise AttachmentError("invalid_evidence")
         if (not 1 <= uint(self.expected_rank_count, 1024) <= 1024
                 or not 1 <= uint(self.expected_prefix_tokens, 128) <= 128
                 or not 1 <= uint(self.hidden_dim, 2**20) <= 2**20
@@ -568,9 +610,15 @@ class CaptureWorkerDescriptor:
     capture_mode: str = ""
     schema: str = "occ3.sglang.worker.v1"
     operation: str = "capture"
+    #: Resolved selection, never the optional request default sentinel.
+    label_anchor_alpha: float = 0.0
 
     def __post_init__(self):
         import math
+        if (type(self.label_anchor_alpha) not in (int, float)
+                or self.label_anchor_alpha not in (0.0, 0.3, 0.5, 0.7, 1.0)):
+            raise AttachmentError("invalid_evidence")
+        object.__setattr__(self, "label_anchor_alpha", float(self.label_anchor_alpha))
         for name in ("attempt_id", "reservation_id", "native_rid", "runtime_epoch",
                      "model_fingerprint", "method_id", "capture_id", "source_session_id",
                      "source_turn_nonce"):
@@ -654,6 +702,8 @@ def normalize_worker_descriptor(value):
     if data.get("schema") != "occ3.sglang.worker.v1":
         raise AttachmentError("invalid_evidence")
     kind = {"capture": CaptureWorkerDescriptor, "consume": ConsumeWorkerDescriptor}.get(data.get("operation"))
+    if kind is CaptureWorkerDescriptor and "label_anchor_alpha" not in data:
+        data = {**data, "label_anchor_alpha": 0.0}
     if kind is None or set(data) != set(kind.__dataclass_fields__):
         raise AttachmentError("invalid_evidence")
     try:

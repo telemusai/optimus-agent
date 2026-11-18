@@ -1,5 +1,31 @@
 {
   "openai-codex": {
+    "gpt-6.2-astra": {
+      "id": "gpt-6.2-astra",
+      "name": "GPT-6.2 Astra",
+      "api": "openai-codex-responses",
+      "provider": "openai-codex",
+      "baseUrl": "https://chatgpt.com/backend-api",
+      "reasoning": true,
+      "thinkingLevelMap": {
+        "off": null,
+        "minimal": null,
+        "xhigh": "xhigh",
+        "max": "max"
+      },
+      "input": [
+        "text",
+        "image"
+      ],
+      "cost": {
+        "input": 8,
+        "output": 40,
+        "cacheRead": 0.4,
+        "cacheWrite": 10
+      },
+      "contextWindow": 272000,
+      "maxTokens": 128000
+    },
     "gpt-6.1-sol": {
       "id": "gpt-6.1-sol",
       "name": "GPT-6.1 Sol",

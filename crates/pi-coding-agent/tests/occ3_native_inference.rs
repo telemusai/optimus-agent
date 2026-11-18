@@ -161,7 +161,7 @@ async fn bind_lease_binds_a_full_method_id_only_against_its_own_identity() {
 
     let mut inbox = Occ3InferenceInbox::new("receiver".into()).unwrap();
     assert!(inbox.admit(envelope, "message-1", "sender", 1).unwrap());
-    assert!(inbox.claim(&["message-1".into()], 1).unwrap().is_some());
+    assert!(inbox.claim(&["message-1".into()], &[], 1).unwrap().is_some());
     // The same family under a different full method id must not bind.
     assert!(matches!(
         inbox.bind_lease(&lease, &identity_b),
@@ -310,7 +310,7 @@ async fn authorized_admission_and_duplicate_id_are_checked_not_prompt_text() {
         Err(Occ3Error::Unauthorized)
     ));
     assert!(inbox
-        .claim(&["unrelated-message".into()], 1)
+        .claim(&["unrelated-message".into()], &[], 1)
         .unwrap()
         .is_none());
     assert_eq!(
@@ -323,9 +323,9 @@ async fn authorized_admission_and_duplicate_id_are_checked_not_prompt_text() {
 async fn one_request_claim_blocks_automatic_text_retry_and_persistent_replay() {
     let (connector, request, _) = fixture().await;
     let mut inbox = admitted(request.envelope.clone());
-    assert!(inbox.claim(&["message-1".into()], 1).unwrap().is_some());
+    assert!(inbox.claim(&["message-1".into()], &[], 1).unwrap().is_some());
     assert!(matches!(
-        inbox.claim(&["message-1".into()], 1),
+        inbox.claim(&["message-1".into()], &[], 1),
         Err(Occ3Error::InferenceOutcomeUncertain { .. })
     ));
     let lease = connector.prepare_inference(request).await.unwrap();
@@ -352,29 +352,161 @@ async fn one_request_claim_blocks_automatic_text_retry_and_persistent_replay() {
         Occ3DeliveryStatus::Failed
     );
     assert!(!permits_text_fallback(inbox.status("message-1").unwrap()));
-    assert!(inbox.claim(&["message-1".into()], 1).is_err());
+    // A terminal failure never re-arms and never yields the envelope again
+    // (no replay, no text fallback); it is journaled and skipped instead, so
+    // the receiver's later inference proceeds without a re-attachment rather
+    // than being bricked by the dead delivery.
+    assert!(inbox.claim(&["message-1".into()], &[], 1).unwrap().is_none());
     let mut restarted = Occ3InferenceInbox::new("receiver".into()).unwrap();
     assert!(
-        restarted.claim(&["message-1".into()], 1).unwrap().is_none(),
+        restarted.claim(&["message-1".into()], &[], 1).unwrap().is_none(),
         "no transcript hydration"
     );
 }
 
+/// Pending admissions queue in arrival order: a second sender may admit
+/// while a first delivery is outstanding, each message keeps its own
+/// receipt record, and `claim` consumes them one per request in context
+/// (arrival) order. A terminal failure of the first never blocks the
+/// second; an in-flight or unknown first delivery still refuses loudly.
 #[tokio::test]
-async fn concurrent_receiver_admission_is_bounded_before_second_capture_use() {
-    let (_, request, _) = fixture().await;
-    let mut inbox = admitted(request.envelope.clone());
-    let mut second = request.envelope.clone();
-    second.message_id = "message-2".into();
+async fn pending_admissions_from_multiple_senders_queue_in_arrival_order() {
+    let (connector, request, _) = fixture().await;
+    let mut inbox = Occ3InferenceInbox::new("receiver".into()).unwrap();
     assert!(inbox
-        .admit(second.clone(), "message-2", "sender", 1)
-        .is_err());
-    assert_eq!(inbox.cancel_pending().len(), 1);
-    assert!(inbox.admit(second, "message-2", "sender", 1).unwrap());
-    assert!(
-        inbox.claim(&["message-1".into()], 1).is_err(),
-        "cancelled message never silently becomes text"
+        .admit(request.envelope.clone(), "message-1", "sender", 1)
+        .unwrap());
+
+    // A second sender's genuinely new admission is accepted while the
+    // first is still merely pending.
+    let mut capture = capture_request();
+    capture.message_id = "message-2".into();
+    capture.sender_session_id = "sender-b".into();
+    let handle = connector.capture_latent(capture).await.unwrap();
+    let second = build_envelope(
+        "message-2".into(),
+        "sender-b".into(),
+        "receiver".into(),
+        identity().fingerprint(),
+        connector.runtime_id(),
+        "mock-occ3".into(),
+        Occ3Method::KvHandoff,
+        handle,
+        "OCC/1\nTASK=fixture\nKIND=RESULT\nSTATUS=done".into(),
+        "occ1".into(),
+    )
+    .unwrap();
+    assert!(inbox.admit(second.clone(), "message-2", "sender-b", 1).unwrap());
+    // Duplicate admission stays idempotent alongside the pending queue.
+    assert!(!inbox
+        .admit(second.clone(), "message-2", "sender-b", 1)
+        .unwrap());
+
+    // Arrival order is explicit in the audit projection.
+    let audit = inbox.audit();
+    let ids: Vec<&str> = audit
+        .iter()
+        .filter_map(|record| record["message_id"].as_str())
+        .collect();
+    assert_eq!(ids, vec!["message-1", "message-2"]);
+    assert_eq!(
+        audit[0]["admission_seq"].as_u64(),
+        Some(1),
+        "arrival sequence is monotonic and explicit"
     );
+
+    // Reversed context order cannot reorder the queue: the earliest
+    // arrival (message-1) is the only claimable record; message-2 stays
+    // pending no matter where the context lists it.
+    let claimed = inbox
+        .claim(
+            &["message-2".to_string(), "message-1".to_string()],
+            &[],
+            1,
+        )
+        .unwrap()
+        .expect("earliest pending delivery is claimable");
+    assert_eq!(claimed.message_id, "message-1");
+    assert_eq!(inbox.status("message-2"), Some(Occ3DeliveryStatus::Admitted));
+
+    // While the first is attached (Delivered) every further claim refuses
+    // loudly receiver-globally: at-most-once, never a second attachment.
+    // The refusal holds even when the active id is absent from the context
+    // (an in-flight delivery dropped from context must not be shadowed).
+    for ids in [
+        vec!["message-1".to_string(), "message-2".to_string()],
+        vec!["message-2".to_string()],
+    ] {
+        assert!(matches!(
+            inbox.claim(&ids, &[], 1),
+            Err(Occ3Error::InferenceOutcomeUncertain { .. })
+        ));
+    }
+
+    // Cancel the first delivery's lease: a Prepared lease cancel is a
+    // proven non-use, terminal and journaled. The pending second delivery
+    // stays claimable instead of being bricked by the dead first one.
+    let lease = connector.prepare_inference(request.clone()).await.unwrap();
+    inbox.bind_lease(&lease, &identity()).unwrap();
+    lease.cancel();
+    assert_eq!(
+        inbox.record_outcome("message-1").unwrap(),
+        Occ3DeliveryStatus::Failed
+    );
+    let next = inbox
+        .claim(
+            &["message-1".to_string(), "message-2".to_string()],
+            &[],
+            1,
+        )
+        .unwrap()
+        .expect("pending delivery after a terminal failure");
+    assert_eq!(next.message_id, "message-2");
+    assert_eq!(inbox.status("message-2"), Some(Occ3DeliveryStatus::Delivered));
+
+    // The now-active second delivery blocks claims the same way, including
+    // when its id is absent from the context.
+    assert!(matches!(
+        inbox.claim(&["message-1".to_string()], &[], 1),
+        Err(Occ3Error::InferenceOutcomeUncertain { .. })
+    ));
+
+    // Resolve the second delivery terminally as well: no pending admission
+    // remains, so a further claim attaches nothing and errors nothing.
+    let mut second_request = request.clone();
+    second_request.envelope = second.clone();
+    second_request.request_id = "inference-2".into();
+    let second_lease = connector
+        .prepare_inference(second_request)
+        .await
+        .unwrap();
+    inbox.bind_lease(&second_lease, &identity()).unwrap();
+    second_lease.cancel();
+    assert_eq!(
+        inbox.record_outcome("message-2").unwrap(),
+        Occ3DeliveryStatus::Failed
+    );
+    assert!(inbox
+        .claim(
+            &["message-1".to_string(), "message-2".to_string()],
+            &[],
+            1
+        )
+        .unwrap()
+        .is_none());
+
+    // No completion is reported while nothing reached Consumed, and
+    // terminal-but-not-consumed deliveries never re-arm.
+    assert!(inbox.poll_consumed().is_empty());
+    assert!(inbox.poll_consumed().is_empty());
+    assert!(inbox
+        .claim(&["message-1".to_string()], &[], 1)
+        .unwrap()
+        .is_none());
+    assert!(inbox
+        .claim(&["message-2".to_string()], &[], 1)
+        .unwrap()
+        .is_none());
 }
 
 #[tokio::test]
@@ -383,11 +515,14 @@ async fn expiry_after_admission_is_recorded_and_not_silent_fallback() {
     request.envelope.state_handle.expires_at_epoch = 5;
     let mut inbox = admitted(request.envelope);
     assert!(matches!(
-        inbox.claim(&["message-1".into()], 5),
+        inbox.claim(&["message-1".into()], &[], 5),
         Err(Occ3Error::HandleExpired { .. })
     ));
     assert_eq!(inbox.status("message-1"), Some(Occ3DeliveryStatus::Expired));
-    assert!(inbox.claim(&["message-1".into()], 5).is_err());
+    // An expired admission is terminal and journaled: it never re-arms and
+    // never silently becomes text, but it also no longer blocks later
+    // pending deliveries from being claimed.
+    assert!(inbox.claim(&["message-1".into()], &[], 5).unwrap().is_none());
     assert!(!permits_text_fallback(Occ3DeliveryStatus::Expired));
 }
 
@@ -639,4 +774,398 @@ async fn unpreparable_wire_identifiers_are_rejected_before_admission() {
         assert!(inbox.admit(envelope, &invalid_id, "sender", 1).is_err());
         assert!(inbox.status(&invalid_id).is_none());
     }
+}
+
+/// End-to-end completed-use through the REAL public provider transport: a
+/// local fixture server answers the guarded `/chat/completions` request with
+/// a genuine `x-optimus-occ3-receipt` header built from the exact attachment
+/// the request carried. The lease is produced by the mock connector through
+/// the normal `prepare_inference` path, bound to the inbox, dispatched via
+/// `stream_simple_openai_completions` (the same public transport production
+/// uses), and the receipt verification inside pi-ai transitions the shared
+/// lease to `Consumed`. This is receipt verification, not status simulation:
+/// no test-only API is exposed and no production surface changes.
+#[tokio::test]
+async fn consumed_receipt_flows_through_real_provider_transport_to_poll_consumed() {
+    use pi_ai::providers::openai_completions::stream_simple_openai_completions;
+    use pi_ai::types::{SimpleStreamOptions, StreamOptions};
+    use pi_ai::utils::event_stream::AssistantMessageEventStream;
+    use std::sync::{Arc, Mutex};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    const COMPLETE: &str = concat!(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"native-fixture-answer\"}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: [DONE]\n\n",
+    );
+
+    // A one-shot local server: it records the request, mirrors a valid
+    // completed-use receipt for the exact `occ3` attachment the client
+    // sent, and answers with a minimal SSE completion.
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let address = listener.local_addr().unwrap();
+    let seen_request = Arc::new(Mutex::new(None::<serde_json::Value>));
+    let captured = seen_request.clone();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut bytes = Vec::new();
+        let body = loop {
+            let mut chunk = [0; 4096];
+            let count = socket.read(&mut chunk).await.unwrap();
+            assert_ne!(count, 0);
+            bytes.extend_from_slice(&chunk[..count]);
+            if let Some(end) = bytes.windows(4).position(|v| v == b"\r\n\r\n") {
+                let head = String::from_utf8(bytes[..end].to_vec()).unwrap();
+                let length: usize = head
+                    .lines()
+                    .filter_map(|line| line.split_once(':'))
+                    .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                    .unwrap()
+                    .1
+                    .trim()
+                    .parse()
+                    .unwrap();
+                if bytes.len() >= end + 4 + length {
+                    break serde_json::from_slice::<serde_json::Value>(
+                        &bytes[end + 4..end + 4 + length],
+                    )
+                    .unwrap();
+                }
+            }
+        };
+        *captured.lock().unwrap() = Some(body.clone());
+        let receipt = serde_json::json!({
+            "attachment": body["occ3"],
+            "consumed": true,
+            "fallback_used": false,
+            "injected_state": true,
+        });
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nx-optimus-occ3-receipt: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            receipt,
+            COMPLETE.len(),
+            COMPLETE,
+        );
+        socket.write_all(response.as_bytes()).await.unwrap();
+    });
+
+    // The receiver model points at the fixture server through the same
+    // loopback transport the guarded native path allows.
+    let model = pi_ai::types::Model::new(
+        "fixture-model",
+        "fixture",
+        pi_ai::types::API_OPENAI_COMPLETIONS,
+        "fixture-provider",
+        format!("http://{address}/v1"),
+    );
+
+    // Capture, envelope, admission and lease binding exactly as production
+    // does: admit -> claim (earliest arrival) -> prepare_inference ->
+    // bind_lease while the lease is still Prepared.
+    let connector = MockOcc3Connector::new(identity(), vec![Occ3Method::KvHandoff]);
+    let handle = connector.capture_latent(capture_request()).await.unwrap();
+    let envelope = build_envelope(
+        "message-1".into(),
+        "sender".into(),
+        "receiver".into(),
+        identity().fingerprint(),
+        connector.runtime_id(),
+        "mock-occ3".into(),
+        Occ3Method::KvHandoff,
+        handle,
+        "OCC/1\nTASK=fixture\nKIND=RESULT\nSTATUS=done".into(),
+        "occ1".into(),
+    )
+    .unwrap();
+    let request = PrepareInferenceRequest {
+        envelope: envelope.clone(),
+        request_id: "inference-1".into(),
+        receiver_session_id: "receiver".into(),
+        receiver_identity: identity(),
+        now_epoch: 1,
+        target: InferenceStateTarget {
+            provider: model.provider.clone(),
+            model_id: model.id.clone(),
+            base_url: model.base_url.clone(),
+        },
+    };
+    let mut inbox = Occ3InferenceInbox::new("receiver".into()).unwrap();
+    assert!(inbox
+        .admit(envelope, "message-1", "sender", 1)
+        .unwrap());
+    let claimed = inbox
+        .claim(&["message-1".to_string()], &[], 1)
+        .unwrap()
+        .expect("earliest pending delivery is claimable");
+    assert_eq!(claimed.message_id, "message-1");
+    let lease = connector.prepare_inference(request).await.unwrap();
+    inbox.bind_lease(&lease, &identity()).unwrap();
+    assert_eq!(inbox.status("message-1"), Some(Occ3DeliveryStatus::Delivered));
+
+    // The actual native inference through the public provider transport.
+    let context = pi_ai::types::Context::new(
+        None,
+        vec![pi_ai::types::Message::User(pi_ai::types::UserMessage::new(
+            pi_ai::types::UserContent::Text("fixture question".into()),
+            1,
+        ))],
+        None,
+    );
+    let options = SimpleStreamOptions {
+        stream: StreamOptions {
+            api_key: Some("synthetic-fixture-key".into()),
+            timeout_ms: Some(3000.0),
+            inference_state: Some(lease.clone()),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let stream: AssistantMessageEventStream =
+        stream_simple_openai_completions(&model, &context, Some(options));
+    let output = stream.result().await;
+    assert!(
+        output.error_message.is_none(),
+        "fixture transport must succeed: {:?}",
+        output.error_message
+    );
+
+    // The fixture answered exactly one guarded request carrying the state.
+    let body = seen_request.lock().unwrap().clone().expect("request captured");
+    assert!(body.get("occ3").is_some(), "guarded body carries the attachment");
+
+    // Receipt verification inside pi-ai consumed the shared lease.
+    assert_eq!(lease.state(), InferenceStateLeaseState::Consumed);
+    assert_eq!(
+        inbox.record_outcome("message-1").unwrap(),
+        Occ3DeliveryStatus::Consumed
+    );
+    // The completion notification drains exactly once, with the sender id.
+    assert_eq!(
+        inbox.poll_consumed(),
+        vec![("message-1".to_string(), "sender".to_string())]
+    );
+    assert!(inbox.poll_consumed().is_empty());
+    // A completed delivery is never a terminal failure notice.
+    assert!(inbox.poll_terminal_failures().is_empty());
+    // And a consumed record never re-arms.
+    assert!(inbox
+        .claim(&["message-1".to_string()], &[], 1)
+        .unwrap()
+        .is_none());
+    server.await.unwrap();
+}
+
+/// The receiver's `prepare_inference` control round trip must classify a
+/// synchronous proven-non-use refusal as the distinct busy error, so the
+/// resolver can retire its inbox claim terminally and route the sender a
+/// fresh-capture retry (the live 2026-11-07 receiver wedge).
+/// `prepare_inference` awaits exactly one control call before the
+/// attachment exists - `sessions/enroll` - so a refusal on that call
+/// proves no receiver attachment was created or submitted. On that route
+/// today the real classified decline is the saturation gate's `quota`
+/// (429: session-table capacity, or the pre-parse 16 KiB body bound);
+/// enroll has no `busy` code, which exists only in the registry's
+/// reserve_capture/reserve_consume admission declines - the paired 409
+/// row keeps the classification's contract for a future control route
+/// that reuses it. Every other decline - including a 409 `expired`, a
+/// malformed, oversized or empty-code envelope, a non-identity
+/// content-encoding, or a 200 carrying an error body on the success path
+/// - keeps the generic fail-closed `TransferFailed { "native control
+/// binding invalid" }` refusal: only the proven busy classes retire a
+/// claim. The request line is asserted to be the enroll route so the
+/// classification is pinned to `prepare_inference`'s own control round
+/// trip, never a publication or retirement call.
+#[tokio::test]
+async fn sglang_prepare_inference_classifies_pre_dispatch_busy_refusals() {
+    use pi_coding_agent::core::occ3_connectors::sglang::{
+        NativeExperimentalPermit, SglangOcc3Config, SglangOcc3Connector,
+    };
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // One raw control fixture: each accepted connection is answered with
+    // the next scripted (status, body) pair, then closed.
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let address = listener.local_addr().unwrap();
+    // (status line, extra headers, body, expected busy) — the classification
+    // table including every parser boundary: the exact-256-byte accept, the
+    // 257-byte reject, empty/64/65-char codes, a non-identity
+    // content-encoding, and a 200 that carries an error body onto the
+    // success path. Route coverage today: enroll returns 429 for quota
+    // (session capacity or the pre-parse 16 KiB body bound) and can never
+    // return `busy` (that is a registry-only decline); the 409-busy row
+    // exists so the paired classification keeps its contract if a future
+    // control route reuses the registry's busy decline.
+    let long_code = "e".repeat(64);
+    let over_code = "e".repeat(65);
+    let busy_pad = r#"{"error":{"code":  "busy"}}"#;
+    assert_eq!(busy_pad.len(), 27);
+    let busy_256 = format!("{busy_pad}{}", " ".repeat(256 - busy_pad.len()));
+    let busy_257 = format!("{busy_pad}{}", " ".repeat(257 - busy_pad.len()));
+    assert_eq!(busy_256.len(), 256);
+    assert_eq!(busy_257.len(), 257);
+    let scripted: Vec<(&str, &str, String, bool)> = vec![
+        ("409 Conflict", "", r#"{"error":{"code":"busy"}}"#.into(), true),
+        ("429 Too Many Requests", "", r#"{"error":{"code":"quota"}}"#.into(), true),
+        // Exactly 256 bytes is still accepted at the bound.
+        ("409 Conflict", "", busy_256, true),
+        ("409 Conflict", "", r#"{"error":{"code":"expired"}}"#.into(), false),
+        ("503 Service Unavailable", "", r#"{"error":{"code":"unavailable"}}"#.into(), false),
+        // One byte over the bound: never classified.
+        ("409 Conflict", "", busy_257, false),
+        ("409 Conflict", "", r#"{"error":{"code":""}}"#.into(), false),
+        // A 64-char code is inside the bound but is not busy; 65 is rejected.
+        ("409 Conflict", "", format!(r#"{{"error":{{"code":"{long_code}"}}}}"#), false),
+        ("409 Conflict", "", format!(r#"{{"error":{{"code":"{over_code}"}}}}"#), false),
+        // A busy code behind a non-identity content-encoding stays generic.
+        ("409 Conflict", "Content-Encoding: gzip\r\n", r#"{"error":{"code":"busy"}}"#.into(), false),
+        // A 200 carrying an error body fails on the success path, generically.
+        ("200 OK", "", r#"{"error":{"code":"busy"}}"#.into(), false),
+    ];
+    // The expected classification per scripted row, captured before the
+    // server task consumes the scripted table by move, so the two tables
+    // cannot drift apart.
+    let expected_busy: Vec<bool> = scripted.iter().map(|row| row.3).collect();
+    let server = tokio::spawn(async move {
+        for (status, extra, body, _) in scripted {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut bytes = Vec::new();
+            // Read until the full head plus content-length body arrived.
+            loop {
+                let mut chunk = [0; 4096];
+                let count = socket.read(&mut chunk).await.unwrap();
+                assert_ne!(count, 0);
+                bytes.extend_from_slice(&chunk[..count]);
+                if let Some(end) = bytes.windows(4).position(|v| v == b"\r\n\r\n") {
+                    let head = String::from_utf8(bytes[..end].to_vec()).unwrap();
+                    let length: usize = head
+                        .lines()
+                        .filter_map(|line| line.split_once(':'))
+                        .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                        .unwrap()
+                        .1
+                        .trim()
+                        .parse()
+                        .unwrap();
+                    if bytes.len() >= end + 4 + length {
+                        break;
+                    }
+                }
+            }
+            let head = String::from_utf8(bytes[..bytes.windows(4).position(|v| v == b"\r\n\r\n").unwrap()].to_vec()).unwrap();
+            let request_line = head.lines().next().unwrap().to_string();
+            assert!(
+                request_line.contains("/occ3/v1/native/sessions/enroll"),
+                "the busy classification must see the enroll control route, saw: {request_line}"
+            );
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n{extra}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len(),
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        }
+    });
+
+    let endpoint: url::Url = format!("http://{address}").parse().unwrap();
+    let mut identity = identity();
+    identity.model_id = "fixture-model".into();
+    let permit = NativeExperimentalPermit {
+        attempt_id: "attempt-fixture-1".into(),
+        identity: identity.clone(),
+        target: InferenceStateTarget {
+            provider: "fixture-provider".into(),
+            model_id: identity.model_id.clone(),
+            base_url: format!("http://{address}/v1"),
+        },
+        runtime_id: "fixture-runtime-epoch-001".into(),
+        runtime_generation: 7,
+        access_domain: "fixture-family".into(),
+        expires_at_epoch: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 600,
+        source_profile: pi_ai::source_capture::SourceCaptureProfile {
+            layer_index: 77,
+            hidden_dim: 6144,
+            dtype: "bfloat16".into(),
+            layout_digest: "b".repeat(64),
+            expected_ranks: 8,
+        },
+        profile_digest: "c".repeat(64),
+        max_capture_bytes: 268_435_456,
+    };
+    let connector = SglangOcc3Connector::new_experimental(
+        SglangOcc3Config {
+            endpoint,
+            api_key: Some("synthetic-fixture-key".into()),
+            control_headers: None,
+        },
+        permit,
+    )
+    .unwrap();
+
+    let request = || PrepareInferenceRequest {
+        envelope: Occ3Envelope {
+            schema: "optimus.occ3.v1".into(),
+            protocol_version: 1,
+            message_id: "message-busy-1".into(),
+            sender_session_id: "sender".into(),
+            receiver_session_id: "receiver".into(),
+            model_fingerprint: identity.fingerprint(),
+            runtime_id: "fixture-runtime-epoch-001".into(),
+            connector_id: "sglang-occ3".into(),
+            latent_method: Occ3Method::KvHandoff,
+            state_handle: pi_coding_agent::core::occ::occ3::Occ3HandleRef {
+                handle_id: "handle-busy-1".into(),
+                connector_id: "sglang-occ3".into(),
+                model_fingerprint: identity.fingerprint(),
+                runtime_generation: 7,
+                expires_at_epoch: u64::MAX,
+                state_size_bytes: 128,
+            },
+            control_summary: "busy classification fixture".into(),
+            fallback_reference: "occ1".into(),
+        },
+        request_id: "inference-busy-1".into(),
+        receiver_session_id: "receiver".into(),
+        receiver_identity: identity.clone(),
+        now_epoch: 1,
+        target: InferenceStateTarget {
+            provider: "fixture-provider".into(),
+            model_id: identity.model_id.clone(),
+            base_url: format!("http://{address}/v1"),
+        },
+    };
+
+    // The classification table, in scripted order. The busy rows are the
+    // distinct proven-non-use refusal; every other row is pinned to the
+    // exact generic fail-closed error, so neither an unrelated error kind
+    // nor a false Ok can pass the negative assertions.
+    for (index, expect_busy) in expected_busy.into_iter().enumerate() {
+        let error = connector
+            .prepare_inference(request())
+            .await
+            .err()
+            .expect("every scripted response must decline or fail the success parse");
+        if expect_busy {
+            assert!(
+                matches!(error, Occ3Error::NativeInferenceBusyRefused { .. }),
+                "row {index}: expected the busy refusal, saw {error:?}"
+            );
+        } else {
+            match error {
+                Occ3Error::TransferFailed { reason } => assert_eq!(
+                    reason, "native control binding invalid",
+                    "row {index}: expected the generic fail-closed refusal, saw {reason}"
+                ),
+                other => panic!("row {index}: expected the generic refusal, saw {other:?}"),
+            }
+        }
+    }
+    server.await.unwrap();
 }

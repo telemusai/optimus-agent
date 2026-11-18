@@ -311,12 +311,12 @@ def test_latent_worker_pins_the_capture_and_commit_arithmetic():
     text = read(WORKER)
     for snippet in (
         "rows = torch.tensor([item.extend_start + item.extend_len - 1], device=hidden_states.device)",
-        "positions = forward_batch.positions.index_select(0, rows).clone()",
+        "positions = forward_batch.positions.index_select(0, rows)",
         "tokens = next_token_ids.reshape(-1)[:1].clone().reshape(1, 1)",
         "indices = torch.where(valid, accept_index, torch.zeros_like(accept_index)).reshape(-1).long()",
-        "hidden = rows.hidden.index_select(0, indices).reshape(1, -1, runtime.profile.hidden_dim).clone()",
-        "tokens = predict.reshape(-1).index_select(0, indices).reshape(1, -1).clone()",
-        "selected_positions = positions.reshape(-1).index_select(0, indices).reshape(1, -1).clone()",
+        "hidden = rows.hidden.index_select(0, indices).reshape(1, -1, runtime.profile.hidden_dim)",
+        "tokens = predict.reshape(-1).index_select(0, indices).reshape(1, -1)",
+        "selected_positions = positions.reshape(-1).index_select(0, indices).reshape(1, -1)",
         "positions = torch.arange(len(req.origin_input_ids) + output_start - 1,",
         "destination = (record.accepted_count + i) % descriptor.max_prefix_tokens",
         "embeddings = self.embedding(tokens)",

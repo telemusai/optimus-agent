@@ -201,6 +201,25 @@ pub struct ActiveSessionState {
     pub unsubscribe: Option<Box<dyn FnOnce() + Send>>,
     /// Client env (e.g. herdr pane identity) bound when the runtime was created.
     pub client_env: Option<HashMap<String, String>>,
+    /// True when this session was restored from a passivated RLM subagent
+    /// (hydration) rather than being live from creation. Agent-message
+    /// receipts consult it to distinguish delivery into a restored
+    /// transcript from delivery to a live consumer; see
+    /// `agent_message_requires_hydration_marker`.
+    pub hydrated_from_passive: bool,
+    /// True when a model change to an OCC-3-capable model arrived while the
+    /// session was streaming and its activation retry is still owed: the
+    /// pre-prompt path (`maybe_activate_pending_occ3`) consumes it at the
+    /// next idle prompt. Cleared after that single attempt.
+    pub occ3_activation_pending: bool,
+    /// Restart-retry deadline for the armed OCC-3 activation retry (epoch
+    /// seconds). Set together with [`Self::occ3_activation_pending`] by the
+    /// worker-ready arming site when a transient activation refusal happens
+    /// (a daemon restart inside the server permit window, or a control plane
+    /// that is not reachable at boot); the pre-prompt consumer re-arms the
+    /// marker after a transiently refused retry only while this deadline is
+    /// in the future.
+    pub occ3_activation_retry_until_epoch: Option<u64>,
 }
 
 impl ActiveSessionState {
@@ -217,6 +236,9 @@ impl ActiveSessionState {
             summary_state: None,
             unsubscribe: None,
             client_env: None,
+            hydrated_from_passive: false,
+            occ3_activation_pending: false,
+            occ3_activation_retry_until_epoch: None,
         }
     }
 }

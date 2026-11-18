@@ -101,6 +101,91 @@ SCENARIOS = (
     {"name": "occ3-identity-absent", "image": "identity-absent"},
     {"name": "occ3-declined", "image": "identity-declined"},
 )
+# One optional capability scenario, appended only when a validated calibrated
+# input was supplied on the command line. Exit fixture only: the run must never
+# reach an identity/admission validation phase.
+CALIBRATED_SCENARIO = {"name": "calibrated-bind-startup-exit", "image": "exit", "calibrated": True}
+
+# The pre-mutation admission receipt every rehearsal plan journals before any
+# mutation: lifecycle.Services.pre_mutation_admission returns exactly this for
+# rehearsal mode (a different shape here means a production-mode receipt, which
+# must never appear in a rehearsal journal).
+CALIBRATED_ADMISSION_RECEIPT = {"ok": True, "scope": "disposable_faults_only_not_gate8"}
+
+# Post-start validation/acceptance phases the exit-fixture scenario can never
+# legitimately reach; a recovery phase such as RESTORED is legitimate and is
+# never rejected on its own.
+CALIBRATED_FORBIDDEN_PHASES = frozenset({"WAIT_NATIVE_INITIAL", "WAIT_NATIVE_FINAL",
+                                          "RESTART_REQUESTED", "POST_RESTART",
+                                          "GATES_COMPLETE", "COMPLETE"})
+
+# Durable journal files that survive any later phase overwrite: the validation
+# checkpoints and external native proof receipts (controller checkpoint()),
+# and the validation restart permit (supervisor permit_restart).
+CALIBRATED_FORBIDDEN_FILES = ("checkpoint-initial.json", "checkpoint-final.json",
+                              "native-proof-initial.json", "native-proof-final.json",
+                              "restart-permit.json")
+
+
+def rehearsal_scenarios(calibrated_input):
+    """The scenario list: today's ten, plus the capability scenario only when
+    a validated calibrated input is present. Names stay unique and the
+    capability scenario is restricted to the exit fixture."""
+    scenarios = list(SCENARIOS)
+    if calibrated_input is None:
+        return scenarios
+    if CALIBRATED_SCENARIO["image"] != "exit":
+        raise Failure("calibrated rehearsal requires the exit fixture")
+    names = [scenario["name"] for scenario in scenarios] + [CALIBRATED_SCENARIO["name"]]
+    if len(set(names)) != len(names):
+        raise Failure("rehearsal scenario names must be unique")
+    return scenarios + [CALIBRATED_SCENARIO]
+
+
+def load_calibrated_input(path):
+    """Bounded exact-field parse of the optional calibrated capability input.
+
+    The document carries exactly calibrated_artifact and
+    calibrated_profile_evidence; the two plan pin fields are derived from the
+    provided profile sha256 (never campaign constants) and the whole capability
+    is validated through the committed calibrated_capability schema before any
+    scenario runs. The input never overrides any other plan field.
+    """
+    from .docker_config import calibrated_capability
+    try:
+        document = read_json(path)
+    except OSError:
+        # Missing or unreadable input: a sanitized refusal, never file content.
+        raise Failure("calibrated input unreadable") from None
+    except json.JSONDecodeError:
+        raise Failure("invalid calibrated input document") from None
+    if not isinstance(document, dict) or set(document) != {"calibrated_artifact",
+                                                            "calibrated_profile_evidence"}:
+        raise Failure("invalid calibrated input document")
+    evidence = document["calibrated_profile_evidence"]
+    if not isinstance(evidence, dict):
+        raise Failure("invalid calibrated input document")
+    sha256 = evidence.get("sha256")
+    fragment = dict(document)
+    fragment["static_input"] = {"sha256": sha256}
+    fragment["native_validator"] = {"static_input_sha256": sha256}
+    try:
+        return calibrated_capability(fragment)
+    except ValueError:
+        raise Failure("invalid calibrated input capability") from None
+
+
+def calibrated_plan_keys(calibrated_input):
+    """The four capability plan fields from a validated input, or none."""
+    if calibrated_input is None:
+        return {}
+    return {"calibrated_artifact": {"sha256": calibrated_input["sha256"],
+                                     "size": calibrated_input["size"]},
+            "calibrated_profile_evidence": {"path": calibrated_input["profile_path"],
+                                            "sha256": calibrated_input["profile_sha256"],
+                                            "bytes": calibrated_input["profile_bytes"]},
+            "static_input": {"sha256": calibrated_input["profile_sha256"]},
+            "native_validator": {"static_input_sha256": calibrated_input["profile_sha256"]}}
 
 
 def fixture_environment(values):
@@ -522,7 +607,109 @@ def cleanup_owned(api, identities, owner):
         api.remove(identity)
 
 
-def run_scenario(api, images, output, scenario):
+def persist_calibrated_echo(output, candidate):
+    """Persist the sanitized capability echo before any assertion or cleanup.
+
+    Explicit allowlist only: container identity, the create-time mount
+    declaration (HostConfig.Mounts) and the resolved top-level Mounts records,
+    each labeled by its source document, plus the bounded state fields.
+    Never Config.Cmd, never Config.Env, never the whole Config or HostConfig
+    objects. A post-write grep must find no credential material; a failure
+    here raises into the except branch, which skips cleanup and keeps the
+    container, so the evidence then survives twice.
+    """
+    state = candidate.get("State") or {}
+    echo = {"schema": "occ3-calibrated-rehearsal-echo/v1",
+            "source_document": "candidate-inspect",
+            "container_id": candidate.get("Id"),
+            "image_id": candidate.get("Image"),
+            "name": candidate.get("Name"),
+            "declared_hostconfig_mounts": deepcopy(candidate.get("HostConfig", {}).get("Mounts")),
+            "resolved_actual_mounts": deepcopy(candidate.get("Mounts")),
+            "state": {key: state.get(key) for key in ("Status", "ExitCode", "Running")}}
+    path = Path(output) / "calibrated-candidate-echo.json"
+    private_json(path, echo, exclusive=True)
+    text = path.read_text(encoding="utf-8")
+    if "--api-key" in text or FIXTURE_KEY in text:
+        raise Failure("calibrated candidate echo is not sanitized")
+    return path
+
+
+def assert_calibrated_capability_evidence(state, original, current, candidate, plan,
+                                           journal_directory):
+    """Create/echo/restore evidence for the one calibrated bind; fail closed.
+
+    The immutable journal binding must equal the pair re-derived from the
+    verified staged profile; the candidate must carry exactly one read-only
+    bind, in both the create-time declaration and the resolved record, with
+    only the committed bounded daemon spellings; and the restored disposable
+    original must carry no mounts.
+
+    Admission versus validation, on durable journal evidence: the unconditional
+    pre-mutation admission receipt must still be present with the rehearsal
+    tooling scope (the supervisor journals it before the controller starts, and
+    the controller journals it again before the first mutation), while any
+    post-start validation or acceptance progression is refused - forbidden
+    phases, journaled gates (every production gate is post-start), a restart
+    request or consumed restart, a persistence record, and the checkpoint,
+    native-proof and restart-permit evidence files. All of those outlive a
+    later recovery-phase overwrite, so a final RESTORED phase cannot conceal
+    progression; legitimate recovery states are not rejected, and no timing
+    assumption is made about the STARTING phase.
+    """
+    from .docker_config import (_CALIBRATION_MOUNT_MODES, _CALIBRATION_MOUNT_PROPAGATION,
+                                calibrated_capability, derive_calibrated_binding,
+                                verify_calibrated_profile)
+    capability = calibrated_capability(plan)
+    if capability is None:
+        raise Failure("calibrated scenario plan lost its capability")
+    derived = derive_calibrated_binding(verify_calibrated_profile(capability), original)
+    expected = {"calibration_source": derived["source"],
+                "calibration_destination": derived["destination"],
+                "calibration_basename": derived["basename"]}
+    if any(state.get(key) != value for key, value in expected.items()):
+        raise Failure("calibrated journal binding differs from the verified derived pair")
+    if state.get("validation_admission") != CALIBRATED_ADMISSION_RECEIPT:
+        raise Failure("calibrated scenario lost its pre-mutation admission receipt")
+    declared = (candidate.get("HostConfig") or {}).get("Mounts")
+    if (not isinstance(declared, list) or len(declared) != 1
+            or declared[0] != {"Type": "bind", "Source": derived["source"],
+                               "Target": derived["destination"], "ReadOnly": True}):
+        raise Failure("calibrated candidate declaration is not the exact one read-only bind")
+    records = candidate.get("Mounts")
+    if not isinstance(records, list) or len(records) != 1:
+        raise Failure("calibrated candidate resolved mounts are not exactly one")
+    record = records[0]
+    if (record.get("Type") != "bind" or record.get("Source") != derived["source"]
+            or record.get("Destination") != derived["destination"]
+            or record.get("RW") is not False
+            or record.get("Mode", "") not in _CALIBRATION_MOUNT_MODES
+            or record.get("Propagation", "") not in _CALIBRATION_MOUNT_PROPAGATION):
+        raise Failure("calibrated candidate resolved record is not the bounded read-only bind")
+    if current.get("Mounts") != []:
+        raise Failure("restored disposable original carries mounts")
+    if state.get("phase") in CALIBRATED_FORBIDDEN_PHASES:
+        raise Failure("calibrated scenario progressed into a forbidden validation phase")
+    if state.get("gates"):
+        raise Failure("calibrated scenario journaled a validation gate")
+    if state.get("restart_count") != 0 or "restart_request" in state:
+        raise Failure("calibrated scenario requested or consumed a validation restart")
+    if state.get("persistence") is not None:
+        raise Failure("calibrated scenario journaled a persistence record")
+    for name in CALIBRATED_FORBIDDEN_FILES:
+        if (Path(journal_directory) / name).exists():
+            raise Failure("calibrated scenario left validation evidence: " + name)
+    return {"calibration_source": derived["source"],
+            "calibration_destination": derived["destination"],
+            "calibration_basename": derived["basename"],
+            "declared_exactly_one_readonly_bind": True,
+            "resolved_record_bounded": True,
+            "restored_original_mounts_empty": True,
+            "pre_mutation_admission_retained": True,
+            "post_start_validation_absent": True}
+
+
+def run_scenario(api, images, output, scenario, calibrated_input=None):
     if os.name != "posix":
         raise Failure("real Docker rehearsals require Linux")
     owner = secrets.token_hex(8)
@@ -552,6 +739,7 @@ def run_scenario(api, images, output, scenario):
             "poll_interval_s": 0.1, "request_timeout_s": 2, "stop_timeout_s": 1,
             "probe_timeout_s": 10, "validation_timeout_s": 10,
         }
+        plan.update(calibrated_plan_keys(calibrated_input if scenario.get("calibrated") else None))
         service = Services(original, plan, api=api)
         wait_ready(api, original_id, images["original"], service.health, time.monotonic() + 10, interval=0.1)
         result["attempt_dir"] = str(output / "attempt")
@@ -595,6 +783,12 @@ def run_scenario(api, images, output, scenario):
                 if not service.chat().get("ok"):
                     raise Failure("independent fixture semantic verification failed")
                 candidate = checked_inspect(api, state["candidate_id"], state["candidate_image_id"])
+                if scenario.get("calibrated"):
+                    # Sanitized echo first, so the daemon's mount spelling
+                    # survives cleanup; then the fail-closed assertions.
+                    persist_calibrated_echo(output, candidate)
+                    result["calibrated_capability_evidence"] = assert_calibrated_capability_evidence(
+                        state, original, current, candidate, plan, journal.directory)
                 controller_state = read_json(journal.directory / "controller.json")
                 result["scenario_evidence"] = assert_scenario_evidence(
                     scenario, state, recovery, controller_state, candidate, injected)
@@ -645,7 +839,7 @@ def run_scenario(api, images, output, scenario):
     return result
 
 
-def run_rehearsals(api, base_image, output_dir):
+def run_rehearsals(api, base_image, output_dir, calibrated_input=None):
     if os.name != "posix":
         raise Failure("Docker rehearsals require Linux")
     output = Path(output_dir)
@@ -659,15 +853,18 @@ def run_rehearsals(api, base_image, output_dir):
         private_json(output / "result.json", result)
         return result
     private_json(output / "images.json", images, exclusive=True)
+    scenarios = rehearsal_scenarios(calibrated_input)
     outcomes = []
-    for scenario in SCENARIOS:
-        outcome = run_scenario(api, images, output / scenario["name"], scenario)
+    for scenario in scenarios:
+        outcome = run_scenario(api, images, output / scenario["name"], scenario,
+                               calibrated_input=calibrated_input)
         outcomes.append(outcome)
         if outcome["result"] != "PASS":
             break
     result = {"schema": "occ3-disposable-rehearsal/v1", "scope": "disposable_fixture_only",
-              "result": "PASS" if len(outcomes) == len(SCENARIOS) and all(x["result"] == "PASS" for x in outcomes) else "FAIL",
+              "result": "PASS" if len(outcomes) == len(scenarios) and all(x["result"] == "PASS" for x in outcomes) else "FAIL",
               "scenarios": outcomes, "production_touched": False,
+              "calibrated_capability_scenario": calibrated_input is not None,
               "live_glm_or_occ3_proven": False, "images_retained": images}
     private_json(output / "result.json", result)
     return result

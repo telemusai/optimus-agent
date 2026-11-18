@@ -1,6 +1,6 @@
 """Frontend real backend with synthetic control transport/journal; NOT GPU proof."""
 import asyncio
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from types import SimpleNamespace as NS
 import sys
 import time
@@ -75,16 +75,24 @@ async def test_source_exact_enrollment_prepare_bind_and_commit():
 
 
 @pytest.mark.asyncio
-async def test_source_commit_carries_method_metadata_without_type_error():
+@pytest.mark.parametrize("alpha", [0.0, 0.3, 0.5, 0.7, 1.0])
+@pytest.mark.parametrize("explicit", [False, True])
+async def test_source_commit_carries_method_metadata_without_type_error(alpha, explicit):
     # Red test: the worker's method_metadata() has added method_id (and
     # artifact_digest for a calibrated method) to record.source_metadata since
     # wave 445d1cdd4, so production source captures reach finish_source with
     # more keys than SourceCaptureCommit(**record["source"]) accepts. The
     # backend must project the commit, not splat the worker metadata.
-    backend,client,identity,expiry=fixture(); p=backend.profile
+    backend,client,identity,expiry=fixture()
+    backend.profile = (replace(backend.profile,
+        label_anchor_alpha_allowed=(0., .3, .5, .7, 1.), label_anchor_alpha_default=.7)
+        if explicit else replace(backend.profile, label_anchor_alpha=alpha))
+    client.p = backend.profile
+    p = backend.profile
     intent=CaptureIntent(capture_id="capture",source_session_id="source",source_request_id="client-rid",turn_nonce="turn",
         model_fingerprint=p.model_fingerprint,runtime_id=p.runtime_epoch,runtime_generation=9,method=p.method,
-        retained_count_limit=8,max_capture_bytes=128*1024*1024,expires_at_epoch=expiry)
+        retained_count_limit=8,max_capture_bytes=128*1024*1024,expires_at_epoch=expiry,
+        label_anchor_alpha=alpha if explicit else None)
     enrollment=await backend.enroll_source(intent,identity,"attempt","native-rid",identity.deadline_monotonic)
     native=NS(rid="native-rid",sampling_params={"max_new_tokens":200},input_ids=[1,2],stream=True)
     view=NativeRequestView(native,200,"s",True,identity.deadline_monotonic)
@@ -94,11 +102,23 @@ async def test_source_commit_carries_method_metadata_without_type_error():
         retained_count=8,predictor_position_offset=-1,representation="final_layer_prenorm_predictor",
         layer_index=77,hidden_dim=6144,dtype="bfloat16",layout_digest="b"*64,ready_ranks=8,expected_ranks=8,
         accepted_sequence_digest="c"*64,expires_at_epoch=expiry,byte_count=8*6144*2,
-        method_id=p.method,artifact_digest="e"*64)
+        method_id=p.method,artifact_digest="e"*64,label_anchor_alpha=alpha)
     provenance=SourceToolProvenance(tool_calls=())
     completion=NativeCompletion("native-rid","stop","d"*64,50,True)
     evidence=await backend.finish_source(enrollment,reservation,completion,provenance)
     assert evidence.commit.capture_commit_id=="commit" and evidence.bound_output_sha256=="d"*64
+    assert evidence.commit.label_anchor_alpha == alpha
+    from occ3_sglang.use_receipts import validate_source_evidence
+    receipt = validate_source_evidence(intent, enrollment, reservation,
+        native.occ3_worker_descriptor, completion, provenance, evidence)
+    assert receipt.wire().get("label_anchor_alpha", 0.0) == alpha
+    client.record["source"]["label_anchor_alpha"] = 0.3 if alpha == 0.0 else 0.0
+    with pytest.raises(LatentError, match="identity"):
+        await backend.finish_source(enrollment,reservation,completion,provenance)
+    if alpha:
+        client.record["source"].pop("label_anchor_alpha")
+        with pytest.raises(LatentError, match="identity"):
+            await backend.finish_source(enrollment,reservation,completion,provenance)
 
 
 @pytest.mark.asyncio
@@ -201,6 +221,49 @@ async def test_canceled_control_remains_uncertain_until_valid_late_reply(monkeyp
     assert client.has_uncertain_control
     deliver_control(tm,dict(schema="occ3.control.result.v1",command_id="first",ok=True,result={},error=""))
     assert not client.has_uncertain_control and not hasattr(tm,"_occ3_control_client")
+
+
+@pytest.mark.asyncio
+async def test_lost_control_replies_age_out_of_the_pending_table(monkeypatch):
+    module=types.ModuleType("sglang.srt.managers.io_struct"); module.Occ3ControlReq=lambda **kw:NS(**kw)
+    monkeypatch.setitem(sys.modules,module.__name__,module)
+    lost=asyncio.Event()
+    async def dispatch(request):
+        if request.rid=="lost":
+            await lost.wait()  # reply never arrives
+    tm=NS(auto_create_handle_loop=lambda:None,_async_dispatch_to_scheduler=dispatch)
+    client=ControlClient(tm,timeout_seconds=0.01,max_pending=1)
+    with pytest.raises(asyncio.TimeoutError): await client.call("health",{},command_id="lost")
+    await asyncio.gather(*client._operations.values(), return_exceptions=True)
+    assert client.has_uncertain_control
+    assert not client._operations
+    # A recent lost reply still holds the only quota slot: the sweep must not
+    # release an entry that is still inside the bounded reply window.
+    with pytest.raises(LatentError): await client.call("health",{})
+    # Age the entry past the TTL; the slot is released, so a new control op is
+    # admitted again instead of refusing "quota" until process restart.
+    envelope_digest, dispatched_at = client._uncertain["lost"]
+    client._uncertain["lost"] = (envelope_digest,
+                                 dispatched_at - client.timeout_seconds * 10)
+    with pytest.raises(asyncio.TimeoutError): await client.call("health",{},command_id="fresh")
+    assert "fresh" in client._uncertain and "lost" not in client._uncertain
+    # A late reply for the aged-out command is ignored like any unknown id.
+    deliver_control(tm,dict(schema="occ3.control.result.v1",command_id="lost",ok=True,result={},error=""))
+    assert "lost" not in client._uncertain and "fresh" in client._uncertain
+    # Reuse of the aged-out id is refused while it is retired: the old
+    # operation may still be live server-side, and its delayed reply would
+    # otherwise settle the new future (deliver matches command_id only and
+    # the result envelope carries no request echo to compare against).
+    deliver_control(tm,dict(schema="occ3.control.result.v1",command_id="fresh",ok=True,result={},error=""))
+    await asyncio.gather(*client._operations.values(), return_exceptions=True)
+    assert "lost" in client._retired
+    with pytest.raises(LatentError): await client.call("health",{},command_id="lost")
+    # The retirement is bounded: after one further sweep window the id is
+    # usable again instead of growing the retired set forever.
+    client._retired["lost"] -= client.timeout_seconds * 10
+    with pytest.raises(asyncio.TimeoutError): await client.call("health",{},command_id="lost")
+    assert "lost" in client._uncertain and "lost" not in client._retired
+    await client.close()
 
 
 @pytest.mark.asyncio
@@ -324,3 +387,47 @@ async def test_v1_enroll_refuses_when_calibration_collection_is_armed(monkeypatc
     monkeypatch.delenv("OCC3_CALIBRATION_CAPTURE_DIR")
     enrollment=await backend.enroll_source(intent,identity,"attempt","native-rid",identity.deadline_monotonic)
     assert enrollment.attempt_id=="attempt"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("code", ["busy", "quota"])
+async def test_source_reserve_capacity_refusal_is_scheduler_busy_503(code):
+    """Byte/record-capacity quota at reserve_capture is pre-dispatch non-use:
+    it must carry the retryable scheduler_busy contract, not a terminal 409
+    that strands the sender while the live-byte budget is saturated."""
+    from occ3_sglang.attachment_contract import AttachmentError
+    backend,client,identity,expiry=fixture(); p=backend.profile
+    intent=CaptureIntent(capture_id="capture",source_session_id="source",source_request_id="client-rid",turn_nonce="turn",
+        model_fingerprint=p.model_fingerprint,runtime_id=p.runtime_epoch,runtime_generation=9,method=p.method,
+        retained_count_limit=8,max_capture_bytes=128*1024*1024,expires_at_epoch=expiry)
+    call=client.call
+    async def refused(op,payload,command_id=None):
+        if op=="reserve_capture":
+            raise LatentError(code, detail="latent_registry.reserve_capture.byte_capacity")
+        return await call(op,payload,command_id)
+    client.call=refused
+    with pytest.raises(AttachmentError) as caught:
+        await backend.enroll_source(intent,identity,"attempt","native-rid",identity.deadline_monotonic)
+    assert (caught.value.code,caught.value.status)==("scheduler_busy",503)
+    assert backend.attempts["attempt"]["retired"]
+
+
+@pytest.mark.asyncio
+async def test_receiver_registry_busy_is_scheduler_busy_503_and_retires_the_attempt():
+    """Fable review 4: the consume busy decline uses the capture busy contract."""
+    from occ3_sglang.attachment_contract import AttachmentError
+    backend,client,identity,expiry=fixture(); p=backend.profile
+    identity=AuthenticatedContext(identity.principal_digest,"receiver",p.model_id,p.model_fingerprint,p.runtime_epoch,9,identity.deadline_monotonic)
+    attachment=InferenceAttachment(1,"nonce","message","connector","receiver",p.model_fingerprint,p.runtime_epoch,9,"handle",expiry,p.method)
+    client.record=dict(source_handle="handle",state_generation=7,expires_at_epoch=expiry,state="published",revoked=False,
+        source=dict(capture_commit_id="commit",expected_ranks=8,retained_count=8,hidden_dim=6144,dtype="bfloat16",layout_digest="b"*64),terminal={})
+    call=client.call
+    async def busy(op,payload,command_id=None):
+        if op=="reserve_consume": raise LatentError("busy")
+        return await call(op,payload,command_id)
+    client.call=busy
+    native=NS(rid="native-rid",input_ids=[1],sampling_params={"max_new_tokens":100},stream=True)
+    with pytest.raises(AttachmentError) as caught:
+        await backend.reserve(attachment,identity,"consume",NativeRequestView(native,100,"s",True,identity.deadline_monotonic))
+    assert (caught.value.code,caught.value.status)==("scheduler_busy",503)
+    assert backend.attempts["consume"]["retired"]

@@ -47,6 +47,12 @@ ALLOWED_HARNESS_PLATFORMS = {"windows-x86_64"}
 ALLOWED_HEADER_NAMES = {"x-pomerium-authorization"}
 FORBIDDEN_HEADER_NAMES = {"authorization", "host", "proxy-authorization",
                           "content-type", "accept-encoding"}
+# The ONE admitted non-HTTPS origin: the exact local SSH tunnel fronting the
+# serving container's own API-key auth layer, which carries no proxy
+# authorization headers. Only this byte-exact string is admitted; every other
+# HTTP origin (any host, port, path, query, userinfo, fragment, slash or case
+# variant) stays refused by the HTTPS rule, and report equality stays exact.
+ADMITTED_LOOPBACK_ORIGIN = "http://127.0.0.1:30101"
 OBSERVED_LAYOUT_FIELDS = ("runtime_epoch", "runtime_generation", "tp_layout_digest",
                           "hidden_dim", "layer_index", "dtype", "expected_ranks", "ready_ranks")
 IDENTITY_FIELDS = ("model_id", "architecture", "checkpoint_revision", "weight_fingerprint",
@@ -88,7 +94,7 @@ PIN_FIELDS = ("schema", "phase", "attempt_id", "static_input_sha256", "runtime_e
 # registry-default per-message method pins the reviewed file
 # deploy/native-build-inputs/native-profile-input.json; every other registered
 # method re-pins the per-method static input digest its plan declared.
-PIN_STATIC_INPUT_SHA256 = "6e676f1c6fc795ba412c4327168b51c8ef6f65056664638c4954eec58e75348a"
+PIN_STATIC_INPUT_SHA256 = "613698c4abf7ac20ba8e15dacdbcca8391c6deb379d168ba513a1f7a94d648a6"
 REPORT_COMMON_FIELDS = ("schema", "phase", "attempt_id", "candidate_id",
                          "candidate_started_at", "validator_challenge", "harness", "binding",
                          "observed", "suite_nonce_sha256", "cases", "logical_cleanup_confirmed",
@@ -282,7 +288,31 @@ def _method_descriptor(method_id):
     return registry, method_id, descriptor
 
 
-def _method_profile_fields(descriptor):
+def _validate_label_anchor_policy(profile):
+    """Validate attested selection policy, including legacy fixed-alpha profiles."""
+    label_alpha = profile.get("label_anchor_alpha", 0.0)
+    _require(type(label_alpha) in (int, float) and math.isfinite(label_alpha)
+             and label_alpha in (0.0, 0.3, 0.5, 0.7, 1.0),
+             "source_label_anchor_alpha_invalid")
+    allowed_present = "label_anchor_alpha_allowed" in profile
+    default_present = "label_anchor_alpha_default" in profile
+    _require(allowed_present == default_present, "source_label_anchor_alpha_invalid")
+    if allowed_present:
+        allowed = profile["label_anchor_alpha_allowed"]
+        default = profile["label_anchor_alpha_default"]
+        _require(type(allowed) in (list, tuple) and 0 < len(allowed) <= 5, "source_label_anchor_alpha_invalid")
+        _require(all(type(x) in (int, float) and math.isfinite(x)
+                     and x in (0.0, 0.3, 0.5, 0.7, 1.0) for x in allowed), "source_label_anchor_alpha_invalid")
+        _require(len(set(allowed)) == len(allowed), "source_label_anchor_alpha_invalid")
+        _require(type(default) in (int, float) and math.isfinite(default)
+                     and default in allowed, "source_label_anchor_alpha_invalid")
+        _require(not label_alpha or (len(allowed) == 1 and default == label_alpha), "source_label_anchor_alpha_invalid")
+        label_alpha = default
+    _require(not (profile["anchor_alpha"] != 0 and label_alpha != 0),
+             "source_anchor_conflict")
+
+
+def _method_profile_fields(descriptor, profile=None):
     """Exact admission source_profile fieldset for one registered method.
 
     Shared static fields for every method, plus the frozen-artifact
@@ -291,6 +321,9 @@ def _method_profile_fields(descriptor):
     registry descriptor declares.
     """
     fields = list(SOURCE_PROFILE_FIELDS)
+    for name in ("label_anchor_alpha", "label_anchor_alpha_allowed", "label_anchor_alpha_default"):
+        if type(profile) is dict and name in profile:
+            fields.append(name)
     if descriptor["requires_calibration_artifact"]:
         fields += list(CALIBRATION_REFERENCE_FIELDS)
     fields += sorted(frozenset(descriptor.get("profile_fields") or ()))
@@ -305,6 +338,8 @@ def _string(value, code, *, limit=256, allow_empty=False):
 
 def _origin(value, code):
     _require(isinstance(value, str), code)
+    if value == ADMITTED_LOOPBACK_ORIGIN:
+        return value
     parsed = urlsplit(value)
     _require(parsed.scheme == "https" and parsed.hostname
              and not parsed.username and not parsed.password
@@ -355,6 +390,13 @@ def _derivation_value(profile, observed):
             _require(name in CALIBRATION_REFERENCE_FIELDS,
                      "profile_derivation_field_missing")
             value[name] = ""
+    # Zero (including an omitted field) retains the historical wire digest.
+    # Only an enabled label anchor changes the binding identity.
+    if profile.get("label_anchor_alpha", 0.0) != 0:
+        value["label_anchor_alpha"] = profile["label_anchor_alpha"]
+    for name in ("label_anchor_alpha_allowed", "label_anchor_alpha_default"):
+        if name in profile:
+            value[name] = profile[name]
     value["runtime_epoch"] = observed["runtime_epoch"]
     value["runtime_generation"] = observed["runtime_generation"]
     return value
@@ -486,7 +528,8 @@ class NativeHandoffValidator:
         self._check_budget(block["budget_resource_receipt"], block["max_budget"])
         self._check_layout_strategy(block["layout_strategy"])
         self._check_endpoint(block["endpoint"])
-        self._check_credential_references(block["credential_references"])
+        self._check_credential_references(block["credential_references"],
+                                         block["endpoint"]["origin"])
         self._check_control_spec(block["control_spec"])
         return block
 
@@ -539,7 +582,8 @@ class NativeHandoffValidator:
         # exactly for methods that require a calibration artifact (and never
         # for the per-message method, which consumes none).
         profile = _exact_fields(value["source_profile"],
-                                _method_profile_fields(descriptor), "source_profile_invalid")
+                                _method_profile_fields(descriptor, value["source_profile"]),
+                                "source_profile_invalid")
         _require(profile["dtype"] in DTYPES, "source_dtype_unsupported")
         _require(profile["expected_ranks"] == 8, "expected_ranks_not_tp8")
         _uint(profile["layer_index"], "layer_index_invalid")
@@ -567,6 +611,7 @@ class NativeHandoffValidator:
                           else len(str(extra)) <= 256), "source_profile_invalid")
         _require(type(profile["anchor_alpha"]) in (int, float)
                  and math.isfinite(profile["anchor_alpha"]), "source_anchor_alpha_invalid")
+        _validate_label_anchor_policy(profile)
         _uint(profile["max_prefix_tokens"], "max_prefix_tokens_invalid", positive=True)
         _uint(profile["max_live_bytes"], "max_live_bytes_invalid", positive=True)
         _uint(profile["workspace_bytes"], "workspace_bytes_invalid", positive=True)
@@ -605,11 +650,16 @@ class NativeHandoffValidator:
         _require(value["control_root"] == "/occ3/v1/native/", "control_root_invalid")
         value["origin"] = origin
 
-    def _check_credential_references(self, value):
+    def _check_credential_references(self, value, origin):
         value = _exact_fields(value, ("api_key", "headers"), "credential_references_invalid")
         _reference(value["api_key"], "api_key_reference_invalid")
         headers = value["headers"]
-        _require(isinstance(headers, dict) and headers, "credential_headers_invalid")
+        _require(isinstance(headers, dict), "credential_headers_invalid")
+        if origin != ADMITTED_LOOPBACK_ORIGIN:
+            # Only the exact admitted loopback origin may pin an empty header
+            # set (the tunnel carries no proxy authorization); every HTTPS
+            # admission still requires at least one permitted header.
+            _require(headers, "credential_headers_invalid")
         for name, reference in headers.items():
             _require(isinstance(name, str) and name.lower() in ALLOWED_HEADER_NAMES
                      and name.lower() not in FORBIDDEN_HEADER_NAMES, "header_name_not_allowed")

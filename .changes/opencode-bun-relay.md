@@ -1,0 +1,1 @@
+- Added an optional authenticated loopback Bun relay for OpenCode's free DeepSeek model, preserving Optimus's native tools, reasoning, streaming and approvals.

@@ -74,6 +74,10 @@ when the URL has no host, or outside a tokio runtime. The additions:
   NO_PROXY coverage AND per-handshake trust: a redirect hop can leave the
   covered host, so both the frozen proxy matcher and TLS staleness must be
   excluded. Any other `Generation` origin stays fresh exactly as before.
+- `Generation` + `https://` with a fully observed environment on
+  per-handshake-trust platforms (added 2026-11-03, see the addendum): the
+  environment digest now also pins the Windows registry values the frozen
+  matcher consults, so the TLS origin no longer needs NO_PROXY coverage.
 
 ## How the no-proxy guard avoids divergence from hyper-util
 
@@ -105,3 +109,38 @@ New `Lease.phase` strings, all visible through `observe_local_phase`:
 `fresh_generation_policy`, `fresh_tls_policy`, `fresh_unknown_policy`,
 `fresh_system_proxy_policy`, `fresh_proxy_tls_policy`, `fresh_changed_policy`,
 `http_client_reused`, `http_client_created`.
+
+
+## Addendum 2026-11-03: HTTPS generation pooling and the Windows registry fingerprint
+
+Two changes to the pooling gate, both offline-verified (unit tests in
+`openai_http_client_pool.rs`; no new live bench yet, so no new numbers):
+
+1. `Generation` + `https://` now pools on per-handshake-trust platforms
+   whenever the environment is fully observed. New phases
+   `http_client_created_generation_https` /
+   `http_client_reused_generation_https`. Fresh generation fallbacks are now
+   reason-specific: `fresh_generation_system_proxy_policy`,
+   `fresh_generation_tls_policy`, `fresh_generation_proxy_tls_policy`, with
+   `fresh_generation_policy` kept for the fully-observed-but-fresh cases
+   (non-per-handshake platforms, unknown origin).
+2. The Windows `fresh_system_proxy_policy` blanket is replaced by a real
+   fingerprint: the pool reads exactly the HKCU `Internet Settings` values
+   hyper-util 0.1.20 `win::with_system` consults (`ProxyEnable`, `ProxyServer`,
+   `ProxyOverride`, presence included) through `windows-registry` (already in
+   the lock via hyper-util) and hashes them into the environment digest. A
+   readable registry makes the store observed; rotation invalidates pooled
+   clients through the existing digest key and double-read checks. macOS
+   SystemConfiguration and unopenable registry keys keep
+   `fresh_system_proxy_policy`. The fingerprint replicates hyper-util's
+   `;`-join and `*.`-strip `ProxyOverride` transform, so registry-only
+   NO_PROXY coverage gates loopback pooling exactly like the frozen matcher
+   would, and an `https://` registry proxy keeps TLS-bearing clients fresh
+   (`fresh_proxy_tls_policy`). Windows' `<local>` override convention is NOT a
+   hyper-util bypass and never counts as coverage.
+
+Live impact path (not yet measured end-to-end): the DGX GLM 5.3 model is
+configured with the HTTPS public LaunchPad base URL, so its audited
+generation traffic previously took the fresh-client-per-request path on
+Windows; it now takes the pooled branch whenever the registry fingerprint is
+stable.

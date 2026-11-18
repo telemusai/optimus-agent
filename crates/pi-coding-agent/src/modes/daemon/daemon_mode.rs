@@ -714,7 +714,7 @@ pub struct DaemonHistoryRange {
 }
 
 /// `DAEMON_COMMAND_TYPES` (ported verbatim from daemon-mode.ts).
-pub const DAEMON_COMMAND_TYPES: [&str; 105] = [
+pub const DAEMON_COMMAND_TYPES: [&str; 109] = [
     "ack_result",
     "list",
     "list_saved_sessions",
@@ -822,6 +822,12 @@ pub const DAEMON_COMMAND_TYPES: [&str; 105] = [
     // capability-gated; an old daemon answers "Unknown daemon command".
     "occ_get_preferences",
     "occ_set_preferences",
+    "occ31_get_preferences",
+    "occ31_set_mode",
+    "occ32_set_enabled",
+    // Manual OCC-3 queue resolution (schema revision 46): optional and
+    // capability-gated; an old daemon answers "Unknown daemon command".
+    "occ_resolve_queue_entry",
     "extension_ui_response",
     "prepare_update_restart",
     "retry_worker",
@@ -1077,6 +1083,20 @@ fn now_millis() -> f64 {
         .map(|duration| duration.as_millis() as f64)
         .unwrap_or(0.0)
 }
+
+fn now_epoch_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
+}
+
+/// Restart-retry window for a transient OCC-3 activation refusal. The server
+/// registry refuses a same-session re-enrollment while the previous
+/// daemon's permit is still live and prunes it once it expires; server
+/// permits are bounded to one hour, so this window covers the whole
+/// conflict span plus a margin.
+const OCC3_ACTIVATION_RESTART_RETRY_WINDOW_SECS: u64 = 3700;
 
 fn json_string(value: &str) -> String {
     serde_json::to_string(value).unwrap_or_else(|_| "\"\"".to_string())
@@ -5917,6 +5937,84 @@ impl AgentDaemon {
                     Some(value),
                 )))
             }
+            "occ32_set_enabled" => {
+                let enabled = body.get("enabled").and_then(Value::as_bool)
+                    .ok_or_else(|| "enabled must be a boolean".to_string())?;
+                let state = self.get_session_state(active_session_id)?;
+                let session_file = self.session_of(&state).session_file()
+                    .ok_or_else(|| "This chat has no saved session identity".to_string())?;
+                let value = crate::core::occ::session_settings::set_latent_preferences(&session_file, enabled)?;
+                Ok(Some(DaemonResponse::success(id, "occ32_set_enabled", Some(value))))
+            }
+            "occ31_get_preferences" => {
+                let state = self.get_session_state(active_session_id)?;
+                let session_file = self.session_of(&state).session_file()
+                    .ok_or_else(|| "This chat has no saved session identity".to_string())?;
+                let value = crate::core::occ::textmas_settings::preferences(&session_file)?;
+                Ok(Some(DaemonResponse::success(id, "occ31_get_preferences", Some(value))))
+            }
+            "occ31_set_mode" => {
+                let mode: crate::core::occ::textmas::TextMasMode = serde_json::from_value(
+                    body.get("mode").cloned().unwrap_or(Value::Null)
+                ).map_err(|_| "mode must be off, sequential, or hierarchical".to_string())?;
+                let state = self.get_session_state(active_session_id)?;
+                let session_file = self.session_of(&state).session_file()
+                    .ok_or_else(|| "This chat has no saved session identity".to_string())?;
+                let value = crate::core::occ::textmas_settings::set_mode(&session_file, mode)?;
+                Ok(Some(DaemonResponse::success(id, "occ31_set_mode", Some(value))))
+            }
+            // Manual resolution (schema 46): cancel or explicitly confirmed
+            // re-emit of ONE uncertain entry on the attached session's own
+            // native OCC-3 queue. The session owns the queue; the daemon
+            // only forwards the already-validated intent. The resolve API
+            // itself refuses any non-uncertain state, so a replayed or
+            // mis-targeted command mutates nothing. The response is
+            // content-free: ids and state only, never the dispatch token.
+            "occ_resolve_queue_entry" => {
+                let queue_id = body
+                    .get("queueId")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| "queueId must be a non-empty string".to_string())?;
+                let reemit = body
+                    .get("reemit")
+                    .and_then(Value::as_bool)
+                    .ok_or_else(|| "reemit must be a boolean".to_string())?;
+                let state = self.get_session_state(active_session_id)?;
+                let agent_session = self
+                    .session_of(&state)
+                    .agent_session()
+                    .ok_or_else(|| "This daemon session does not expose an agent session".to_string())?;
+                let native = agent_session
+                    .experimental_native_occ3()
+                    .ok_or_else(|| "This chat has no active OCC-3 native session".to_string())?;
+                let notice = native
+                    .sender_queue_resolve_uncertain(queue_id, reemit)
+                    .map_err(|error| format!("Queue resolution refused: {error}"))?;
+                // The wrapper journals the outcome into the durable outbox
+                // atomically with the resolution itself (one lock, one
+                // persist), so the transcript records, the /occ table and
+                // the roster projection observe the resolution within one
+                // drain cycle (turn end or the 30s idle sweep). The full
+                // notice (dispatch token included) stays in-process: the
+                // wire response below never carries it.
+                let value = match &notice {
+                    Some(notice) => serde_json::json!({
+                        "queueId": notice.queue_id,
+                        "messageId": notice.message_id.clone().unwrap_or_default(),
+                        "state": notice.state,
+                        "reason": notice.reason.clone().unwrap_or_else(|| {
+                            if reemit { "manual_reemit".to_string() } else { "manual_cancel".to_string() }
+                        }),
+                    }),
+                    None => serde_json::json!({ "queueId": queue_id, "state": "unchanged" }),
+                };
+                Ok(Some(DaemonResponse::success(
+                    id,
+                    "occ_resolve_queue_entry",
+                    Some(value),
+                )))
+            }
             "get_messages" => {
                 let state = self.get_session_state(active_session_id)?;
                 let messages = self
@@ -6252,10 +6350,16 @@ impl AgentDaemon {
                 let Some(model) = model else {
                     return Err(format!("Model not found: {provider}/{model_id}"));
                 };
+                // The identity before the switch, so the OCC-3 model-change
+                // hook can tell a real identity change from a same-model
+                // re-selection.
+                let previous_model = session.model_identity();
                 session
                     .set_model(&model, !(session.is_streaming() || session.is_compacting()))
                     .await?;
                 self.schedule_roster_flush();
+                self.maybe_activate_occ3_on_model_change(&state, previous_model)
+                    .await;
                 Ok(Some(DaemonResponse::success(
                     id,
                     "set_model",
@@ -6265,6 +6369,7 @@ impl AgentDaemon {
             "cycle_model" => {
                 let state = self.get_session_state(active_session_id)?;
                 let session = self.session_of(&state);
+                let previous_model = session.model_identity();
                 let result = session
                     .cycle_model(
                         body.get("direction").and_then(Value::as_str).unwrap_or(""),
@@ -6272,6 +6377,8 @@ impl AgentDaemon {
                     )
                     .await?;
                 self.schedule_roster_flush();
+                self.maybe_activate_occ3_on_model_change(&state, previous_model)
+                    .await;
                 Ok(Some(DaemonResponse::success(
                     id,
                     "cycle_model",
@@ -7318,7 +7425,28 @@ impl AgentDaemon {
         // ordinary session. When it is opted in, the session is enrolled
         // before its first prompt so the native permit and handoff tool are
         // installed while the session is still idle.
-        let _ = self.activate_experimental_occ3(&state).await;
+        if let Err(decline) = self.activate_experimental_occ3(&state).await {
+            // A daemon restart inside the server's permit window leaves the
+            // previous daemon's enrollment for this session still live, and
+            // the registry refuses a same-session re-enrollment until the old
+            // permit expires (bounded by the one-hour server TTL); a control
+            // plane that is not reachable yet behaves the same at boot. Both
+            // refusals are transient, so the retry is armed for the
+            // pre-prompt consumer instead of leaving the root session
+            // without the occ3_handoff tool until a manual model change or
+            // another restart happens to fire.
+            if matches!(
+                decline,
+                crate::core::occ3_connectors::activation::Occ3Decline::ModelIdentityMismatch
+                    | crate::core::occ3_connectors::activation::Occ3Decline::ConnectorUnavailable
+            ) {
+                let mut guard = state.lock().expect("active session poisoned");
+                guard.occ3_activation_pending = true;
+                guard.occ3_activation_retry_until_epoch = Some(
+                    now_epoch_secs() + OCC3_ACTIVATION_RESTART_RETRY_WINDOW_SECS,
+                );
+            }
+        }
         Ok(state)
     }
 
@@ -8731,18 +8859,21 @@ impl AgentDaemon {
             return;
         }
         let busy = busy_override.unwrap_or_else(|| worker_recovery_busy(session.as_ref()));
-        journal.record(WorkerRecoveryRecordInput {
-            active_session_id: entry
-                .state
-                .lock()
-                .expect("active session poisoned")
-                .active_session_id
-                .clone(),
+        let active_session_id = entry
+            .state
+            .lock()
+            .expect("active session poisoned")
+            .active_session_id
+            .clone();
+        if let Err(error) = journal.record(WorkerRecoveryRecordInput {
+            active_session_id,
             session_id,
             session_file: session.session_file(),
             busy,
             operation: operation.to_string(),
-        });
+        }) {
+            eprintln!("Could not persist worker recovery state: {error}");
+        }
     }
 }
 
@@ -11743,6 +11874,13 @@ impl AgentDaemon {
                 return Err(error);
             }
         };
+        // Long-lived OCC-3 sessions: renew a native enrollment that aged out
+        // with its permit before the prompt dispatches, so handoffs keep
+        // working past the one-hour server TTL instead of degrading until a
+        // session restart. A model-change activation that armed while the
+        // session was streaming retries here too.
+        self.maybe_reactivate_expired_occ3(&state).await;
+        self.maybe_activate_pending_occ3(&state).await;
         let controller = admission_entry
             .as_ref()
             .and_then(|(_, controller)| controller.clone());
@@ -15088,7 +15226,13 @@ impl AgentDaemon {
                     let mut slot = state_ref_for_callback.lock().expect("session state slot poisoned");
                     *slot = Some(Arc::clone(state));
                 }
-                state.lock().expect("active session poisoned").client_env = hydration_env.clone();
+                let mut state = state.lock().expect("active session poisoned");
+                state.client_env = hydration_env.clone();
+                // Hydration marker for receiver-liveness honesty: this
+                // session came back from a passivated subagent, so message
+                // receipts must distinguish it from a live consumer until a
+                // client attaches or the session starts running.
+                state.hydrated_from_passive = true;
             })), None)
             .await?;
         // The session transcript is authoritative for mutable metadata such as a
@@ -15571,6 +15715,28 @@ impl AgentDaemon {
         .map(|_| ())
     }
 
+    /// Receiver-liveness honesty for `sendAgentSessionMessage` receipts: the
+    /// target was restored from a passivated subagent and nothing live is
+    /// consuming it right now (no attached client, no attach in flight, not
+    /// streaming). Such a delivery lands in a restored transcript; the
+    /// receipt must not present it as an ordinary live delivery. Keyed on
+    /// the receiver's state at receipt time so it stays true for later sends
+    /// to the same hydrated receiver, and clears as soon as a client
+    /// attaches or the session runs.
+    fn agent_message_requires_hydration_marker(
+        &self,
+        target_state: &Arc<StdMutex<ActiveSessionState>>,
+    ) -> bool {
+        let (hydrated, clients, pending_attaches) = {
+            let state = target_state.lock().expect("active session poisoned");
+            (state.hydrated_from_passive, state.clients.len(), state.pending_attaches)
+        };
+        hydrated
+            && clients == 0
+            && pending_attaches == 0
+            && !self.session_of(target_state).is_streaming()
+    }
+
     /// `sendAgentSessionMessage(options)`.
     async fn send_agent_session_message(
         self: &Arc<Self>,
@@ -15582,6 +15748,15 @@ impl AgentDaemon {
         let target_selector = assert_direct_agent_message_target(&options.target_selector)?;
         let message =
             normalize_agent_session_message(&options.message, DEFAULT_AGENT_MESSAGE_MAX_CHARS)?;
+        // Receiver-liveness honesty: a target that is not currently resident
+        // and had to be hydrated (restored from saved session artifacts)
+        // accepts the message into its transcript, but nothing live consumed
+        // it. The marker is keyed on the receiver's actual state at receipt
+        // time (`agent_message_requires_hydration_marker`), not on which
+        // resolution branch this send took, so a second send to the same
+        // hydrated receiver is still marked, while waiting for an
+        // in-flight spawn of a never-passivated session is not (a live child
+        // will consume the message).
         let target_state = match self.get_bound_session_state(&target_selector) {
             Ok(state) => state,
             Err(error) => {
@@ -15718,11 +15893,14 @@ impl AgentDaemon {
             .accept_agent_session_message(&target_state, &payload)
             .await
         {
-            Ok(status) => Ok(create_agent_session_message_receipt(
-                &payload,
-                &status,
-                &now_iso(),
-            )),
+            Ok(status) => {
+                let receipt = create_agent_session_message_receipt(&payload, &status, &now_iso());
+                Ok(if self.agent_message_requires_hydration_marker(&target_state) {
+                    receipt.with_hydrated_receiver()
+                } else {
+                    receipt
+                })
+            }
             Err(error) => {
                 self.agent_message_rate_limiter
                     .lock()
@@ -16733,18 +16911,41 @@ impl AgentDaemon {
             }
             None => (false, false, None),
         };
-        // Off by default: no network, no log line, no behaviour change.
+        // Off by default: no network and no behaviour change. Ordinary models
+        // also get no log line; a model that declares an enabled `occ3` block
+        // logs the named decline, because the missing `occ3_handoff` tool is
+        // otherwise the only symptom of the missing opt-in.
         if !enabled && !experimental {
+            if let Some(line) = activation::early_decline_log_line(
+                &model,
+                Occ3Decline::DisabledByPolicy,
+                &session.session_id(),
+            ) {
+                self.log(&line);
+            }
             return Err(Occ3Decline::DisabledByPolicy);
         }
         // The control plane is keyed to the provider the session runs on, so
         // activation uses the credential this session resolves for its own
         // requests; nothing comes from `models.json`. An unresolvable
-        // credential is a named decline before any network.
-        let (api_key, control_headers) = agent_session
+        // credential is a named decline before any network, logged on the
+        // same terms as the policy decline above.
+        let (api_key, control_headers) = match agent_session
             .occ3_activation_credentials(&model)
             .await
-            .map_err(|_| Occ3Decline::ConnectorUnavailable)?;
+        {
+            Ok(credentials) => credentials,
+            Err(_) => {
+                if let Some(line) = activation::early_decline_log_line(
+                    &model,
+                    Occ3Decline::ConnectorUnavailable,
+                    &session.session_id(),
+                ) {
+                    self.log(&line);
+                }
+                return Err(Occ3Decline::ConnectorUnavailable);
+            }
+        };
         let request = Occ3ActivationRequest::new(&model, enabled, experimental)
             .with_endpoint_override(endpoint)
             .with_credentials(api_key, control_headers);
@@ -16782,6 +16983,139 @@ impl AgentDaemon {
                     session_id,
                 ));
                 Err(Occ3Decline::ModelIdentityMismatch)
+            }
+        }
+    }
+
+    /// Renewal hook for long-lived sessions. The native OCC-3 enrollment ages
+    /// out with its permit (server max_ttl_seconds, bounded to one hour); an
+    /// enrollment that died of expiry deactivates cleanly so turns keep the
+    /// ordinary inference path, and this hook re-runs the activation so
+    /// native handoffs work again without a session restart. No-op unless an
+    /// installed native session is dead: disabled sessions and sessions that
+    /// never activated keep their existing behavior, and a live enrollment
+    /// is never re-installed.
+    async fn maybe_reactivate_expired_occ3(
+        self: &Arc<Self>,
+        state: &Arc<StdMutex<ActiveSessionState>>,
+    ) {
+        let Some(agent_session) = self.session_of(state).agent_session() else { return };
+        // Installing fresh hooks requires an idle session; a busy one
+        // retries the renewal on its next prompt.
+        if agent_session.is_streaming() { return; }
+        let Some(native) = agent_session.experimental_native_occ3() else { return };
+        if !native.is_dead() { return; }
+        let _ = self.activate_experimental_occ3(state).await;
+    }
+
+    /// Model-change activation hook. A session that starts on a non-OCC-3
+    /// model declines activation at creation and previously never retried,
+    /// so switching that same root session to an OCC-3-capable model left it
+    /// without the `occ3_handoff` tool forever - only freshly spawned
+    /// subagents activated. When the session's model identity actually
+    /// changed and no native session is installed, activation is re-attempted
+    /// once per switch; the activation itself still declines fast and named
+    /// for ordinary models, so opted-out configurations pay no cost and no
+    /// log line. Guards mirror the renewal hook above: an installed native
+    /// session is never re-activated here (a live enrollment refuses
+    /// re-installation through its own seam, which stays authoritative, and
+    /// a dead one keeps the pre-prompt renewal path instead of doubling
+    /// activation attempts per switch), and a streaming session keeps its
+    /// ordinary path.
+    async fn maybe_activate_occ3_on_model_change(
+        self: &Arc<Self>,
+        state: &Arc<StdMutex<ActiveSessionState>>,
+        previous_model: Option<pi_ai::types::Model>,
+    ) {
+        use crate::core::model_resolver::models_are_equal;
+        let session = self.session_of(state);
+        // Only a real identity change retries: a same-model re-selection must
+        // not multiply activation attempts or decline log lines.
+        let identity_changed = match (session.model_identity().as_ref(), previous_model.as_ref()) {
+            (Some(current), Some(previous)) => !models_are_equal(Some(current), Some(previous)),
+            (None, None) => false,
+            _ => true,
+        };
+        if !identity_changed {
+            return;
+        }
+        let Some(agent_session) = session.agent_session() else {
+            return;
+        };
+        // Installing fresh hooks requires an idle session. A busy one keeps
+        // its ordinary path, but the retry is not dropped: it is armed as
+        // pending and the pre-prompt path
+        // (`maybe_activate_pending_occ3`) consumes it at the next idle
+        // prompt, so the streaming window cannot leave the session without
+        // the occ3_handoff tool until another model change happens to fire.
+        if agent_session.is_streaming() {
+            state
+                .lock()
+                .expect("active session poisoned")
+                .occ3_activation_pending = true;
+            return;
+        }
+        // Only a session with no installed native permit retries here. This
+        // is what unblocks the root session that declined at creation; live
+        // and dead enrollments keep their existing lifecycle paths.
+        if agent_session.experimental_native_occ3().is_some() {
+            return;
+        }
+        let _ = self.activate_experimental_occ3(state).await;
+    }
+
+    /// Pre-prompt consumer for a model-change activation retry that armed
+    /// while the session was streaming (see `maybe_activate_occ3_on_model_change`).
+    /// Runs once at the next idle prompt, then clears the pending marker
+    /// whether or not activation succeeded: a failed attempt does not
+    /// re-arm per prompt (the next model change re-arms it), and a success
+    /// installs the enrollment this hook exists to reach.
+    async fn maybe_activate_pending_occ3(
+        self: &Arc<Self>,
+        state: &Arc<StdMutex<ActiveSessionState>>,
+    ) {
+        let Some(agent_session) = self.session_of(state).agent_session() else { return };
+        // Installing fresh hooks requires an idle session; a still-busy one
+        // keeps the marker armed for a later prompt.
+        if agent_session.is_streaming() { return; }
+        if !state
+            .lock()
+            .expect("active session poisoned")
+            .occ3_activation_pending
+        {
+            return;
+        }
+        state
+            .lock()
+            .expect("active session poisoned")
+            .occ3_activation_pending = false;
+        // Only a session with no installed native permit retries; live and
+        // dead enrollments keep their existing lifecycle paths (the dead
+        // one through `maybe_reactivate_expired_occ3`).
+        if agent_session.experimental_native_occ3().is_some() { return; }
+        if let Err(decline) = self.activate_experimental_occ3(state).await {
+            // A transient refusal re-arms the marker while the restart-retry
+            // window (set by the worker-ready arming site) is still open: a
+            // restart inside the server permit window cannot re-enroll this
+            // session until the old permit expires, so a single prompt-spaced
+            // retry is not enough there. Past the window - or for stable
+            // declines - the marker stays cleared exactly like the one-shot
+            // model-change retry: the next model change or restart re-arms.
+            if matches!(
+                decline,
+                crate::core::occ3_connectors::activation::Occ3Decline::ModelIdentityMismatch
+                    | crate::core::occ3_connectors::activation::Occ3Decline::ConnectorUnavailable
+            ) {
+                let retry_until = state
+                    .lock()
+                    .expect("active session poisoned")
+                    .occ3_activation_retry_until_epoch;
+                if retry_until.is_some_and(|deadline| now_epoch_secs() < deadline) {
+                    state
+                        .lock()
+                        .expect("active session poisoned")
+                        .occ3_activation_pending = true;
+                }
             }
         }
     }
@@ -17092,6 +17426,132 @@ impl AgentSessionMessageController for DaemonAgentMessageController {
                 &speaker,
                 true,
             )
+        })
+    }
+
+    /// OCC-3 sender-queue parent notification: durably records one
+    /// child queue notice in the PARENT session's transcript. The
+    /// parent target resolves through the daemon's own session registry
+    /// (`get_bound_session_state`) from the spawn-relationship id the
+    /// sender host passed - never a model-supplied name - and a live,
+    /// non-closing session must exist for the delivery to be accepted.
+    /// The record carries the content-free notice details plus
+    /// `childSessionId`; its stable `noticeId` makes a replay (crash
+    /// between this durable accept and the sender's local outbox ack)
+    /// an idempotent no-op.
+    fn notify_parent_queue_notice(
+        &self,
+        child_session_id: &str,
+        parent_session_id: &str,
+        details: serde_json::Value,
+    ) -> pi_ai::types::BoxFuture<Result<(), String>> {
+        let daemon = self.daemon.clone();
+        let child_session_id = child_session_id.to_string();
+        let parent_session_id = parent_session_id.to_string();
+        // Caller authentication resolves OUTSIDE the boxed future:
+        // require_current_state is sync and returns an owned Arc, so the
+        // receiver borrow never enters the 'static future. A failure is
+        // still surfaced as an asynchronous Err (same external contract
+        // as before the hoist).
+        let current = match self.require_current_state() {
+            Ok(current) => current,
+            Err(error) => return Box::pin(async move { Err(error) }),
+        };
+        Box::pin(async move {
+            use crate::core::agent_session::occ3_sender_queue::OCC3_CHILD_QUEUE_NOTICE_CUSTOM_TYPE;
+            use crate::core::session_manager::CustomMessageEntryContent;
+            let notice_id = details
+                .get("noticeId")
+                .and_then(serde_json::Value::as_str)
+                .ok_or("Parent queue notification missing noticeId")?
+                .to_string();
+            // Caller authentication: the notifying session must BE the
+            // controller's current session (the registry-resolved handle,
+            // never a caller-supplied id).
+            let child = daemon
+                .session_of(&current)
+                .agent_session()
+                .ok_or("Notifying session unavailable")?;
+            if child.session_id() != child_session_id {
+                return Err("Parent queue notification caller identity mismatch".into());
+            }
+            // Relationship authentication: the parent must be the
+            // child's RECORDED parent (catalog family entry, from the
+            // daemon-owned runtime metadata), never a caller-supplied
+            // name. Fail closed when no relationship is recorded.
+            let child_entry = daemon.agent_family_entry(&current);
+            if child_entry.parent_session_id.as_deref() != Some(parent_session_id.as_str()) {
+                return Err("Parent queue notification target is not the recorded parent".into());
+            }
+            let parent_state = daemon.get_bound_session_state(&parent_session_id)?;
+            let parent = daemon
+                .session_of(&parent_state)
+                .agent_session()
+                .ok_or("Parent agent session unavailable")?;
+            let mut details = details;
+            details["childSessionId"] = serde_json::Value::String(child_session_id.clone());
+            let state = details.get("state").and_then(serde_json::Value::as_str).unwrap_or("unknown");
+            let queue_id = details.get("queueId").and_then(serde_json::Value::as_str).unwrap_or("");
+            let reason = details.get("reason").and_then(serde_json::Value::as_str);
+            let line = match reason {
+                Some(reason) => format!("OCC-3 child queue notice: {state} handoff {queue_id} from child session {child_session_id} ({reason})."),
+                None => format!("OCC-3 child queue notice: {state} handoff {queue_id} from child session {child_session_id}."),
+            };
+            let content = CustomMessageEntryContent::Text(line.clone());
+            // The session-manager guard is scoped: dedup + durable
+            // append complete and the guard DROPS before the async
+            // follow-up below, keeping the future `Send`.
+            {
+                let mut manager = parent
+                    .session_manager
+                    .lock()
+                    .map_err(|_| "Parent session manager poisoned".to_string())?;
+                // Replay dedup over the FULL history (no window): if the
+                // parent already accepted this noticeId, the duplicate
+                // delivery is a no-op (never a second record).
+                if manager.has_custom_message_notice(OCC3_CHILD_QUEUE_NOTICE_CUSTOM_TYPE, &notice_id)
+                {
+                    return Ok(());
+                }
+                manager
+                    .append_custom_message_entry_with_rollback(
+                        OCC3_CHILD_QUEUE_NOTICE_CUSTOM_TYPE,
+                        &content,
+                        true,
+                        Some(details.clone()),
+                    )
+                    .map_err(|error| format!("Parent queue notification not durably accepted: {error}"))?;
+            }
+            // Live steering for an active parent, terminal states only: a
+            // busy parent learns of the outcome without waiting for its
+            // next turn. Intermediate states stay durable-only, so they
+            // cannot flood the parent with follow-up turns. The prompt is
+            // coalesced per (child, queueId): a newer notice replaces an
+            // older prompt that has not started yet. Prompt failure never
+            // un-acks: the durable record above already replays into the
+            // parent's context at the next turn boundary.
+            use crate::core::agent_session::occ3_sender_queue::{
+                parent_notice_prompts_live, parent_notice_queue_key,
+            };
+            let queue_key = parent_notice_queue_key(&child_session_id, queue_id);
+            if !parent_notice_prompts_live(state) {
+                // An older terminal-or-not prompt for this entry is stale
+                // once a newer notice exists.
+                parent.remove_queued_follow_up(&queue_key);
+                return Ok(());
+            }
+            let custom = crate::core::messages::CustomMessage {
+                role: "user".into(),
+                custom_type: OCC3_CHILD_QUEUE_NOTICE_CUSTOM_TYPE.into(),
+                content: pi_agent_core::types::CustomMessageContent::Text(line.clone()),
+                display: true,
+                details: Some(details),
+                timestamp: crate::core::agent_session::now_ms() as i64,
+            };
+            let _ = parent
+                .queue_keyed_agent_message_follow_up(&line, &queue_key, Some(custom))
+                .await;
+            Ok(())
         })
     }
 }

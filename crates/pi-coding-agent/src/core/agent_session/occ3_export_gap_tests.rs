@@ -145,6 +145,7 @@ impl Occ3Connector for FixtureConnector {
                 expires_at_epoch: now() + 600,
                 span_policy: SOURCE_SPAN_POLICY.into(),
                 capture_mode: String::new(),
+                label_anchor_alpha: None,
             },
             self.profile.clone(),
             limits,
@@ -228,6 +229,7 @@ async fn resolve_capture(session: &Arc<Occ3NativeSession>) {
         model: fixture_model(),
         context: Default::default(),
         messages: Vec::new(),
+        newly_supplied_messages: Vec::new(),
         signal: None,
     })
     .await

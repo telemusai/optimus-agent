@@ -31,6 +31,20 @@ pub fn set_log_sink(next: Option<LogSink>) {
     }
 }
 
+/// Serialize sink-swap test bodies. The sink is process-wide, so two tests
+/// that install their own capture sinks and run in parallel can clear each
+/// other's sink mid-assert. Every test that installs a sink must hold this
+/// guard for its whole body (drop order with the reset guard does not
+/// matter: both are released at test end).
+#[doc(hidden)]
+pub fn test_sink_guard() -> std::sync::MutexGuard<'static, ()> {
+    static TEST_SINK_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    TEST_SINK_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// JSON serialization that never fails: the entry is built from JSON values, so
 /// there are no circular references or BigInts to degrade.
 pub fn stringify_log_entry(entry: &Value) -> String {

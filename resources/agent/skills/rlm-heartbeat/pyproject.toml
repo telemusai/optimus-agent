@@ -5,7 +5,7 @@
 [project]
 name = "rlm-heartbeat"
 version = "0.1.0"
-description = "Prime Agent RLM heartbeat skill: internal recurring session checks over the host bridge"
+description = "Optimus RLM heartbeat skill: internal recurring session checks over the host bridge"
 requires-python = ">=3.10"
 dependencies = []
 

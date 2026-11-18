@@ -16,8 +16,8 @@ import sys
 import time
 
 from .docker_api import DockerAPI
-from .lifecycle import (Failure, FileLock, Journal, Services, checked_inspect,
-                        consume_authorization, is_running, private_json,
+from .lifecycle import (Failure, FileLock, Journal, Services, calibrated_binding_from_state,
+                        checked_inspect, consume_authorization, is_running, private_json,
                         process_identity, read_json, recover, reconcile_helpers, helpers_settled,
                         rotate_helper_admission, reconcile_helper_operations, helper_operations_settled,
                         PERSIST_CANDIDATE_ON_SUCCESS, PERSISTED_CANDIDATE, PERSISTED_PHASE,
@@ -38,7 +38,14 @@ def complete(state):
 
 
 def persisted(state):
-    """A readiness-verified candidate whose persistence decision is already durable."""
+    """A fully verified candidate whose persistence decision is already durable.
+
+    Independent acceptance gate: the durable record and the persistence gates
+    are necessary but not sufficient. Retention is accepted only when the
+    complete REQUIRED_GATES native validation chain is present and ok, so a
+    forged or partial PERSISTED_CANDIDATE state with a missing, failed or
+    still-pending proof link is rejected and restored instead.
+    """
     record = state.get("persistence")
     record = record if isinstance(record, dict) else {}
     original = record.get("original") if isinstance(record.get("original"), dict) else {}
@@ -53,7 +60,10 @@ def persisted(state):
             original.get("image_id") == state.get("original_image_id") and
             isinstance(record.get("recovery_command"), str) and bool(record["recovery_command"]) and
             PERSISTENCE_GATES <= gates.keys() and
-            all(gates[name].get("ok") is True for name in PERSISTENCE_GATES))
+            all(gates[name].get("ok") is True for name in PERSISTENCE_GATES) and
+            REQUIRED_GATES <= gates.keys() and
+            all(isinstance(gates[name], dict) and gates[name].get("ok") is True
+                for name in REQUIRED_GATES))
 
 
 def claim_original_fence(journal, fence_root, identity):
@@ -207,7 +217,8 @@ class Supervisor:
             raise Failure("completion state changed")
         from .docker_config import assert_candidate_parity
         assert_candidate_parity(self.original, candidate, self.state["candidate_image_id"],
-                                self.state["plan"].get("environment_additions"))
+                                self.state["plan"].get("environment_additions"),
+                                calibrated_binding_from_state(self.state))
         assert_candidate_parity(self.original, original, self.state["original_image_id"])
         rotate_helper_admission(self.journal, "closed")
         cleanup = reconcile_helpers(self.api, self.journal)

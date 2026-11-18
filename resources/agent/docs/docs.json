@@ -16,7 +16,7 @@
           "path": "architecture.md"
         },
         {
-          "title": "Using Prime Agent",
+          "title": "Using Optimus",
           "path": "usage.md"
         },
         {
@@ -73,7 +73,7 @@
           "path": "themes.md"
         },
         {
-          "title": "Prime Agent Packages",
+          "title": "Optimus Packages",
           "path": "packages.md"
         },
         {

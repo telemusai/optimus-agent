@@ -14,11 +14,13 @@ from .latent_types import (LatentError, Publication, SessionEnrollment, bounded_
 
 
 class BrokerAuthority:
-    def __init__(self, profile, *, principal_id):
+    def __init__(self, profile, *, principal_id, epoch=time.time):
         identifier(principal_id)
         self.profile, self.principal_id = profile, principal_id
         self.principal_digest = hashlib.sha256(principal_id.encode("ascii")).hexdigest()
         self._marker = object()
+        # Wall clock for permit expiry; injectable like LatentRegistry's.
+        self.epoch = epoch
         self.sessions = {}
         self.operations = {}
 
@@ -42,12 +44,27 @@ class BrokerAuthority:
 
     def check_session(self, principal, session):
         value = self.sessions.get((principal, session))
-        require(value is not None and value.expires_at_epoch > time.time(), "identity")
+        require(value is not None and value.expires_at_epoch > self.epoch(), "identity")
         return value
+
+    def _prune(self):
+        """Drop expired enrollments, as LatentRegistry.enroll does.
+
+        The table lives for the whole process. Without this, expired permits
+        kept their quota slots: after profile.max_records enrollments every new
+        one was refused with quota (HTTP 429) until a restart, and renewing a
+        session whose permit had expired was refused as an identity conflict.
+        Either way the client declined activation and installed no
+        occ3_handoff tool. Live enrollments are never dropped.
+        """
+        now = self.epoch()
+        for key in [k for k, s in self.sessions.items() if s.expires_at_epoch <= now]:
+            del self.sessions[key]
 
     def remember_session(self, enrollment):
         require(enrollment.principal_digest == self.principal_digest, "identity")
         key = (enrollment.principal_digest, enrollment.session_id)
+        self._prune()
         old = self.sessions.get(key)
         require(old is None or old == enrollment, "identity")
         require(old is not None or len(self.sessions) < self.profile.max_records, "quota")
@@ -72,7 +89,7 @@ class BrokerAuthority:
             return AuthenticatedContext(principal, session, self.profile.model_id,
                 enrollment.model_fingerprint, enrollment.runtime_epoch,
                 enrollment.runtime_generation,
-                min(deadline, time.monotonic() + enrollment.expires_at_epoch - time.time()))
+                min(deadline, time.monotonic() + enrollment.expires_at_epoch - self.epoch()))
         except LatentError:
             raise AttachmentError("identity_mismatch", 401) from None
 

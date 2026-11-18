@@ -168,3 +168,10 @@ git pull --rebase && git push
 ### User override
 
 If the user instructions conflict with rules set out here, ask for confirmation that they want to override the rules. Only then execute their instructions.
+
+## Upstream PRs (fork-based workflow)
+
+- `origin` (telemusai/optimus-agent) is read-only for fork contributors: a `git push origin` 403 is expected, not an error to debug. Pushes go to your fork remote.
+- Open PRs via the REST API when the gh CLI is unavailable: read the token with `printf "protocol=https\nhost=github.com\n\n" | git credential fill` (never print it), POST `repos/telemusai/optimus-agent/pulls` with head `"<user>:<branch>"`, base `main`. Verify on the wire before claiming success: GET the PR and confirm `state=open` and `head.sha` equals the local HEAD.
+- Workflow-scope rejection: if your fork credential lacks the `workflow` scope and the push is refused because the range carries a `.github/workflows/` change that upstream main already merged, rebase your commits onto a fork-known base that predates the workflow commit. The push then carries only your commits (none touching workflows) and the existing credential passes. Mandatory pre-push check: `git diff origin/main..HEAD --stat -- .github/workflows/` must be empty or deletions-only, and `git diff <tested-commit> HEAD -- <your-files>` must be empty so the PR ships exactly what you verified.
+- Every PR needs a `.changes/<slug>.md` fragment inside its commit range, a `No-Ticket: <one-line reason>` line in the body when there is no Linear ticket, conventional commit messages, and measured numbers only (never projections; NOT-RUN items listed). Never merge your own PR — the maintainer merges.

@@ -1,0 +1,5 @@
+- Fixed long guarded OCC-3 turns by offering negotiated keepalive streaming by default, with an explicit client opt-out.
+- Added native-turn completion and interruption summaries, plus bounded opt-in server output excerpts for operator diagnosis.
+- Fixed keepalive cadence during steady decode and classified first-event deferred busy refusals as proven non-use, preserving bounded retry guidance.
+- Fixed diagnostic failure isolation and cancellation labels; capped summary messages at 16 KiB.
+- Fixed excerpt omission under the log cap: all output excerpt kinds are now kept under the log cap by reducing their effective limit; kept event counts after collection stops and aligned terminal cancellation summaries.

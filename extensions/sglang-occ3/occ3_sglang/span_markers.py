@@ -109,6 +109,7 @@ __all__ = [
     "MarkerResolutionError", "ArgumentDelimiters", "ContentDelimiters",
     "MarkerTable", "resolve_marker_ids", "resolve_marker_table",
     "resolve_stop_ids", "resolve_turn_stop_ids", "vocabulary_bound",
+    "USER_ROLE_LITERALS", "resolve_user_role_id",
 ]
 
 #: Version of the resolved-table contract.  A receipt that names a marker
@@ -197,6 +198,11 @@ _GLM_XML_KV = (
 )
 
 _PROFILES = {DEFAULT_PROFILE: _GLM_XML_KV}
+
+#: The user-turn role-token spelling of each profile's chat template. The
+#: GLM-4.5/4.7/5.x template opens every user turn with this single added
+#: token. Used only to attest the token id; the prompt is searched by id.
+USER_ROLE_LITERALS = {DEFAULT_PROFILE: "<|user|>"}
 
 
 def _error(reason: str, role: str = "") -> MarkerResolutionError:
@@ -589,3 +595,30 @@ def resolve_turn_stop_ids(tokenizer, model_config=None, *,
             if len(ids) == 1:
                 extra.add(ids[0])
     return resolve_stop_ids(tokenizer, extra=tuple(sorted(extra)))
+
+
+def resolve_user_role_id(tokenizer, *, profile: str = DEFAULT_PROFILE):
+    """The tokenizer's own single user role-token id, or None.
+
+    Attested exactly like a stop-set role token (resolve_turn_stop_ids): the
+    profile's spelling must encode to exactly one id below the vocabulary
+    bound and decode back to the same spelling. A tokenizer that does not
+    know it as one token returns None (the caller falls back), never a guess.
+    The answer is cached on the tokenizer object.
+    """
+    if type(profile) is not str or profile not in USER_ROLE_LITERALS:
+        return None
+    cached = getattr(tokenizer, "_occ3_user_role_id", None)
+    if type(cached) is tuple and len(cached) == 2 and cached[0] == profile:
+        return cached[1]
+    try:
+        ids = _candidate_ids(tokenizer, USER_ROLE_LITERALS[profile], "",
+                             vocabulary_bound(tokenizer), require_roundtrip=True)
+    except MarkerResolutionError:
+        ids = ()
+    value = ids[0] if len(ids) == 1 else None
+    try:
+        setattr(tokenizer, "_occ3_user_role_id", (profile, value))
+    except Exception:
+        pass
+    return value

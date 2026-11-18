@@ -430,7 +430,7 @@ fn routed_server_capability_supported(
     direct_supported: bool,
 ) -> bool {
     // Roster metadata comes from the control plane, never the direct worker.
-    if capability == "streaming_throughput" {
+    if capability == "streaming_throughput" || capability == "agent_communication_queue" {
         supervisor_connected && supervisor_supported
     } else {
         supervisor_supported || direct_supported
@@ -712,6 +712,16 @@ mod tests {
             control.message,
             "Daemon control-plane transport failed: boom"
         );
+    }
+
+    #[test]
+    fn communication_queue_metadata_never_uses_the_direct_worker_capability() {
+        // Queue metadata is roster metadata from the control plane, exactly
+        // like streaming throughput: a newer direct worker cannot satisfy
+        // an older supervisor, and a connected supervisor must advertise it.
+        assert!(!routed_server_capability_supported("agent_communication_queue", true, false, true));
+        assert!(!routed_server_capability_supported("agent_communication_queue", false, true, true));
+        assert!(routed_server_capability_supported("agent_communication_queue", true, true, false));
     }
 
     #[test]

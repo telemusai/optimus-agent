@@ -165,6 +165,18 @@ pub struct Occ3Envelope {
 /// Bounded default for the embedded control summary.
 pub const OCC3_MAX_SUMMARY_CHARS: usize = 2048;
 
+/// Fixed receiver-framed control summary for native handoffs.
+///
+/// The summary is the only durable, model-visible text framing the receiver
+/// gets for an attached native state. Differential forensics (2026-11-08
+/// cross-machine drills) showed receivers in long contexts recovering the
+/// sender's facts only approximately (prefix loss, case loss, adjacent-token
+/// drift) when the framing did not direct the model to extract from the
+/// attached state. The proof harness framing that recovered facts byte-exact
+/// named the attachment position and required verbatim reporting; this
+/// constant carries those properties while staying receiver-framed.
+pub const OCC3_CONTROL_SUMMARY: &str = "You are the receiver of this attached native state. It is the sender's context, not your own history. The sender's latent rows are attached to this turn immediately after this message as the primary information source. Read the attached state carefully before answering, and prefer its content verbatim: when it carries facts, codes, or numbers, report them exactly as the state presents them, character for character, without paraphrasing, completing, or guessing. As the receiver, answer your current task using that state.";
+
 /// Error taxonomy for OCC-3 bridge operations. All variants are
 /// fallback-classified by [`super::negotiation`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -194,6 +206,15 @@ pub enum Occ3Error {
     TransferFailed { reason: String },
     /// The connector cannot attach state to an actual native inference.
     NativeInferenceUnsupported { connector_id: String },
+    /// The connector refused to prepare the receiver's native inference as
+    /// busy before any dispatch: a synchronous admission-unavailability
+    /// decline (the control path's busy/quota gate; on sessions/enroll the
+    /// real decline is quota). Proven non-use - nothing was generated and
+    /// the attachment was never submitted - so the receiver retires its
+    /// inbox claim terminally and routes the busy signal to the sender,
+    /// whose fresh-capture re-arm becomes the sole retry path. Never a
+    /// replay permit.
+    NativeInferenceBusyRefused { connector_id: String },
     /// A native inference may have accepted the state. Never replay as text.
     InferenceOutcomeUncertain { message_id: String },
     /// OCC-3 disabled by configuration or policy.
@@ -227,6 +248,12 @@ impl std::fmt::Display for Occ3Error {
                 write!(
                     f,
                     "occ3: native inference attachment unsupported: {connector_id}"
+                )
+            }
+            Occ3Error::NativeInferenceBusyRefused { connector_id } => {
+                write!(
+                    f,
+                    "occ3: native inference busy refused: {connector_id}"
                 )
             }
             Occ3Error::InferenceOutcomeUncertain { message_id } => {

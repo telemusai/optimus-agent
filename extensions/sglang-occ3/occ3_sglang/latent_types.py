@@ -3,6 +3,12 @@ from __future__ import annotations
 
 import ast
 import math
+import inspect
+import json
+import logging
+import threading
+from functools import wraps
+from contextlib import contextmanager
 import os
 import re
 import sys
@@ -21,11 +27,204 @@ _REGISTRY_SOURCE_LIMIT = 2 * 1024 * 1024
 _METHOD_TABLE = {"method_id", "requires_calibration_artifact"}
 
 
+# Only source-defined detail tags may leave the worker. No request-derived strings.
+_ADMISSION_DETAILS = frozenset((
+    'latent_registry.reserve_capture.descriptor_type',
+    'latent_registry.reserve_capture.method_deadline',
+    'latent_registry.reserve_capture.budget_owner_expiry',
+    'latent_registry.reserve_capture.existing_attempt',
+    'latent_registry.reserve_capture.tombstone_replay',
+    'latent_registry.reserve_capture.record_capacity',
+    'latent_registry.reserve_capture.tombstone_capacity',
+    'latent_registry.reserve_capture.active_slot',
+    'latent_registry.reserve_capture.byte_capacity',
+    'latent_registry.retire.consumer_pending',
+    'latent_worker.admit_request.request_identity',
+    'latent_worker.admit_request.capture_reserved',
+    'latent_worker.admit_request.consume_leased',
+    'latent_worker.admit_request.request_shape',
+    'latent_worker.admit_request.embedding_override',
+    'latent_worker.admit_request.already_attached',
+    'latent_worker.admit_request.capture_inflight',
+    'latent_worker.admit_request.consume_eager_inflight',
+    'latent_worker.admit_request.marker_attestation',
+    'latent_worker.admit_request.prefix_offset',
+    'latent_worker.admit_request.consume_capacity',
+    'latent_worker.admit_request.sparse_pin',
+    'latent_worker.capture_budget.prefix_count',
+    'latent_worker.capture_budget.span_policy',
+    'latent_worker.capture_budget.workspace_capacity',
+    'latent_backend._slot.attempt_slot',
+    'latent_backend._reservation.native_identity',
+    'latent_backend._reservation.native_bounds',
+    'latent_backend.enroll_source.profile_identity',
+    'latent_backend.enroll_source.retained_limit',
+    'latent_backend.enroll_source.source_request_identity',
+    'latent_backend.prepare_source.source_reservation',
+))
+_ADMISSION_OPERATIONS = frozenset(("reserve_capture", "reserve_consume", "release_lease",
+    "retire", "reap", "worker_admit", "enroll_source", "prepare_source",
+    "release_unused", "backend_retire", "frontend_charge", "frontend_release",
+    "terminal_release", "worker_abort", "worker_control", "finish_source", "quarantine", "terminal_gate", "terminal_resolve"))
+_ADMISSION_LOCK = threading.Lock()
+_ADMISSION_COUNTS = {}
+_ADMISSION_LOGS = 0
+_ADMISSION_LAST = {}
+
+
+def admission_diagnostics_snapshot():
+    """Process-local counters only; not a cross-rank status or proof of release."""
+    try:
+        if os.environ.get("OCC3_DIAG_TOKEN_TRACE") != "1":
+            return {}
+        with _ADMISSION_LOCK:
+            return {"counts": dict(_ADMISSION_COUNTS), "logged": _ADMISSION_LOGS,
+                    "last": {k: dict(v) for k, v in _ADMISSION_LAST.items()}}
+    except Exception:
+        return {}
+
+
+def admission_event(operation, outcome, *, registry=None, error=None, owner=None):
+    """Bounded scalar-only diagnostics; failures never alter admission/cleanup."""
+    global _ADMISSION_LOGS
+    try:
+        if os.environ.get("OCC3_DIAG_TOKEN_TRACE") != "1":
+            return
+        if operation not in _ADMISSION_OPERATIONS or outcome not in ("entry", "exit", "error"):
+            return
+        row = {"operation": operation, "outcome": outcome}
+        from .attachment_contract import AttachmentError
+        from .turn_diagnostics import _FAILURE_CODES
+        if isinstance(error, (LatentError, AttachmentError)) and error.code in _FAILURE_CODES:
+            row.update(code=error.code, detail=getattr(error, "detail", None))
+        if registry is not None:
+            with registry.lock:
+                records = tuple(registry.records.values())
+                row.update(active=sum(not r.revoked and r.state in
+                    ("reserved", "capturing", "leased", "injected") for r in records),
+                    max_active=registry.profile.max_active, total=len(records),
+                    max_records=registry.profile.max_records,
+                    inflight=sum(r.inflight for r in records),
+                    reservation=sum(not r.revoked and r.state == "reserved" for r in records),
+                    charged_bytes=registry.charged_bytes,
+                    max_live_bytes=registry.profile.max_live_bytes,
+                    revoked=sum(r.revoked for r in records),
+                    gpu_freed=sum(r.gpu_freed for r in records),
+                    retained_rows=sum(len(r.retained) for r in records),
+                    admitted_capture=sum(r.admitted_capture for r in records),
+                    admitted_consume=sum(r.admitted_consume for r in records),
+                    leased=sum(not r.revoked and r.state == "leased" for r in records),
+                    capturing=sum(not r.revoked and r.state == "capturing" for r in records))
+        if owner is not None:
+            if hasattr(owner, "_active"):
+                row.update(active=owner._active, max_active=owner.profile.max_active,
+                           terminal_active=owner._terminal_active,
+                           terminal_attempts=len(owner._terminal_attempts),
+                           fences=len(getattr(owner, "_attempts", ())),
+                           quarantined=len(getattr(owner, "_quarantined", ())),
+                           terminal_tasks=len(getattr(owner, "_terminal_tasks", ())))
+            if hasattr(owner, "attempts"):
+                row["attempts"] = len(owner.attempts)
+            control = getattr(owner, "client", None)
+            if hasattr(control, "pending"):
+                row.update(pending=len(control.pending), uncertain=len(control._uncertain),
+                           operations=len(control._operations), max_pending=control.max_pending)
+            if type(getattr(owner, "rank", None)) is int:
+                row["rank"] = min(65535, max(0, owner.rank))
+            if hasattr(owner, "poisoned"):
+                row["poisoned"] = bool(owner.poisoned)
+                row["commands"] = len(owner.commands)
+        with _ADMISSION_LOCK:
+            _ADMISSION_LAST[operation] = dict(row)
+            key = operation + "." + outcome
+            _ADMISSION_COUNTS[key] = min(2**63 - 1, _ADMISSION_COUNTS.get(key, 0) + 1)
+            _ADMISSION_LOGS = min(2**63 - 1, _ADMISSION_LOGS + 1)
+        logging.getLogger("occ3_sglang.admission").info(
+            "occ3-bridge: admission %s", json.dumps(row, separators=(",", ":")))
+    except Exception:
+        pass
+
+
+def admission_probe(operation, *, registry=False):
+    """Count entries and every exit, including cancellation, without inspecting args."""
+    def decorate(function):
+        def event(args, outcome, error=None):
+            try:
+                owner = args[0]
+                runtime = getattr(owner, "occ3_runtime", None)
+                owner = runtime if runtime is not None else owner
+                reg = owner if registry else getattr(owner, "registry", None)
+                admission_event(operation, outcome, registry=reg, error=error, owner=owner)
+                if isinstance(error, Exception) and operation in ("worker_admit", "worker_abort"):
+                    from .turn_diagnostics import log_failure
+                    log_failure(error, phase="admission")
+            except Exception:
+                pass
+        if inspect.iscoroutinefunction(function):
+            @wraps(function)
+            async def asynchronous(*args, **kwargs):
+                event(args, "entry")
+                try:
+                    return await function(*args, **kwargs)
+                except BaseException as error:
+                    event(args, "error", error)
+                    raise
+                finally:
+                    event(args, "exit")
+            return asynchronous
+        @wraps(function)
+        def synchronous(*args, **kwargs):
+            event(args, "entry")
+            try:
+                return function(*args, **kwargs)
+            except BaseException as error:
+                event(args, "error", error)
+                raise
+            finally:
+                event(args, "exit")
+        return synchronous
+    return decorate
+
+
+_ADMISSION_LOCK_TRACE = os.environ.get("OCC3_DIAG_TOKEN_TRACE") == "1"
+_ADMISSION_LOG = logging.getLogger("occ3_sglang.admission")
+
+
+def admission_lock(registry):
+    """Return the original lock unless import-time opt-in and DEBUG are enabled."""
+    try:
+        if _ADMISSION_LOCK_TRACE and _ADMISSION_LOG.isEnabledFor(logging.DEBUG):
+            return _traced_admission_lock(registry)
+    except Exception:
+        pass
+    return registry.lock
+
+
+def _admission_lock_note(event):
+    try:
+        _ADMISSION_LOG.debug("occ3-bridge: admission lock %s", event)
+    except Exception:
+        pass
+
+
+@contextmanager
+def _traced_admission_lock(registry):
+    """Observe the existing lock boundary without adding a second lock scope."""
+    _admission_lock_note("acquire_wait")
+    with registry.lock:
+        _admission_lock_note("acquired")
+        try:
+            yield
+        finally:
+            _admission_lock_note("releasing")
+    _admission_lock_note("released")
+
+
 class LatentError(RuntimeError):
-    def __init__(self, code="latent_failed", members=None):
+    def __init__(self, code="latent_failed", members=None, *, detail=None):
         allowed = {"latent_failed", "unavailable", "profile", "identity", "expired",
                    "quota", "replay", "state", "lineage", "ranks", "invalid",
-                   "not_ready", "retired", "numerical", "cancelled"}
+                   "not_ready", "retired", "numerical", "cancelled", "busy"}
         self.code = code if code in allowed else "latent_failed"
         # Bounded sanitised names of the profile members that tripped; a live
         # decline names every failing check in one attempt instead of one.
@@ -35,6 +234,7 @@ class LatentError(RuntimeError):
             self.members = ",".join(members)[:128]
         else:
             self.members = None
+        self.detail = detail if detail in _ADMISSION_DETAILS else None
         super().__init__(self.code)
 
 
@@ -49,9 +249,9 @@ class UniformRequestCancellation(LatentError):
         super().__init__(code)
 
 
-def require(condition, code="invalid"):
+def require(condition, code="invalid", *, detail=None):
     if not condition:
-        raise LatentError(code)
+        raise LatentError(code, detail=detail)
 
 
 def require_members(checks, code="profile"):
@@ -269,6 +469,10 @@ class RuntimeProfile:
     max_live_bytes: int = 256 * 1024 * 1024
     workspace_bytes: int = 128 * 1024 * 1024
     max_records: int = 256
+    #: Concurrent live captures/leases the registry admits. 1 is the pinned
+    #: deployment default; 2 is operator-selectable through OCC3_MAX_ACTIVE at
+    #: profile load (see latent_worker.load_runtime_profile). The effective
+    #: value is attested to clients via binding_digest.
     max_active: int = 1
     max_ttl_seconds: int = 3600
     anchor_alpha: float = 0.0
@@ -285,6 +489,10 @@ class RuntimeProfile:
     # dispatch) before any aligner exists, so a mismatched file is never loaded.
     calibration_path: str = ""
     calibration_digest: str = ""
+    # Optional label-space anchoring; mutually exclusive with nearest-vocab anchoring.
+    label_anchor_alpha: float = 0.0
+    label_anchor_alpha_allowed: tuple[float, ...] | list[float] | None = None
+    label_anchor_alpha_default: float | None = None
 
     def __post_init__(self):
         for key in ("runtime_epoch", "model_fingerprint", "model_id"):
@@ -311,14 +519,51 @@ class RuntimeProfile:
             # Registry-driven, method-agnostic: a reference may only be carried
             # by a method whose registry entry requires a calibration artifact.
             require(_registered_table().get(self.method, False), "profile")
-        require(self.max_active == 1 and 1 <= self.max_records <= 4096, "profile")
+        require(self.max_active in (1, 2) and 1 <= self.max_records <= 4096, "profile")
         require(0 < self.max_live_bytes <= 2**30 and 0 < self.workspace_bytes <= 2**30, "profile")
         require(self.anchor_alpha in (0.0, 0.3) and 1 <= self.tile_rows <= 4096, "profile")
+        require(type(self.label_anchor_alpha) in (int, float)
+                and math.isfinite(self.label_anchor_alpha)
+                and self.label_anchor_alpha in (0.0, 0.3, 0.5, 0.7, 1.0), "profile")
+        allowed = self.label_anchor_alpha_allowed
+        default = self.label_anchor_alpha_default
+        require((allowed is None) == (default is None), "profile")
+        if allowed is not None:
+            require(type(allowed) in (list, tuple) and 0 < len(allowed) <= 5, "profile")
+            require(all(type(x) in (int, float) and math.isfinite(x)
+                        and x in (0.0, 0.3, 0.5, 0.7, 1.0) for x in allowed), "profile")
+            require(len(set(allowed)) == len(allowed), "profile")
+            require(type(default) in (int, float) and math.isfinite(default)
+                    and default in allowed, "profile")
+            require(not self.label_anchor_alpha or
+                    (len(allowed) == 1 and default == self.label_anchor_alpha), "profile")
+            # Freeze caller-owned lists so attested policy cannot change after binding.
+            object.__setattr__(self, "label_anchor_alpha_allowed", tuple(allowed))
+        self.resolve_label_anchor()
         require(0 < self.max_ttl_seconds <= 3600, "profile")
+
+    def resolve_label_anchor(self, requested=None):
+        """Resolve one request against attested policy; never combine two anchors."""
+        allowed = self.label_anchor_alpha_allowed
+        default = self.label_anchor_alpha_default
+        if allowed is None:
+            allowed, default = (self.label_anchor_alpha,), self.label_anchor_alpha
+        selected = default if requested is None else requested
+        require(type(selected) in (int, float) and math.isfinite(selected)
+                and selected in allowed, "profile")
+        require(not (self.anchor_alpha and selected), "profile")
+        return float(selected)
 
     @property
     def binding_digest(self):
-        return digest(asdict(self))
+        values = asdict(self)
+        if self.label_anchor_alpha_allowed is None:
+            values.pop("label_anchor_alpha_allowed")
+            values.pop("label_anchor_alpha_default")
+        # Zero is the legacy path: retain bindings minted before this field existed.
+        if self.label_anchor_alpha == 0:
+            values.pop("label_anchor_alpha")
+        return digest(values)
 
 
 @dataclass(frozen=True, repr=False)
@@ -401,7 +646,8 @@ class Publication:
 def control_request(command_id, operation, payload):
     identifier(command_id)
     require(operation in {"health", "enroll_session", "reserve_capture", "reserve_consume",
-                          "publish", "publication_status", "status", "retire", "bind_output"})
+                          "publish", "publication_status", "status", "retire", "bind_output",
+                          "release_lease", "finish_consume"})
     bounded_payload(payload)
     return {"schema": "occ3.control.v1", "command_id": command_id,
             "operation": operation, "payload": payload}
@@ -424,3 +670,73 @@ def validate_control_payload(value, *, result=False):
     require(type(value["result"]) is dict and type(value["error"]) is str)
     require((value["ok"] and not value["error"]) or (not value["ok"] and not value["result"]))
     return value
+
+
+# Capture reservation knobs. The frontend installer and the scheduler ranks read
+# the same per-boot environment. A ValueError carries the fixed decline code.
+# The ranks compare their values before a capture is parked; a difference only
+# declines. No capture is parked when a queue limit (max_queued_requests), a
+# request timeout sweep (SGLANG_REQ_WAITING_TIMEOUT, SGLANG_REQ_RUNNING_TIMEOUT)
+# or receive skipping (scheduler_recv_interval above 1) is configured: a held
+# request could be rejected or expire there, and a skipped receive drops the
+# signal that ends the hold. That capture gets the busy decline at once and the
+# frontend sends it again.
+CAPTURE_BUSY_WAIT_MAX_SECONDS = 10.0
+CAPTURE_BUSY_WAIT_DEFAULT_SECONDS = 10.0
+CAPTURE_DRAIN_DEFAULT_SECONDS = 2.0
+CAPTURE_PREEMPT_MODES = ("off", "retract")
+CAPTURE_PREEMPT_DEFAULT = "off"
+
+
+def _knob_seconds(raw, high, code):
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        raise ValueError(code) from None
+    if not (math.isfinite(value) and 0.0 <= value <= high):
+        raise ValueError(code)
+    return value
+
+
+def capture_busy_wait_seconds(raw):
+    """OCC3_CAPTURE_BUSY_WAIT_SECONDS. 0 disables the busy waits and the reservation."""
+    if raw is None:
+        return CAPTURE_BUSY_WAIT_DEFAULT_SECONDS
+    return _knob_seconds(raw, CAPTURE_BUSY_WAIT_MAX_SECONDS, "capture_busy_wait_seconds_invalid")
+
+
+def capture_drain_seconds(raw, window):
+    """OCC3_CAPTURE_DRAIN_SECONDS: the time one parked capture gives running
+    requests to finish while new ordinary prefills wait. The scheduler ends the
+    hold in its next iteration after that time. Never longer than the busy
+    window."""
+    if raw is None:
+        return min(CAPTURE_DRAIN_DEFAULT_SECONDS, window)
+    return _knob_seconds(raw, window, "capture_drain_seconds_invalid")
+
+
+def capture_preempt_mode(raw):
+    """OCC3_CAPTURE_PREEMPT: "off" (drain only) or "retract" (operator opt-in:
+    plain rows still running after the drain are retracted and resume later. A
+    session row, or a row that cannot resume from the same output position, is
+    never retracted; the capture is then declined as with "off")."""
+    if raw is None:
+        return CAPTURE_PREEMPT_DEFAULT
+    if raw not in CAPTURE_PREEMPT_MODES:
+        raise ValueError("capture_preempt_invalid")
+    return raw
+
+
+@dataclass(frozen=True)
+class CaptureHoldSettings:
+    window: float
+    drain: float
+    preempt: str
+
+
+def capture_hold_settings(environ=None):
+    environ = os.environ if environ is None else environ
+    window = capture_busy_wait_seconds(environ.get("OCC3_CAPTURE_BUSY_WAIT_SECONDS"))
+    return CaptureHoldSettings(
+        window, capture_drain_seconds(environ.get("OCC3_CAPTURE_DRAIN_SECONDS"), window),
+        capture_preempt_mode(environ.get("OCC3_CAPTURE_PREEMPT")))

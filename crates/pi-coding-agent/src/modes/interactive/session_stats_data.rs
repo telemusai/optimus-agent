@@ -7,6 +7,7 @@ use pi_ai::types::Usage;
 use pi_jev::correlate::CorrelationRecord;
 use serde_json::Value;
 
+use crate::core::occ::textmas::{usage_record, TextMasUsageLedger, TextMasUsageSummary};
 use crate::core::usage::{add_assistant_usage, empty_usage, subtract_assistant_usage};
 use crate::modes::agent_connection::types as wire;
 
@@ -68,6 +69,7 @@ pub(super) struct Accounting {
     pub models: BTreeMap<(String, String), ModelUsage>,
     pub turns: Vec<f64>,
     pub compactions: usize,
+    pub textmas_usage: Option<TextMasUsageSummary>,
 }
 
 impl Accounting {
@@ -83,6 +85,18 @@ impl Accounting {
         self.models.values().map(|m| m.missing_usage).sum()
     }
     fn merge(&mut self, other: Self) {
+        if let Some(overhead) = other.textmas_usage {
+            match &mut self.textmas_usage {
+                Some(total) => {
+                    total.calls = total.calls.saturating_add(overhead.calls);
+                    total.known_tokens += overhead.known_tokens;
+                    total.unknown_usage_calls = total.unknown_usage_calls.saturating_add(overhead.unknown_usage_calls);
+                    total.unknown_cost_calls = total.unknown_cost_calls.saturating_add(overhead.unknown_cost_calls);
+                    add_assistant_usage(&mut total.known_subtotal, &overhead.known_subtotal);
+                }
+                None => self.textmas_usage = Some(overhead),
+            }
+        }
         for (key, row) in other.models {
             let target = self
                 .models
@@ -130,8 +144,12 @@ pub(super) fn account(entries: &[Value], leaf: Option<&str>) -> Accounting {
         }
     }
     let mut result = Accounting::default();
+    let mut overhead = TextMasUsageLedger::default();
     let mut turn = None;
     for entry in branch {
+        if let Some(record) = entry.as_object().and_then(usage_record) {
+            overhead.observe(record);
+        }
         if entry["message"]["role"] == "user" {
             if let Some(tokens) = turn.take() {
                 result.turns.push(tokens);
@@ -185,6 +203,7 @@ pub(super) fn account(entries: &[Value], leaf: Option<&str>) -> Accounting {
     if let Some(tokens) = turn {
         result.turns.push(tokens);
     }
+    result.textmas_usage = overhead.summary();
     result
 }
 
@@ -352,6 +371,13 @@ fn usage_entry(entry: &Value) -> Value {
     ] {
         if let Some(value) = entry.get(key) {
             result.insert(key.into(), value.clone());
+        }
+    }
+    // Keep only the validated, content-free accounting schema, never arbitrary custom payloads.
+    if let Some(record) = entry.as_object().and_then(usage_record) {
+        result.insert("customType".into(), Value::String(crate::core::occ::textmas::USAGE_CUSTOM_TYPE.into()));
+        if let Ok(data) = serde_json::to_value(record) {
+            result.insert("data".into(), data);
         }
     }
     if let Some(message) = entry.get("message") {

@@ -91,7 +91,9 @@ async def test_quota_rejects_without_second_generation(harness):
     await spin_until(lambda: harness.tm.calls)
     second, _ = raw_request(canonical({"occ3": attachment(state_handle="other-handle").wire()}))
     response = await harness.chat.handle_request(chat_request(), second)
-    assert response.status_code == 429 and len(harness.tm.calls) == 1
+    # Adapter concurrency refusal is proven non-use: the retryable busy contract.
+    assert response.status_code == 503 and response.headers["retry-after"] == "5"
+    assert len(harness.tm.calls) == 1
     queue.put_nowait({"type": "http.disconnect"})
     await task
     assert harness.adapter._active == 0
@@ -121,7 +123,7 @@ async def test_uncooperative_reservation_quarantines_quota_and_cannot_dispatch_l
     assert not harness.tm.calls and len(harness.backend.retires) == 1
     other, _ = raw_request(canonical({"occ3": attachment(state_handle="new-handle").wire()}))
     denied = await harness.chat.handle_request(chat_request(), other)
-    assert denied.status_code == 429
+    assert denied.status_code == 503 and b"scheduler_busy" in denied.body
     release.set()
     await spin_until(lambda: harness.adapter._active == 0)
     assert not harness.tm.calls and not harness.adapter._quarantined

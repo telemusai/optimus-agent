@@ -31,7 +31,7 @@ from .statebridge_calibrated_procrustes import METHOD_ID_PLAIN as PROCRUSTES_MET
 from .statebridge_calibrated_procrustes import METHOD_ID_SO as PROCRUSTES_METHOD_SO
 
 __all__ = ["ProfileError", "load_pinned_profile", "load_source_attestation",
-           "get_runtime_incarnation", "PER_MESSAGE_METHOD", "CALIBRATED_METHOD",
+           "get_runtime_incarnation", "DECLARED_IDENTITY", "PER_MESSAGE_METHOD", "CALIBRATED_METHOD",
            "advertised_methods", "registered_methods", "method_descriptor",
            "require_method", "receipt_descriptor", "validate_method_binding"]
 
@@ -55,11 +55,26 @@ _PROFILE_FIELDS = frozenset({
     "max_prefix_tokens", "max_live_bytes", "workspace_bytes", "max_records",
     "max_active", "max_ttl_seconds", "anchor_alpha", "tile_rows", "method",
 })
+# The declared-launch identity block (the eleven optimus.occ3.identity.v1
+# fields pinned at deploy time) is optional in a pinned profile: an older
+# pinned file stays valid and GET /occ3/v1/identity fails closed instead of
+# ever falling back to runtime-derived values. The names are a literal here,
+# not an import from occ3_sglang.identity, because the packaging static parse
+# (deploy/v3/native_package._static_registry) resolves only scalar constants
+# through relative imports; a test pins the two definitions together.
+DECLARED_IDENTITY = "declared_identity"
+_DECLARED_IDENTITY_FIELDS = frozenset({
+    "model_id", "architecture", "checkpoint_revision", "weight_fingerprint",
+    "tokenizer_fingerprint", "chat_template_fingerprint", "quantisation",
+    "tensor_geometry", "kv_layout", "latent_method", "runtime",
+})
 # The frozen-artifact reference (absolute path plus expected artifact_digest) is
 # optional in a pinned profile: the per-message method names none, and an older
 # pinned file stays valid. load_pinned_profile always returns the pair, empty
 # when absent, so the runtime profile has one shape.
-_OPTIONAL_PROFILE_FIELDS = frozenset({"calibration_path", "calibration_digest"})
+_OPTIONAL_PROFILE_FIELDS = frozenset({"calibration_path", "calibration_digest",
+                                      DECLARED_IDENTITY, "label_anchor_alpha",
+                                      "label_anchor_alpha_allowed", "label_anchor_alpha_default"})
 _RUNTIME_FIELDS = frozenset({"runtime_epoch", "runtime_generation",
                             "incarnation_digest", "profile_sha256",
                             "source_attestation_sha256"})
@@ -403,6 +418,16 @@ def _artifact(name, attribute, limit):
 
 def _validate_profile(value):
     _require(_PROFILE_FIELDS <= set(value) <= _PROFILE_FIELDS | _OPTIONAL_PROFILE_FIELDS)
+    if DECLARED_IDENTITY in value:
+        # The declared-launch identity: all eleven fields present, non-empty
+        # bounded strings. Anything less - including an explicit null - is
+        # refused here, before any route or worker can serve a partial
+        # declaration. Only a genuinely absent block stays valid.
+        declared = value[DECLARED_IDENTITY]
+        _require(type(declared) is dict and set(declared) == _DECLARED_IDENTITY_FIELDS)
+        for name in _DECLARED_IDENTITY_FIELDS:
+            item = declared[name]
+            _require(type(item) is str and 0 < len(item) <= 512)
     path_value = value.get("calibration_path", "")
     digest_value = value.get("calibration_digest", "")
     _require(type(path_value) is str and type(digest_value) is str
@@ -426,6 +451,24 @@ def _validate_profile(value):
         _require(_uint(value[name], minimum=0 if name == "layer_index" else 1))
     _require(type(value["anchor_alpha"]) in (int, float)
              and math.isfinite(value["anchor_alpha"]))
+    label_alpha = value.get("label_anchor_alpha", 0.0)
+    _require(type(label_alpha) in (int, float) and math.isfinite(label_alpha)
+             and label_alpha in (0.0, 0.3, 0.5, 0.7, 1.0))
+    allowed_present = "label_anchor_alpha_allowed" in value
+    default_present = "label_anchor_alpha_default" in value
+    _require(allowed_present == default_present)
+    if allowed_present:
+        allowed = value["label_anchor_alpha_allowed"]
+        default = value["label_anchor_alpha_default"]
+        _require(type(allowed) in (list, tuple) and 0 < len(allowed) <= 5)
+        _require(all(type(x) in (int, float) and math.isfinite(x)
+                     and x in (0.0, 0.3, 0.5, 0.7, 1.0) for x in allowed))
+        _require(len(set(allowed)) == len(allowed))
+        _require(type(default) in (int, float) and math.isfinite(default)
+                     and default in allowed)
+        _require(not label_alpha or (len(allowed) == 1 and default == label_alpha))
+        label_alpha = default
+    _require(not (value["anchor_alpha"] and label_alpha))
     # RuntimeProfile owns semantic/model/TP/cache validation. No second profile type.
     return value
 

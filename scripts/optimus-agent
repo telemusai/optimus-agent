@@ -27,6 +27,24 @@ fi
 optimus_release_name=${optimus_install##*/}
 optimus_runtime_dir="${OPTIMUS_RUST_TMPDIR:-${XDG_RUNTIME_DIR:-$HOME/.cache}/optimus-rust/$optimus_release_name}"
 umask 077
+
+# Unix socket paths are limited to 103 bytes on macOS. Daemon workers bind
+# "<runtime dir>/prime-agent-<uid>/worker-<12 hex>-<12 hex>.sock". If the
+# default directory makes that path too long, use a short per-user directory.
+if [ -z "${OPTIMUS_RUST_TMPDIR:-}" ]; then
+    optimus_uid=$(id -u)
+    optimus_worker_socket_suffix="/prime-agent-$optimus_uid/worker-000000000000-000000000000.sock"
+    if [ $(( ${#optimus_runtime_dir} + ${#optimus_worker_socket_suffix} )) -gt 103 ]; then
+        optimus_short_root="/tmp/optimus-rust-$optimus_uid"
+        mkdir -p -- "$optimus_short_root"
+        if [ -L "$optimus_short_root" ] || [ ! -O "$optimus_short_root" ]; then
+            echo "$optimus_short_root is not a directory owned by the current user. Set OPTIMUS_RUST_TMPDIR to a short private directory." >&2
+            exit 1
+        fi
+        optimus_runtime_dir="$optimus_short_root/$optimus_release_name"
+    fi
+fi
+
 mkdir -p -- "$optimus_runtime_dir"
 export TMPDIR="$optimus_runtime_dir"
 optimus_binary="$optimus_install/bin/optimus-rust"

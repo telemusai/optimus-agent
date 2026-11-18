@@ -1,0 +1,21 @@
+{
+  "task": "medqa",
+  "condition": "text_mas_hierarchical",
+  "n": 300,
+  "correct": 109,
+  "accuracy": 0.36333333333333334,
+  "truncated_completed": 46,
+  "wall_s": 1266.1,
+  "mean_role_latency_sum_s": 27.858,
+  "completion_per_item": 3997.1666666666665,
+  "mcnemar_b": 103,
+  "mcnemar_c": 38,
+  "mcnemar_p": 4.0980479312963796e-08,
+  "scoring": "exact_upstream_extract_normalize_on_historical_final_compare_exact_manifest_gold",
+  "run_dir": "/home/nvidia/latentmas-bench/results/noncode-20261110t170106z/medqa-8734b1d3e08b3a9525fd9b628476cb285857d46fb576e87be42f9b600817fde0/text_mas_hierarchical-20261111t072849z",
+  "source_files": {
+    "scored_private": "scored-private.json",
+    "scored_safe": "scored-safe.json"
+  },
+  "notes": "hierarchical role routing (Math/Science/Code -> Task Summarizer); same letter-choice collapse pattern as GPQA/ARC hierarchical"
+}

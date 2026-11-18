@@ -303,12 +303,64 @@ def test_disjoint_manifest_paths_are_mandatory_before_any_write(fixture):
     fixture.no_writes()
 
 
-@pytest.mark.parametrize("count", [0, 1, 2, 4])
-def test_exactly_three_manifests_required(fixture, count):
-    fixture.manifest_paths = (fixture.manifest_paths * 2)[:count]
-    with pytest.raises(package.PackageError, match="exactly_three"):
+def test_manifest_count_must_be_within_bounds(fixture):
+    fixture.manifest_paths = []
+    with pytest.raises(package.PackageError, match="manifest_count_invalid"):
         fixture.prepare()
     fixture.no_writes()
+    fixture.manifest_paths = [fixture.root / ("m%d.json" % index)
+                              for index in range(package.MAX_MANIFESTS + 1)]
+    with pytest.raises(package.PackageError, match="manifest_count_invalid"):
+        fixture.prepare()
+    fixture.no_writes()
+
+
+@pytest.mark.parametrize("count", [1, 2])
+def test_fewer_disjoint_manifests_prepare_only_their_files(fixture, count):
+    fixture.manifest_paths = fixture.manifest_paths[:count]
+    plan = fixture.prepare()
+    assert [name for name, _ in plan.manifests] == sorted(path.name for path in fixture.manifest_paths)
+    assert len(plan.overlay.files) == count
+    fixture.no_writes()
+
+
+def test_repeated_manifest_path_is_refused(fixture):
+    fixture.manifest_paths = fixture.manifest_paths + [fixture.manifest_paths[0]]
+    with pytest.raises(package.PackageError, match="duplicate_input_path"):
+        fixture.prepare()
+    fixture.no_writes()
+
+
+def test_five_manifests_apply_with_order_independent_attestation(fixture):
+    """The image build passes five disjoint manifests; the merged overlay and the
+    generated attestation must not depend on the order they are passed in."""
+    (fixture.sg / "sub" / "c.py").write_bytes(b"VALUE = 5\n")
+    fixture.originals["sub/c.py"] = b"VALUE = 5\n"
+    fixture.baseline["files"].append({"path": "sub/c.py", "sha256": digest(b"VALUE = 5\n")})
+    write_json(fixture.baseline_path, fixture.baseline)
+    for index, path in ((3, "untouched.py"), (4, "sub/c.py")):
+        original = fixture.originals[path]
+        manifest = {"schema": package.source_patch.SCHEMA, "source_revision": package.SOURCE_REVISION,
+                    "source_version": package.SOURCE_VERSION, "patch_set": "fixture-" + str(index),
+                    "files": [{"path": path, "before_sha256": digest(original),
+                               "after_sha256": digest(original.replace(b"VALUE", b"PATCHED")),
+                               "replacements": [{"before": "VALUE", "after": "PATCHED"}]}]}
+        target = fixture.root / ("fixture-" + str(index) + ".json")
+        write_json(target, manifest)
+        fixture.manifest_paths.append(target)
+    assert len(fixture.manifest_paths) == 5
+    forward = fixture.prepare()
+    fixture.manifest_paths = list(reversed(fixture.manifest_paths))
+    backward = fixture.prepare()
+    assert forward.manifests == backward.manifests
+    assert forward.overlay.manifest_sha256 == backward.overlay.manifest_sha256
+    assert dict(forward.artifacts) == dict(backward.artifacts)
+    result = package.apply(forward, disposable=True)
+    assert result["patched_source_files"] == 5
+    assert [entry["name"] for entry in result["manifests"]] == sorted(
+        "fixture-%d.json" % index for index in range(5))
+    for path in ("a.py", "sub/b.py", "http_server.py", "untouched.py", "sub/c.py"):
+        assert (fixture.sg / path).read_bytes().startswith(b"PATCHED")
 
 
 def test_corrupt_third_manifest_and_syntax_do_not_apply_earlier_plans(fixture):
@@ -724,6 +776,74 @@ def test_profile_identifier_outside_shared_contract_refused_without_write(fixtur
     fixture.no_writes()
 
 
+def _declared_block():
+    return {
+        "model_id": "fixture-model", "architecture": "FixtureForCausalLM",
+        "checkpoint_revision": "0" * 40,
+        "weight_fingerprint": "metadata-manifest-sha256:" + "1" * 64,
+        "tokenizer_fingerprint": "sha256:" + "2" * 64,
+        "chat_template_fingerprint": "sha256:" + "3" * 64,
+        "quantisation": "fp8", "tensor_geometry": "layers78:hidden6144",
+        "kv_layout": "declared-launch:tp8:kv-fp8_e4m3",
+        "latent_method": "kv-radix-channel-v1",
+        "runtime": "sglang:0.5.21:" + "4" * 40}
+
+
+def test_profile_declared_identity_block_passes_validation_unchanged():
+    # The pure validation seam (the same check prepare applies to the input
+    # file) accepts the block and the canonical form carries it verbatim.
+    value = {"model_fingerprint": "fixture-fingerprint-not-production",
+             "model_id": "fixture-model",
+             "expected_ranks": 8, "hidden_dim": 6144, "layer_index": 77,
+             "max_prefix_tokens": 128, "max_live_bytes": 256 * 1024**2,
+             "workspace_bytes": 128 * 1024**2, "max_records": 256, "max_active": 1,
+             "max_ttl_seconds": 3600, "anchor_alpha": 0.0, "tile_rows": 256,
+             "method": package.METHOD,
+             "declared_identity": _declared_block()}
+    canonical = package._profile(value)
+    assert json.loads(canonical)["declared_identity"] == _declared_block()
+
+
+def test_real_per_message_input_file_passes_profile_validation():
+    # The shipped input must stay packageable at the same seam.
+    root = Path(package.__file__).resolve().parents[2]
+    raw = (root / "deploy/native-build-inputs/native-profile-input.json").read_bytes()
+    value = package._json(raw)
+    assert json.loads(package._profile(value))["declared_identity"]["model_id"] == "glm-5.3"
+
+
+@pytest.mark.parametrize("mutation", [
+    "missing-field", "empty-field", "oversize-field", "wrong-type-field",
+    "extra-field", "explicit-null", "not-a-dict",
+])
+def test_profile_declared_identity_block_refused(mutation):
+    value = {"model_fingerprint": "fixture-fingerprint-not-production",
+             "model_id": "fixture-model",
+             "expected_ranks": 8, "hidden_dim": 6144, "layer_index": 77,
+             "max_prefix_tokens": 128, "max_live_bytes": 256 * 1024**2,
+             "workspace_bytes": 128 * 1024**2, "max_records": 256, "max_active": 1,
+             "max_ttl_seconds": 3600, "anchor_alpha": 0.0, "tile_rows": 256,
+             "method": package.METHOD}
+    block = _declared_block()
+    if mutation == "missing-field":
+        block.pop("latent_method")
+    elif mutation == "empty-field":
+        block["quantisation"] = ""
+    elif mutation == "oversize-field":
+        block["runtime"] = "x" * 513
+    elif mutation == "wrong-type-field":
+        block["model_id"] = 7
+    elif mutation == "extra-field":
+        block["extra"] = "field"
+    elif mutation == "explicit-null":
+        block = None
+    else:
+        block = "string-block"
+    value["declared_identity"] = block
+    with pytest.raises(package.PackageError, match="invalid_profile_fields"):
+        package._profile(value)
+
+
 def test_merged_manifest_respects_same_byte_bound_as_normal_source_patch_prepare(fixture, monkeypatch):
     for path, manifest in zip(fixture.manifest_paths, fixture.manifests):
         path.write_bytes(package._canonical(manifest))
@@ -747,8 +867,8 @@ def test_merged_manifest_respects_same_byte_bound_as_normal_source_patch_prepare
 
 
 def fixture_final_source_bytes(fixture):
-    # Independent fixture arithmetic: manifests replace VALUE by PATCHED in
-    # exactly three SG files; the fourth and every plugin module are unchanged.
+    # Independent fixture arithmetic: the three fixture manifests replace VALUE
+    # by PATCHED in three SG files; the fourth and every plugin module are unchanged.
     patched = {"a.py", "sub/b.py", "http_server.py"}
     return (sum(len(raw.replace(b"VALUE", b"PATCHED")) if path in patched else len(raw)
                 for path, raw in fixture.originals.items())
@@ -849,3 +969,47 @@ def test_offline_prepare_and_apply_survive_a_blocked_registry_import(fixture, mo
     monkeypatch.setitem(_sys.modules, "occ3_sglang.native_profile", _Poison())
     plan = fixture.prepare()
     assert package.apply(plan, disposable=True)["ok"] is True
+
+
+@pytest.mark.parametrize("alpha", [0, 0.0, 0.3, 0.5, 0.7, 1])
+def test_label_anchor_profile_allowed(fixture, alpha):
+    fixture.profile["label_anchor_alpha"] = alpha
+    assert json.loads(package._profile(fixture.profile))["label_anchor_alpha"] == alpha
+
+
+@pytest.mark.parametrize("alpha", [True, False, None, "0.3", -0.3, 0.2, 1.1,
+                                    float("inf"), float("-inf"), float("nan")])
+def test_label_anchor_profile_invalid(fixture, alpha):
+    fixture.profile["label_anchor_alpha"] = alpha
+    with pytest.raises(package.PackageError):
+        package._profile(fixture.profile)
+
+
+def test_label_anchor_profile_conflicts_with_source_anchor(fixture):
+    fixture.profile.update(anchor_alpha=0.3, label_anchor_alpha=0.3)
+    with pytest.raises(package.PackageError):
+        package._profile(fixture.profile)
+
+
+def test_omitted_label_anchor_preserves_packaged_bytes(fixture):
+    raw = package._profile(fixture.profile)
+    assert "label_anchor_alpha" not in json.loads(raw)
+
+
+def test_live_label_policy_packaging_and_native_parity(fixture):
+    from occ3_sglang.native_profile import _validate_profile, ProfileError
+    fixture.profile.update(label_anchor_alpha_allowed=[0, 0.3, 0.5, 0.7, 1],
+                           label_anchor_alpha_default=0, anchor_alpha=0.3)
+    assert json.loads(package._profile(fixture.profile)) == fixture.profile
+    assert _validate_profile(fixture.profile) == fixture.profile
+
+
+@pytest.mark.parametrize("allowed,default", [([], 0), ([0, 0], 0), ([True], 1),
+                                              ([0.2], 0.2), ([0], False), ([0], 0.5)])
+def test_live_label_policy_packaging_and_native_reject(fixture, allowed, default):
+    from occ3_sglang.native_profile import _validate_profile, ProfileError
+    fixture.profile.update(label_anchor_alpha_allowed=allowed, label_anchor_alpha_default=default)
+    with pytest.raises(package.PackageError):
+        package._profile(fixture.profile)
+    with pytest.raises(ProfileError):
+        _validate_profile(fixture.profile)

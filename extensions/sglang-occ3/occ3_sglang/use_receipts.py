@@ -446,7 +446,12 @@ class SourceCaptureCommit:
     span_contains_tool_call: bool | None = None
     span_message_truncated: bool | None = None
 
+    label_anchor_alpha: float = 0.0
+
     def __post_init__(self):
+        if (type(self.label_anchor_alpha) not in (int, float)
+                or self.label_anchor_alpha not in (0.0, 0.3, 0.5, 0.7, 1.0)):
+            raise AttachmentError("invalid_evidence")
         block = [getattr(self, name) for name in SPAN_BLOCK_FIELDS]
         present = [value is not None for value in block]
         if all(present):
@@ -506,6 +511,7 @@ def source_receipt_bytes(receipt: SourceCaptureReceipt, limit: int = MAX_RECEIPT
 def source_receipt_upper_bound(limit: int = MAX_RECEIPT_BYTES) -> bytes:
     """Valid maximum-width wire: reserve BEFORE source enrollment/generation."""
     receipt = SourceCaptureReceipt(
+        label_anchor_alpha=0.7,
         intent_digest="f" * 64, source_handle="x" * 128, native_rid="x" * 96,
         response_id="x" * 96, capture_commit_id="x" * 96,
         accepted_span_start=2**64 - 1 - 128, accepted_span_end=2**64 - 1,
@@ -527,6 +533,7 @@ def source_receipt_v2_upper_bound(limit: int = MAX_RECEIPT_BYTES) -> bytes:
     what the receipt can actually cost.
     """
     receipt = SourceCaptureReceipt(
+        label_anchor_alpha=0.7,
         intent_digest="f" * 64, source_handle="x" * 128, native_rid="x" * 96,
         response_id="x" * 96, capture_commit_id="x" * 96,
         accepted_span_start=2**64 - 1 - 128, accepted_span_end=2**64 - 1,

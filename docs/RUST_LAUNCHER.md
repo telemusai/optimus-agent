@@ -69,7 +69,7 @@ The archive contains the executable, resource bundle, Python runtime source, ins
 
 Use `--prefix` and `--bin-dir` for an isolated installation. Set `OPTIMUS_RUST_ROOT` to a custom prefix when invoking its launcher. Copying only the executable is insufficient for Python tools and bundled skills.
 
-The launcher respects `PRIME_AGENT_CODING_AGENT_DIR` and `PRIME_AGENT_KERNEL_VENV` overrides. `OPTIMUS_RUST_TMPDIR` overrides the socket directory; keep it short enough for Unix socket limits. The default is `$XDG_RUNTIME_DIR/optimus-rust/<release>`, falling back to `~/.cache/optimus-rust/<release>`. It is separate from Prime's temporary socket directory.
+The launcher respects `PRIME_AGENT_CODING_AGENT_DIR` and `PRIME_AGENT_KERNEL_VENV` overrides. `OPTIMUS_RUST_TMPDIR` overrides the socket directory; keep it short enough for Unix socket limits. The default is `$XDG_RUNTIME_DIR/optimus-rust/<release>`, falling back to `~/.cache/optimus-rust/<release>`. If that default makes daemon worker socket paths longer than the 103-byte macOS limit, the launcher uses `/tmp/optimus-rust-<uid>/<release>` instead. It is separate from Prime's temporary socket directory.
 
 Closing the TUI disconnects that client; the supervisor and resident sessions can continue in the background. Client-owned temporary sessions have their own disconnect cleanup. Changing the launcher does not restart existing processes.
 

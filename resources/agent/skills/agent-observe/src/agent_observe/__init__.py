@@ -1,7 +1,7 @@
-"""Read-only Prime Agent session observation skill.
+"""Read-only Optimus session observation skill.
 
-All session lookup and data access live in the TypeScript daemon. These
-functions only call the host bridge exposed inside the Prime Agent Python
+All session lookup and data access live in the native daemon. These
+functions only call the host bridge exposed inside the Optimus Python
 kernel.
 """
 

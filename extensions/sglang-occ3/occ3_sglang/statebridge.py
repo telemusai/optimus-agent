@@ -112,6 +112,20 @@ def mean_embedding_norm(embedding, *, tp_group=None, tile_rows=1024):
     return (total[0] / total[1]).float()
 
 
+def anchor_to_labels(prefix, embeddings, *, alpha=0.0):
+    """Blend known accepted-token embeddings before TP broadcast and vocab anchor.
+
+    Zero returns the original object without arithmetic. Scratch is bounded by
+    the existing 128-row solver workspace; no vocabulary-sized tensors or syncs.
+    """
+    require(type(alpha) in (int, float) and alpha in (0.0, 0.3, 0.5, 0.7, 1.0), "profile")
+    if alpha == 0:
+        return prefix
+    require(prefix.shape == embeddings.shape and prefix.device == embeddings.device, "profile")
+    with _torch().no_grad():
+        return ((1 - alpha) * prefix.float() + alpha * embeddings.float()).to(prefix.dtype).contiguous()
+
+
 def anchor_tiled(prefix, embedding, *, alpha=0.3, tp_group=None, tile_rows=1024):
     """Exact global max cosine + smallest-token tie; never gather vocab weights."""
     torch = _torch()

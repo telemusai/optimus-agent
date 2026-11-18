@@ -1,0 +1,5 @@
+- Added opt-in bounded OCC-3 token, alignment cosine, per-rank embedding-hash, actual DSA pin, position and KV-slot diagnostics for synthetic handoff drills.
+- Added per-rank MLA/DSA byte hashes at injected `prefill_complete`, nonterminal `consume_released` after copy-done and a local fence, and `private_release` before freeing KV; terminal settle reports only saved injection slots.
+- Changed KV sampling to reserve the last 16 slots before spacing samples, with one combined CPU transfer per point and exception-isolated, default-off hooks.
+- Fixed physical MLA/DSA capacity validation to retain valid final-page slots and log out-of-storage or diagnostic-fence skips explicitly.
+- Changed documentation to note that the live staging module-count pin was already stale on main (37); deploy files remain unchanged.

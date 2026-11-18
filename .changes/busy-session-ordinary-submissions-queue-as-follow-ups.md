@@ -1,0 +1,3 @@
+Added: ordinary user submissions while a conversation is busy now queue as in-order follow-ups and execute against updated history instead of failing with a streamingBehavior error; explicit steering stays available through the follow-up key (Alt+Enter) and the existing cancel paths
+Changed: the interactive tray, hotkey guide, and queue-edit labels reflect the new roles: Enter queues a follow-up while busy, Alt+Enter steers the running turn
+Changed: ordinary Telegram chat traffic queues in order instead of interrupting the running turn; explicit steering remains available through the command surface

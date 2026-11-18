@@ -252,11 +252,12 @@ def test_a_profile_reference_is_all_or_nothing_and_message_method_takes_none(art
 def test_capture_metadata_reports_the_method_and_only_the_digest_it_has():
     from occ3_sglang.latent_worker import method_metadata
     message = method_metadata(_message_profile())
-    assert message == {"method_id": PER_MESSAGE_METHOD}
+    assert message == {"method_id": PER_MESSAGE_METHOD, "label_anchor_alpha": 0.0}
     calibrated = method_metadata(_calibrated_profile(PLACEHOLDER, "c" * 64), "d" * 64)
-    assert calibrated == {"method_id": CALIBRATED_METHOD, "artifact_digest": "d" * 64}
+    assert calibrated == {"method_id": CALIBRATED_METHOD, "artifact_digest": "d" * 64,
+                          "label_anchor_alpha": 0.0}
     # Scalars only: nothing that could carry rows or tensor content.
-    assert all(type(value) is str for value in calibrated.values())
+    assert all(type(value) in (str, float) for value in calibrated.values())
 
 
 def test_the_worker_resolves_one_aligner_and_calls_it_once():
@@ -265,7 +266,7 @@ def test_the_worker_resolves_one_aligner_and_calls_it_once():
     assert source.count("self.aligner = aligner_for(profile, self.calibration)") == 1
     assert source.count("aligned, _ = self.aligner(h, embeddings, self.target_norm)") == 1
     assert "align_hidden_sequence(" not in source
-    assert "method_metadata(self.profile, self.calibration_digest)" in source
+    assert "method_metadata(self.profile, self.calibration_digest, label_anchor_alpha=alpha)" in source
     assert '"artifact_digest"' in source
     # The renorm step is serving-config driven: N0 skips the norm measurement.
     assert "_serving_renorm(self.aligner)" in source

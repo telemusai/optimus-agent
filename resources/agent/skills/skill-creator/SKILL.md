@@ -1,11 +1,11 @@
 ---
 name: skill-creator
-description: Create, validate, and install Prime Agent skills - both markdown skills and Python-backed skills callable from the Python kernel. Use when the user asks to create a skill, turn a workflow, script, or prompt into a reusable skill, add a Python skill the agent can call, or asks how to write a SKILL.md and where skills live.
+description: Create, validate, and install Optimus skills - both markdown skills and Python-backed skills callable from the Python kernel. Use when the user asks to create a skill, turn a workflow, script, or prompt into a reusable skill, add a Python skill the agent can call, or asks how to write a SKILL.md and where skills live.
 ---
 
 # Skill Creator
 
-A skill is a directory with a `SKILL.md` file (YAML frontmatter + markdown instructions). At startup Prime Agent reads only each skill's name and description into the system prompt; the full file loads on demand when a task matches. Prime Agent follows the [Agent Skills standard](https://agentskills.io/specification) and extends it with Python-backed skills.
+A skill is a directory with a `SKILL.md` file (YAML frontmatter + markdown instructions). At startup Optimus reads only each skill's name and description into the system prompt; the full file loads on demand when a task matches. Optimus follows the [Agent Skills standard](https://agentskills.io/specification) and extends it with Python-backed skills.
 
 | Kind | What it is | When to use |
 |---|---|---|

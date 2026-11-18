@@ -20,7 +20,81 @@ impl super::super::interactive_mode_services::Component for ErrorNotice {
     fn as_any(&self) -> &dyn std::any::Any { self }
 }
 
+/// A short-lived confirmation line (OCC toggle acknowledgements). Same
+/// lifecycle as [`ErrorNotice`]: bounded, never stored in the conversation,
+/// and removed by the owner loop once expired.
+pub(super) const TRANSIENT_STATUS_DURATION: Duration = Duration::from_secs(6);
+
+struct StatusNotice {
+    text: Text,
+    expires_at: Instant,
+}
+
+impl super::super::interactive_mode_services::Component for StatusNotice {
+    fn render(&self, width: usize) -> Vec<String> {
+        let mut lines = vec![String::new()];
+        lines.extend(super::super::interactive_mode_services::Component::render(&self.text, width));
+        lines
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any { self }
+}
+
 impl InteractiveMode {
+    /// A confirmation line that auto-hides after a few moments. Unlike
+    /// `show_status`, the text does not persist in the transcript: the OCC
+    /// toggle acknowledgement is a status echo, not conversation content.
+    pub fn show_transient_status(&mut self, message: &str, tone: &str, now: Instant) {
+        let expires_at = now + TRANSIENT_STATUS_DURATION;
+        self.chat_container.add_child(Box::new(StatusNotice {
+            text: Text::new(theme().fg(tone, message), 1, 0),
+            expires_at,
+        }));
+        self.next_transient_status_expiry = Some(
+            self.next_transient_status_expiry
+                .map_or(expires_at, |next| next.min(expires_at)),
+        );
+        self.last_status_spacer_index = None;
+        self.last_status_text_index = None;
+        self.ui.request_render();
+    }
+
+    /// Owner-loop tick counterpart of [`Self::show_transient_status`]:
+    /// removes expired confirmation lines. Returns true when something
+    /// changed (the caller re-renders).
+    pub fn expire_transient_status_notices(&mut self, now: Instant) -> bool {
+        if self
+            .next_transient_status_expiry
+            .is_none_or(|next| now < next)
+        {
+            return false;
+        }
+        self.next_transient_status_expiry = None;
+        let before = self.chat_container.len();
+        self.chat_container.children.retain(|child| {
+            let Some(notice) = child.as_any().downcast_ref::<StatusNotice>() else {
+                return true;
+            };
+            if now >= notice.expires_at {
+                return false;
+            }
+            self.next_transient_status_expiry = Some(
+                self.next_transient_status_expiry
+                    .map_or(notice.expires_at, |next| next.min(notice.expires_at)),
+            );
+            true
+        });
+        if before != self.chat_container.len() {
+            // Removing a notice shifts indices; no later status may overwrite
+            // an unrelated row using an index cached before removal.
+            self.last_status_spacer_index = None;
+            self.last_status_text_index = None;
+            self.ui.request_render();
+            return true;
+        }
+        false
+    }
+
     pub(super) fn show_error_at(&mut self, message: &str, now: Instant) {
         let expires_at = now + ERROR_DURATION;
         self.chat_container.add_child(Box::new(ErrorNotice {
@@ -76,6 +150,27 @@ mod tests {
         assert!(mode.expire_error_notices(now + Duration::from_secs(7)));
         assert!(chat_lines(&mode).is_empty());
         assert!(!mode.expire_error_notices(now + Duration::from_secs(8)));
+    }
+
+    #[test]
+    fn transient_status_confirms_then_auto_hides_without_touching_the_transcript() {
+        crate::modes::interactive::theme::theme::init_theme(Some("prime"), false);
+        let now = Instant::now();
+        let mut mode = test_mode();
+        mode.show_transient_status("OCC3 native handoff enabled (daemon)", "dim", now);
+        let visible = chat_lines(&mode).join("\n");
+        assert!(visible.contains("OCC3 native handoff enabled"));
+        // Not expired one tick early; expiry is bounded by the duration.
+        assert!(!mode.expire_transient_status_notices(now + TRANSIENT_STATUS_DURATION - Duration::from_millis(1)));
+        // A later status line must not resurrect or overwrite the notice row.
+        mode.show_status("later status", "dim");
+        assert!(mode.expire_transient_status_notices(now + TRANSIENT_STATUS_DURATION));
+        let visible = chat_lines(&mode).join("\n");
+        assert!(!visible.contains("OCC3 native handoff enabled"));
+        assert!(visible.contains("later status"), "later status survives: {visible}");
+        // All expired: nothing left, and further ticks are no-ops.
+        assert!(!mode.expire_transient_status_notices(now + TRANSIENT_STATUS_DURATION + Duration::from_secs(1)));
+        assert!(chat_lines(&mode).join("\n").contains("later status"));
     }
 
     #[test]

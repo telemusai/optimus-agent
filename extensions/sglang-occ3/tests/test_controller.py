@@ -735,3 +735,70 @@ def test_v3_supervisor_attempt_local_fence_needs_no_system_path(tmp_path, monkey
     fence = journal.directory / "fences" / (journal.read()["original_id"] + ".json")
     assert fence.exists()
     assert journal.read()["phase"] == "NOOP"
+
+
+# --- health timeout consistency with the shell deploy lanes (PR #258) -------
+#
+# deploy.sh and rollback.sh default OCC3_HEALTH_TIMEOUT to 1500 s; the
+# controller must apply the same default and honor the same override so no
+# lane can roll back a working 13.5-minute B300 weight load.
+
+
+def load_controller_fresh():
+    """Exec the controller source into a brand-new module object so the
+    environment-dependent constants can be exercised without disturbing the
+    shared module instance the other tests import."""
+    fresh_spec = importlib.util.spec_from_file_location(
+        "occ3_controller_env_probe", DEPLOY_DIR / "occ3_controller.py"
+    )
+    module = importlib.util.module_from_spec(fresh_spec)
+    fresh_spec.loader.exec_module(module)
+    return module
+
+
+def test_controller_health_timeout_default_matches_shell_lanes(monkeypatch):
+    monkeypatch.delenv("OCC3_HEALTH_TIMEOUT", raising=False)
+    assert load_controller_fresh().HEALTH_TIMEOUT_S == 1500
+
+
+def test_controller_health_timeout_reads_the_shared_env_override(monkeypatch):
+    monkeypatch.setenv("OCC3_HEALTH_TIMEOUT", "2400")
+    assert load_controller_fresh().HEALTH_TIMEOUT_S == 2400
+
+
+def test_controller_health_timeout_env_garbage_falls_back_to_default(monkeypatch):
+    monkeypatch.setenv("OCC3_HEALTH_TIMEOUT", "not-a-number")
+    assert load_controller_fresh().HEALTH_TIMEOUT_S == 1500
+
+
+def test_controller_rollback_verification_budget_tracks_the_health_budget(monkeypatch):
+    # The rollback lane waits for the RESTORED original to pass the same
+    # health gate, so its budget must never be shorter than the health
+    # budget: a slow-restoring original would false-fail under the
+    # controller lane while rollback.sh (OCC3_HEALTH_TIMEOUT) passes.
+    monkeypatch.delenv("OCC3_HEALTH_TIMEOUT", raising=False)
+    monkeypatch.delenv("OCC3_ROLLBACK_DEADLINE_S", raising=False)
+    assert load_controller_fresh().ROLLBACK_DEADLINE_S == 1500
+
+    monkeypatch.setenv("OCC3_HEALTH_TIMEOUT", "2400")
+    assert load_controller_fresh().ROLLBACK_DEADLINE_S == 2400
+
+    # An explicit rollback deadline still wins (an operator may want a
+    # tighter or looser verification lane than the health gate).
+    monkeypatch.setenv("OCC3_ROLLBACK_DEADLINE_S", "1800")
+    assert load_controller_fresh().ROLLBACK_DEADLINE_S == 1800
+
+    # ...but a shorter-than-health explicit value is still honored as the
+    # operator's explicit choice; the floor only applies to the default.
+    monkeypatch.setenv("OCC3_ROLLBACK_DEADLINE_S", "600")
+    assert load_controller_fresh().ROLLBACK_DEADLINE_S == 600
+
+
+def test_watchdog_rollback_kill_covers_the_controller_verification_budget():
+    # The watchdog hard-kills the controller rollback lane; it must read the
+    # same health budget (plus overhead) rather than a fixed 900s that no
+    # longer covers the verification wait.
+    script = (DEPLOY_DIR / "occ3_watchdog.sh").read_text()
+    assert 'OCC3_HEALTH_TIMEOUT="${OCC3_HEALTH_TIMEOUT:-1500}"' in script
+    assert "ROLLBACK_KILL_S=$((OCC3_HEALTH_TIMEOUT + 600))" in script
+    assert "timeout --signal=TERM --kill-after=60 \"$ROLLBACK_KILL_S\"" in script

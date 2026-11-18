@@ -1,0 +1,1 @@
+- Fixed: GET /occ3/v1/identity now serves the deployment's pinned declared-launch identity from the installed profile (fail-closed 503 when absent) instead of runtime-derived fields, so client activation binds the attested fingerprint.
