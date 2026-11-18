@@ -11,10 +11,14 @@ import tempfile
 import threading
 import time
 import unittest
+import importlib
 from contextlib import contextmanager
 from unittest import mock
 
 SRC = os.path.join(os.path.dirname(__file__), "..", "src")
+if SRC not in sys.path:
+    sys.path.insert(0, SRC)
+repl = importlib.import_module("rlm.repl")
 
 if os.name == "nt":
     import ctypes
@@ -1598,6 +1602,62 @@ class ReplTest(unittest.TestCase):
             self.assertEqual(done["restored"], [])
             self.assertEqual(done["failed"], [])
             self.assertEqual(done["reason"], "snapshot not found")
+
+
+class RequestReaderTest(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self) -> None:
+        self.old_loop = repl._loop
+        repl._loop = asyncio.get_running_loop()
+        self.old_pending = repl._pending_host.copy()
+        self.old_host_closed = repl._host_closed
+        repl._pending_host.clear()
+
+    async def asyncTearDown(self) -> None:
+        repl._pending_host.clear()
+        repl._pending_host.update(self.old_pending)
+        repl._host_closed = self.old_host_closed
+        repl._loop = self.old_loop
+
+    def run_reader(self, stream: mock.MagicMock) -> asyncio.Queue:
+        request_queue = asyncio.Queue()
+        stream.__enter__.return_value = stream
+        with mock.patch.object(repl.os, "fdopen", return_value=stream):
+            repl._read_requests(0, request_queue)
+        return request_queue
+
+    async def test_overlong_frame_is_bounded_drained_and_next_request_is_served(self) -> None:
+        valid = json.dumps({"type": "list_names", "id": "after-overlong"}).encode()
+        stream = mock.MagicMock()
+        stream.readline.side_effect = [b"x" * 65, b"discard-me\n", valid + b"\n", b""]
+        with mock.patch.object(repl, "_MAX_REQUEST_LINE_BYTES", 64), \
+                mock.patch.object(repl, "_protocol_error") as protocol_error, \
+                mock.patch.object(repl, "_handle_request_line") as handle_line:
+            request_queue = self.run_reader(stream)
+        self.assertGreater(len(valid), 0)
+        self.assertLessEqual(len(valid), 64)
+        handle_line.assert_called_once_with(valid, request_queue)
+        self.assertEqual(handle_line.call_count, 1)
+        self.assertIn("exceeds 64 bytes", protocol_error.call_args.args[0])
+        for call in stream.readline.call_args_list:
+            self.assertEqual(call.args, (65,))
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        self.assertEqual(request_queue.get_nowait(), {"type": "shutdown"})
+
+    async def test_read_oserror_fails_pending_host_request_and_queues_shutdown(self) -> None:
+        stream = mock.MagicMock()
+        stream.readline.side_effect = OSError("injected stdin failure")
+        pending = asyncio.get_running_loop().create_future()
+        repl._pending_host["pending"] = pending
+        with mock.patch.object(repl, "_protocol_error"):
+            request_queue = self.run_reader(stream)
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        self.assertTrue(pending.done())
+        with self.assertRaisesRegex(RuntimeError, "host connection closed"):
+            pending.result()
+        self.assertEqual(request_queue.get_nowait(), {"type": "shutdown"})
+        self.assertIs(repl._pending_host["pending"], pending)
 
 
 class FinishRequestTest(unittest.TestCase):

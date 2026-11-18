@@ -81,6 +81,31 @@ class SnapshotRestoreFunctionsTest(unittest.TestCase):
             "(2, 2, 2, True, True, True, True)",
         )
 
+    def test_exact_tuple_list_self_cycle_roundtrips(self):
+        self.roundtrip(
+            "cycle = ([],)\ncycle[0].append(cycle)",
+            "(cycle[0][0] is cycle, cycle[0][0][0] is cycle[0])",
+            "(True, True)",
+        )
+
+    def test_mixed_tuple_function_container_cycle_preserves_rebuilt_identity(self):
+        self.roundtrip(
+            "G = 1\ndef reader():\n    return G\n"
+            "cycle = ([], reader)\ncycle[0].append(cycle)\nreader.cycle = cycle",
+            "G = 2\n(cycle[1](), cycle[0][0] is cycle, "
+            "cycle[1].cycle is cycle, cycle[1].cycle[1] is cycle[1])",
+            "(2, True, True, True)",
+        )
+
+    def test_function_tuple_dictionary_key_keeps_value_alias_identity(self):
+        self.roundtrip(
+            "def reader():\n    return 1\n"
+            "cycle = (reader,)\nbundle = {cycle: 'tuple-key', 'alias': cycle}",
+            "key = next(k for k in bundle if isinstance(k, tuple))\n"
+            "(bundle[key], bundle['alias'] is key, key[0] is bundle['alias'][0], key[0]())",
+            "('tuple-key', True, True, 1)",
+        )
+
     def test_private_function_globals_backfill_respects_exclusions(self):
         self.roundtrip(
             "exec('PUB = 42\\n_hidden = 2\\nIn = 3\\nOut = 4\\nmcp = 5\\n"

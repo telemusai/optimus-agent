@@ -1,0 +1,3 @@
+- Fixed legacy snapshot restores ignoring configured outer, per-variable, and aggregate size caps, and fixed tuple/container/function cycles failing during snapshot revival.
+- Bounded NDJSON request frames and made stdin failures settle pending host requests before shutdown; added durable parent-directory syncs to harness state and quarantine renames.
+- Fixed POSIX escaped-process cleanup signaling recycled PIDs by recording and revalidating process start identities immediately before liveness checks and signals.
