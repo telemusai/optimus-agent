@@ -132,7 +132,7 @@ struct BashChild {
     #[cfg(windows)]
     child: KernelProcess,
     #[cfg(not(windows))]
-    child: tokio::process::Child,
+    child: crate::utils::child_process::OwnedChild,
     /// Windows: set when the containment handle was handed to the detached
     /// registry; Drop must not terminate what the call deliberately left
     /// running.
@@ -143,7 +143,7 @@ impl std::ops::Deref for BashChild {
     #[cfg(windows)]
     type Target = KernelProcess;
     #[cfg(not(windows))]
-    type Target = tokio::process::Child;
+    type Target = crate::utils::child_process::OwnedChild;
     fn deref(&self) -> &Self::Target { &self.child }
 }
 impl std::ops::DerefMut for BashChild {
@@ -175,7 +175,9 @@ impl Drop for BashChild {
             let _ = self.child.start_kill();
         }
         if let Some(pid) = self.child.id() {
-            untrack_detached_child_pid(pid as i32);
+            if !crate::utils::child_process::is_process_alive(pid as i32) {
+                untrack_detached_child_pid(pid as i32);
+            }
         }
     }
 }
@@ -256,8 +258,11 @@ impl BashOperations for LocalBashOperations {
                 }
                 command_builder.process_group(0);
 
+                command_builder.kill_on_drop(true);
                 match command_builder.spawn() {
-                    Ok(child) => BashChild { child },
+                    Ok(child) => BashChild {
+                        child: crate::utils::child_process::OwnedChild::new(child, false),
+                    },
                     Err(error) => return Err(error.to_string()),
                 }
             };
@@ -389,10 +394,17 @@ impl BashOperations for LocalBashOperations {
                 (options.on_data)(b"\n[Shell exited; closed output pipes held by a background process. Redirect background output to a file to retain it.]\n");
             }
 
-            // TS bash.ts:102/:116: the child settled (exit or kill), so the
-            // journal record goes inactive in both the success and error paths.
+            // TS bash.ts:102/:116 clears settled children. A live child
+            // after a failed cancellation kill remains active for retry.
             if let Some(pid) = tracked_child_pid {
-                untrack_detached_child_pid(pid);
+                // A normal wait has reaped the shell. After cancellation or a
+                // timeout, untrack only when exit is observed; otherwise retain
+                // active evidence for the detached shutdown/retry path.
+                if matches!(result, Some(Ok(_)))
+                    || !crate::utils::child_process::is_process_alive(pid)
+                {
+                    untrack_detached_child_pid(pid);
+                }
             }
 
             if aborted {

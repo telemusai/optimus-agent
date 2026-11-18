@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use crate::utils::child_process::{wait_with_timeout, SpawnOptions};
+use crate::utils::child_process::SpawnOptions;
 use crate::utils::shell::get_shell_config;
 
 /// Only successful credentials are cached; temporary helper failures must be retried.
@@ -262,40 +262,19 @@ fn run_with_config_value_timeout(
     timeout_ms: u64,
 ) -> std::io::Result<std::process::Output> {
     command.stdin(std::process::Stdio::null());
-    let mut child = command.spawn()?;
-    // Drain the pipes on their own threads: a command that writes more than the
-    // pipe buffer would otherwise stall the child until the deadline killed it.
-    // The readers are not joined on the timeout path, because a killed shell can
-    // still hold the pipe open through its own children.
-    let stdout_reader = child.stdout.take().map(|mut pipe| {
-        std::thread::spawn(move || {
-            use std::io::Read;
-            let mut buffer = Vec::new();
-            let _ = pipe.read_to_end(&mut buffer);
-            buffer
-        })
-    });
-    let stderr_reader = child.stderr.take().map(|mut pipe| {
-        std::thread::spawn(move || {
-            use std::io::Read;
-            let mut buffer = Vec::new();
-            let _ = pipe.read_to_end(&mut buffer);
-            buffer
-        })
-    });
-    let status = match wait_with_timeout(&mut child, timeout_ms) {
-        Some(status) => status,
-        None => {
-            return Err(std::io::Error::new(
+    let child = command.spawn()?;
+    crate::utils::child_process::wait_for_sync_child_with_timeout(child, timeout_ms).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::TimedOut {
+            std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
                 format!("{label} ETIMEDOUT (timeout {timeout_ms}ms)"),
-            ))
+            )
+        } else {
+            error
         }
-    };
-    let stdout = stdout_reader.and_then(|reader| reader.join().ok()).unwrap_or_default();
-    let stderr = stderr_reader.and_then(|reader| reader.join().ok()).unwrap_or_default();
-    Ok(std::process::Output { status, stdout, stderr })
+    })
 }
+
 
 /// The `cwd`, `env`, `stdio` and `windowsHide` handling of
 /// `child_process::apply_std_options`, applied to a command built here.

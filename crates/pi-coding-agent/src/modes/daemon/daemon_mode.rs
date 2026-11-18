@@ -3138,6 +3138,8 @@ impl AgentDaemon {
                             .unwrap_or_else(|| ".".to_string()),
                     ),
                     env: Some(env.into_iter().collect()),
+                    // The supervisor intentionally outlives this launch call.
+                    detached: true,
                     ..SpawnOptions::default()
                 },
             );

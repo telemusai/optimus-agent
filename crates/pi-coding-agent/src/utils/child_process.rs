@@ -12,7 +12,7 @@ pub mod kernel_job;
 #[cfg(windows)]
 pub use kernel_job::{spawn_kernel, KernelJob, KernelProcess};
 #[cfg(not(windows))]
-pub type KernelProcess = tokio::process::Child;
+pub type KernelProcess = OwnedChild;
 
 #[cfg(not(windows))]
 pub fn spawn_kernel(command: &str, args: &[String], options: SpawnOptions) -> std::io::Result<KernelProcess> {
@@ -42,15 +42,63 @@ pub struct SpawnOptions {
     pub stdin_piped: bool,
 }
 
+/// Owned asynchronous child. Non-detached children remain owned until an
+/// explicit wait consumes them; cancelling that wait kills the process tree
+/// and Tokio's kill-on-drop reaper schedules the final wait. A deliberately
+/// detached spawn has no drop kill, matching the caller's detach contract.
+pub struct OwnedChild {
+    child: tokio::process::Child,
+    detached: bool,
+}
+
+impl OwnedChild {
+    pub(crate) fn new(child: tokio::process::Child, detached: bool) -> Self {
+        Self { child, detached }
+    }
+}
+
+impl std::ops::Deref for OwnedChild {
+    type Target = tokio::process::Child;
+
+    fn deref(&self) -> &Self::Target {
+        &self.child
+    }
+}
+
+impl std::ops::DerefMut for OwnedChild {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.child
+    }
+}
+
+impl Drop for OwnedChild {
+    fn drop(&mut self) {
+        if self.detached {
+            return;
+        }
+        if let Some(pid) = self.child.id() {
+            if !matches!(self.child.try_wait(), Ok(Some(_))) {
+                // Poll errors fail closed: the inner kill-on-drop still owns
+                // the root, while this path also reaches its descendants.
+                crate::utils::shell::kill_process_tree(pid as i32);
+                let _ = self.child.start_kill();
+            }
+        }
+    }
+}
+
 pub struct ChildProcessHandle {
-    pub child: tokio::process::Child,
+    pub child: OwnedChild,
 }
 
 pub fn spawn_hidden(command: &str, args: &[String], options: SpawnOptions) -> std::io::Result<ChildProcessHandle> {
     let mut builder = build_tokio_command(command, args, &options);
-    builder.kill_on_drop(false);
+    builder.kill_on_drop(!options.detached);
     Ok(ChildProcessHandle {
-        child: builder.spawn()?,
+        child: OwnedChild {
+            child: builder.spawn()?,
+            detached: options.detached,
+        },
     })
 }
 
@@ -114,34 +162,83 @@ pub fn spawn_sync_hidden_with_timeout(
 ) -> std::io::Result<std::process::Output> {
     if let Some(override_fn) = SYNC_SPAWN_OVERRIDE.lock().unwrap().as_ref() {
         if let Some(child) = override_fn(command, args, &options) {
-            // The bounded path: the overridden child is subject to the same
-            // deadline as a real spawn.
-            return match wait_with_timeout(&mut child?, timeout_ms) {
-                Some(status) => Ok(std::process::Output {
-                    status,
-                    stdout: Vec::new(),
-                    stderr: Vec::new(),
-                }),
-                None => Err(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    format!("command timed out after {}ms: {}", timeout_ms, command),
-                )),
-            };
+            return wait_for_sync_child_with_timeout(child?, timeout_ms);
         }
     }
     let mut builder = build_std_command(command, args, &options);
-    let mut child = builder.spawn()?;
-    match wait_with_timeout(&mut child, timeout_ms) {
-        Some(status) => Ok(std::process::Output {
-            status,
-            stdout: drain_child_pipe(child.stdout.take()),
-            stderr: drain_child_pipe(child.stderr.take()),
-        }),
-        None => Err(std::io::Error::new(
+    let child = builder.spawn()?;
+    wait_for_sync_child_with_timeout(child, timeout_ms)
+        .map_err(|error| sync_timeout_error(error, command, timeout_ms))
+}
+
+fn sync_timeout_error(error: std::io::Error, command: &str, timeout_ms: u64) -> std::io::Error {
+    if error.kind() == std::io::ErrorKind::TimedOut {
+        std::io::Error::new(
             std::io::ErrorKind::TimedOut,
             format!("command timed out after {}ms: {}", timeout_ms, command),
-        )),
+        )
+    } else {
+        error
     }
+}
+
+struct SyncPipeDrain {
+    receiver: std::sync::mpsc::Receiver<Vec<u8>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+fn start_sync_pipe_drain<P: Read + Send + 'static>(mut pipe: P) -> SyncPipeDrain {
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    let thread = std::thread::spawn(move || {
+        let mut buffer = Vec::new();
+        let _ = pipe.read_to_end(&mut buffer);
+        let _ = sender.send(buffer);
+    });
+    SyncPipeDrain {
+        receiver,
+        thread: Some(thread),
+    }
+}
+
+impl SyncPipeDrain {
+    /// Receive and join only inside the caller's original deadline. If a
+    /// descendant inherited the pipe, the blocked reader owns it and is left
+    /// detached rather than wedging process cleanup or accumulating a join.
+    fn finish(mut self, deadline: Instant) -> Vec<u8> {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match self.receiver.recv_timeout(remaining) {
+            Ok(buffer) => {
+                if let Some(thread) = self.thread.take() {
+                    let _ = thread.join();
+                }
+                buffer
+            }
+            Err(_) => {
+                drop(self.thread.take());
+                Vec::new()
+            }
+        }
+    }
+}
+
+/// Wait, reap, and drain a synchronous child under one deadline. Both captured
+/// pipes are drained while the child runs, preventing a full-pipe deadlock.
+pub fn wait_for_sync_child_with_timeout(
+    mut child: std::process::Child,
+    timeout_ms: u64,
+) -> std::io::Result<std::process::Output> {
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+    let stdout = child.stdout.take().map(start_sync_pipe_drain);
+    let stderr = child.stderr.take().map(start_sync_pipe_drain);
+    let status = wait_with_timeout(&mut child, timeout_ms)?
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::TimedOut, "command timed out"))?;
+    let stdout = stdout.map(|pipe| pipe.finish(deadline)).unwrap_or_default();
+    let stderr = stderr.map(|pipe| pipe.finish(deadline)).unwrap_or_default();
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
 }
 
 pub fn exec_sync_hidden(command: &str, options: SpawnOptions) -> std::io::Result<std::process::Output> {
@@ -187,7 +284,7 @@ pub fn exec_sync_hidden_with_input(
         let _ = stdin.flush();
         drop(stdin);
     }
-    match wait_with_timeout(&mut child, timeout_ms) {
+    match wait_with_timeout(&mut child, timeout_ms)? {
         Some(status) => Ok(status),
         None => Err(std::io::Error::new(
             std::io::ErrorKind::TimedOut,
@@ -558,45 +655,82 @@ pub fn normalized_exit_code(code: Option<i32>, signal: Option<Signal>) -> Option
     code.or_else(|| signal_exit_code(signal))
 }
 
-/// Wait for a child process to terminate without hanging on inherited stdio handles.
-///
-/// On Windows, daemonized descendants can inherit the child's stdout/stderr pipe
-/// handles. In that case the child emits `exit`, but `close` can hang forever even
-/// though the original process is already gone. We wait briefly for stdio to end,
-/// then forcibly stop tracking the inherited handles.
-pub async fn wait_for_child_process(mut child: tokio::process::Child) -> std::io::Result<Option<i32>> {
-    let status = child.wait().await?;
-    if let Some(mut stdout) = child.stdout.take() {
-        let mut sink = Vec::new();
-        let _ = tokio::time::timeout(Duration::from_millis(EXIT_STDIO_GRACE_MS), async {
-            let _ = tokio::io::AsyncReadExt::read_to_end(&mut stdout, &mut sink).await;
-        })
-        .await;
-    }
-    if let Some(mut stderr) = child.stderr.take() {
-        let mut sink = Vec::new();
-        let _ = tokio::time::timeout(Duration::from_millis(EXIT_STDIO_GRACE_MS), async {
-            let _ = tokio::io::AsyncReadExt::read_to_end(&mut stderr, &mut sink).await;
-        })
-        .await;
-    }
+/// Captured output from an asynchronous child whose pipes were drained while
+/// the process ran. Pipes still held by descendants are closed after the grace
+/// period. Output from a pipe that does not close in time may be omitted.
+pub struct ChildProcessOutput {
+    pub status: std::process::ExitStatus,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+}
 
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::ExitStatusExt;
-        let signal = status.signal().map(|number| match number {
-            libc::SIGHUP => Signal::Hup,
-            libc::SIGINT => Signal::Int,
-            libc::SIGKILL => Signal::Kill,
-            libc::SIGTERM => Signal::Term,
-            _ => Signal::Term,
-        });
-        Ok(normalized_exit_code(status.code(), signal))
+async fn read_async_pipe<P>(pipe: Option<P>) -> Vec<u8>
+where
+    P: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
+    let mut buffer = Vec::new();
+    if let Some(mut pipe) = pipe {
+        let _ = tokio::io::AsyncReadExt::read_to_end(&mut pipe, &mut buffer).await;
     }
-    #[cfg(not(unix))]
-    {
-        Ok(status.code())
+    buffer
+}
+
+async fn finish_async_pipe(
+    mut task: tokio::task::JoinHandle<Vec<u8>>,
+    deadline: tokio::time::Instant,
+) -> Vec<u8> {
+    match tokio::time::timeout_at(deadline, &mut task).await {
+        Ok(Ok(buffer)) => buffer,
+        Ok(Err(_)) => Vec::new(),
+        Err(_) => {
+            task.abort();
+            let _ = task.await;
+            Vec::new()
+        }
     }
+}
+
+/// Wait for a child while concurrently draining both captured pipes. Waiting
+/// for exit before starting a reader can deadlock as soon as either pipe fills.
+pub async fn wait_for_child_process_with_output(child: &mut OwnedChild) -> std::io::Result<ChildProcessOutput> {
+    let stdout = tokio::spawn(read_async_pipe(child.stdout.take()));
+    let stderr = tokio::spawn(read_async_pipe(child.stderr.take()));
+    let status = match child.wait().await {
+        Ok(status) => status,
+        Err(error) => {
+            stdout.abort();
+            stderr.abort();
+            return Err(error);
+        }
+    };
+
+    // Shell exit does not imply EOF. Drain both readers under one shared,
+    // post-exit deadline instead of giving inherited handles sequential grace.
+    let drain_deadline = tokio::time::Instant::now() + Duration::from_millis(EXIT_STDIO_GRACE_MS);
+    let (stdout, stderr) = tokio::join!(
+        finish_async_pipe(stdout, drain_deadline),
+        finish_async_pipe(stderr, drain_deadline),
+    );
+    Ok(ChildProcessOutput { status, stdout, stderr })
+}
+
+pub async fn wait_for_child_process(mut child: OwnedChild) -> std::io::Result<Option<i32>> {
+    let output = wait_for_child_process_with_output(&mut child).await?;
+    Ok(exit_code_for_status(&output.status))
+}
+
+/// Node-compatible exit code from the status itself. Do not map unknown Unix
+/// signals through the small public `Signal` enum: SIGUSR1/SIGABRT and future
+/// signal values must retain their actual platform numbers.
+#[cfg(unix)]
+pub fn exit_code_for_status(status: &std::process::ExitStatus) -> Option<i32> {
+    use std::os::unix::process::ExitStatusExt;
+    Some(status.code().unwrap_or_else(|| 128 + status.signal().unwrap_or(0)))
+}
+
+#[cfg(not(unix))]
+pub fn exit_code_for_status(status: &std::process::ExitStatus) -> Option<i32> {
+    status.code()
 }
 
 /// Reads a child's captured stdout after the process finished.
@@ -608,28 +742,168 @@ pub fn read_child_stdout(output: &mut std::process::Child) -> String {
     buffer
 }
 
-/// Bounded wait used by the synchronous clipboard helpers (`execSync` timeout).
-pub fn wait_with_timeout(child: &mut std::process::Child, timeout_ms: u64) -> Option<std::process::ExitStatus> {
+trait SyncChildWait {
+    fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>>;
+    fn kill(&mut self) -> std::io::Result<()>;
+    fn wait(&mut self) -> std::io::Result<std::process::ExitStatus>;
+}
+
+impl SyncChildWait for std::process::Child {
+    fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        std::process::Child::try_wait(self)
+    }
+
+    fn kill(&mut self) -> std::io::Result<()> {
+        std::process::Child::kill(self)
+    }
+
+    fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        std::process::Child::wait(self)
+    }
+}
+
+fn wait_with_timeout_inner<C: SyncChildWait>(
+    child: &mut C,
+    timeout_ms: u64,
+) -> std::io::Result<Option<std::process::ExitStatus>> {
     let deadline = Instant::now() + Duration::from_millis(timeout_ms);
     loop {
         match child.try_wait() {
-            Ok(Some(status)) => return Some(status),
-            Ok(None) => {
-                if Instant::now() >= deadline {
-                    let _ = child.kill();
-                    return None;
-                }
+            Ok(Some(status)) => return Ok(Some(status)),
+            Ok(None) if Instant::now() < deadline => {
                 std::thread::sleep(Duration::from_millis(5));
             }
-            Err(_) => return None,
+            Ok(None) => {
+                // A failed kill is not a timeout success: report it immediately
+                // rather than either discarding the error or waiting forever.
+                child.kill().map_err(|error| {
+                    std::io::Error::new(
+                        error.kind(),
+                        format!("failed to kill child after {timeout_ms}ms timeout: {error}"),
+                    )
+                })?;
+                // A successful kill must be reaped before the caller returns.
+                child.wait().map_err(|error| {
+                    std::io::Error::new(
+                        error.kind(),
+                        format!("failed to reap killed child after {timeout_ms}ms timeout: {error}"),
+                    )
+                })?;
+                return Ok(None);
+            }
+            Err(error) => {
+                return Err(std::io::Error::new(
+                    error.kind(),
+                    format!("failed to poll child status: {error}"),
+                ));
+            }
         }
     }
+}
+
+/// Bounded wait used by synchronous helpers. `Ok(None)` means the deadline
+/// expired, the kill succeeded, and the child was reaped. Poll, kill, and reap
+/// failures remain distinguishable `Err` values.
+pub fn wait_with_timeout(
+    child: &mut std::process::Child,
+    timeout_ms: u64,
+) -> std::io::Result<Option<std::process::ExitStatus>> {
+    wait_with_timeout_inner(child, timeout_ms)
 }
 
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const HELPER_ENV: &str = "OPTIMUS_CHILD_PROCESS_TEST_HELPER";
+    const HELPER_TEST: &str = "utils::child_process::tests::child_process_test_helper";
+    const LARGE_OUTPUT_BYTES: usize = 1_100_000;
+
+    fn helper_args() -> Vec<String> {
+        vec![
+            "--exact".to_string(),
+            HELPER_TEST.to_string(),
+            "--nocapture".to_string(),
+        ]
+    }
+
+    fn helper_options(mode: &str, capture: bool) -> SpawnOptions {
+        SpawnOptions {
+            env: Some(vec![(HELPER_ENV.to_string(), mode.to_string())]),
+            capture_stdout: capture,
+            capture_stderr: capture,
+            ..Default::default()
+        }
+    }
+
+    fn spawn_async_helper(mode: &str, detached: bool, capture: bool) -> ChildProcessHandle {
+        let mut options = helper_options(mode, capture);
+        options.detached = detached;
+        spawn_hidden(
+            std::env::current_exe().unwrap().to_str().unwrap(),
+            &helper_args(),
+            options,
+        )
+        .unwrap()
+    }
+
+    fn spawn_sync_helper(mode: &str, capture: bool, timeout_ms: u64) -> std::io::Result<std::process::Output> {
+        spawn_sync_hidden_with_timeout(
+            std::env::current_exe().unwrap().to_str().unwrap(),
+            &helper_args(),
+            helper_options(mode, capture),
+            timeout_ms,
+        )
+    }
+
+    /// Test-owned process entrypoint. It is inert during the normal suite and
+    /// active only in a process spawned with `HELPER_ENV` by these tests.
+    #[test]
+    fn child_process_test_helper() {
+        let Ok(mode) = std::env::var(HELPER_ENV) else {
+            return;
+        };
+        match mode.as_str() {
+            "large-output" => {
+                use std::io::Write;
+                std::io::stdout().write_all(&vec![b'o'; LARGE_OUTPUT_BYTES]).unwrap();
+                std::io::stdout().flush().unwrap();
+                std::io::stderr().write_all(&vec![b'e'; LARGE_OUTPUT_BYTES]).unwrap();
+                std::io::stderr().flush().unwrap();
+            }
+            "hold-pipes" => {
+                let mut options = helper_options("sleep-brief", false);
+                options.capture_stdout = false;
+                options.capture_stderr = false;
+                let mut builder = build_std_command(
+                    std::env::current_exe().unwrap().to_str().unwrap(),
+                    &helper_args(),
+                    &options,
+                );
+                // Inherit this helper's captured output handles in the
+                // short-lived descendant after the direct child exits.
+                builder.stdout(Stdio::inherit()).stderr(Stdio::inherit());
+                builder.spawn().unwrap();
+            }
+            "sleep-brief" => std::thread::sleep(Duration::from_secs(2)),
+            "sleep" => std::thread::sleep(Duration::from_secs(30)),
+            unexpected => panic!("unexpected helper mode: {unexpected}"),
+        }
+        std::process::exit(0);
+    }
+
+    #[cfg(unix)]
+    fn wait_until_reaped(pid: i32) {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            if !is_process_alive(pid) && !is_zombie_process(pid) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("child {pid} was not reaped");
+    }
 
     #[cfg(unix)]
     #[test]
@@ -774,4 +1048,217 @@ mod tests {
         assert!(result.status.success());
         assert_eq!(String::from_utf8_lossy(&result.stdout).trim(), "parity-ok");
     }
+
+    #[tokio::test]
+    async fn async_wait_drains_large_captured_pipes_without_external_readers() {
+        let mut handle = spawn_async_helper("large-output", false, true);
+        let result = tokio::time::timeout(Duration::from_secs(10), async {
+            wait_for_child_process_with_output(&mut handle.child).await.unwrap()
+        })
+        .await
+        .expect("full pipes must not deadlock waiting for child exit");
+        assert!(result.status.success());
+        assert!(result.stdout.len() >= LARGE_OUTPUT_BYTES);
+        assert!(result.stderr.len() >= LARGE_OUTPUT_BYTES);
+    }
+
+    #[tokio::test]
+    async fn async_wait_also_drains_when_output_is_not_returned() {
+        let handle = spawn_async_helper("large-output", false, true);
+        let code = tokio::time::timeout(
+            Duration::from_secs(10),
+            wait_for_child_process(handle.child),
+        )
+        .await
+        .expect("uncaptured large output must still be drained")
+        .unwrap();
+        assert_eq!(code, Some(0));
+    }
+
+    #[test]
+    fn sync_wait_drains_large_captured_pipes_during_the_wait() {
+        let output = spawn_sync_helper("large-output", true, 10_000).unwrap();
+        assert!(output.status.success());
+        assert!(output.stdout.len() >= LARGE_OUTPUT_BYTES);
+        assert!(output.stderr.len() >= LARGE_OUTPUT_BYTES);
+    }
+
+    #[test]
+    fn sync_wait_binds_inherited_pipe_drains_to_the_original_deadline() {
+        let started = Instant::now();
+        let output = spawn_sync_helper("hold-pipes", true, 1_000).unwrap();
+        assert!(output.status.success());
+        assert!(
+            started.elapsed() < Duration::from_millis(1_800),
+            "inherited pipes outlasted the deadline: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn async_wait_binds_inherited_pipe_drains_to_one_grace_period() {
+        let mut handle = spawn_async_helper("hold-pipes", false, true);
+        let started = Instant::now();
+        let output = tokio::time::timeout(
+            Duration::from_secs(1),
+            wait_for_child_process_with_output(&mut handle.child),
+        )
+        .await
+        .expect("inherited handles must not hold the wait open")
+        .unwrap();
+        assert!(output.status.success());
+        assert!(started.elapsed() < Duration::from_millis(900));
+    }
+
+    struct KillFailure;
+
+    impl SyncChildWait for KillFailure {
+        fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+            Ok(None)
+        }
+
+        fn kill(&mut self) -> std::io::Result<()> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "injected kill failure",
+            ))
+        }
+
+        fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+            panic!("a failed kill must not start an unbounded wait")
+        }
+    }
+
+    #[test]
+    fn timeout_propagates_kill_failure_without_waiting() {
+        let started = Instant::now();
+        let error = wait_with_timeout_inner(&mut KillFailure, 0).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(error.to_string().contains("failed to kill child"));
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    struct PollFailure;
+
+    impl SyncChildWait for PollFailure {
+        fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+            Err(std::io::Error::other("injected status failure"))
+        }
+
+        fn kill(&mut self) -> std::io::Result<()> {
+            panic!("a status failure must not be converted into a timeout kill")
+        }
+
+        fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+            unreachable!()
+        }
+    }
+
+    #[test]
+    fn timeout_preserves_status_errors() {
+        let error = wait_with_timeout_inner(&mut PollFailure, 100).unwrap_err();
+        assert!(error.to_string().contains("failed to poll child status"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn timeout_kills_and_reaps_a_sleeper_without_a_zombie() {
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "sleep 30"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = child.id() as i32;
+        assert_eq!(wait_with_timeout(&mut child, 25).unwrap(), None);
+        assert!(matches!(child.try_wait(), Ok(Some(_))));
+        assert!(!is_process_alive(pid));
+        assert!(!is_zombie_process(pid));
+    }
+
+    #[tokio::test]
+    async fn aborted_wait_kills_and_reaps_a_non_detached_child() {
+        let handle = spawn_async_helper("sleep", false, false);
+        let pid = handle.child.id().unwrap() as i32;
+        let task = tokio::spawn(wait_for_child_process(handle.child));
+        tokio::task::yield_now().await;
+        task.abort();
+        let _ = task.await;
+        #[cfg(unix)]
+        wait_until_reaped(pid);
+        #[cfg(not(unix))]
+        {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while is_process_alive(pid) && Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert!(!is_process_alive(pid));
+        }
+    }
+
+    #[tokio::test]
+    async fn detached_child_survives_owner_drop() {
+        let handle = spawn_async_helper("sleep-brief", true, false);
+        let pid = handle.child.id().unwrap() as i32;
+        drop(handle);
+        assert!(is_process_alive(pid));
+        let deadline = Instant::now() + Duration::from_secs(4);
+        while is_process_alive(pid) && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(!is_process_alive(pid));
+        #[cfg(unix)]
+        unsafe {
+            // A deliberately detached tokio child has no async reaper. Reap
+            // this test-owned process directly after proving it survived drop.
+            let mut status = 0;
+            assert_eq!(libc::waitpid(pid, &mut status, 0), pid);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exit_codes_use_the_actual_unix_status_signal() {
+        use std::os::unix::process::ExitStatusExt;
+        for signal in [libc::SIGUSR1, libc::SIGABRT] {
+            let status = std::process::ExitStatus::from_raw(signal);
+            assert_eq!(status.signal(), Some(signal));
+            assert_eq!(exit_code_for_status(&status), Some(128 + signal));
+        }
+    }
+
+
+    #[tokio::test]
+    async fn cancelled_borrowed_wait_preserves_owner_for_graceful_termination() {
+        let mut handle = spawn_async_helper("sleep", false, false);
+        let pid = handle.child.id().unwrap() as i32;
+        let first = tokio::time::timeout(
+            Duration::from_millis(25),
+            wait_for_child_process_with_output(&mut handle.child),
+        )
+        .await;
+        assert!(first.is_err(), "the sleeper must trigger the first bound");
+        assert!(
+            is_process_alive(pid),
+            "dropping a borrowed wait must not preempt the graceful signal"
+        );
+
+        assert!(signal_process_group_or_process(pid, Signal::Term));
+        let output = tokio::time::timeout(
+            Duration::from_secs(2),
+            wait_for_child_process_with_output(&mut handle.child),
+        )
+        .await
+        .expect("successful termination must be reaped")
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            assert_eq!(output.status.signal(), Some(libc::SIGTERM));
+            assert_eq!(exit_code_for_status(&output.status), Some(128 + libc::SIGTERM));
+        }
+        assert!(!is_process_alive(pid));
+    }
+
 }
