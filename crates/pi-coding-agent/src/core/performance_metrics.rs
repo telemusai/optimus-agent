@@ -72,7 +72,7 @@ const COMPONENTS: [PerformanceMetricComponent; 8] = [
 ];
 
 /// `MEASUREMENTS`.
-const MEASUREMENTS: [PerformanceMetricMeasurement; 65] = [
+const MEASUREMENTS: [PerformanceMetricMeasurement; 69] = [
     PerformanceMetricMeasurement::TotalMs,
     PerformanceMetricMeasurement::WaitMs,
     PerformanceMetricMeasurement::DispatchToResponseHeadersMs,
@@ -137,6 +137,10 @@ const MEASUREMENTS: [PerformanceMetricMeasurement; 65] = [
     PerformanceMetricMeasurement::UiPendingCount,
     PerformanceMetricMeasurement::UiEventCount,
     PerformanceMetricMeasurement::UiTickFallbackCount,
+    PerformanceMetricMeasurement::UiTickFallbackSkipped,
+    PerformanceMetricMeasurement::UiAckDeadlineMs,
+    PerformanceMetricMeasurement::RenderMs,
+    PerformanceMetricMeasurement::DiffMs,
     PerformanceMetricMeasurement::MaxMs,
 ];
 
@@ -608,6 +612,32 @@ struct LocalRecorderState {
     sequence: i64,
 }
 
+struct PendingMetricLine {
+    json: String,
+    dropped_records: f64,
+}
+
+/// Accounts for the unappended suffix if a flush future is cancelled. Once an
+/// append succeeds, its prefix is excluded so a later drop report cannot claim
+/// records that are already persisted. An interrupted append is conservatively
+/// accounted as dropped rather than retried, which avoids duplicate JSONL lines.
+struct PendingMetricBatch<'a> {
+    recorder: &'a LocalPerformanceMetricRecorderInner,
+    lines: Vec<PendingMetricLine>,
+    appended: usize,
+}
+
+impl Drop for PendingMetricBatch<'_> {
+    fn drop(&mut self) {
+        let dropped = self.lines[self.appended..]
+            .iter()
+            .fold(0.0, |total, line| total + line.dropped_records);
+        if dropped > 0.0 {
+            self.recorder.note_dropped_record(dropped);
+        }
+    }
+}
+
 impl LocalPerformanceMetricRecorder {
     /// `constructor(options)`.
     pub fn new(options: LocalPerformanceMetricRecorderOptions) -> Self {
@@ -919,7 +949,10 @@ impl LocalPerformanceMetricRecorderInner {
             state.pending_dropped_records = 0.0;
             (lines, buffered_record_count, previously_dropped)
         };
-        let mut lines = lines;
+        let mut lines: Vec<PendingMetricLine> = lines
+            .into_iter()
+            .map(|json| PendingMetricLine { json, dropped_records: 1.0 })
+            .collect();
         if previously_dropped > 0.0 {
             let drop_line = self.serialize_event(&PerformanceMetricEvent {
                 operation: PerformanceMetricOperation::Recorder,
@@ -952,15 +985,16 @@ impl LocalPerformanceMetricRecorderInner {
                 self.note_dropped_record(previously_dropped + buffered_record_count as f64);
                 return;
             };
-            lines.insert(0, drop_line);
+            lines.insert(
+                0,
+                PendingMetricLine { json: drop_line, dropped_records: previously_dropped },
+            );
         }
+        let mut batch = PendingMetricBatch { recorder: self, lines, appended: 0 };
         if self.file_io.mkdir(&self.directory).await.is_err() {
-            self.note_dropped_record(previously_dropped + buffered_record_count as f64);
             return;
         }
-        if self.write_lines(lines).await.is_err() {
-            self.note_dropped_record(previously_dropped + buffered_record_count as f64);
-        }
+        let _ = self.write_lines(&mut batch).await;
     }
 
     /// `flush()`.
@@ -985,29 +1019,35 @@ impl LocalPerformanceMetricRecorderInner {
     }
 
     /// `private async writeLines(lines)`.
-    async fn write_lines(&self, lines: Vec<String>) -> Result<(), ()> {
-        let mut chunk: Vec<String> = Vec::new();
-        let mut chunk_bytes = 0usize;
-        for line in lines {
-            let bytes = line.len();
-            if bytes > self.max_file_bytes {
-                self.note_dropped_record(1.0);
+    async fn write_lines(&self, batch: &mut PendingMetricBatch<'_>) -> Result<(), ()> {
+        while batch.appended < batch.lines.len() {
+            let start = batch.appended;
+            let first_bytes = batch.lines[start].json.len();
+            if first_bytes > self.max_file_bytes {
+                let dropped = batch.lines[start].dropped_records;
+                batch.appended += 1;
+                self.note_dropped_record(dropped);
                 continue;
             }
-            if chunk_bytes > 0 && chunk_bytes + bytes > self.max_file_bytes {
-                if self.append_chunk(&chunk.join(""), chunk_bytes).await.is_err() {
-                    return Err(());
+
+            let mut end = start;
+            let mut chunk_bytes = 0usize;
+            while end < batch.lines.len() {
+                let bytes = batch.lines[end].json.len();
+                if bytes > self.max_file_bytes
+                    || (chunk_bytes > 0 && chunk_bytes + bytes > self.max_file_bytes)
+                {
+                    break;
                 }
-                chunk = Vec::new();
-                chunk_bytes = 0;
+                chunk_bytes += bytes;
+                end += 1;
             }
-            chunk.push(line);
-            chunk_bytes += bytes;
-        }
-        if chunk_bytes > 0 {
-            if self.append_chunk(&chunk.join(""), chunk_bytes).await.is_err() {
-                return Err(());
-            }
+            let data = batch.lines[start..end]
+                .iter()
+                .map(|line| line.json.as_str())
+                .collect::<String>();
+            self.append_chunk(&data, chunk_bytes).await?;
+            batch.appended = end;
         }
         Ok(())
     }
@@ -1055,12 +1095,15 @@ impl LocalPerformanceMetricRecorderInner {
     }
 
     /// `close()` bounded by `closeTimeoutMs`.
-    async fn close(&self) {
+    async fn close(self: &Arc<Self>) {
         self.closed.store(true, Ordering::SeqCst);
         let deadline =
             tokio::time::Instant::now() + std::time::Duration::from_millis(self.close_timeout_ms);
-        let flush = self.flush();
-        let _ = tokio::time::timeout_at(deadline, flush).await;
+        let inner = Arc::clone(self);
+        let mut flush = tokio::spawn(async move { inner.flush().await });
+        // Dropping the join handle after the deadline detaches the owned drain;
+        // it does not cancel and discard the future-owned metrics batch.
+        let _ = tokio::time::timeout_at(deadline, &mut flush).await;
     }
 }
 
@@ -1128,7 +1171,13 @@ pub fn create_local_performance_metric_recorder_from_environment(
 ) -> Option<LocalPerformanceMetricRecorder> {
     let env: HashMap<String, String> = match options.env.clone() {
         Some(env) => env,
-        None => std::env::vars().collect(),
+        None => std::env::vars_os()
+            .filter_map(|(key, value)| {
+                // Configuration keys are ASCII; ignore non-Unicode keys and
+                // lossily decode values instead of panicking on unrelated env.
+                Some((key.into_string().ok()?, value.to_string_lossy().into_owned()))
+            })
+            .collect(),
     };
     if !opt_in_enabled(env.get("PRIME_AGENT_PERFORMANCE_METRICS").map(String::as_str)) {
         return None;
@@ -1401,9 +1450,81 @@ mod tests {
             assert_eq!(sanitized.len(), 1);
             assert_eq!(sanitized.get(&measurement), Some(&None));
         }
+        assert_eq!(MEASUREMENTS.len(), 69);
+        assert_eq!(measurement_names.len(), MEASUREMENTS.len());
         assert!(OPERATIONS.contains(&PerformanceMetricOperation::UiEventApply));
         assert!(OPERATIONS.contains(&PerformanceMetricOperation::UiTick));
         assert!(MEASUREMENTS.contains(&PerformanceMetricMeasurement::UiSubmitToReceiptRenderMs));
+    }
+
+    #[tokio::test]
+    async fn native_host_metrics_survive_jsonl_serialization_and_sanitization() {
+        let io = Arc::new(MemoryFileIo::new());
+        let recorder = create_recorder(
+            Arc::clone(&io),
+            LocalPerformanceMetricRecorderOptions::default(),
+        );
+
+        let mut render = sample_event("render");
+        render.operation = PerformanceMetricOperation::UiRender;
+        render.measurements = Some(
+            [
+                (PerformanceMetricMeasurement::RenderMs, Some(1.25)),
+                (PerformanceMetricMeasurement::DiffMs, Some(2.5)),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        recorder.record(render);
+
+        let mut tick = sample_event("tick");
+        tick.operation = PerformanceMetricOperation::UiTick;
+        tick.measurements = Some(
+            [
+                (PerformanceMetricMeasurement::UiTickFallbackCount, Some(2.0)),
+                (PerformanceMetricMeasurement::UiTickFallbackSkipped, Some(1.0)),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        recorder.record(tick);
+
+        let mut ack = sample_event("ack");
+        ack.operation = PerformanceMetricOperation::UiInputAck;
+        ack.measurements = Some(
+            [
+                (PerformanceMetricMeasurement::UiAckDeadlineMs, Some(10_000.0)),
+                (PerformanceMetricMeasurement::UiSubmitToReplyMs, None),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        recorder.record(ack);
+        recorder.flush().await;
+
+        let records = parse_records(&io);
+        assert_eq!(records.len(), 3);
+        assert_eq!(records[0]["operation"], "ui_render");
+        assert_eq!(records[0]["measurements"]["render_ms"], 1.25);
+        assert_eq!(records[0]["measurements"]["diff_ms"], 2.5);
+        assert_eq!(records[1]["operation"], "ui_tick");
+        assert_eq!(records[1]["measurements"]["ui_tick_fallback_count"], 2.0);
+        assert_eq!(records[1]["measurements"]["ui_tick_fallback_skipped"], 1.0);
+        assert_eq!(records[2]["operation"], "ui_input_ack");
+        assert_eq!(records[2]["measurements"]["ui_ack_deadline_ms"], 10_000.0);
+        assert!(records[2]["measurements"]["ui_submit_to_reply_ms"].is_null());
+
+        let invalid = sanitize_measurements(Some(&serde_json::json!({
+            "render_ms": -1,
+            "diff_ms": -2,
+            "ui_tick_fallback_skipped": -3,
+            "ui_ack_deadline_ms": -4,
+            "private_measurement": 5,
+        })))
+        .expect("known measurements remain present");
+        assert_eq!(invalid.len(), 4);
+        assert!(invalid.values().all(Option::is_none));
+        recorder.close().await;
     }
 
     #[tokio::test]
@@ -1615,6 +1736,107 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancellation_accounts_only_for_the_unappended_suffix() {
+        struct SecondAppendGate {
+            memory: MemoryFileIo,
+            calls: Arc<std::sync::atomic::AtomicUsize>,
+            gate: Arc<tokio::sync::Semaphore>,
+        }
+        impl PerformanceMetricFileIo for SecondAppendGate {
+            fn mkdir(&self, path: &str) -> pi_ai::types::BoxFuture<Result<(), PerformanceMetricIoError>> {
+                self.memory.mkdir(path)
+            }
+            fn size(&self, path: &str) -> pi_ai::types::BoxFuture<Result<Option<u64>, PerformanceMetricIoError>> {
+                self.memory.size(path)
+            }
+            fn rename(&self, source: &str, destination: &str) -> pi_ai::types::BoxFuture<Result<(), PerformanceMetricIoError>> {
+                self.memory.rename(source, destination)
+            }
+            fn remove(&self, path: &str) -> pi_ai::types::BoxFuture<Result<(), PerformanceMetricIoError>> {
+                self.memory.remove(path)
+            }
+            fn append(&self, path: &str, data: &str) -> pi_ai::types::BoxFuture<Result<(), PerformanceMetricIoError>> {
+                let write = self.memory.append(path, data);
+                let calls = Arc::clone(&self.calls);
+                let gate = Arc::clone(&self.gate);
+                Box::pin(async move {
+                    if calls.fetch_add(1, Ordering::SeqCst) == 1 {
+                        gate.acquire().await.unwrap().forget();
+                    }
+                    write.await
+                })
+            }
+        }
+
+        let io = Arc::new(SecondAppendGate {
+            memory: MemoryFileIo::new(),
+            calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            gate: Arc::new(tokio::sync::Semaphore::new(0)),
+        });
+        let recorder = LocalPerformanceMetricRecorder::new(LocalPerformanceMetricRecorderOptions {
+            directory: "C:/isolated/cancel-suffix".into(),
+            session_id: "cancel-suffix".into(),
+            max_file_bytes: Some(4096),
+            max_record_bytes: Some(2048),
+            max_files: Some(2),
+            flush_interval_ms: Some(60_000),
+            random_id: Some(Arc::new(|| "cancel-suffix".into())),
+            file_io: Some(io.clone()),
+            ..Default::default()
+        });
+        for id in ["first", "second", "third"] {
+            let serialized = recorder.inner.serialize_event(&sample_event(id)).unwrap();
+            let json = serialized.trim_end();
+            let line = format!("{json}{}\n", " ".repeat(1500 - json.len() - 1));
+            assert_eq!(line.len(), 1500);
+            let mut state = recorder.inner.state.lock().unwrap();
+            state.buffered_bytes += line.len();
+            state.buffered_lines.push(line);
+        }
+
+        let inner = Arc::clone(&recorder.inner);
+        let flush = tokio::spawn(async move { inner.flush_once().await });
+        for _ in 0..100 {
+            if io.calls.load(Ordering::SeqCst) == 2 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(io.calls.load(Ordering::SeqCst), 2);
+        flush.abort();
+        let _ = flush.await;
+
+        // The first two records are already appended. Cancellation accounts for
+        // only the third as dropped; retry writes a marker, never the old prefix.
+        recorder.flush().await;
+        let records = parse_records(&io.memory);
+        assert_eq!(records.len(), 3);
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| record["operation"] == "recorder")
+                .count(),
+            1
+        );
+        let marker = records.iter().find(|record| record["operation"] == "recorder").unwrap();
+        assert_eq!(marker["measurements"]["dropped_count"], 1.0);
+        for id in ["first", "second"] {
+            assert_eq!(
+                records
+                    .iter()
+                    .filter(|record| record["correlation"]["logicalRequestId"] == id)
+                    .count(),
+                1
+            );
+        }
+        assert!(!serde_json::to_string(&records).unwrap().contains("third"));
+
+        recorder.flush().await;
+        assert_eq!(parse_records(&io.memory).len(), 3, "retry adds no duplicate lines");
+        recorder.close().await;
+    }
+
+    #[tokio::test]
     async fn rotates_bounded_files_instead_of_growing_one_log_indefinitely() {
         let io = Arc::new(MemoryFileIo::new());
         let recorder = create_recorder(
@@ -1727,6 +1949,59 @@ mod tests {
         )
         .expect("configured recorder");
         assert!(configured.log_path().starts_with(metrics_dir.to_string_lossy().as_ref()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_environment_tolerates_unrelated_non_unicode_values() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        static ENV_LOCK: Mutex<()> = Mutex::new(());
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let enabled_key = "PRIME_AGENT_PERFORMANCE_METRICS";
+        let directory_key = "PRIME_AGENT_PERFORMANCE_METRICS_DIR";
+        let unrelated_key = "OPTIMUS_TEST_UNRELATED_NON_UNICODE";
+        let previous = [enabled_key, directory_key, unrelated_key]
+            .map(|key| (key, std::env::var_os(key)));
+        let temp = tempfile::tempdir().unwrap();
+        std::env::set_var(enabled_key, "1");
+        std::env::set_var(directory_key, temp.path());
+        std::env::set_var(unrelated_key, OsString::from_vec(vec![b'v', 0xff]));
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            create_local_performance_metric_recorder_from_environment(
+                EnvironmentPerformanceMetricRecorderOptions {
+                    agent_dir: temp.path().to_string_lossy().into_owned(),
+                    session_id: "non-unicode-env".into(),
+                    env: None,
+                    max_buffered_records: None,
+                    max_buffered_bytes: None,
+                    max_record_bytes: None,
+                    max_file_bytes: None,
+                    max_files: None,
+                    flush_interval_ms: None,
+                    close_timeout_ms: None,
+                    monotonic_now: None,
+                    wall_now: None,
+                    random_id: Some(Arc::new(|| "non-unicode-env".into())),
+                    file_io: Some(Arc::new(MemoryFileIo::new())),
+                    error_text_enabled: None,
+                },
+            )
+        }));
+        for (key, value) in previous {
+            if let Some(value) = value {
+                std::env::set_var(key, value);
+            } else {
+                std::env::remove_var(key);
+            }
+        }
+
+        let recorder = result
+            .expect("an unrelated non-Unicode value must not panic")
+            .expect("the valid Unicode opt-in still enables recording");
+        assert!(recorder.log_path().starts_with(temp.path().to_string_lossy().as_ref()));
     }
 
     /// A3: `PRIME_AGENT_PERFORMANCE_METRICS_ERROR_TEXT=1` is the only way the

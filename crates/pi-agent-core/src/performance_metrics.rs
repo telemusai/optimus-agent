@@ -1161,6 +1161,7 @@ mod tests {
             (PerformanceMetricMeasurement::RenderMs, "render_ms", 1.25),
             (PerformanceMetricMeasurement::DiffMs, "diff_ms", 2.5),
             (PerformanceMetricMeasurement::UiTickFallbackSkipped, "ui_tick_fallback_skipped", 9.0),
+            (PerformanceMetricMeasurement::UiAckDeadlineMs, "ui_ack_deadline_ms", 10_000.0),
         ];
         let mut measurements = PerformanceMetricMeasurements::new();
         for (measurement, wire_name, value) in registered {
@@ -1175,6 +1176,7 @@ mod tests {
             "render_ms": 1.25,
             "diff_ms": 2.5,
             "ui_tick_fallback_skipped": 9.0,
+            "ui_ack_deadline_ms": 10_000.0,
         }));
         assert_eq!(serde_json::from_value::<PerformanceMetricMeasurements>(encoded).unwrap(), measurements);
     }
