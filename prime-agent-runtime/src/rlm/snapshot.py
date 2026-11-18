@@ -921,6 +921,7 @@ def _cas_generation_for_unchanged_outcome(
     *,
     max_bytes: int,
     max_variable_bytes: int,
+    repairable_digests: set[str] | None = None,
 ) -> dict[str, Any] | None:
     """The committed current generation when it already equals this outcome.
 
@@ -928,6 +929,9 @@ def _cas_generation_for_unchanged_outcome(
     comparison cannot go stale across process restarts or external writes.
     Returns None when anything differs or cannot be validated; the caller then
     runs the normal write path with its own full validation and error surface.
+    Same-size blob hash mismatches are collected in ``repairable_digests`` so
+    the writer can restore their expected bytes before validating the current
+    generation. Other damage keeps the normal write path's error behavior.
     """
     try:
         _validate_format(root)
@@ -942,9 +946,18 @@ def _cas_generation_for_unchanged_outcome(
     if _generation_outcome_digest(generation) != legacy_outcome_digest(payload, skipped, pruned, dropped):
         return None
     for entry in generation["entries"]:
-        identity = _file_identity(_owned_path(root, BLOBS_DIRNAME, f"{entry['sha256']}.blob"))
-        if identity is None or identity[0] != entry["size"]:
+        digest = entry["sha256"]
+        path = _owned_path(root, BLOBS_DIRNAME, f"{digest}.blob")
+        try:
+            existing = _read_regular_file(path, max_bytes=entry["size"], expected_size=entry["size"])
+        except SnapshotStoreError:
             return None
+        if hashlib.sha256(existing).hexdigest() != digest:
+            if repairable_digests is None:
+                return None
+            repairable_digests.add(digest)
+    if repairable_digests:
+        return None
     return generation
 
 
@@ -1316,6 +1329,7 @@ def snapshot_cas_v2(
         pointer = _read_pointer(root, required=False) if os.path.isdir(root) else None
         saved = sorted(payload)
         pruned = sorted(name for name in oversized if name in ns) if prune_oversized else []
+        repairable_digests: set[str] = set()
         if pointer is not None:
             unchanged = _cas_generation_for_unchanged_outcome(
                 root,
@@ -1326,6 +1340,7 @@ def snapshot_cas_v2(
                 dropped,
                 max_bytes=max_bytes,
                 max_variable_bytes=max_variable_bytes,
+                repairable_digests=repairable_digests,
             )
             if unchanged is not None:
                 # The committed current generation already holds exactly this
@@ -1361,6 +1376,18 @@ def snapshot_cas_v2(
                     committed.append(result)
                 return result
         _initialize_for_write(root, written)
+        if repairable_digests:
+            # These blobs had the expected size but failed their content hash.
+            # Restore the known-good serialized bytes before the current
+            # generation is validated and retained as `previous`.
+            payload_by_digest = {digests[name]: blob for name, blob in payload.items()}
+            for digest in sorted(repairable_digests):
+                blob = payload_by_digest[digest]
+                path = _owned_path(root, BLOBS_DIRNAME, f"{digest}.blob")
+                _atomic_write_bytes(path, blob, written)
+                persisted = _read_regular_file(path, max_bytes=len(blob), expected_size=len(blob))
+                if hashlib.sha256(persisted).hexdigest() != digest or persisted != blob:
+                    raise SnapshotStoreError(f"repaired CAS blob validation failed: {digest}")
         if pointer is not None:
             # A generation promoted to `previous` must still be complete now.
             with open_cas_generation(

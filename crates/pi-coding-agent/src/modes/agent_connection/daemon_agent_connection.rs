@@ -1317,6 +1317,10 @@ impl DaemonAgentConnection {
     }
 }
 
+fn is_initial_attach_transport_error(error: &str) -> bool {
+    error.starts_with("Connection to the Optimus Agent daemon closed.")
+}
+
 impl DaemonAgentConnection {
     /// `DaemonAgentConnection.attach(client, activeSessionId, options)`.
     pub fn attach(
@@ -1333,16 +1337,26 @@ impl DaemonAgentConnection {
             connection.bind_transport(&connection);
             let mut attach_scope = AttachScope(Some(connection.clone()));
             *connection.initial_attach_pending.lock().unwrap() = true;
+            let requested_active_session_id = connection.active_session_id();
+            let had_direct_transport = connection.client.has_direct_transport();
             let initial = connection.attach_once(true).await;
             if let Err(error) = initial {
-                // The routed transport falls back to the supervisor and retries once;
-                // this retry owns its failure.
+                let fell_back_to_control_plane = had_direct_transport
+                    && !connection.client.has_direct_transport()
+                    && connection.client.is_control_plane_ready();
+                if !fell_back_to_control_plane || !is_initial_attach_transport_error(&error) {
+                    let authoritative = connection.initial_control_plane_close.lock().unwrap().clone();
+                    *connection.initial_attach_pending.lock().unwrap() = false;
+                    connection.dispose_inner().await;
+                    return Err(authoritative.unwrap_or(error));
+                }
+                connection.clean_failed_initial_attach(&requested_active_session_id);
+                // Only a real direct-to-supervisor fallback owns one bounded retry.
                 if let Err(retry_error) = connection.attach_once(false).await {
                     // A control-plane close saved during the window is the authoritative cause.
                     let authoritative = connection.initial_control_plane_close.lock().unwrap().clone();
                     *connection.initial_attach_pending.lock().unwrap() = false;
                     connection.dispose_inner().await;
-                    let _ = error;
                     return Err(authoritative.unwrap_or(retry_error));
                 }
             }
@@ -1358,6 +1372,20 @@ impl DaemonAgentConnection {
             attach_scope.0 = None;
             Ok(connection)
         })
+    }
+
+    fn clean_failed_initial_attach(&self, active_session_id: &str) {
+        self.reject_snapshot_assemblies("Retrying initial attach through the supervisor".to_string());
+        self.deferred_session_events.lock().unwrap().failure = None;
+        *self.attach_snapshot_pending.lock().unwrap() = false;
+        self.set_active_session_id(active_session_id.to_string());
+        *self.attached_session_id.lock().unwrap() = None;
+        *self.attached_session_file.lock().unwrap() = None;
+        *self.latest_snapshot.lock().unwrap() = None;
+        *self.latest_snapshot_is_fresh.lock().unwrap() = false;
+        *self.last_event_sequence.lock().unwrap() = None;
+        *self.last_event_cursor.lock().unwrap() = None;
+        *self.child_roster_sequence.lock().unwrap() = None;
     }
 
     async fn attach_once(&self, recoverable: bool) -> Result<(), String> {
@@ -4604,6 +4632,9 @@ mod daemon_backlog_tests;
 #[cfg(test)]
 #[path = "daemon_restart_tests.rs"]
 mod daemon_restart_tests;
+#[cfg(test)]
+#[path = "daemon_initial_attach_tests.rs"]
+mod daemon_initial_attach_tests;
 
 #[cfg(test)]
 #[path = "jev_status_tests.rs"]

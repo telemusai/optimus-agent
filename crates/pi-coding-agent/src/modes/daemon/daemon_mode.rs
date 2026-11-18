@@ -8731,18 +8731,21 @@ impl AgentDaemon {
             return;
         }
         let busy = busy_override.unwrap_or_else(|| worker_recovery_busy(session.as_ref()));
-        journal.record(WorkerRecoveryRecordInput {
-            active_session_id: entry
-                .state
-                .lock()
-                .expect("active session poisoned")
-                .active_session_id
-                .clone(),
+        let active_session_id = entry
+            .state
+            .lock()
+            .expect("active session poisoned")
+            .active_session_id
+            .clone();
+        if let Err(error) = journal.record(WorkerRecoveryRecordInput {
+            active_session_id,
             session_id,
             session_file: session.session_file(),
             busy,
             operation: operation.to_string(),
-        });
+        }) {
+            eprintln!("Could not persist worker recovery state: {error}");
+        }
     }
 }
 

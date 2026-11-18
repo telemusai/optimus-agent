@@ -77,14 +77,14 @@ impl WorkerRecoveryJournal {
         }
     }
 
-    pub fn record(&mut self, input: WorkerRecoveryRecordInput) {
+    pub fn record(&mut self, input: WorkerRecoveryRecordInput) -> std::io::Result<()> {
         let previous = self.latest.get(&input.active_session_id);
         if previous.is_some_and(|previous| {
             previous.busy == input.busy
                 && previous.operation == input.operation
                 && previous.session_file == input.session_file
         }) {
-            return;
+            return Ok(());
         }
         let record = WorkerRecoveryRecord {
             version: 1,
@@ -95,12 +95,15 @@ impl WorkerRecoveryJournal {
             operation: input.operation,
             recorded_at: now_iso(),
         };
-        self.append(&record);
+        self.append(&record)?;
         self.latest.insert(record.active_session_id.clone(), record);
         let all_idle = self.latest.values().all(|entry| !entry.busy);
         if all_idle || self.exceeds_compact_budget() {
+            // The appended record is already durable. A failed compaction must
+            // not hide that success or roll back the in-memory latest state.
             self.compact();
         }
+        Ok(())
     }
 
     /// The append-only tail is bounded even while a busy entry persists: once
@@ -121,18 +124,31 @@ impl WorkerRecoveryJournal {
         parse_records(path).values().cloned().collect()
     }
 
-    fn append(&self, record: &WorkerRecoveryRecord) {
-        let Ok(mut file) = std::fs::OpenOptions::new()
+    fn append(&self, record: &WorkerRecoveryRecord) -> std::io::Result<()> {
+        let mut file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(&self.path)
-        else {
-            return;
-        };
-        let line = serde_json::to_string(record).unwrap_or_default();
-        let _ = file.write_all(format!("{line}\n").as_bytes());
-        let _ = file.sync_all();
+            .open(&self.path)?;
+        let line = serde_json::to_string(record)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        let mut payload = Vec::new();
+        if std::fs::metadata(&self.path)?.len() > 0 {
+            use std::io::{Read, Seek, SeekFrom};
+            let mut tail = std::fs::File::open(&self.path)?;
+            tail.seek(SeekFrom::End(-1))?;
+            let mut last = [0u8; 1];
+            tail.read_exact(&mut last)?;
+            if last[0] != b'\n' {
+                // Keep a torn final write from consuming the next valid record.
+                payload.push(b'\n');
+            }
+        }
+        payload.extend_from_slice(line.as_bytes());
+        payload.push(b'\n');
+        file.write_all(&payload)?;
+        file.sync_all()?;
         set_private_mode(&self.path);
+        Ok(())
     }
 
     fn compact(&self) {
@@ -211,8 +227,8 @@ mod tests {
             busy: true,
             operation: "prompt".to_string(),
         };
-        journal.record(input.clone());
-        journal.record(input.clone());
+        journal.record(input.clone()).expect("first append");
+        journal.record(input.clone()).expect("deduplicated append");
         let latest = journal.get_latest();
         assert_eq!(latest.len(), 1);
         assert_eq!(latest[0].operation, "prompt");
@@ -225,7 +241,7 @@ mod tests {
             busy: false,
             operation: "idle".to_string(),
             ..input
-        });
+        }).expect("idle append");
         let reloaded = WorkerRecoveryJournal::read_latest(&path);
         assert_eq!(reloaded.len(), 1);
         assert!(!reloaded[0].busy);
@@ -248,10 +264,10 @@ mod tests {
             busy: true,
             operation: "tool_call".to_string(),
         };
-        journal.record(base.clone());
+        journal.record(base.clone()).expect("base append");
         let padding = "x".repeat(2048);
         for index in 0..400 {
-            journal.record(WorkerRecoveryRecordInput { operation: format!("{padding}-{index}"), ..base.clone() });
+            journal.record(WorkerRecoveryRecordInput { operation: format!("{padding}-{index}"), ..base.clone() }).expect("append");
         }
         let size = std::fs::metadata(&path).expect("journal exists").len();
         assert!(
@@ -265,6 +281,60 @@ mod tests {
         assert!(latest[0].busy);
         assert_eq!(latest[0].active_session_id, "stale-busy");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+
+    #[test]
+    fn failed_append_preserves_durable_state_and_allows_identical_retry() {
+        let path = temp_path("journal.jsonl");
+        let mut journal = WorkerRecoveryJournal::new(&path);
+        let base = WorkerRecoveryRecordInput {
+            active_session_id: "active-1".to_string(),
+            session_id: "session-1".to_string(),
+            session_file: Some("/tmp/s.jsonl".to_string()),
+            busy: true,
+            operation: "prompt".to_string(),
+        };
+        journal.record(base.clone()).expect("initial append");
+        let idle = WorkerRecoveryRecordInput {
+            busy: false,
+            operation: "idle".to_string(),
+            ..base
+        };
+        std::fs::remove_file(&path).expect("remove journal");
+        std::fs::create_dir(&path).expect("make append target unwritable");
+        assert!(journal.record(idle.clone()).is_err());
+        assert_eq!(journal.get_latest()[0].operation, "prompt");
+        assert!(journal.get_latest()[0].busy);
+        std::fs::remove_dir(&path).expect("restore append target");
+        journal.record(idle).expect("identical retry after failure");
+        let latest = WorkerRecoveryJournal::read_latest(&path);
+        assert_eq!(latest.len(), 1);
+        assert_eq!(latest[0].operation, "idle");
+    }
+
+    #[test]
+    fn append_separates_a_torn_final_write_from_the_retry() {
+        let path = temp_path("journal.jsonl");
+        let mut journal = WorkerRecoveryJournal::new(&path);
+        let base = WorkerRecoveryRecordInput {
+            active_session_id: "active-1".to_string(),
+            session_id: "session-1".to_string(),
+            session_file: None,
+            busy: true,
+            operation: "prompt".to_string(),
+        };
+        journal.record(base.clone()).expect("initial append");
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("open torn tail")
+            .write_all(b"{\"version\":1")
+            .expect("write torn tail");
+        journal.record(WorkerRecoveryRecordInput { operation: "retry".to_string(), ..base }).expect("retry");
+        let contents = std::fs::read_to_string(&path).expect("journal contents");
+        assert_eq!(contents.lines().count(), 3);
+        assert_eq!(WorkerRecoveryJournal::read_latest(&path)[0].operation, "retry");
     }
 
     #[test]
