@@ -1008,6 +1008,12 @@ impl Editor {
         (self.state.cursor_line, self.state.cursor_col)
     }
 
+    fn char_before_cursor(&self) -> Option<char> {
+        let current_line = self.state.lines.get(self.state.cursor_line)?;
+        let prefix = current_line.get(..self.state.cursor_col.min(current_line.len()))?;
+        prefix.chars().next_back()
+    }
+
     pub fn set_text(&mut self, text: &str) {
         self.cancel_autocomplete();
         self.last_action = None;
@@ -1278,22 +1284,11 @@ impl Editor {
         // If pasting a file path (starts with /, ~, or .) and the character before
         // the cursor is a word character, prepend a space for better readability
         if filtered_text.starts_with('/') || filtered_text.starts_with('~') || filtered_text.starts_with('.') {
-            let current_line = self
-                .state
-                .lines
-                .get(self.state.cursor_line)
-                .cloned()
-                .unwrap_or_default();
-            let char_before_cursor = if self.state.cursor_col > 0 {
-                current_line
-                    .chars()
-                    .nth(self.state.cursor_col - 1)
-                    .map(|c| c.to_string())
-                    .unwrap_or_default()
-            } else {
-                String::new()
-            };
-            if !char_before_cursor.is_empty() && is_word_char(&char_before_cursor) {
+            if self
+                .char_before_cursor()
+                .map(|character| is_word_char(&character.to_string()))
+                .unwrap_or(false)
+            {
                 filtered_text = format!(" {filtered_text}");
             }
         }
@@ -1369,18 +1364,7 @@ impl Editor {
             return false;
         }
 
-        let current_line = self
-            .state
-            .lines
-            .get(self.state.cursor_line)
-            .cloned()
-            .unwrap_or_default();
-        self.state.cursor_col > 0
-            && current_line
-                .chars()
-                .nth(self.state.cursor_col - 1)
-                .map(|c| c == '\\')
-                .unwrap_or(false)
+        self.char_before_cursor() == Some('\\')
     }
 
     fn submit_value(&mut self) {
@@ -3379,19 +3363,7 @@ impl Component for Editor {
 
             // Workaround for terminals without Shift+Enter support:
             // If char before cursor is \, delete it and insert newline instead of submitting.
-            let current_line = self
-                .state
-                .lines
-                .get(self.state.cursor_line)
-                .cloned()
-                .unwrap_or_default();
-            if self.state.cursor_col > 0
-                && current_line
-                    .chars()
-                    .nth(self.state.cursor_col - 1)
-                    .map(|c| c == '\\')
-                    .unwrap_or(false)
-            {
+            if self.char_before_cursor() == Some('\\') {
                 self.handle_backspace();
                 self.add_new_line();
                 return;
@@ -3892,6 +3864,40 @@ mod tests {
             editor.borrow().is_showing_autocomplete(),
             "focus alone clears nothing"
         );
+    }
+
+    #[test]
+    fn unicode_backslash_enter_inserts_newline_instead_of_submitting() {
+        let ui = Rc::new(RefCell::new(TUI::new(
+            Box::new(crate::terminal::ProcessTerminal::new()),
+            None,
+        )));
+        let mut editor = Editor::new(ui, test_theme(), EditorOptions::default());
+        editor.set_text("é\\");
+        let submitted = Rc::new(RefCell::new(None::<String>));
+        let submitted_slot = Rc::clone(&submitted);
+        editor.on_submit = Some(Box::new(move |text| {
+            *submitted_slot.borrow_mut() = Some(text.to_string());
+        }));
+
+        editor.handle_input("\r");
+
+        assert_eq!(editor.get_text(), "é\n");
+        assert!(submitted.borrow().is_none());
+    }
+
+    #[test]
+    fn absolute_paste_is_separated_after_a_multibyte_word_character() {
+        let ui = Rc::new(RefCell::new(TUI::new(
+            Box::new(crate::terminal::ProcessTerminal::new()),
+            None,
+        )));
+        let mut editor = Editor::new(ui, test_theme(), EditorOptions::default());
+        editor.set_text("é");
+
+        editor.handle_input("\x1b[200~/tmp/café\x1b[201~");
+
+        assert_eq!(editor.get_text(), "é /tmp/café");
     }
 
     /// Shared theme builder for the editor tests.

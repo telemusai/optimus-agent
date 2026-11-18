@@ -5,10 +5,11 @@ use pi_tui::components::spacer::Spacer;
 use pi_tui::components::text::Text;
 use pi_tui::tui::{Component, Container, TUI};
 use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::rc::Rc;
 
 use crate::core::tools::truncate::{
-    truncate_tail, TruncationOptions, TruncationResult, DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES,
+    TruncatedBy, TruncationResult, DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES,
 };
 use crate::modes::interactive::components::dynamic_border::DynamicBorder;
 use crate::modes::interactive::components::keybinding_hints::{
@@ -37,7 +38,20 @@ pub struct BashExecutionOptions {
 /// Port of `BashExecutionComponent`.
 pub struct BashExecutionComponent {
     command: String,
-    output_lines: Vec<String>,
+    output_lines: VecDeque<String>,
+    retained_bytes: usize,
+    discarded_bytes: usize,
+    discarded_lines: usize,
+    // Bytes previously cut from the current first line still count when the
+    // reference algorithm decides whether that original line fits a later tail.
+    first_line_truncated_bytes: usize,
+    retained_first_line_partial: bool,
+    display_dirty: bool,
+    // A terminal CR is already rendered as LF. Remember it so a leading LF in
+    // the next chunk completes that CRLF pair instead of adding another line.
+    pending_carriage_return: bool,
+    #[cfg(test)]
+    display_rebuild_count: usize,
     status: BashExecutionStatus,
     exit_code: Option<f64>,
     error_message: Option<String>,
@@ -114,7 +128,16 @@ impl BashExecutionComponent {
 
         Self {
             command: command.to_string(),
-            output_lines: Vec::new(),
+            output_lines: VecDeque::new(),
+            retained_bytes: 0,
+            discarded_bytes: 0,
+            discarded_lines: 0,
+            first_line_truncated_bytes: 0,
+            retained_first_line_partial: false,
+            display_dirty: false,
+            pending_carriage_return: false,
+            #[cfg(test)]
+            display_rebuild_count: 0,
             status: BashExecutionStatus::Running,
             exit_code: None,
             error_message: None,
@@ -131,24 +154,109 @@ impl BashExecutionComponent {
     /// (preview only).
     pub fn set_expanded(&mut self, expanded: bool) {
         self.expanded = expanded;
-        self.update_display();
+        self.display_dirty = true;
     }
 
     /// Port of `appendOutput`.
     pub fn append_output(&mut self, chunk: &str) {
         // Note: binary data is already sanitized in tui-renderer.ts executeBashCommand
-        let clean = strip_ansi(chunk).replace("\r\n", "\n").replace('\r', "\n");
-
-        let new_lines: Vec<String> = clean.split('\n').map(|line| line.to_string()).collect();
-        if !self.output_lines.is_empty() && !new_lines.is_empty() {
-            let last_index = self.output_lines.len() - 1;
-            self.output_lines[last_index].push_str(&new_lines[0]);
-            self.output_lines.extend(new_lines[1..].iter().cloned());
+        let clean = strip_ansi(chunk);
+        let clean_input = if self.pending_carriage_return && !clean.is_empty() {
+            self.pending_carriage_return = false;
+            clean.strip_prefix('\n').unwrap_or(&clean)
         } else {
-            self.output_lines.extend(new_lines);
+            &clean
+        };
+        if !clean.is_empty() {
+            self.pending_carriage_return = clean_input.ends_with('\r');
+        }
+        let clean = clean_input.replace("\r\n", "\n").replace('\r', "\n");
+        let mut new_lines = clean.split('\n');
+
+        if let Some(last) = self.output_lines.back_mut() {
+            if let Some(first) = new_lines.next() {
+                self.retained_bytes += first.len();
+                last.push_str(first);
+            }
+        }
+        for line in new_lines {
+            // Discard before growing at the line limit. In particular, one large
+            // input chunk cannot make the retained deque allocate for all of its
+            // lines before the old-head truncation pass runs.
+            if self.output_lines.len() >= DEFAULT_MAX_LINES {
+                self.discard_front_line();
+            }
+            if !self.output_lines.is_empty() {
+                self.retained_bytes += 1;
+            }
+            self.retained_bytes += line.len();
+            self.output_lines.push_back(line.to_string());
+        }
+        if self.output_lines.is_empty() {
+            self.output_lines.push_back(String::new());
         }
 
-        self.update_display();
+        self.discard_excess_head();
+        self.display_dirty = true;
+    }
+
+    fn discard_excess_head(&mut self) {
+        while self.output_lines.len() > DEFAULT_MAX_LINES {
+            self.discard_front_line();
+        }
+
+        while self
+            .retained_bytes
+            .saturating_add(self.first_line_truncated_bytes)
+            > DEFAULT_MAX_BYTES
+        {
+            if self.output_lines.len() == 1 {
+                self.truncate_front_line();
+                break;
+            }
+
+            let trailing_lines_are_blank =
+                self.output_lines.iter().skip(1).all(|line| line.is_empty());
+            if trailing_lines_are_blank {
+                self.truncate_front_line();
+                break;
+            }
+            self.discard_front_line();
+        }
+    }
+
+    fn discard_front_line(&mut self) {
+        let Some(line) = self.output_lines.pop_front() else {
+            return;
+        };
+        let discarded = line.len() + usize::from(!self.output_lines.is_empty());
+        self.retained_bytes = self.retained_bytes.saturating_sub(discarded);
+        self.discarded_bytes += discarded;
+        self.discarded_lines += 1;
+        self.first_line_truncated_bytes = 0;
+        self.retained_first_line_partial = false;
+    }
+
+    fn truncate_front_line(&mut self) {
+        let trailing_bytes = self
+            .retained_bytes
+            .saturating_sub(self.output_lines.front().map_or(0, String::len));
+        let budget = DEFAULT_MAX_BYTES.saturating_sub(trailing_bytes);
+        let Some(line) = self.output_lines.front_mut() else {
+            return;
+        };
+        let mut start = line.len().saturating_sub(budget);
+        while start < line.len() && !line.is_char_boundary(start) {
+            start += 1;
+        }
+        self.retained_bytes = self.retained_bytes.saturating_sub(start);
+        self.discarded_bytes += start;
+        self.first_line_truncated_bytes += start;
+        if start > 0 {
+            self.retained_first_line_partial = true;
+        }
+        line.drain(..start);
+        line.shrink_to_fit();
     }
 
     /// Port of `setComplete`.
@@ -173,7 +281,7 @@ impl BashExecutionComponent {
 
         self.loader.borrow_mut().stop();
 
-        self.update_display();
+        self.display_dirty = true;
     }
 
     /// Mark the execution as failed before producing a result (e.g. spawn failure).
@@ -181,20 +289,17 @@ impl BashExecutionComponent {
         self.error_message = Some(message.to_string());
         self.status = BashExecutionStatus::Error;
         self.loader.borrow_mut().stop();
-        self.update_display();
+        self.display_dirty = true;
     }
 
     /// Port of `updateDisplay`.
     fn update_display(&mut self) {
-        // Apply truncation for LLM context limits (same limits as bash tool)
-        let full_output = self.output_lines.join("\n");
-        let context_truncation = truncate_tail(
-            &full_output,
-            TruncationOptions {
-                max_lines: Some(DEFAULT_MAX_LINES),
-                max_bytes: Some(DEFAULT_MAX_BYTES),
-            },
-        );
+        #[cfg(test)]
+        {
+            self.display_rebuild_count += 1;
+        }
+        self.display_dirty = false;
+        let context_truncation = self.output_truncation();
 
         // Recompute wrapping from the render width so resizes and split panes
         // cannot use stale columns.
@@ -312,9 +417,50 @@ impl BashExecutionComponent {
         }
     }
 
-    /// Get the raw output for creating BashExecutionMessage.
+    /// Return the retained output and exact totals for the original stream.
+    pub fn output_truncation(&self) -> TruncationResult {
+        let content = self.get_output();
+        let truncated = self.discarded_bytes > 0;
+        let total_lines = if self.output_lines.is_empty() {
+            1
+        } else {
+            self.discarded_lines + self.output_lines.len()
+        };
+        let truncated_by = if !truncated {
+            None
+        } else if self.retained_first_line_partial {
+            Some(TruncatedBy::Bytes)
+        } else if self.output_lines.len() >= DEFAULT_MAX_LINES && total_lines > DEFAULT_MAX_LINES {
+            Some(TruncatedBy::Lines)
+        } else {
+            Some(TruncatedBy::Bytes)
+        };
+        TruncationResult {
+            content,
+            truncated,
+            truncated_by,
+            total_lines,
+            total_bytes: self.discarded_bytes + self.retained_bytes,
+            output_lines: if self.output_lines.is_empty() {
+                1
+            } else {
+                self.output_lines.len()
+            },
+            output_bytes: self.retained_bytes,
+            last_line_partial: self.retained_first_line_partial,
+            first_line_exceeds_limit: false,
+            max_lines: DEFAULT_MAX_LINES,
+            max_bytes: DEFAULT_MAX_BYTES,
+        }
+    }
+
+    /// Get the retained output for creating BashExecutionMessage.
     pub fn get_output(&self) -> String {
-        self.output_lines.join("\n")
+        self.output_lines
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     /// Get the command that was executed.
@@ -375,6 +521,9 @@ impl Component for PreviewText {
 
 impl Component for BashExecutionComponent {
     fn render(&mut self, width: f64) -> Vec<String> {
+        if self.display_dirty {
+            self.update_display();
+        }
         self.container.render(width)
     }
 
@@ -384,7 +533,7 @@ impl Component for BashExecutionComponent {
 
     fn invalidate(&mut self) {
         self.container.invalidate();
-        self.update_display();
+        self.display_dirty = true;
     }
 }
 
@@ -425,6 +574,7 @@ fn strip_ansi(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::tools::truncate::{truncate_tail, TruncationOptions};
     use crate::modes::interactive::theme::theme::init_theme;
     use pi_tui::terminal::ProcessTerminal;
     use pi_tui::tui::TUI;
@@ -476,6 +626,93 @@ mod tests {
             BashExecutionComponent::new("cmd", ui(), false, BashExecutionOptions::default());
         component.append_output("\u{1b}[31mred\u{1b}[0m\r\nnext\rthird");
         assert_eq!(component.get_output(), "red\nnext\nthird");
+    }
+
+    #[tokio::test]
+    async fn split_crlf_chunks_match_one_shot_with_exact_counters() {
+        init();
+        let oversized = format!("{}\r", "é".repeat(DEFAULT_MAX_BYTES));
+        let prefix_sensitive = format!("a{}\r", "😀".repeat(DEFAULT_MAX_BYTES));
+        let limit_lines = format!("{}\r", "x\n".repeat(DEFAULT_MAX_LINES + 2));
+        let cases = vec![
+            vec!["a\r", "\nb"],
+            vec!["a\r", "", "\nb"],
+            vec!["a\r", "\u{1b}[31m", "\nb"],
+            vec!["a\r", "\r", "\n", "\n", "b"],
+            vec!["é\r", "\n😀"],
+            vec![oversized.as_str(), "\n尾"],
+            vec![prefix_sensitive.as_str(), "x\r"],
+            vec![limit_lines.as_str(), "\nend"],
+        ];
+
+        for (case_index, chunks) in cases.iter().enumerate() {
+            let full = chunks.concat();
+            let mut component = BashExecutionComponent::new(
+                "cmd",
+                ui(),
+                false,
+                BashExecutionOptions::default(),
+            );
+            let mut prefix = String::new();
+            for (chunk_index, chunk) in chunks.iter().enumerate() {
+                prefix.push_str(chunk);
+                component.append_output(chunk);
+                let normalised = strip_ansi(&prefix).replace("\r\n", "\n").replace('\r', "\n");
+                let expected = truncate_tail(&normalised, TruncationOptions::default());
+                assert_eq!(
+                    component.output_truncation(),
+                    expected,
+                    "case {case_index}, chunk {chunk_index}"
+                );
+                assert_eq!(component.get_output(), expected.content);
+                assert_eq!(
+                    component.discarded_bytes + component.retained_bytes,
+                    normalised.len(),
+                    "byte counters at case {case_index}, chunk {chunk_index}"
+                );
+                assert_eq!(
+                    component.discarded_lines + component.output_lines.len(),
+                    normalised.split('\n').count(),
+                    "line counters at case {case_index}, chunk {chunk_index}"
+                );
+            }
+
+            let mut one_shot = BashExecutionComponent::new(
+                "cmd",
+                ui(),
+                false,
+                BashExecutionOptions::default(),
+            );
+            one_shot.append_output(&full);
+            component.set_complete(Some(0.0), false, None, None);
+            one_shot.set_complete(Some(0.0), false, None, None);
+            assert_eq!(component.render(60.0), one_shot.render(60.0));
+        }
+    }
+
+    #[tokio::test]
+    async fn one_large_chunk_does_not_set_retained_storage_capacity() {
+        init();
+        let full: String = (0..DEFAULT_MAX_LINES * 4)
+            .map(|index| format!("line {index} café\n"))
+            .collect();
+        let mut component =
+            BashExecutionComponent::new("cmd", ui(), false, BashExecutionOptions::default());
+        component.append_output(&full);
+
+        assert_eq!(
+            component.output_truncation(),
+            truncate_tail(&full, TruncationOptions::default())
+        );
+        assert_eq!(component.output_lines.len(), DEFAULT_MAX_LINES);
+        assert!(
+            component.output_lines.capacity() <= DEFAULT_MAX_LINES * 2,
+            "retained capacity {} must not depend on the 8000-line input chunk",
+            component.output_lines.capacity()
+        );
+        assert_eq!(component.discarded_lines, DEFAULT_MAX_LINES * 3 + 1);
+        assert_eq!(component.discarded_bytes + component.retained_bytes, full.len());
+        assert_eq!(component.display_rebuild_count, 0);
     }
 
     #[tokio::test]
@@ -554,6 +791,86 @@ mod tests {
             .join("\n");
         assert!(text.contains("... 6 more lines"));
         assert!(text.contains("to expand"));
+    }
+
+    #[tokio::test]
+    async fn retained_tail_matches_reference_across_utf8_and_chunk_boundaries() {
+        init();
+        let full = format!("a{}", "é".repeat(DEFAULT_MAX_BYTES));
+        let mut component =
+            BashExecutionComponent::new("cmd", ui(), false, BashExecutionOptions::default());
+        let mut chunk = String::new();
+        for character in full.chars() {
+            chunk.push(character);
+            if chunk.len() >= 997 {
+                component.append_output(&chunk);
+                chunk.clear();
+            }
+        }
+        component.append_output(&chunk);
+
+        let expected = truncate_tail(&full, TruncationOptions::default());
+        assert_eq!(component.output_truncation(), expected);
+        assert_eq!(component.get_output(), expected.content);
+        assert!(component.retained_bytes <= DEFAULT_MAX_BYTES);
+        assert!(component.output_lines.len() <= DEFAULT_MAX_LINES);
+        assert_eq!(
+            component.discarded_bytes + component.retained_bytes,
+            full.len(),
+            "discarded and retained bytes account for every input byte"
+        );
+        assert_eq!(component.display_rebuild_count, 0);
+
+        component.render(60.0);
+        component.render(60.0);
+        assert_eq!(component.display_rebuild_count, 1);
+        component.append_output("tail");
+        component.render(60.0);
+        assert_eq!(component.display_rebuild_count, 2);
+    }
+
+    #[tokio::test]
+    async fn retained_line_tail_and_preview_counts_match_reference() {
+        init();
+        let full: String = (0..DEFAULT_MAX_LINES + 25)
+            .map(|index| format!("line {index} café\n"))
+            .collect();
+        let mut component =
+            BashExecutionComponent::new("cmd", ui(), false, BashExecutionOptions::default());
+        let lines: Vec<&str> = full.split_inclusive('\n').collect();
+        for chunk in lines.chunks(3) {
+            component.append_output(&chunk.concat());
+        }
+
+        let expected = truncate_tail(&full, TruncationOptions::default());
+        assert_eq!(component.output_truncation(), expected);
+        assert_eq!(component.discarded_lines, 26);
+        assert!(component.retained_bytes <= DEFAULT_MAX_BYTES);
+        assert_eq!(component.display_rebuild_count, 0);
+
+        component.set_complete(Some(0.0), false, None, Some("/tmp/full.txt".to_string()));
+        let text = component
+            .render(100.0)
+            .iter()
+            .map(|line| strip(line))
+            .collect::<Vec<String>>()
+            .join("\n");
+        assert!(text.contains("... 1980 more lines"), "{text}");
+        assert!(text.contains("Output truncated. Full output: /tmp/full.txt"));
+        assert_eq!(component.display_rebuild_count, 1);
+    }
+
+    #[tokio::test]
+    async fn oversized_line_with_trailing_blanks_matches_reference() {
+        init();
+        let full = format!("{}\n\n", "x".repeat(DEFAULT_MAX_BYTES + 20));
+        let mut component =
+            BashExecutionComponent::new("cmd", ui(), false, BashExecutionOptions::default());
+        component.append_output(&full);
+        assert_eq!(
+            component.output_truncation(),
+            truncate_tail(&full, TruncationOptions::default())
+        );
     }
 
     #[tokio::test]

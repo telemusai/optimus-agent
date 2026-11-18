@@ -1624,27 +1624,41 @@ fn open_external_editor_for(
     };
     let current_text = editor.borrow().editor().get_text().to_string();
     let tmp_file = std::env::temp_dir().join(format!("pi-editor-{}.pi.md", now_ms()));
-    if std::fs::write(&tmp_file, &current_text).is_err() {
+    let mut command = match crate::modes::interactive::components::extension_editor::external_editor_command(
+        &editor_cmd,
+        &tmp_file,
+    ) {
+        Ok(command) => command,
+        Err(error) => {
+            mode.borrow_mut().show_error(&error);
+            return;
+        }
+    };
+    if let Err(error) = std::fs::write(&tmp_file, &current_text) {
+        mode.borrow_mut()
+            .show_error(&format!("Could not write the editor draft: {error}"));
         return;
     }
     tui.borrow_mut().stop(TuiStopOptions::default());
-    let parts: Vec<String> = editor_cmd.split(' ').map(|part| part.to_string()).collect();
-    let editor_program = parts.first().cloned().unwrap_or_default();
-    let mut command = std::process::Command::new(&editor_program);
-    for arg in parts.iter().skip(1) {
-        command.arg(arg);
-    }
-    command.arg(&tmp_file);
-    if let Ok(status) = command.status() {
-        if status.success() {
-            if let Ok(content) = std::fs::read_to_string(&tmp_file) {
+    match command.status() {
+        Ok(status) if status.success() => match std::fs::read_to_string(&tmp_file) {
+            Ok(content) => {
                 let new_content =
-                crate::modes::interactive::components::extension_editor::strip_trailing_newline(
-                    &content,
-                );
+                    crate::modes::interactive::components::extension_editor::strip_trailing_newline(
+                        &content,
+                    );
                 editor.borrow_mut().editor_mut().set_text(&new_content);
             }
-        }
+            Err(error) => mode
+                .borrow_mut()
+                .show_error(&format!("Could not read the editor draft: {error}")),
+        },
+        Ok(status) => mode
+            .borrow_mut()
+            .show_error(&format!("External editor exited with {status}")),
+        Err(error) => mode
+            .borrow_mut()
+            .show_error(&format!("Could not start the external editor: {error}")),
     }
     let _ = std::fs::remove_file(&tmp_file);
     tui.borrow_mut().start();
