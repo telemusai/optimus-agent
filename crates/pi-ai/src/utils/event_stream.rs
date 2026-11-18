@@ -205,6 +205,18 @@ struct EventStreamState<T, R> {
 // TypeScript calls them from plain callbacks) and the lock is never held across
 // an await point.
 
+/// Terminal read error for a stream that ended without pushing or supplying a result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EventStreamEndedWithoutResult;
+
+impl std::fmt::Display for EventStreamEndedWithoutResult {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("event stream ended without a terminal result")
+    }
+}
+
+impl std::error::Error for EventStreamEndedWithoutResult {}
+
 /// `class EventStream<T, R = T>`.
 pub struct EventStream<T, R = T> {
     state: Arc<Mutex<EventStreamState<T, R>>>,
@@ -307,7 +319,7 @@ impl<T, R> EventStream<T, R> {
     }
 
     /// `result(): Promise<R>`
-    pub async fn result(&self) -> R
+    pub async fn result(&self) -> Result<R, EventStreamEndedWithoutResult>
     where
         R: Clone,
     {
@@ -317,8 +329,8 @@ impl<T, R> EventStream<T, R> {
             notified.as_mut().enable();
             {
                 let state = self.lock();
-                if let Some(result) = state.result.as_ref() {
-                    return result.clone();
+                if state.done {
+                    return state.result.clone().ok_or(EventStreamEndedWithoutResult);
                 }
             }
             notified.await;
@@ -437,7 +449,14 @@ impl AssistantMessageEventStream {
     }
 
     pub async fn result(&self) -> AssistantMessage {
-        self.stream.result().await
+        self.stream.result().await.unwrap_or_else(|_| {
+            let mut error = AssistantMessage::default();
+            error.stop_reason = crate::types::STOP_REASON_ERROR.to_string();
+            error.error_message = Some(
+                "Assistant stream ended without a terminal result".to_string(),
+            );
+            error
+        })
     }
 
     pub fn result_if_ready(&self) -> Option<AssistantMessage> {
@@ -848,10 +867,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn end_without_result_terminates_the_iterator() {
+    async fn end_without_result_terminates_the_iterator_and_result_waiter() {
         let stream = AssistantMessageEventStream::new();
         stream.end(None);
         assert!(stream.next().await.is_none());
+        let result = tokio::time::timeout(Duration::from_secs(1), stream.result())
+            .await
+            .expect("done without a result must settle result()");
+        assert_eq!(result.stop_reason, crate::types::STOP_REASON_ERROR);
+        assert!(result.error_message.as_deref().is_some_and(|message| message.contains("without a terminal result")));
+        assert!(stream.result_or_end().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn generic_result_reports_done_without_result() {
+        let stream = EventStream::<(), ()>::new(Box::new(|_| false), Box::new(|_| ()));
+        stream.end(None);
+        assert_eq!(stream.result().await, Err(EventStreamEndedWithoutResult));
     }
 
     #[tokio::test]

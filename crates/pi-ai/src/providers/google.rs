@@ -137,12 +137,12 @@ pub fn stream_google(
 	context: &Context,
 	options: Option<GoogleOptions>,
 ) -> AssistantMessageEventStream {
-	let stream = create_assistant_message_event_stream();
-	let out = stream.clone();
+	let stream = AssistantMessageEventStream::new_owned();
+	let out = stream.producer_handle();
 	let model = model.clone();
 	let context = context.clone();
 	let options = options.unwrap_or_default();
-	tokio::spawn(async move {
+	stream.spawn(async move {
 		let mut output = AssistantMessage {
 			content: Vec::new(),
 			api: "google-generative-ai".to_string(),
@@ -221,8 +221,20 @@ async fn run_stream_google(
 	stream.push(AssistantMessageEvent::Start {
 		partial: output.clone(),
 	});
+	let chunks = SseChunkStream::new(response, options.stream.signal.clone());
+	process_google_chunks(chunks, model, options, output, stream).await
+}
+
+/// Consume parsed SSE chunks and settle only on an explicit provider terminal.
+async fn process_google_chunks(
+	mut chunks: SseChunkStream,
+	model: &Model,
+	options: &GoogleOptions,
+	output: &mut AssistantMessage,
+	stream: &AssistantMessageEventStream,
+) -> Result<(), GoogleStreamError> {
 	let mut current_block: Option<CurrentBlock> = None;
-	let mut chunks = SseChunkStream::new(response, options.stream.signal.clone());
+	let mut terminal_received = false;
 
 	while let Some(chunk) = chunks.next().await? {
 		// Typed shape for the common chunk; Value fallback keeps the exact
@@ -249,6 +261,7 @@ async fn run_stream_google(
 
 				if let Some(finish_reason) = candidate.and_then(|candidate| candidate.finish_reason.as_deref()) {
 					output.stop_reason = map_stop_reason(finish_reason).map_err(GoogleStreamError::Message)?;
+					terminal_received = true;
 					if output
 						.content
 						.iter()
@@ -261,6 +274,9 @@ async fn run_stream_google(
 					}
 				}
 
+				if typed.prompt_feedback.as_ref().is_some_and(|feedback| !feedback.is_null()) {
+					terminal_received = true;
+				}
 				if let Some(usage_metadata) = &typed.usage_metadata {
 					output.usage = super::google_usage::normalize(usage_metadata);
 					calculate_cost(model, &mut output.usage, None);
@@ -292,6 +308,7 @@ async fn run_stream_google(
 					.and_then(Value::as_str)
 				{
 					output.stop_reason = map_stop_reason(finish_reason).map_err(GoogleStreamError::Message)?;
+					terminal_received = true;
 					if output
 						.content
 						.iter()
@@ -304,6 +321,9 @@ async fn run_stream_google(
 					}
 				}
 
+				if chunk.get("promptFeedback").is_some_and(|feedback| !feedback.is_null()) {
+					terminal_received = true;
+				}
 				if let Some(usage_metadata) = chunk.get("usageMetadata") {
 					output.usage = super::google_usage::normalize(usage_metadata);
 					calculate_cost(model, &mut output.usage, None);
@@ -312,6 +332,11 @@ async fn run_stream_google(
 		}
 	}
 
+	if !terminal_received {
+		return Err(GoogleStreamError::Message(
+			"Stream ended without a finishReason or promptFeedback".to_string(),
+		));
+	}
 	if let Some(block) = current_block {
 		finish_block(&block, output, stream);
 	}
@@ -1180,6 +1205,8 @@ struct TypedGoogleChunk {
 	candidates: Vec<TypedGoogleCandidate>,
 	#[serde(rename = "usageMetadata", default, deserialize_with = "crate::utils::typed_json::optional_value")]
 	usage_metadata: Option<Value>,
+	#[serde(rename = "promptFeedback", default)]
+	pub prompt_feedback: Option<Value>,
 }
 
 #[derive(serde::Deserialize, Default)]
@@ -1271,7 +1298,29 @@ impl SseChunkStream {
 					return Err(GoogleStreamError::Message("Request was aborted".to_string()));
 				}
 			}
-			match self.chunks.next().await {
+			let next_chunk = self.chunks.next();
+			tokio::pin!(next_chunk);
+			let idle_timeout = crate::utils::sse_frames::resolve_sse_idle_timeout();
+			let idle = tokio::time::sleep(idle_timeout);
+			tokio::pin!(idle);
+			let read = if let Some(signal) = &self.signal {
+				tokio::select! {
+					biased;
+					_ = signal.cancelled() => return Err(GoogleStreamError::Message("Request was aborted".to_string())),
+					_ = idle.as_mut() => return Err(GoogleStreamError::Message(format!(
+						"SSE stream stalled: no data received within {}ms", idle_timeout.as_millis()
+					))),
+					read = next_chunk.as_mut() => read,
+				}
+			} else {
+				tokio::select! {
+					_ = idle.as_mut() => return Err(GoogleStreamError::Message(format!(
+						"SSE stream stalled: no data received within {}ms", idle_timeout.as_millis()
+					))),
+					read = next_chunk.as_mut() => read,
+				}
+			};
+			match read {
 				None => {
 					self.finished = true;
 				}
@@ -2279,6 +2328,63 @@ mod t15_controls_tests {
 
 	/// (a) `Some("")` must omit `systemInstruction` exactly like the TS spread
 	/// guard; `Some("rules")` must still be sent; `None` must stay absent.
+	#[tokio::test]
+	async fn clean_eof_requires_finish_reason_or_prompt_feedback() {
+		for (frame, succeeds) in [
+			(r#"data: {"candidates":[{"content":{"parts":[{"text":"partial"}]}}]}
+
+"#, false),
+			(r#"data: {"candidates":[{"content":{"parts":[{"text":"short"}]},"finishReason":"STOP"}]}
+
+"#, true),
+			(r#"data: {"promptFeedback":{"blockReason":"OTHER"}}
+
+"#, true),
+		] {
+			let model = t15_model();
+			let options = GoogleOptions::default();
+			let mut output = AssistantMessage::new(model.api.clone(), model.provider.clone(), model.id.clone(), 0);
+			output.stop_reason = "stop".to_string();
+			let stream = AssistantMessageEventStream::new_owned();
+			let chunks = SseChunkStream {
+				chunks: Box::pin(futures::stream::iter(vec![Ok::<_, reqwest::Error>(bytes::Bytes::from(frame))])),
+				buffer: String::new(),
+				pending: Vec::new(),
+				byte_pending: Vec::new(),
+				finished: false,
+				signal: None,
+			};
+			let result = process_google_chunks(chunks, &model, &options, &mut output, &stream).await;
+			assert_eq!(result.is_ok(), succeeds, "frame: {frame:?}; result: {result:?}");
+			assert_eq!(stream.is_done(), succeeds, "no Done without terminal");
+			if !succeeds {
+				assert_eq!(output.content.len(), 1, "partial output stays attached to its error");
+			}
+		}
+	}
+
+	#[tokio::test]
+	async fn pending_body_read_responds_to_cancellation() {
+		let signal = tokio_util::sync::CancellationToken::new();
+		let stream = SseChunkStream {
+			chunks: Box::pin(futures::stream::pending()),
+			buffer: String::new(),
+			pending: Vec::new(),
+			byte_pending: Vec::new(),
+			finished: false,
+			signal: Some(signal.clone()),
+		};
+		let reader = tokio::spawn(async move {
+			let mut stream = stream;
+			stream.next().await
+		});
+		tokio::task::yield_now().await;
+		signal.cancel();
+		let error = tokio::time::timeout(std::time::Duration::from_secs(1), reader)
+			.await.expect("body read must settle").unwrap().unwrap_err();
+		assert_eq!(error.message(), "Request was aborted");
+	}
+
 	#[test]
 	fn t15_empty_optional_values_match_contract_system_prompt() {
 		let model = t15_model();

@@ -55,7 +55,14 @@ impl ProxyMessageEventStream {
     }
 
     pub async fn result(&self) -> AssistantMessage {
-        self.0.result().await
+        self.0.result().await.unwrap_or_else(|_| {
+            let mut error = AssistantMessage::default();
+            error.stop_reason = pi_ai::types::STOP_REASON_ERROR.to_string();
+            error.error_message = Some(
+                "Proxy stream ended without a terminal result".to_string(),
+            );
+            error
+        })
     }
 
     pub fn is_done(&self) -> bool {
@@ -743,6 +750,19 @@ mod tests {
             while let Some(event) = stream.next().await { events.push(event); }
             (events, stream.result().await)
         }).await.expect("proxy final result must settle")
+    }
+
+    #[tokio::test]
+    async fn done_without_result_returns_explicit_error_message() {
+        let stream = ProxyMessageEventStream::new();
+        stream.end(None);
+        let result = tokio::time::timeout(Duration::from_secs(1), stream.result())
+            .await.expect("missing result must settle");
+        assert_eq!(result.stop_reason, "error");
+        assert_eq!(
+            result.error_message.as_deref(),
+            Some("Proxy stream ended without a terminal result")
+        );
     }
 
     #[tokio::test]

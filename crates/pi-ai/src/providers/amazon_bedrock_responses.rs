@@ -11,7 +11,7 @@ use serde_json::{json, Map, Value};
 
 use crate::models::clamp_thinking_level;
 use crate::types::{AssistantMessage, AssistantMessageEvent, Context, Model, SimpleStreamOptions, StreamOptions, Usage};
-use crate::utils::event_stream::{create_assistant_message_event_stream, AssistantMessageEventStream};
+use crate::utils::event_stream::AssistantMessageEventStream;
 use crate::utils::headers::header_map_to_record;
 use crate::utils::now_ms;
 use crate::utils::stream_failure::{
@@ -101,13 +101,13 @@ pub fn stream_bedrock_responses_with_options(
 	context: &Context,
 	options: Option<BedrockResponsesOptions>,
 ) -> AssistantMessageEventStream {
-	let stream = create_assistant_message_event_stream();
+	let stream = AssistantMessageEventStream::new_owned();
 
 	let model = model.clone();
 	let context = context.clone();
 	let options = options.unwrap_or_default();
-	let producer = stream.clone();
-	let out = stream.clone();
+	let producer = stream.producer_handle();
+	let out = stream.producer_handle();
 
 	// TS: `(async () => { try { ... } catch (error) { ... } })();`
 	producer.spawn(async move {
@@ -418,6 +418,7 @@ async fn run_bedrock_responses_stream(
 			apply_bedrock_astra_context_pricing(usage)
 		})),
 		on_usage_observation: options.stream.on_usage_observation.clone(),
+        idle_timeout: Some(crate::utils::sse_frames::resolve_sse_idle_timeout()),
 	};
 
 	// The SSE reader `throw`s out of the `for await` loop for a body read error, an
@@ -428,22 +429,21 @@ async fn run_bedrock_responses_stream(
 	let sse_error: Arc<std::sync::Mutex<Option<ResponsesRunError>>> =
 		Arc::new(std::sync::Mutex::new(None));
 	let events = responses_event_stream(response, sse_error.clone());
-	process_responses_stream(events, output, stream, model, Some(&stream_options))
-		.await
-		.map_err(|error| match error {
-			super::openai_responses_shared::ResponsesStreamError::StreamFailure(failure) => {
-				ResponsesRunError::Failure(Box::new(failure))
-			}
-			super::openai_responses_shared::ResponsesStreamError::Message(message) => {
-				ResponsesRunError::Message(message)
-			}
-		})?;
+	let parsed = process_responses_stream(events, output, stream, model, Some(&stream_options)).await;
 
-	// `throw` from inside the `for await (const event of openaiStream)` loop wins over the
-	// loop's normal completion, exactly like a JavaScript `throw` inside the loop body.
+	// SSE read, JSON parse and data.error failures explain the early EOF. Surface
+	// their original details before the shared parser's missing-terminal fallback.
 	if let Some(error) = sse_error.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take() {
 		return Err(error);
 	}
+	parsed.map_err(|error| match error {
+		super::openai_responses_shared::ResponsesStreamError::StreamFailure(failure) => {
+			ResponsesRunError::Failure(Box::new(failure))
+		}
+		super::openai_responses_shared::ResponsesStreamError::Message(message) => {
+			ResponsesRunError::Message(message)
+		}
+	})?;
 
 	if options
 		.stream
