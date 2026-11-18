@@ -45,7 +45,7 @@ pub(super) fn create(
     mode: Rc<RefCell<InteractiveMode>>,
     catalog: Rc<RefCell<Vec<wire::AgentConnectionHeartbeat>>>,
     rows: Rc<Cell<f64>>,
-    send: mpsc::Sender<HostEvent>,
+    send: HostEventSender,
     connection: Arc<dyn wire::AgentConnection>,
 ) -> HeartbeatManagerComponent {
     let close = send.clone();
@@ -310,7 +310,7 @@ mod tests {
         apply_catalog(&mut mode, &connection.catalog());
         let mode = Rc::new(RefCell::new(mode));
         let catalog = Rc::new(RefCell::new(connection.catalog()));
-        let (send, receive) = mpsc::channel();
+        let (send, receive) = host_event_channel(64 * 1024);
         let mut manager = create(
             mode.clone(),
             catalog.clone(),
@@ -373,7 +373,7 @@ mod tests {
         apply_catalog(&mut mode, &connection.catalog());
         let mode = Rc::new(RefCell::new(mode));
         let catalog = Rc::new(RefCell::new(connection.catalog()));
-        let (send, _receive) = mpsc::channel();
+        let (send, _receive) = host_event_channel(64 * 1024);
         let mut manager = create(
             mode,
             catalog,

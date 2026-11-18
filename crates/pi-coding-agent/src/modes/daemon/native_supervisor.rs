@@ -126,6 +126,42 @@ struct PublicClient {
     /// `client.backpressured`: a resync is deferred while the writer is behind.
     backpressured: AtomicBool,
 }
+struct AttachMembershipGuard {
+    public: Arc<PublicClient>,
+    previous: Vec<(String, bool)>,
+    committed: bool,
+}
+
+impl AttachMembershipGuard {
+    fn new(public: &Arc<PublicClient>, active: &str, previous_active: Option<&str>) -> Self {
+        let ids = std::iter::once(active.to_string())
+            .chain(previous_active.filter(|previous| *previous != active).map(str::to_string))
+            .collect::<Vec<_>>();
+        let subscriptions = public.subscriptions.lock().unwrap();
+        let previous = ids.into_iter().map(|id| {
+            let present = subscriptions.contains(&id);
+            (id, present)
+        }).collect();
+        drop(subscriptions);
+        Self { public: Arc::clone(public), previous, committed: false }
+    }
+
+    fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for AttachMembershipGuard {
+    fn drop(&mut self) {
+        if self.committed { return; }
+        let mut subscriptions = self.public.subscriptions.lock().unwrap();
+        for (id, present) in &self.previous {
+            if *present { subscriptions.insert(id.clone()); }
+            else { subscriptions.remove(id); }
+        }
+    }
+}
+
 impl PublicClient {
     fn write(&self, value: &Value) -> bool {
         let Ok(mut bytes) = serde_json::to_vec(value) else { return false; };
@@ -1170,23 +1206,37 @@ impl Supervisor {
     }
     /// `hydrateSeededEntry(entry)`: refresh a seeded row's cwd from its transcript.
     /// `syncRootDescriptorFromRosterEntry(worker, entry)`.
-    fn sync_root_descriptor_from_roster_entry(&self, worker: &Arc<Worker>, entry: &WorkerRosterEntry) {
+    fn sync_root_descriptor_from_roster_entry(&self, worker: &Arc<Worker>, entry: &WorkerRosterEntry) -> bool {
         let summary = &entry.summary;
-        if summary.active_session_id.as_deref() != Some(worker.descriptor.lock().unwrap().root_active_session_id.as_str()) { return; }
-        {
-            let mut descriptor = worker.descriptor.lock().unwrap();
-            if descriptor.root_session_id == Some(summary.session_id.clone()) && descriptor.session_file == summary.session_file { return; }
-            descriptor.root_session_id = Some(summary.session_id.clone());
-            descriptor.session_file = summary.session_file.clone();
-            descriptor.create_command = DurableDaemonCreateCommand {
+        if summary.active_session_id.as_deref() != Some(worker.descriptor.lock().unwrap().root_active_session_id.as_str()) { return false; }
+        let candidate = {
+            let descriptor = worker.descriptor.lock().unwrap();
+            let root_session_id = Some(summary.session_id.clone());
+            let session_file = summary.session_file.clone();
+            let create_command = DurableDaemonCreateCommand {
                 type_: "create".into(),
-                session_path: summary.session_file.clone(),
+                session_path: session_file.clone(),
                 no_session: descriptor.create_command.no_session,
                 extra: Map::new(),
             };
+            if (&descriptor.root_session_id, &descriptor.session_file, &descriptor.create_command) == (&root_session_id, &session_file, &create_command) { return false; }
+            let mut candidate = descriptor.clone();
+            candidate.root_session_id = root_session_id;
+            candidate.session_file = session_file;
+            candidate.create_command = create_command;
+            candidate
+        };
+        // Do not let an in-memory update suppress the next identical roster frame
+        // when the durable descriptor write failed.
+        if let Err(error) = self.persist_worker(&candidate) {
+            eprintln!("Could not persist worker descriptor {}: {error}", candidate.worker_id);
+            return false;
         }
-        let descriptor = worker.descriptor.lock().unwrap().clone();
-        if let Err(error) = self.persist_worker(&descriptor) { eprintln!("Could not persist worker descriptor {}: {error}", descriptor.worker_id); }
+        let mut descriptor = worker.descriptor.lock().unwrap();
+        descriptor.root_session_id = candidate.root_session_id;
+        descriptor.session_file = candidate.session_file;
+        descriptor.create_command = candidate.create_command;
+        true
     }
     /// `markWorkerRosterEntries(worker, statusLabel)`.
     fn mark_worker_roster_entries(&self, worker: &Arc<Worker>, status_label: Option<&str>) {
@@ -3377,6 +3427,7 @@ impl Supervisor {
         let attaching = matches!(kind.as_str(), "attach" | "reattach");
         let chunked_attach = attaching && body.get("capabilities").and_then(Value::as_array)
             .is_some_and(|capabilities| capabilities.iter().any(|capability| capability == "chunked_snapshot"));
+        let mut attach_membership = attaching.then(|| AttachMembershipGuard::new(&public, &active, previous_active.as_deref()));
         if attaching {
             let supports_ui = body.get("supportsExtensionUi").and_then(Value::as_bool) == Some(true) || body.get("capabilities").and_then(Value::as_array).is_some_and(|capabilities| capabilities.iter().any(|value| value.as_str() == Some("extension_ui")));
             public.supports_extension_ui.store(supports_ui, std::sync::atomic::Ordering::SeqCst);
@@ -3446,24 +3497,29 @@ impl Supervisor {
                 return Err("Session input pause acquisition was invalidated before completion".into());
             }
         }
-        if attaching {
-            if !response.success { public.subscriptions.lock().unwrap().remove(&active); }
-            else {
-                if let Some(data) = response.data.as_mut().and_then(Value::as_object_mut) {
-                    if let Some(client) = data.get_mut("client").and_then(Value::as_object_mut) { client.insert("id".into(), json!(public.id.lock().unwrap().clone())); }
-                }
-                if let Some(snapshot) = response.data.as_ref().and_then(|data| data.get("snapshot")) {
-                    let message = snapshot.get("summary").and_then(|summary| summary.get("streamingMessage")).filter(|value| value.get("role").and_then(Value::as_str) == Some("assistant"))
-                        .or_else(|| snapshot.get("messages").and_then(Value::as_array).and_then(|messages| messages.iter().rev().find(|value| value.get("role").and_then(Value::as_str) == Some("assistant"))));
-                    if let Some(message) = message.and_then(|value| serde_json::from_value(value.clone()).ok()) { worker.stream.lock().unwrap().seed(&active, message); }
-                }
-                self.subscribe(&worker, &active).await?;
-                if kind == "reattach" { if let Some(previous) = previous_active.filter(|previous| previous != &active) { public.subscriptions.lock().unwrap().remove(&previous); public.write(&json!({"type":"session_detached","activeSessionId":previous})); } }
+        if attaching && response.success {
+            if let Some(data) = response.data.as_mut().and_then(Value::as_object_mut) {
+                if let Some(client) = data.get_mut("client").and_then(Value::as_object_mut) { client.insert("id".into(), json!(public.id.lock().unwrap().clone())); }
             }
+            if let Some(snapshot) = response.data.as_ref().and_then(|data| data.get("snapshot")) {
+                let message = snapshot.get("summary").and_then(|summary| summary.get("streamingMessage")).filter(|value| value.get("role").and_then(Value::as_str) == Some("assistant"))
+                    .or_else(|| snapshot.get("messages").and_then(Value::as_array).and_then(|messages| messages.iter().rev().find(|value| value.get("role").and_then(Value::as_str) == Some("assistant"))));
+                if let Some(message) = message.and_then(|value| serde_json::from_value(value.clone()).ok()) { worker.stream.lock().unwrap().seed(&active, message); }
+            }
+            self.subscribe(&worker, &active).await?;
         }
         if chunked_attach && response.success {
-            self.stream_cached_attach(public, &active, &mut response).await?;
-            return Ok(None);
+            self.stream_cached_attach(&public, &active, &mut response).await?;
+        }
+        if attaching && response.success {
+            if kind == "reattach" {
+                if let Some(previous) = previous_active.filter(|previous| previous != &active) {
+                    public.subscriptions.lock().unwrap().remove(&previous);
+                    public.write(&json!({"type":"session_detached","activeSessionId":previous}));
+                }
+            }
+            if let Some(guard) = attach_membership.take() { guard.commit(); }
+            if chunked_attach { return Ok(None); }
         }
         Ok(Some(response))
     }
@@ -4198,6 +4254,55 @@ async fn commit_gate(mut gate: tokio::process::ChildStdin) -> Result<(), String>
 mod tests {
     use super::*;
 
+
+    fn attach_membership_test_client(subscriptions: &[&str]) -> Arc<PublicClient> {
+        let (output, _) = mpsc::channel(8);
+        let (snapshot_dequeue, _) = tokio::sync::broadcast::channel(8);
+        Arc::new(PublicClient {
+            connection_id: "connection".into(),
+            id: Mutex::new("client".into()),
+            protocol_id: Mutex::new(None),
+            subscriptions: Mutex::new(subscriptions.iter().map(|id| (*id).to_string()).collect()),
+            supports_extension_ui: AtomicBool::new(false),
+            pause_epoch: AtomicU64::new(0),
+            output,
+            snapshot_dequeue,
+            stopped: CancellationToken::new(),
+            roster_subscribed: AtomicBool::new(false),
+            roster_resync_pending: AtomicBool::new(false),
+            backpressured: AtomicBool::new(false),
+        })
+    }
+
+    #[test]
+    fn failed_attach_restores_exact_old_and_new_membership() {
+        let public = attach_membership_test_client(&["old", "unrelated"]);
+        {
+            let _guard = AttachMembershipGuard::new(&public, "new", Some("old"));
+            let mut subscriptions = public.subscriptions.lock().unwrap();
+            subscriptions.insert("new".into());
+            subscriptions.remove("old");
+        }
+        let subscriptions = public.subscriptions.lock().unwrap();
+        assert_eq!(subscriptions.iter().map(String::as_str).collect::<HashSet<_>>(), HashSet::from(["old", "unrelated"]));
+    }
+
+    #[test]
+    fn successful_attach_commits_membership_transition() {
+        let public = attach_membership_test_client(&["old"]);
+        {
+            let guard = AttachMembershipGuard::new(&public, "new", Some("old"));
+            let mut subscriptions = public.subscriptions.lock().unwrap();
+            subscriptions.insert("new".into());
+            subscriptions.remove("old");
+            drop(subscriptions);
+            guard.commit();
+        }
+        let subscriptions = public.subscriptions.lock().unwrap();
+        assert!(subscriptions.contains("new"));
+        assert!(!subscriptions.contains("old"));
+    }
+
     #[tokio::test]
     async fn backlog_recovery_and_disconnect_registry_lock_order() {
         use super::daemon_supervisor_parity_tests::{SupervisorFixture, add_descriptor_only_worker};
@@ -4219,6 +4324,74 @@ mod tests {
         assert!(fixture.supervisor.stop_worker(&worker, true, false).await.unwrap_err().contains("replaced during stop"));
         assert!(Arc::ptr_eq(fixture.supervisor.workers.lock().unwrap().get("worker").unwrap(), &replacement));
     }
+    #[tokio::test]
+    async fn root_descriptor_sync_skips_duplicate_and_persists_real_delta() {
+        use super::daemon_supervisor_parity_tests::{SupervisorFixture, add_descriptor_only_worker};
+        let fixture = SupervisorFixture::new("root-descriptor-dedup").await;
+        let worker = add_descriptor_only_worker(&fixture, "worker", "root", "token", DAEMON_WORKER_LIFECYCLE_READY);
+        let entry = WorkerRosterEntry {
+            agent_id: "root".into(),
+            queued_child: None,
+            seeded_cwd: None,
+            summary: RosterSessionSummary {
+                active_session_id: Some("root".into()),
+                session_id: "saved".into(),
+                session_file: Some("/tmp/saved.jsonl".into()),
+                ..Default::default()
+            },
+        };
+        assert!(fixture.supervisor.sync_root_descriptor_from_roster_entry(&worker, &entry));
+        let descriptor_path = fixture.supervisor.descriptor_dir.join("worker.json");
+        let persisted = std::fs::read(&descriptor_path).unwrap();
+        assert!(!fixture.supervisor.sync_root_descriptor_from_roster_entry(&worker, &entry));
+        assert_eq!(std::fs::read(&descriptor_path).unwrap(), persisted);
+        let mut changed = entry.clone();
+        changed.summary.session_id = "saved-next".into();
+        changed.summary.session_file = Some("/tmp/saved-next.jsonl".into());
+        assert!(fixture.supervisor.sync_root_descriptor_from_roster_entry(&worker, &changed));
+        assert_ne!(std::fs::read(&descriptor_path).unwrap(), persisted);
+        let current = worker.descriptor.lock().unwrap();
+        assert_eq!(current.root_session_id.as_deref(), Some("saved-next"));
+        assert_eq!(current.session_file.as_deref(), Some("/tmp/saved-next.jsonl"));
+        assert_eq!(current.create_command.session_path.as_deref(), Some("/tmp/saved-next.jsonl"));
+    }
+
+    #[tokio::test]
+    async fn root_descriptor_sync_retries_an_identical_frame_after_persist_failure() {
+        use super::daemon_supervisor_parity_tests::{SupervisorFixture, add_descriptor_only_worker};
+        let fixture = SupervisorFixture::new("root-descriptor-persist-retry").await;
+        let worker = add_descriptor_only_worker(&fixture, "worker", "root", "token", DAEMON_WORKER_LIFECYCLE_READY);
+        let entry = WorkerRosterEntry {
+            agent_id: "root".into(),
+            queued_child: None,
+            seeded_cwd: None,
+            summary: RosterSessionSummary {
+                active_session_id: Some("root".into()),
+                session_id: "saved".into(),
+                session_file: Some("/tmp/saved.jsonl".into()),
+                ..Default::default()
+            },
+        };
+        let descriptor_path = fixture.supervisor.descriptor_dir.join("worker.json");
+        let prior = std::fs::read(&descriptor_path).unwrap();
+        std::fs::remove_file(&descriptor_path).unwrap();
+        std::fs::create_dir(&descriptor_path).unwrap();
+        assert!(!fixture.supervisor.sync_root_descriptor_from_roster_entry(&worker, &entry));
+        assert_eq!(std::fs::metadata(&descriptor_path).unwrap().is_dir(), true);
+        {
+            let descriptor = worker.descriptor.lock().unwrap();
+            assert_eq!(descriptor.root_session_id.as_deref(), Some("root"));
+            assert_eq!(descriptor.session_file, None);
+        }
+        std::fs::remove_dir(&descriptor_path).unwrap();
+        std::fs::write(&descriptor_path, prior).unwrap();
+        assert!(fixture.supervisor.sync_root_descriptor_from_roster_entry(&worker, &entry), "identical frame must retry the failed durable write");
+        assert!(!fixture.supervisor.sync_root_descriptor_from_roster_entry(&worker, &entry));
+        let current = worker.descriptor.lock().unwrap();
+        assert_eq!(current.root_session_id.as_deref(), Some("saved"));
+        assert_eq!(current.session_file.as_deref(), Some("/tmp/saved.jsonl"));
+    }
+
     #[test]
     fn descriptor_and_socket_paths_match_the_typescript_hash_contract() {
         assert_eq!(descriptor_key("/tmp/daemon.sock"), format!("{:x}", Sha256::digest(b"/tmp/daemon.sock"))[..12]);

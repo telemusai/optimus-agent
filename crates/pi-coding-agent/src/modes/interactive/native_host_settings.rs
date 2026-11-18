@@ -56,7 +56,7 @@ impl Change {
 pub(super) fn create(
     mode: &InteractiveMode,
     state: &wire::AgentConnectionState,
-    send: &mpsc::Sender<HostEvent>,
+    send: &HostEventSender,
 ) -> Result<SettingsSelectorComponent, String> {
     let manager = mode.settings_manager();
     let settings = manager.lock().map_err(|e| e.to_string())?;
@@ -282,7 +282,7 @@ pub(super) async fn apply_remote<T: SettingsDaemon + ?Sized>(
 pub(super) fn spawn_remote<T: SettingsDaemon + Send + Sync + 'static + ?Sized>(
     change: Change,
     connection: Arc<T>,
-    send: mpsc::Sender<HostEvent>,
+    send: HostEventSender,
 ) {
     if !change.touches_the_daemon() {
         return;
@@ -326,7 +326,7 @@ pub(super) fn apply_change<T: SettingsDaemon + Send + Sync + 'static + ?Sized>(
     ui: &Rc<RefCell<TUI>>,
     transcript: &Rc<RefCell<Transcript>>,
     connection: &Arc<T>,
-    send: &mpsc::Sender<HostEvent>,
+    send: &HostEventSender,
 ) {
     spawn_remote(change.clone(), connection.clone(), send.clone());
     if let Err(error) = apply_local(change, mode, editor, ui, transcript) {
@@ -562,7 +562,7 @@ mod tests {
 
     /// Yields until the sender produces a message, or the deadline passes.
     async fn next_event(
-        receive: &mut mpsc::Receiver<HostEvent>,
+        receive: &mut HostEventReceiver,
         timeout: std::time::Duration,
     ) -> Option<HostEvent> {
         let deadline = std::time::Instant::now() + timeout;
@@ -625,7 +625,7 @@ mod tests {
         let mode = settings_mode("settings-failure");
         let (editor, ui, transcript) = host(&mode);
         let daemon = Arc::new(ParkedDaemon::rejecting());
-        let (send, mut receive) = mpsc::channel();
+        let (send, mut receive) = host_event_channel(64 * 1024);
 
         let before = mode
             .borrow()
@@ -691,7 +691,7 @@ mod tests {
         let (editor, ui, transcript) = host(&mode);
         let (release, parked) = tokio::sync::oneshot::channel::<()>();
         let daemon = Arc::new(ParkedDaemon::parked(parked));
-        let (send, mut receive) = mpsc::channel();
+        let (send, mut receive) = host_event_channel(64 * 1024);
 
         mode.borrow_mut()
             .apply_connection_state_snapshot(local::AgentConnectionState {
@@ -755,7 +755,7 @@ mod tests {
         let mode = settings_mode("settings-thinking");
         let (editor, ui, transcript) = host(&mode);
         let daemon = Arc::new(ParkedDaemon::rejecting());
-        let (send, mut receive) = mpsc::channel();
+        let (send, mut receive) = host_event_channel(64 * 1024);
 
         mode.borrow_mut()
             .apply_connection_state_snapshot(local::AgentConnectionState {
@@ -809,7 +809,7 @@ mod tests {
         let mode = settings_mode("settings-accepted");
         let (editor, ui, transcript) = host(&mode);
         let daemon = Arc::new(ParkedDaemon::default());
-        let (send, mut receive) = mpsc::channel();
+        let (send, mut receive) = host_event_channel(64 * 1024);
 
         mode.borrow_mut()
             .apply_connection_state_snapshot(local::AgentConnectionState {

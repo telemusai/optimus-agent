@@ -1,0 +1,4 @@
+- Fixed async and sync process waits draining captured stdout/stderr concurrently, bounding inherited-pipe cleanup, and killing/reaping timed-out children without masking kill or status failures.
+- Fixed cancelled non-detached async children escaping cleanup while preserving intentional detached spawns.
+- Fixed detached process-tree cleanup checking kill and exit results, retaining failed kills for retry, and processing registrations made during shutdown without erasing them.
+- Fixed Unix signal exit codes to use the actual status signal and fixed bash accident guards treating `git checkout -b/-B` option arguments as path-discard operands.

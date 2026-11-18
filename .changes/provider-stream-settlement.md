@@ -1,0 +1,3 @@
+- Fixed streamed responses so interrupted requests cannot finish successfully or execute incomplete tool calls.
+- Fixed provider body-read cancellation, task ownership, usage observation settlement, and missing-result fallbacks.
+- Fixed session replacement rollback on candidate build failure and replacement listener dispatch during unsubscription.

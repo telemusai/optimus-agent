@@ -82,7 +82,7 @@ mod tests {
     #[test]
     fn clipboard_notice_direct_report_and_session_reset() {
         let mode = Rc::new(RefCell::new(super::super::tests::stash_mode("clipboard-reset")));
-        let (send, receive) = mpsc::channel();
+        let (send, receive) = host_event_channel(64 * 1024);
         CommandOutput::ClipboardNotice("copy feedback".into()).report(&mode, &send);
         let HostEvent::ClipboardNotice(message) = receive.try_recv().unwrap() else {
             panic!("direct reporting must also remain transient");

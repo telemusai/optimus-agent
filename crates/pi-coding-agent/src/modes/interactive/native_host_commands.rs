@@ -70,7 +70,7 @@ pub(super) enum ScopeChange {
 struct LogoutPicker {
     picker: crate::modes::interactive::components::oauth_selector::OAuthSelectorComponent,
     reply: Option<oneshot::Sender<Option<String>>>,
-    send: mpsc::Sender<HostEvent>,
+    send: HostEventSender,
 }
 impl TuiComponent for LogoutPicker {
     fn render(&mut self, width: f64) -> Vec<String> {
@@ -96,7 +96,7 @@ pub(super) fn mount(
     ui: Rc<RefCell<TUI>>,
     mode: &InteractiveMode,
     connection: Arc<dyn wire::AgentConnection>,
-    send: mpsc::Sender<HostEvent>,
+    send: HostEventSender,
 ) -> Rc<RefCell<dyn TuiComponent>> {
     if let Dialog::Stats = dialog {
         return Rc::new(RefCell::new(stats_panel::StatsPanel::new(connection, send, ui)));
@@ -265,7 +265,7 @@ pub(super) fn mount(
     }
 }
 
-async fn select(send: &mpsc::Sender<HostEvent>, title: &str, choices: &[&str]) -> Option<String> {
+async fn select(send: &HostEventSender, title: &str, choices: &[&str]) -> Option<String> {
     let (reply, wait) = oneshot::channel();
     send.send(HostEvent::CommandDialog(Dialog::Select(
         title.into(),
@@ -276,7 +276,7 @@ async fn select(send: &mpsc::Sender<HostEvent>, title: &str, choices: &[&str]) -
     wait.await.ok().flatten()
 }
 
-async fn input(send: &mpsc::Sender<HostEvent>, title: &str, multiline: bool) -> Option<String> {
+async fn input(send: &HostEventSender, title: &str, multiline: bool) -> Option<String> {
     let (reply, wait) = oneshot::channel();
     send.send(HostEvent::CommandDialog(Dialog::Input(
         title.into(),
@@ -289,7 +289,7 @@ async fn input(send: &mpsc::Sender<HostEvent>, title: &str, multiline: bool) -> 
 
 pub(super) async fn run(
     connection: &Arc<dyn wire::AgentConnection>,
-    send: &mpsc::Sender<HostEvent>,
+    send: &HostEventSender,
     name: &str,
     args: &str,
 ) -> Result<CommandOutput, String> {
@@ -572,7 +572,7 @@ pub(super) async fn run(
     Ok(CommandOutput::Nothing)
 }
 
-async fn monitor(send: &mpsc::Sender<HostEvent>, args: &str) -> Result<CommandOutput, String> {
+async fn monitor(send: &HostEventSender, args: &str) -> Result<CommandOutput, String> {
     use crate::core::performance_monitor::{parse_monitor_command, MonitorCommand, PerformanceMonitor};
     let monitor = PerformanceMonitor::from_environment(crate::config::get_agent_dir());
     let command = parse_monitor_command(args)?;
@@ -615,7 +615,7 @@ impl crate::core::mcp::mcp_command::McpCredentialStore for Credentials {
 }
 async fn mcp(
     connection: &Arc<dyn wire::AgentConnection>,
-    send: &mpsc::Sender<HostEvent>,
+    send: &HostEventSender,
     args: &str,
 ) -> Result<CommandOutput, String> {
     let args = crate::core::prompt_templates::parse_command_args(args);
@@ -690,7 +690,7 @@ async fn mcp(
 
 async fn share(
     connection: &Arc<dyn wire::AgentConnection>,
-    send: &mpsc::Sender<HostEvent>,
+    send: &HostEventSender,
 ) -> Result<CommandOutput, String> {
     let mut gh_auth = tokio::process::Command::new("gh");
     gh_auth.args(["auth", "status"]);
@@ -757,7 +757,7 @@ async fn share(
 
 async fn traces(
     connection: &Arc<dyn wire::AgentConnection>,
-    send: &mpsc::Sender<HostEvent>,
+    send: &HostEventSender,
     args: &str,
 ) -> Result<CommandOutput, String> {
     use crate::core::agent_traces::*;
@@ -891,7 +891,7 @@ async fn traces(
 }
 
 async fn trace_login(
-    send: &mpsc::Sender<HostEvent>,
+    send: &HostEventSender,
     auth: &mut AuthStorage,
 ) -> Result<bool, String> {
     let Some(key) = input(send, "Prime Agent Traces: enter Prime API key", false).await else {
@@ -948,7 +948,7 @@ fn format_upload(result: &crate::core::agent_traces::AgentTraceUploadResult) -> 
 pub(super) async fn debug(
     ui: &Rc<RefCell<TUI>>,
     connection: &Arc<dyn wire::AgentConnection>,
-    send: &mpsc::Sender<HostEvent>,
+    send: &HostEventSender,
 ) -> Result<(), String> {
     let (width, height) = {
         let ui = ui.borrow();

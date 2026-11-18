@@ -718,7 +718,7 @@ fn transport_error(message: &str) -> Value {
     json!({"type":"error","code":"responses_request_interrupted","message":message})
 }
 
-fn normalize_event(event: &mut Value) {
+pub(crate) fn normalize_event(event: &mut Value) {
     if !event.is_object() {
         *event = transport_error("Invalid WebSocket event envelope");
         return;
@@ -741,7 +741,6 @@ fn normalize_event(event: &mut Value) {
             }
         }
         Some("response.incomplete") => {
-            event["type"] = json!("response.completed");
             event["response"]["status"] = json!("incomplete");
         }
         Some("response.done") => {
@@ -757,19 +756,31 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    #[test]
-    fn transport_errors_and_incomplete_responses_keep_shared_parser_contract() {
+    #[tokio::test]
+    async fn normalized_websocket_terminal_reaches_shared_parser() {
         let mut error =
             json!({"type":"error","error":{"code":"rate_limit_error","message":"wait"}});
         normalize_event(&mut error);
         assert_eq!(error["message"], "wait");
         assert_eq!(error["code"], "rate_limit_error");
         let mut incomplete =
-            json!({"type":"response.incomplete","response":{"id":"r","usage":{"output_tokens":3}}});
+            json!({"type":"response.incomplete","response":{"id":"r","usage":{"output_tokens":3},"incomplete_details":{"reason":"max_output_tokens"}}});
         normalize_event(&mut incomplete);
         assert_eq!(incomplete["response"]["status"], "incomplete");
-        assert_eq!(incomplete["type"], "response.completed");
+        assert_eq!(incomplete["type"], "response.incomplete");
         assert_eq!(incomplete["response"]["usage"]["output_tokens"], 3);
+
+        let model = Model::default();
+        let mut output = crate::types::AssistantMessage::new(
+            model.api.clone(), model.provider.clone(), model.id.clone(), 0,
+        );
+        let stream = crate::utils::event_stream::AssistantMessageEventStream::new();
+        crate::providers::openai_responses_shared::process_responses_stream(
+            Box::pin(futures::stream::iter(vec![incomplete])),
+            &mut output, &stream, &model, None,
+        ).await.unwrap();
+        assert_eq!(output.stop_reason, "length");
+        assert_eq!(output.stop_reason_raw.as_deref(), Some("max_output_tokens"));
     }
 
     #[tokio::test]

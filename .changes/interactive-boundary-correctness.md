@@ -1,0 +1,3 @@
+- Fixed empty tree and resource selectors so navigation remains safe and renderable when no entries match.
+- Fixed Unicode cursor handling for backslash-enter and absolute-path paste, quoted external-editor commands, and visible spawn errors without draft loss.
+- Fixed bash output display to retain a bounded tail with exact truncation totals and coalesced render updates.

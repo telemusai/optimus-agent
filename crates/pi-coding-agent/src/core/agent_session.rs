@@ -24848,6 +24848,16 @@ mod post_compaction_continuation_tests {
                 auto_refine: Value,
                 extension_factories: Vec<crate::core::extensions::types::ExtensionFactory>,
             ) -> Self {
+                Self::new_with_persistence(case, serialized_refine, auto_refine, extension_factories, true).await
+            }
+
+            async fn new_with_persistence(
+                case: &str,
+                serialized_refine: bool,
+                auto_refine: Value,
+                extension_factories: Vec<crate::core::extensions::types::ExtensionFactory>,
+                persist: bool,
+            ) -> Self {
                 static T11_ENV_SCOPE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
                 let _env_scope = T11_ENV_SCOPE.lock().await;
                 let agent = ScriptedAgent::new(vec![]);
@@ -24888,10 +24898,13 @@ mod post_compaction_continuation_tests {
                         .clone(),
                     ),
                 ));
-                let manager = Arc::new(Mutex::new(
+                let manager = Arc::new(Mutex::new(if persist {
                     crate::core::session_manager::SessionManager::create(&cwd, Some(&sessions))
-                        .expect("persisted session manager"),
-                ));
+                        .expect("persisted session manager")
+                } else {
+                    crate::core::session_manager::SessionManager::in_memory(Some(&cwd), Some(&sessions))
+                        .expect("in-memory session manager")
+                }));
                 let loader = Arc::new(crate::core::resource_loader::DefaultResourceLoader::new(
                     crate::core::resource_loader::DefaultResourceLoaderOptions {
                         cwd: cwd.clone(),
@@ -26736,6 +26749,272 @@ mod post_compaction_continuation_tests {
                 "H-08: replacing/disposing the session must emit `session_shutdown` through the \
              connected runner (agent-session-runtime.ts:200-205, 689-698); observed {seen:?}"
             );
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn replacement_build_failure_keeps_old_session_and_self_unsubscribe_does_not_skip() {
+            let t = T11Session::new(
+                "replacement-transaction",
+                false,
+                serde_json::json!({"enabled": false}),
+                vec![],
+            )
+            .await;
+            let services = crate::core::agent_session_services::create_agent_session_services(
+                crate::core::agent_session_services::CreateAgentSessionServicesOptions {
+                    cwd: t.session.cwd.clone(),
+                    agent_dir: t.session.agent_dir.clone(),
+                    auth_storage: None,
+                    settings_manager: Some(Arc::clone(&t.session.settings_manager)),
+                    model_registry: Some(Arc::clone(&t.session.model_registry)),
+                    extension_flag_values: None,
+                    no_builtin_herdr_reporter: Some(true),
+                    telemetry_disabled: Some(true),
+                    resource_loader_options: None,
+                },
+            )
+            .await
+            .expect("services");
+            let fail_build = Arc::new(std::sync::atomic::AtomicBool::new(true));
+            let factory_settings = Arc::clone(&t.session.settings_manager);
+            let factory_registry = Arc::clone(&t.session.model_registry);
+            let factory_model = t.session.model();
+            let fail_build_for_factory = Arc::clone(&fail_build);
+            let factory: crate::core::agent_session_runtime::CreateAgentSessionRuntimeFactory =
+                Arc::new(move |input: crate::core::agent_session_runtime::CreateAgentSessionRuntimeInput| {
+                    let fail_build = fail_build_for_factory.clone();
+                    let settings_manager = Arc::clone(&factory_settings);
+                    let model_registry = Arc::clone(&factory_registry);
+                    let model = factory_model.clone();
+                    Box::pin(async move {
+                        if fail_build.load(std::sync::atomic::Ordering::SeqCst) {
+                            return Err("synthetic candidate build failure".to_string());
+                        }
+                        let services = crate::core::agent_session_services::create_agent_session_services(
+                            crate::core::agent_session_services::CreateAgentSessionServicesOptions {
+                                cwd: input.cwd.clone(),
+                                agent_dir: Some(input.agent_dir.clone()),
+                                auth_storage: None,
+                                settings_manager: Some(settings_manager),
+                                model_registry: Some(model_registry),
+                                extension_flag_values: None,
+                                no_builtin_herdr_reporter: Some(true),
+                                telemetry_disabled: Some(true),
+                                resource_loader_options: None,
+                            },
+                        )
+                        .await
+                        .map_err(|error| error.to_string())?;
+                        let services = Arc::new(services);
+                        let created = crate::core::agent_session_services::create_agent_session_from_services(
+                            crate::core::agent_session_services::CreateAgentSessionFromServicesOptions {
+                                services: Arc::clone(&services),
+                                session_manager: input.session_manager.clone(),
+                                session_start_event: input.session_start_event.clone(),
+                                creation: crate::core::agent_session_services::AgentSessionCreationOptions {
+                                    model,
+                                    no_tools: Some("all".to_string()),
+                                    prewarm_ipython_kernel: Some(false),
+                                    telemetry_disabled: Some(true),
+                                    rlm_depth: Some(0),
+                                    serialized_refine: Some(false),
+                                    ..Default::default()
+                                },
+                            },
+                        )
+                        .await
+                        .map_err(|error| error.to_string())?;
+                        Ok(crate::core::agent_session_runtime::CreateAgentSessionRuntimeResult {
+                            result: created,
+                            services,
+                            diagnostics: Vec::new(),
+                        })
+                    })
+                });
+            let old_session = Arc::clone(&t.session);
+            let runtime = crate::core::agent_session_runtime::AgentSessionRuntime::new(
+                Arc::clone(&old_session),
+                Arc::new(services),
+                factory,
+                Vec::new(),
+                None,
+                None,
+                crate::core::agent_session_runtime::AgentSessionRuntimeMetadata::top_level(),
+                None,
+            );
+            let error = runtime.new_session(None).await.unwrap_err();
+            assert_eq!(error, "synthetic candidate build failure");
+            assert!(Arc::ptr_eq(&runtime.session(), &old_session));
+            let prompt_error = old_session.prompt("still admitted", None).await.unwrap_err();
+            assert!(
+                prompt_error.starts_with("Session input dispatch settled without durable delivery (action "),
+                "old session still accepts and settles prompt dispatch: {prompt_error}"
+            );
+
+            struct FailingDisposeHost;
+            impl crate::core::rlm_runtime::SubagentRuntimeHost for FailingDisposeHost {
+                fn create_rlm_subagent_runtime(
+                    &self,
+                    _options: crate::core::rlm_runtime::CreateRlmSubagentRuntimeOptions,
+                ) -> pi_ai::types::BoxFuture<Result<crate::core::rlm_runtime::RlmSubagentRuntime, String>> {
+                    Box::pin(async { Err("unexpected child creation".to_string()) })
+                }
+                fn delete_rlm_subagent_runtime(
+                    &self,
+                    _child_id: &str,
+                    _session: Option<&Arc<AgentSession>>,
+                ) -> pi_ai::types::BoxFuture<Result<(), String>> {
+                    Box::pin(async { Ok(()) })
+                }
+                fn dispose_rlm_subagent_runtimes(&self) -> pi_ai::types::BoxFuture<Result<(), String>> {
+                    Box::pin(async { Err("synthetic hosted-child disposal failure".to_string()) })
+                }
+            }
+            let invalidated = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let invalidation_flag = invalidated.clone();
+            runtime.set_before_session_invalidate(Some(Arc::new(move || {
+                invalidation_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            })));
+            let old_session = runtime.session();
+            fail_build.store(false, std::sync::atomic::Ordering::SeqCst);
+            runtime.set_subagent_runtime_host(Some(Arc::new(FailingDisposeHost)));
+            let error = runtime.new_session(None).await.unwrap_err();
+            assert_eq!(error, "synthetic hosted-child disposal failure");
+            assert!(Arc::ptr_eq(&runtime.session(), &old_session));
+            assert!(!invalidated.load(std::sync::atomic::Ordering::SeqCst));
+            let prompt_error = old_session.prompt("still admitted after child failure", None).await.unwrap_err();
+            assert!(
+                prompt_error.starts_with("Session input dispatch settled without durable delivery (action "),
+                "old session still accepts and settles prompt dispatch: {prompt_error}"
+            );
+            runtime.set_subagent_runtime_host(None);
+            runtime.set_before_session_invalidate(None);
+
+
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let unsubscribe_a: Arc<Mutex<Option<Arc<dyn Fn() + Send + Sync>>>> = Arc::new(Mutex::new(None));
+            let listener_slot = unsubscribe_a.clone();
+            let listener_calls = calls.clone();
+            let unsubscribe = runtime.on_session_replaced(Arc::new(move |_| {
+                let listener_slot = listener_slot.clone();
+                let listener_calls = listener_calls.clone();
+                Box::pin(async move {
+                    listener_calls.lock().unwrap().push("a");
+                    if let Some(unsubscribe) = listener_slot.lock().unwrap().take() {
+                        unsubscribe();
+                    }
+                })
+            }));
+            *unsubscribe_a.lock().unwrap() = Some(unsubscribe);
+            let listener_calls = calls.clone();
+            runtime.on_session_replaced(Arc::new(move |_| {
+                let listener_calls = listener_calls.clone();
+                Box::pin(async move {
+                    listener_calls.lock().unwrap().push("b");
+                })
+            }));
+            fail_build.store(false, std::sync::atomic::Ordering::SeqCst);
+            runtime.new_session(None).await.unwrap();
+            assert_eq!(*calls.lock().unwrap(), vec!["a", "b"]);
+
+            calls.lock().unwrap().clear();
+            let unsubscribe_d: Arc<Mutex<Option<Arc<dyn Fn() + Send + Sync>>>> = Arc::new(Mutex::new(None));
+            let added = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let weak_runtime = Arc::downgrade(&runtime);
+            let d_slot = unsubscribe_d.clone();
+            let listener_calls = calls.clone();
+            let added_listener = added.clone();
+            runtime.on_session_replaced(Arc::new(move |_| {
+                let d_slot = d_slot.clone();
+                let listener_calls = listener_calls.clone();
+                let weak_runtime = weak_runtime.clone();
+                let added_listener = added_listener.clone();
+                Box::pin(async move {
+                    listener_calls.lock().unwrap().push("c");
+                    if let Some(unsubscribe) = d_slot.lock().unwrap().take() {
+                        unsubscribe();
+                    }
+                    if !added_listener.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                        let runtime = weak_runtime.upgrade().unwrap();
+                        let listener_calls = listener_calls.clone();
+                        runtime.on_session_replaced(Arc::new(move |_| {
+                            let listener_calls = listener_calls.clone();
+                            Box::pin(async move { listener_calls.lock().unwrap().push("e"); })
+                        }));
+                    }
+                })
+            }));
+            let listener_calls = calls.clone();
+            let unsubscribe = runtime.on_session_replaced(Arc::new(move |_| {
+                let listener_calls = listener_calls.clone();
+                Box::pin(async move { listener_calls.lock().unwrap().push("d"); })
+            }));
+            *unsubscribe_d.lock().unwrap() = Some(unsubscribe);
+            runtime.new_session(None).await.unwrap();
+            assert_eq!(*calls.lock().unwrap(), vec!["b", "c", "e"]);
+
+            runtime.dispose(Some(Default::default())).await.unwrap();
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn nonpersisted_fork_build_failure_keeps_live_manager_unchanged() {
+            let t = T11Session::new_with_persistence(
+                "replacement-transaction-in-memory",
+                false,
+                serde_json::json!({"enabled": false}),
+                vec![],
+                false,
+            ).await;
+            let old_session = Arc::clone(&t.session);
+            assert!(old_session.session_file().is_none(), "fixture must exercise non-persisted branch");
+            let services = crate::core::agent_session_services::create_agent_session_services(
+                crate::core::agent_session_services::CreateAgentSessionServicesOptions {
+                    cwd: t.session.cwd.clone(),
+                    agent_dir: t.session.agent_dir.clone(),
+                    auth_storage: None,
+                    settings_manager: Some(Arc::clone(&t.session.settings_manager)),
+                    model_registry: Some(Arc::clone(&t.session.model_registry)),
+                    extension_flag_values: None,
+                    no_builtin_herdr_reporter: Some(true),
+                    telemetry_disabled: Some(true),
+                    resource_loader_options: None,
+                },
+            ).await.expect("services");
+            let factory: crate::core::agent_session_runtime::CreateAgentSessionRuntimeFactory =
+                Arc::new(|_input| Box::pin(async {
+                    Err("synthetic candidate build failure".to_string())
+                }));
+            let runtime = crate::core::agent_session_runtime::AgentSessionRuntime::new(
+                Arc::clone(&old_session), Arc::new(services), factory, Vec::new(), None, None,
+                crate::core::agent_session_runtime::AgentSessionRuntimeMetadata::top_level(), None,
+            );
+            let manager = Arc::clone(&old_session.session_manager);
+            let user_id = manager.lock().unwrap().append_message(AgentMessage::Message(Message::User(
+                pi_ai::types::UserMessage::new(
+                    pi_ai::types::UserContent::Text("in-memory fork fixture".to_string()),
+                    now_ms_i64(),
+                ),
+            ))).expect("append real in-memory user entry");
+            let (old_leaf, old_entries, old_header) = {
+                let manager = manager.lock().unwrap();
+                (manager.get_leaf_id(), manager.get_entries(), manager.get_header())
+            };
+            assert_eq!(old_leaf.as_deref(), Some(user_id.as_str()));
+            let fork_leaf = user_id;
+            let error = runtime.fork(
+                &fork_leaf,
+                Some(crate::core::agent_session_runtime::ForkOptionsInput {
+                    position: Some("at".to_string()), with_session: None,
+                }),
+            ).await.unwrap_err();
+            assert_eq!(error, "synthetic candidate build failure");
+            assert!(Arc::ptr_eq(&runtime.session(), &old_session));
+            let manager = manager.lock().unwrap();
+            assert_eq!(manager.get_leaf_id(), old_leaf, "staged branch cannot leak into live manager");
+            assert_eq!(manager.get_entries(), old_entries, "live transcript stays unchanged");
+            assert_eq!(manager.get_header(), old_header, "live header stays unchanged");
+            drop(manager);
+            runtime.dispose(Some(Default::default())).await.unwrap();
         }
 
         /// H-08 negative control: with no extension handlers the reload path stays

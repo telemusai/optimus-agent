@@ -244,6 +244,101 @@ mod tests {
         emitter.close().await;
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn close_timeout_detaches_the_owned_lifecycle_drain() {
+        use crate::core::performance_metrics::{
+            LocalPerformanceMetricRecorderOptions, PerformanceMetricFileIo, PerformanceMetricIoError,
+        };
+        use std::collections::HashMap;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct GatedFileIo {
+            files: Arc<Mutex<HashMap<String, String>>>,
+            release: Arc<tokio::sync::Semaphore>,
+            append_calls: Arc<AtomicUsize>,
+        }
+        impl PerformanceMetricFileIo for GatedFileIo {
+            fn mkdir(&self, _path: &str) -> pi_ai::types::BoxFuture<Result<(), PerformanceMetricIoError>> {
+                Box::pin(async { Ok(()) })
+            }
+            fn append(
+                &self,
+                path: &str,
+                data: &str,
+            ) -> pi_ai::types::BoxFuture<Result<(), PerformanceMetricIoError>> {
+                let path = path.to_string();
+                let data = data.to_string();
+                let files = Arc::clone(&self.files);
+                let release = Arc::clone(&self.release);
+                let calls = Arc::clone(&self.append_calls);
+                Box::pin(async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    release.acquire().await.unwrap().forget();
+                    files.lock().unwrap().entry(path).or_default().push_str(&data);
+                    Ok(())
+                })
+            }
+            fn size(
+                &self,
+                path: &str,
+            ) -> pi_ai::types::BoxFuture<Result<Option<u64>, PerformanceMetricIoError>> {
+                let path = path.to_string();
+                let files = Arc::clone(&self.files);
+                Box::pin(async move {
+                    Ok(files.lock().unwrap().get(&path).map(|data| data.len() as u64))
+                })
+            }
+            fn rename(
+                &self,
+                _source: &str,
+                _destination: &str,
+            ) -> pi_ai::types::BoxFuture<Result<(), PerformanceMetricIoError>> {
+                Box::pin(async { Ok(()) })
+            }
+            fn remove(&self, _path: &str) -> pi_ai::types::BoxFuture<Result<(), PerformanceMetricIoError>> {
+                Box::pin(async { Ok(()) })
+            }
+        }
+
+        let io = Arc::new(GatedFileIo {
+            files: Arc::new(Mutex::new(HashMap::new())),
+            release: Arc::new(tokio::sync::Semaphore::new(0)),
+            append_calls: Arc::new(AtomicUsize::new(0)),
+        });
+        let recorder = Arc::new(LocalPerformanceMetricRecorder::new(
+            LocalPerformanceMetricRecorderOptions {
+                directory: "C:/isolated/daemon-close".into(),
+                session_id: "supervisor-close".into(),
+                close_timeout_ms: Some(1),
+                flush_interval_ms: Some(60_000),
+                file_io: Some(io.clone()),
+                ..Default::default()
+            },
+        ));
+        let emitter = DaemonLifecycleEmitter { recorder: Some(Arc::clone(&recorder)) };
+        emitter.emit(DAEMON_LIFECYCLE_STAGE_STOP, PerformanceMetricOutcome::Success, None, None);
+        emitter.close().await;
+        assert_eq!(io.append_calls.load(Ordering::SeqCst), 1);
+        assert!(io.files.lock().unwrap().is_empty());
+
+        // A late filesystem completion still belongs to the production close;
+        // joining another flush observes it without regenerating the event.
+        io.release.add_permits(1);
+        recorder.flush().await;
+        let records: Vec<serde_json::Value> = io
+            .files
+            .lock()
+            .unwrap()
+            .values()
+            .flat_map(|data| data.lines())
+            .map(|line| serde_json::from_str(line).expect("valid JSONL"))
+            .collect();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0]["operation"], "daemon_lifecycle");
+        assert_eq!(records[0]["stage"], "stop");
+        assert_eq!(io.append_calls.load(Ordering::SeqCst), 1);
+    }
+
     #[tokio::test]
     async fn opt_in_emitter_records_lifecycle_events() {
         let root = std::env::temp_dir().join(format!(

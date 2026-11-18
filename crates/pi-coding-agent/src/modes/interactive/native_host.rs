@@ -31,6 +31,7 @@ use crate::modes::interactive::interactive_mode_services as local;
 use crate::modes::interactive::prompt_stash_state::{
     PromptStashCapture, PromptStashEditorEffect, PromptStashOutcome, PromptStashSession,
 };
+use pi_agent_core::types::AgentEvent;
 use pi_tui::components::text::Text as TuiText;
 use pi_tui::render_cache::RenderedLine;
 use pi_tui::utils::visible_width;
@@ -44,6 +45,154 @@ use std::time::{Duration, Instant};
 
 const MAX_HOST_EVENTS_PER_FRAME: usize = 64;
 const MAX_HOST_EVENT_TIME_PER_FRAME: Duration = Duration::from_millis(8);
+/// Raw events waiting for the UI owner. Producers block at this explicit
+/// bound; adjacent streaming snapshots are folded by `HostEventBudget`.
+const MAX_PENDING_HOST_EVENTS: usize = 256;
+
+struct HostEventChannelState {
+    receive: std::sync::Mutex<mpsc::Receiver<HostEvent>>,
+    /// Oldest events moved aside by a UI-owner send when the raw channel was
+    /// full. The receiver always drains these before the raw channel.
+    owner_backlog: std::sync::Mutex<std::collections::VecDeque<HostEvent>>,
+}
+
+#[derive(Clone)]
+pub(super) struct HostEventSender {
+    send: mpsc::SyncSender<HostEvent>,
+    owner: std::thread::ThreadId,
+    state: std::sync::Arc<HostEventChannelState>,
+}
+
+pub(super) struct HostEventReceiver {
+    state: std::sync::Arc<HostEventChannelState>,
+}
+
+pub(super) fn host_event_channel(capacity: usize) -> (HostEventSender, HostEventReceiver) {
+    let (send, receive) = mpsc::sync_channel(capacity);
+    let state = std::sync::Arc::new(HostEventChannelState {
+        receive: std::sync::Mutex::new(receive),
+        owner_backlog: std::sync::Mutex::new(std::collections::VecDeque::with_capacity(
+            MAX_PENDING_HOST_EVENTS,
+        )),
+    });
+    (
+        HostEventSender {
+            send,
+            owner: std::thread::current().id(),
+            state: state.clone(),
+        },
+        HostEventReceiver { state },
+    )
+}
+
+impl HostEventSender {
+    /// External producers apply bounded backpressure. The UI owner never waits
+    /// on its own receiver: it moves the oldest full-channel event into an
+    /// ordered bounded backlog, then nonblockingly requeues its new event.
+    fn send(&self, mut event: HostEvent) -> Result<(), mpsc::SendError<HostEvent>> {
+        if std::thread::current().id() != self.owner {
+            return self.send.send(event);
+        }
+        loop {
+            match self.send.try_send(event) {
+                Ok(()) => return Ok(()),
+                Err(mpsc::TrySendError::Disconnected(event)) => {
+                    return Err(mpsc::SendError(event));
+                }
+                Err(mpsc::TrySendError::Full(returned)) => event = returned,
+            }
+            let oldest = match self.state.receive.lock().expect("host receiver").try_recv() {
+                Ok(oldest) => oldest,
+                Err(mpsc::TryRecvError::Empty) => continue,
+                Err(mpsc::TryRecvError::Disconnected) => return Err(mpsc::SendError(event)),
+            };
+            let mut backlog = self.state.owner_backlog.lock().expect("host owner backlog");
+            // Owner actions emit a small finite batch and the loop drains this
+            // queue before any more input. Fail loudly, never silently discard,
+            // if a broken action exceeds that batch invariant.
+            assert!(
+                backlog.len() < MAX_PENDING_HOST_EVENTS,
+                "UI-owner host backlog exceeded before its deterministic drain"
+            );
+            backlog.push_back(oldest);
+        }
+    }
+
+    fn try_send(&self, event: HostEvent) -> Result<(), mpsc::TrySendError<HostEvent>> {
+        self.send.try_send(event)
+    }
+
+    fn owner_backlog_pending(&self) -> bool {
+        !self
+            .state
+            .owner_backlog
+            .lock()
+            .expect("host owner backlog")
+            .is_empty()
+    }
+}
+
+impl HostEventReceiver {
+    fn try_recv(&self) -> Result<HostEvent, mpsc::TryRecvError> {
+        if let Some(event) = self
+            .state
+            .owner_backlog
+            .lock()
+            .expect("host owner backlog")
+            .pop_front()
+        {
+            return Ok(event);
+        }
+        self.state.receive.lock().expect("host receiver").try_recv()
+    }
+
+    fn try_iter(&self) -> impl Iterator<Item = HostEvent> + '_ {
+        std::iter::from_fn(|| self.try_recv().ok())
+    }
+
+    fn recv_timeout(&self, timeout: Duration) -> Result<HostEvent, mpsc::RecvTimeoutError> {
+        if let Some(event) = self
+            .state
+            .owner_backlog
+            .lock()
+            .expect("host owner backlog")
+            .pop_front()
+        {
+            return Ok(event);
+        }
+        self.state
+            .receive
+            .lock()
+            .expect("host receiver")
+            .recv_timeout(timeout)
+    }
+}
+
+/// Admit terminal input one item at a time. An owner event send can fill the
+/// channel in the middle of a batch; in that case retain the current item and
+/// every later item ahead of subsequently queued terminal input. They stay
+/// asleep until the normal host-event drain clears the owner backlog.
+fn drain_input_batch(
+    input: &Rc<RefCell<Vec<String>>>,
+    send: &HostEventSender,
+    mut handle: impl FnMut(String),
+) {
+    if send.owner_backlog_pending() {
+        return;
+    }
+    let mut pending: std::collections::VecDeque<String> =
+        std::mem::take(&mut *input.borrow_mut()).into();
+    while let Some(data) = pending.pop_front() {
+        if send.owner_backlog_pending() {
+            let mut retained = Vec::with_capacity(pending.len() + 1);
+            retained.push(data);
+            retained.extend(pending);
+            input.borrow_mut().splice(0..0, retained);
+            return;
+        }
+        handle(data);
+    }
+}
 
 fn fallback_repaint_due(tick_index: u64, animation_live: bool, idle_paint_enabled: bool) -> bool {
     idle_paint_enabled || animation_live || tick_index % 10 == 0
@@ -52,18 +201,85 @@ fn fallback_repaint_due(tick_index: u64, animation_live: bool, idle_paint_enable
 struct HostEventBudget {
     started: Instant,
     remaining: usize,
+    /// One non-coalescible barrier read ahead while folding adjacent deltas.
+    pending: Option<HostEvent>,
 }
 impl HostEventBudget {
-    fn new() -> Self { Self { started: Instant::now(), remaining: MAX_HOST_EVENTS_PER_FRAME } }
-    fn next<T>(&mut self, receive: &mpsc::Receiver<T>) -> Option<T> {
-        self.next_at(receive, Instant::now())
+    fn new() -> Self {
+        Self {
+            started: Instant::now(),
+            remaining: MAX_HOST_EVENTS_PER_FRAME,
+            pending: None,
+        }
     }
+
+    fn start_frame(&mut self) {
+        self.started = Instant::now();
+        self.remaining = MAX_HOST_EVENTS_PER_FRAME;
+    }
+
+    fn next(&mut self, receive: &HostEventReceiver) -> Option<HostEvent> {
+        self.next_host_at(receive, Instant::now())
+    }
+
+    fn next_host_at(&mut self, receive: &HostEventReceiver, now: Instant) -> Option<HostEvent> {
+        if self.remaining == 0
+            || now.saturating_duration_since(self.started) >= MAX_HOST_EVENT_TIME_PER_FRAME
+        {
+            return None;
+        }
+        let mut event = self.pending.take().or_else(|| receive.try_recv().ok())?;
+        let first_received_at = match &event {
+            HostEvent::TimedConnection(_, received_at) => Some(*received_at),
+            _ => None,
+        };
+        let mut folded = 0;
+        // Folding still consumes queue work. Cap it so a continuously refilled
+        // snapshot queue cannot bypass the host's per-frame yield discipline.
+        while folded < MAX_HOST_EVENTS_PER_FRAME && is_streaming_snapshot(&event) {
+            match receive.try_recv() {
+                Ok(next) if is_streaming_snapshot(&next) => {
+                    event = next;
+                    folded += 1;
+                }
+                Ok(barrier) => {
+                    self.pending = Some(barrier);
+                    break;
+                }
+                Err(_) => break,
+            }
+        }
+        // Queue age belongs to the first superseded paint, not the newest
+        // snapshot, so coalescing cannot hide producer-to-UI latency.
+        if let (Some(first), HostEvent::TimedConnection(_, received_at)) =
+            (first_received_at, &mut event)
+        {
+            *received_at = first;
+        }
+        self.remaining -= 1;
+        Some(event)
+    }
+
+    #[cfg(test)]
     fn next_at<T>(&mut self, receive: &mpsc::Receiver<T>, now: Instant) -> Option<T> {
         if self.remaining == 0 || now.saturating_duration_since(self.started) >= MAX_HOST_EVENT_TIME_PER_FRAME { return None; }
         let event = receive.try_recv().ok()?;
         self.remaining -= 1;
         Some(event)
     }
+}
+
+fn is_streaming_snapshot(event: &HostEvent) -> bool {
+    matches!(
+        event,
+        HostEvent::TimedConnection(
+            wire::AgentConnectionEvent::SessionEvent {
+                event: wire::AgentConnectionSessionEvent::MessageUpdate { .. }
+                    | wire::AgentConnectionSessionEvent::Agent(AgentEvent::MessageUpdate { .. }),
+            },
+            _,
+        )
+    )
 }
 
 #[path = "native_host_autocomplete.rs"]
@@ -1166,7 +1382,7 @@ type ExtensionReply = (String, wire::AgentConnectionExtensionUiResponse);
 
 fn respond_extension(
     connection: &Arc<dyn wire::AgentConnection>,
-    send: &mpsc::Sender<HostEvent>,
+    send: &HostEventSender,
     reply: ExtensionReply,
     local: Option<&Arc<native_extension_bridge::Bridge>>,
 ) {
@@ -1362,7 +1578,7 @@ async fn escape_repeat_step(
     editor: &Rc<RefCell<CustomEditor>>,
     ui: &Rc<RefCell<TUI>>,
     connection: &Arc<dyn wire::AgentConnection>,
-    send: &mpsc::Sender<HostEvent>,
+    send: &HostEventSender,
 ) -> bool {
     mode.borrow_mut().clear_ctrl_c_exit_hint(true);
     // Bind before matching: the scrutinee temporary would otherwise hold the
@@ -1408,27 +1624,41 @@ fn open_external_editor_for(
     };
     let current_text = editor.borrow().editor().get_text().to_string();
     let tmp_file = std::env::temp_dir().join(format!("pi-editor-{}.pi.md", now_ms()));
-    if std::fs::write(&tmp_file, &current_text).is_err() {
+    let mut command = match crate::modes::interactive::components::extension_editor::external_editor_command(
+        &editor_cmd,
+        &tmp_file,
+    ) {
+        Ok(command) => command,
+        Err(error) => {
+            mode.borrow_mut().show_error(&error);
+            return;
+        }
+    };
+    if let Err(error) = std::fs::write(&tmp_file, &current_text) {
+        mode.borrow_mut()
+            .show_error(&format!("Could not write the editor draft: {error}"));
         return;
     }
     tui.borrow_mut().stop(TuiStopOptions::default());
-    let parts: Vec<String> = editor_cmd.split(' ').map(|part| part.to_string()).collect();
-    let editor_program = parts.first().cloned().unwrap_or_default();
-    let mut command = std::process::Command::new(&editor_program);
-    for arg in parts.iter().skip(1) {
-        command.arg(arg);
-    }
-    command.arg(&tmp_file);
-    if let Ok(status) = command.status() {
-        if status.success() {
-            if let Ok(content) = std::fs::read_to_string(&tmp_file) {
+    match command.status() {
+        Ok(status) if status.success() => match std::fs::read_to_string(&tmp_file) {
+            Ok(content) => {
                 let new_content =
-                crate::modes::interactive::components::extension_editor::strip_trailing_newline(
-                    &content,
-                );
+                    crate::modes::interactive::components::extension_editor::strip_trailing_newline(
+                        &content,
+                    );
                 editor.borrow_mut().editor_mut().set_text(&new_content);
             }
-        }
+            Err(error) => mode
+                .borrow_mut()
+                .show_error(&format!("Could not read the editor draft: {error}")),
+        },
+        Ok(status) => mode
+            .borrow_mut()
+            .show_error(&format!("External editor exited with {status}")),
+        Err(error) => mode
+            .borrow_mut()
+            .show_error(&format!("Could not start the external editor: {error}")),
     }
     let _ = std::fs::remove_file(&tmp_file);
     tui.borrow_mut().start();
@@ -1834,7 +2064,7 @@ async fn run_terminal(
         connection.dispose().await?;
         return Ok(None);
     }
-    let (send, receive) = mpsc::channel();
+    let (send, receive) = host_event_channel(MAX_PENDING_HOST_EVENTS);
     {
         let send = send.clone();
         ui.borrow_mut().on_copy = Some(Box::new(move |text| {
@@ -1983,7 +2213,13 @@ async fn run_terminal(
     if in_process_connection.is_some() {
         native_commands::jev_host::publish_session_footer(&send, &current_session_id);
     }
+    let mut event_budget = HostEventBudget::new();
     loop {
+        if send.owner_backlog_pending() {
+            // A full raw channel made an owner action retain older events. Do
+            // not admit more input until those events and any new owner replies
+            // have gone through the normal ordered event processor below.
+        } else {
         match ui.borrow_mut().terminal.poll_input() {
             Ok(true) => {}
             Ok(false) => break,
@@ -2004,9 +2240,9 @@ async fn run_terminal(
         if history_requested.replace(false) {
             history_runtime.request(&mode.borrow());
         }
-        for data in std::mem::take(&mut *input.borrow_mut()) {
+        drain_input_batch(&input, &send, |data| {
             let data = if let Some(bridge) = &local_extension_bridge {
-                let Some(data) = bridge.filter_input(data) else { continue; }; data
+                let Some(data) = bridge.filter_input(data) else { return; }; data
             } else { data };
             if let Some(splash) = &onboarding_splash {
                 splash.borrow_mut().handle_input(&data);
@@ -2050,7 +2286,7 @@ async fn run_terminal(
                 editor.borrow_mut().handle_input(&data);
             }
             ui.borrow_mut().request_render();
-        }
+        });
         while let Ok(reply) = extension_receive.try_recv() {
             if extension.as_ref().map(|dialog| dialog.request.id.as_str()) == Some(reply.0.as_str())
             {
@@ -2378,8 +2614,9 @@ async fn run_terminal(
             }
             ui.borrow_mut().request_render();
         }
-        // Preserve event order, but yield back to input/rendering under a continuous stream.
-        let mut event_budget = HostEventBudget::new();
+        }
+        // Preserve event order and the read-ahead barrier across frame yields.
+        event_budget.start_frame();
         while let Some(event) = event_budget.next(&receive) {
             let (event, received_at) = match event {
                 HostEvent::TimedConnection(event, received_at) => (HostEvent::Connection(event), Some(received_at)),
@@ -3234,19 +3471,13 @@ async fn run_terminal(
                         let _ =
                             selection_send.send(Some(format!("{}/{}", model.provider, model.id)));
                     } else {
-                        let _ = send.send(HostEvent::Configuration(
-                            wire::AgentConnectionModelCatalog {
-                                models: models.clone(),
-                                configured_providers: configured_providers
-                                    .iter()
-                                    .cloned()
-                                    .collect(),
-                                ..Default::default()
-                            },
-                            "models",
+                        requeue_models_picker(
+                            &send,
+                            &models,
+                            &configured_providers,
                             search,
-                        ));
-                        let _ = send.send(HostEvent::MenuTiming(started));
+                            started,
+                        );
                     }
                 }
             }
@@ -3526,7 +3757,7 @@ async fn interrupt_active_work(
 /// exactly as typed.
 fn submit(
     connection: &Arc<dyn wire::AgentConnection>,
-    send: &mpsc::Sender<HostEvent>,
+    send: &HostEventSender,
     text: String,
     follow_up: bool,
     images: Option<Vec<ImageContent>>,
@@ -3552,6 +3783,25 @@ fn submission_attachment_invalidated(event: &HostEvent) -> bool {
             | wire::AgentConnectionEvent::ConnectionStatus { .. }))
 }
 
+fn requeue_models_picker(
+    send: &HostEventSender,
+    models: &[wire::AgentConnectionModel],
+    configured_providers: &std::collections::HashSet<String>,
+    search: Option<String>,
+    started: Instant,
+) {
+    let _ = send.send(HostEvent::Configuration(
+        wire::AgentConnectionModelCatalog {
+            models: models.to_vec(),
+            configured_providers: configured_providers.iter().cloned().collect(),
+            ..Default::default()
+        },
+        "models",
+        search,
+    ));
+    let _ = send.send(HostEvent::MenuTiming(started));
+}
+
 fn apply_submission_reply(
     mode: &Rc<RefCell<InteractiveMode>>,
     transcript: &Rc<RefCell<Transcript>>,
@@ -3567,7 +3817,7 @@ fn apply_submission_reply(
 
 fn submit_from_editor(
     connection: &Arc<dyn wire::AgentConnection>,
-    send: &mpsc::Sender<HostEvent>,
+    send: &HostEventSender,
     text: String,
     follow_up: bool,
     metrics: &mut native_metrics::UiMetrics,
@@ -3591,7 +3841,7 @@ fn submit_from_editor(
 
 fn submit_with_metrics(
     connection: &Arc<dyn wire::AgentConnection>,
-    send: &mpsc::Sender<HostEvent>,
+    send: &HostEventSender,
     text: String,
     follow_up: bool,
     images: Option<Vec<ImageContent>>,
@@ -3621,7 +3871,7 @@ fn submit_with_metrics(
 /// connection (`interactive-mode.ts:4784-5039`).
 async fn dispatch_submission(
     connection: &Arc<dyn wire::AgentConnection>,
-    send: &mpsc::Sender<HostEvent>,
+    send: &HostEventSender,
     text: &str,
     follow_up: bool,
     images: Option<Vec<ImageContent>>,
@@ -3736,7 +3986,7 @@ fn handle_prompt_session(
     mode: &Rc<RefCell<InteractiveMode>>,
     editor: &Rc<RefCell<CustomEditor>>,
     connection: &Arc<dyn wire::AgentConnection>,
-    send: &mpsc::Sender<HostEvent>,
+    send: &HostEventSender,
     text: &str,
 ) {
     let images = mode.borrow_mut().collect_images_for(text);
@@ -3931,7 +4181,7 @@ enum CommandOutput {
 
 impl CommandOutput {
     /// Applies the output to the host, then reports any failure.
-    fn report(self, mode: &Rc<RefCell<InteractiveMode>>, send: &mpsc::Sender<HostEvent>) {
+    fn report(self, mode: &Rc<RefCell<InteractiveMode>>, send: &HostEventSender) {
         match self {
             CommandOutput::Nothing => {}
             CommandOutput::Status(status) => {
@@ -4225,7 +4475,7 @@ async fn heartbeat_command(
 /// registry already resolved any alias.
 async fn run_builtin_command(
     connection: &Arc<dyn wire::AgentConnection>,
-    send: &mpsc::Sender<HostEvent>,
+    send: &HostEventSender,
     text: &str,
     name: &str,
     args: &str,
@@ -5088,7 +5338,7 @@ fn start_login(
     generation: LoginGeneration,
     provider: String,
     oauth: bool,
-    send: mpsc::Sender<HostEvent>,
+    send: HostEventSender,
     cancel: tokio_util::sync::CancellationToken,
 ) {
     let runtime = tokio::runtime::Handle::current();
@@ -6046,7 +6296,7 @@ fn apply_event_legacy_for_speed(
         let connection: Arc<dyn wire::AgentConnection> = fake.clone();
         let (reply, wait) = tokio::sync::oneshot::channel();
         fake.prompt_replies.lock().unwrap().push_back(wait);
-        let (send, receive) = mpsc::channel();
+        let (send, receive) = host_event_channel(64 * 1024);
         submit_from_editor(&connection, &send, "private submitted prompt".into(), false, &mut metrics, &h.transcript);
         assert_eq!(metrics.pending_count(), 1);
         assert!(fake.calls().is_empty(), "the receipt/ID must exist before the task runs");
@@ -6514,18 +6764,315 @@ fn apply_event_legacy_for_speed(
 
     #[test]
     fn event_budget_yields_without_dropping_or_reordering_events() {
-        let (send, receive) = mpsc::channel();
+        let (send, receive) = mpsc::sync_channel(64 * 1024);
         for index in 0..MAX_HOST_EVENTS_PER_FRAME + 3 { send.send(index).unwrap(); }
         let mut budget = HostEventBudget::new();
         let frame_start = budget.started;
         let mut drained = Vec::new();
         while let Some(event) = budget.next_at(&receive, frame_start) { drained.push(event); }
         assert_eq!(drained.len(), MAX_HOST_EVENTS_PER_FRAME);
-        let mut expired = HostEventBudget { started: frame_start, remaining: 1 };
+        let mut expired = HostEventBudget { started: frame_start, remaining: 1, pending: None };
         assert_eq!(expired.next_at(&receive, frame_start + MAX_HOST_EVENT_TIME_PER_FRAME), None);
         let rest: Vec<_> = receive.try_iter().collect();
         drained.extend(rest);
         assert_eq!(drained, (0..MAX_HOST_EVENTS_PER_FRAME + 3).collect::<Vec<_>>());
+    }
+
+    fn streaming_snapshot(text: &str, received_at: Instant) -> HostEvent {
+        let partial = pi_ai::types::AssistantMessage {
+            content: vec![pi_ai::types::ContentBlock::Text(pi_ai::types::TextContent::new(text))],
+            ..Default::default()
+        };
+        HostEvent::TimedConnection(
+            wire::AgentConnectionEvent::SessionEvent {
+                event: wire::AgentConnectionSessionEvent::MessageUpdate {
+                    message: partial.clone().into(),
+                    assistant_message_event: pi_ai::types::AssistantMessageEvent::TextDelta {
+                        content_index: 0,
+                        delta: text.to_string(),
+                        partial,
+                    },
+                },
+            },
+            received_at,
+        )
+    }
+
+    fn wrapped_streaming_snapshot(text: &str, received_at: Instant) -> HostEvent {
+        let HostEvent::TimedConnection(
+            wire::AgentConnectionEvent::SessionEvent {
+                event: wire::AgentConnectionSessionEvent::MessageUpdate {
+                    message,
+                    assistant_message_event,
+                },
+            },
+            _,
+        ) = streaming_snapshot(text, received_at)
+        else {
+            panic!("unwrapped fixture required")
+        };
+        HostEvent::TimedConnection(
+            wire::AgentConnectionEvent::SessionEvent {
+                event: wire::AgentConnectionSessionEvent::Agent(AgentEvent::MessageUpdate {
+                    message,
+                    assistant_message_event,
+                }),
+            },
+            received_at,
+        )
+    }
+
+    fn streamed_text(event: HostEvent) -> String {
+        let HostEvent::TimedConnection(
+            wire::AgentConnectionEvent::SessionEvent { event },
+            _,
+        ) = event
+        else {
+            panic!("expected a coalesced streaming snapshot")
+        };
+        let message = match event {
+            wire::AgentConnectionSessionEvent::MessageUpdate { message, .. }
+            | wire::AgentConnectionSessionEvent::Agent(AgentEvent::MessageUpdate {
+                message,
+                ..
+            }) => message,
+            _ => panic!("expected message update content"),
+        };
+        let AgentMessage::Message(pi_ai::types::Message::Assistant(message)) = message else {
+            panic!("expected assistant content")
+        };
+        match &message.content[0] {
+            pi_ai::types::ContentBlock::Text(text) => text.text.clone(),
+            _ => panic!("expected text"),
+        }
+    }
+
+    #[test]
+    fn streaming_burst_coalesces_only_inside_control_barriers() {
+        let (send, receive) = host_event_channel(MAX_PENDING_HOST_EVENTS);
+        let started = Instant::now();
+        for index in 0..96 {
+            send.send(streaming_snapshot(&format!("draft-{index}"), started)).unwrap();
+        }
+        send.send(HostEvent::Status("barrier".into())).unwrap();
+        for index in 96..100 {
+            send.send(streaming_snapshot(&format!("draft-{index}"), started)).unwrap();
+        }
+        let final_message: AgentMessage = pi_ai::types::AssistantMessage {
+            content: vec![pi_ai::types::ContentBlock::Text(pi_ai::types::TextContent::new("final exact"))],
+            ..Default::default()
+        }.into();
+        send.send(HostEvent::TimedConnection(
+            wire::AgentConnectionEvent::SessionEvent {
+                event: wire::AgentConnectionSessionEvent::MessageEnd { message: final_message },
+            },
+            started,
+        )).unwrap();
+
+        let mut budget = HostEventBudget::new();
+        budget.remaining = 1;
+        let mut processed = 0;
+        let first = budget.next_host_at(&receive, started).unwrap();
+        processed += 1;
+        assert_eq!(streamed_text(first), "draft-64");
+        assert!(budget.next_host_at(&receive, started).is_none());
+        // A control event read ahead during the first fold must survive the
+        // exhausted frame budget instead of disappearing with that budget.
+        budget.start_frame();
+        budget.remaining = 1;
+        let second = budget.next_host_at(&receive, started).unwrap();
+        processed += 1;
+        assert_eq!(streamed_text(second), "draft-95");
+        assert!(budget.next_host_at(&receive, started).is_none());
+        budget.start_frame();
+        let Some(HostEvent::Status(status)) = budget.next_host_at(&receive, started) else {
+            panic!("control event must stop coalescing")
+        };
+        processed += 1;
+        assert_eq!(status, "barrier");
+        let last = budget.next_host_at(&receive, started).unwrap();
+        processed += 1;
+        assert_eq!(streamed_text(last), "draft-99");
+        let Some(HostEvent::TimedConnection(
+            wire::AgentConnectionEvent::SessionEvent {
+                event: wire::AgentConnectionSessionEvent::MessageEnd { message },
+            },
+            _,
+        )) = budget.next_host_at(&receive, started) else {
+            panic!("final message event must not be dropped or reordered")
+        };
+        let AgentMessage::Message(pi_ai::types::Message::Assistant(message)) = message else {
+            panic!("final assistant content required")
+        };
+        assert!(matches!(
+            &message.content[0],
+            pi_ai::types::ContentBlock::Text(text) if text.text == "final exact"
+        ));
+        processed += 1;
+        assert_eq!(processed, 5, "raw folds stay bounded and retain both barriers");
+        assert!(receive.try_recv().is_err());
+    }
+
+    #[test]
+    fn wrapped_agent_streaming_coalesces_and_delivers_exact_final_text() {
+        let (send, receive) = host_event_channel(MAX_PENDING_HOST_EVENTS);
+        let started = Instant::now();
+        for index in 0..100 {
+            send.send(wrapped_streaming_snapshot(&format!("wrapped-{index}"), started))
+                .unwrap();
+        }
+        let final_message: AgentMessage = pi_ai::types::AssistantMessage {
+            content: vec![pi_ai::types::ContentBlock::Text(
+                pi_ai::types::TextContent::new("wrapped final exact"),
+            )],
+            ..Default::default()
+        }
+        .into();
+        send.send(HostEvent::TimedConnection(
+            wire::AgentConnectionEvent::SessionEvent {
+                event: wire::AgentConnectionSessionEvent::Agent(AgentEvent::MessageEnd {
+                    message: final_message,
+                }),
+            },
+            started,
+        ))
+        .unwrap();
+
+        let mut budget = HostEventBudget::new();
+        assert_eq!(
+            streamed_text(budget.next_host_at(&receive, started).unwrap()),
+            "wrapped-64"
+        );
+        assert_eq!(
+            streamed_text(budget.next_host_at(&receive, started).unwrap()),
+            "wrapped-99"
+        );
+        let Some(HostEvent::TimedConnection(
+            wire::AgentConnectionEvent::SessionEvent {
+                event: wire::AgentConnectionSessionEvent::Agent(AgentEvent::MessageEnd {
+                    message,
+                }),
+            },
+            _,
+        )) = budget.next_host_at(&receive, started)
+        else {
+            panic!("wrapped final event must remain a barrier")
+        };
+        let AgentMessage::Message(pi_ai::types::Message::Assistant(message)) = message else {
+            panic!("wrapped final assistant content required")
+        };
+        assert!(matches!(
+            &message.content[0],
+            pi_ai::types::ContentBlock::Text(text) if text.text == "wrapped final exact"
+        ));
+        assert!(receive.try_recv().is_err());
+    }
+
+    #[test]
+    fn ui_owner_full_queue_requeues_close_models_and_shutdown_in_order() {
+        let (send, receive) = host_event_channel(MAX_PENDING_HOST_EVENTS);
+        for index in 0..MAX_PENDING_HOST_EVENTS {
+            send.send(HostEvent::Status(format!("older-{index}"))).unwrap();
+        }
+
+        // These are the same owner-local sends used by JevMenuOverlay close,
+        // the two-event Models fallback, and shutdown respectively. Every call
+        // must return without waiting for this receiving thread.
+        send.send(HostEvent::CloseCommandDialog).unwrap();
+        assert!(send.owner_backlog_pending());
+        requeue_models_picker(
+            &send,
+            &[],
+            &std::collections::HashSet::new(),
+            None,
+            Instant::now(),
+        );
+        send.send(HostEvent::Shutdown).unwrap();
+
+        let events: Vec<HostEvent> = receive.try_iter().collect();
+        assert_eq!(events.len(), MAX_PENDING_HOST_EVENTS + 4);
+        for (index, event) in events[..MAX_PENDING_HOST_EVENTS].iter().enumerate() {
+            assert!(matches!(event, HostEvent::Status(status) if status == &format!("older-{index}")));
+        }
+        assert!(matches!(events[MAX_PENDING_HOST_EVENTS], HostEvent::CloseCommandDialog));
+        assert!(matches!(events[MAX_PENDING_HOST_EVENTS + 1], HostEvent::Configuration(..)));
+        assert!(matches!(events[MAX_PENDING_HOST_EVENTS + 2], HostEvent::MenuTiming(_)));
+        assert!(matches!(events[MAX_PENDING_HOST_EVENTS + 3], HostEvent::Shutdown));
+        assert!(!send.owner_backlog_pending());
+    }
+
+    #[test]
+    fn owner_backlog_stops_input_batch_and_preserves_remaining_fifo() {
+        let (send, receive) = host_event_channel(MAX_PENDING_HOST_EVENTS);
+        let (menu_events, _menu_receive) = tokio::sync::mpsc::unbounded_channel();
+        let mut menu = native_commands::jev_host::JevMenuOverlay::new(
+            pi_jev::types::JevMode::Off,
+            menu_events,
+            send.clone(),
+        );
+        menu.handle_input("\x1b");
+        assert!(matches!(receive.try_recv(), Ok(HostEvent::CloseCommandDialog)));
+        for index in 0..MAX_PENDING_HOST_EVENTS {
+            send.send(HostEvent::Status(format!("older-{index}"))).unwrap();
+        }
+        let input = Rc::new(RefCell::new(
+            (0..300).map(|index| format!("key-{index}")).collect::<Vec<_>>(),
+        ));
+        let mut processed = 0;
+        let mut events = Vec::new();
+        for _ in 0..8 {
+            drain_input_batch(&input, &send, |data| {
+                assert_eq!(data, format!("key-{processed}"));
+                processed += 1;
+                // The overlay is already closed: this is the reviewer's exact
+                // repeated-close path, not a stand-in for its owner send.
+                menu.handle_input(&data);
+            });
+            if processed == 300 {
+                break;
+            }
+            assert!(send.owner_backlog_pending(), "admission must stop at the full send");
+            events.extend(receive.try_iter());
+        }
+        assert_eq!(processed, 300, "every retained input eventually resumes in FIFO order");
+        send.send(HostEvent::Shutdown).unwrap();
+        events.extend(receive.try_iter());
+        assert_eq!(events.len(), MAX_PENDING_HOST_EVENTS + 301);
+        for (index, event) in events[..MAX_PENDING_HOST_EVENTS].iter().enumerate() {
+            assert!(matches!(event, HostEvent::Status(status) if status == &format!("older-{index}")));
+        }
+        assert!(events[MAX_PENDING_HOST_EVENTS..MAX_PENDING_HOST_EVENTS + 300]
+            .iter()
+            .all(|event| matches!(event, HostEvent::CloseCommandDialog)));
+        assert!(matches!(events.last(), Some(HostEvent::Shutdown)));
+        assert!(!send.owner_backlog_pending());
+        assert!(input.borrow().is_empty());
+    }
+
+    #[test]
+    fn noncoalescible_overflow_applies_backpressure_without_losing_order() {
+        let (send, receive) = host_event_channel(1);
+        send.send(HostEvent::Status("one".into())).unwrap();
+        assert!(matches!(
+            send.try_send(HostEvent::Status("overflow".into())),
+            Err(mpsc::TrySendError::Full(_))
+        ));
+        let worker_send = send.clone();
+        let worker = std::thread::spawn(move || {
+            worker_send.send(HostEvent::Status("two".into())).unwrap();
+            worker_send.send(HostEvent::Status("three".into())).unwrap();
+        });
+        for expected in ["one", "two", "three"] {
+            let event = loop {
+                match receive.try_recv() {
+                    Ok(event) => break event,
+                    Err(mpsc::TryRecvError::Empty) => std::thread::yield_now(),
+                    Err(error) => panic!("host channel disconnected: {error}"),
+                }
+            };
+            assert!(matches!(event, HostEvent::Status(status) if status == expected));
+        }
+        worker.join().expect("synchronous producer finishes after the UI drains");
     }
 
     #[tokio::test]
@@ -6747,7 +7294,7 @@ fn apply_event_legacy_for_speed(
                     ..Default::default()
                 };
                 let connection: Arc<dyn wire::AgentConnection> = recorder.clone();
-                let (send, receive) = mpsc::channel();
+                let (send, receive) = host_event_channel(64 * 1024);
                 let expected_tiers = if initially_on {
                     ["default", "priority"]
                 } else {
@@ -6825,7 +7372,7 @@ fn apply_event_legacy_for_speed(
                 ..Default::default()
             };
             let connection: Arc<dyn wire::AgentConnection> = recorder.clone();
-            let (send, receive) = mpsc::channel();
+            let (send, receive) = host_event_channel(64 * 1024);
             dispatch_submission(&connection, &send, "/fast", false, None).await.unwrap();
             let events: Vec<_> = receive.try_iter().collect();
             assert!(
@@ -6847,7 +7394,7 @@ fn apply_event_legacy_for_speed(
                 ..Default::default()
             };
             let connection: Arc<dyn wire::AgentConnection> = recorder.clone();
-            let (send, receive) = mpsc::channel();
+            let (send, receive) = host_event_channel(64 * 1024);
             let text = format!("/fast {args}");
             dispatch_submission(&connection, &send, &text, false, None).await.unwrap();
             let events: Vec<_> = receive.try_iter().collect();
@@ -6878,7 +7425,7 @@ fn apply_event_legacy_for_speed(
     #[test]
     fn settings_search_reaches_the_real_change_and_cancel_callbacks() {
         let mode = stash_mode("settings-host");
-        let (send, receive) = mpsc::channel();
+        let (send, receive) = host_event_channel(64 * 1024);
         let mut picker =
             native_settings::create(&mode, &wire::AgentConnectionState::default(), &send).unwrap();
         assert!(picker.render(80.0).join("\n").contains("Auto-compact"));
@@ -7023,7 +7570,7 @@ fn apply_event_legacy_for_speed(
         ] {
             let recorder = Arc::new(RecordingConnection::new());
             let connection: Arc<dyn wire::AgentConnection> = recorder.clone();
-            let (send, _receive) = mpsc::channel();
+            let (send, _receive) = host_event_channel(64 * 1024);
             assert_eq!(
                 classify_submission(text),
                 SlashDispatch::SessionCommand(text.trim().to_string()),
@@ -7079,7 +7626,7 @@ fn apply_event_legacy_for_speed(
         );
         let recorder = Arc::new(RecordingConnection::new());
         let connection: Arc<dyn wire::AgentConnection> = recorder.clone();
-        let (send, _receive) = mpsc::channel();
+        let (send, _receive) = host_event_channel(64 * 1024);
         // `run_builtin_command` is the LOCAL chain: no session command may appear
         // there, so it must report the name as unhandled rather than act on it.
         let local = run_builtin_command(&connection, &send, text, "compact", "keep the plan").await;
@@ -7110,7 +7657,7 @@ fn apply_event_legacy_for_speed(
         for text in ["/clear foo", "/clear extra words", "/clear --name x"] {
             let recorder = Arc::new(RecordingConnection::new());
             let connection: Arc<dyn wire::AgentConnection> = recorder.clone();
-            let (send, _receive) = mpsc::channel();
+            let (send, _receive) = host_event_channel(64 * 1024);
             let command =
                 crate::core::slash_commands::parse_slash_command(text).expect("a slash command");
             let resolved = crate::core::slash_commands::resolve_slash_command(&command);
@@ -7152,7 +7699,7 @@ fn apply_event_legacy_for_speed(
         for text in ["/clear", "/clear   ", "/new"] {
             let recorder = Arc::new(RecordingConnection::new());
             let connection: Arc<dyn wire::AgentConnection> = recorder.clone();
-            let (send, _receive) = mpsc::channel();
+            let (send, _receive) = host_event_channel(64 * 1024);
             let command = crate::core::slash_commands::parse_slash_command(text).unwrap();
             let resolved = crate::core::slash_commands::resolve_slash_command(&command);
             assert_eq!(resolved.name, "new");
@@ -7181,7 +7728,7 @@ fn apply_event_legacy_for_speed(
     async fn new_with_a_name_still_starts_a_session_and_sets_the_name() {
         let recorder = Arc::new(RecordingConnection::new());
         let connection: Arc<dyn wire::AgentConnection> = recorder.clone();
-        let (send, _receive) = mpsc::channel();
+        let (send, _receive) = host_event_channel(64 * 1024);
         let text = "/new --name scratch";
         let command = crate::core::slash_commands::parse_slash_command(text).unwrap();
         let resolved = crate::core::slash_commands::resolve_slash_command(&command);
@@ -7225,7 +7772,7 @@ fn apply_event_legacy_for_speed(
             "children": []
         });
         let connection: Arc<dyn wire::AgentConnection> = recorder.clone();
-        let (send, _receive) = mpsc::channel();
+        let (send, _receive) = host_event_channel(64 * 1024);
 
         let output = run_builtin_command(&connection, &send, "/context", "context", "")
             .await
@@ -7359,7 +7906,7 @@ fn apply_event_legacy_for_speed(
                 "children": []
             });
             let connection: Arc<dyn wire::AgentConnection> = recorder.clone();
-            let (send, _receive) = mpsc::channel();
+            let (send, _receive) = host_event_channel(64 * 1024);
             let output = run_builtin_command(&connection, &send, text, name, "")
                 .await
                 .unwrap_or_else(|error| panic!("{text} must succeed: {error}"));
@@ -7584,7 +8131,7 @@ fn apply_event_legacy_for_speed(
         for supported in [false, true] {
             let recorder = Arc::new(RecordingConnection { execution_mode_support: supported, ..Default::default() });
             let connection: Arc<dyn wire::AgentConnection> = recorder.clone();
-            let (send, _receive) = mpsc::channel();
+            let (send, _receive) = host_event_channel(64 * 1024);
             let result = dispatch_submission(&connection, &send, "/mode toggle", true, None).await;
             assert_eq!(result.is_ok(), supported);
             let calls = recorder.calls();
@@ -8181,7 +8728,7 @@ fn apply_event_legacy_for_speed(
                 vec![ThinkingLevel::Off, ThinkingLevel::Minimal, ThinkingLevel::Low, ThinkingLevel::Medium, ThinkingLevel::High];
         }
         let connection: Arc<dyn wire::AgentConnection> = recorder.clone();
-        let (send, _receive) = mpsc::channel();
+        let (send, _receive) = host_event_channel(64 * 1024);
         let output = run_builtin_command(&connection, &send, "/effort bogus", "effort", "bogus")
             .await
             .expect("effort command must succeed");
@@ -8208,7 +8755,7 @@ fn apply_event_legacy_for_speed(
         )));
         editor.borrow_mut().editor_mut().set_text("draft text");
         let connection: Arc<dyn wire::AgentConnection> = Arc::new(RecordingConnection::new());
-        let (send, _receive) = mpsc::channel();
+        let (send, _receive) = host_event_channel(64 * 1024);
         assert!(!escape_repeat_step(&mode, &editor, &ui, &connection, &send).await);
         assert!(escape_repeat_step(&mode, &editor, &ui, &connection, &send).await);
         assert_eq!(editor.borrow().editor().get_text(), "");
@@ -8279,7 +8826,7 @@ fn apply_event_legacy_for_speed(
         )));
         editor.borrow_mut().editor_mut().set_text("kept draft");
         let connection: Arc<dyn wire::AgentConnection> = Arc::new(RecordingConnection::new());
-        let (send, _receive) = mpsc::channel();
+        let (send, _receive) = host_event_channel(64 * 1024);
         assert!(!escape_repeat_step(&mode, &editor, &ui, &connection, &send).await);
         tokio::time::sleep(std::time::Duration::from_millis(550)).await;
         assert!(!escape_repeat_step(&mode, &editor, &ui, &connection, &send).await);
@@ -8304,7 +8851,7 @@ fn apply_event_legacy_for_speed(
         )));
         let recorder = Arc::new(RecordingConnection::new());
         let connection: Arc<dyn wire::AgentConnection> = recorder.clone();
-        let (send, receive) = mpsc::channel();
+        let (send, receive) = host_event_channel(64 * 1024);
         assert!(!escape_repeat_step(&mode, &editor, &ui, &connection, &send).await);
         assert!(escape_repeat_step(&mode, &editor, &ui, &connection, &send).await);
         let status = tokio::time::timeout(Duration::from_secs(5), async {
@@ -8337,7 +8884,7 @@ fn apply_event_legacy_for_speed(
             "leafId": "entry"
         })).unwrap();
         let connection: Arc<dyn wire::AgentConnection> = recorder.clone();
-        let (send, receive) = mpsc::channel();
+        let (send, receive) = host_event_channel(64 * 1024);
         assert!(!escape_repeat_step(&mode, &editor, &ui, &connection, &send).await);
         assert!(tokio::time::timeout(Duration::from_millis(500),
             escape_repeat_step(&mode, &editor, &ui, &connection, &send),
@@ -8386,7 +8933,7 @@ fn apply_event_legacy_for_speed(
     async fn t14_a08_reload_refreshes_the_command_catalogue() {
         let recorder = Arc::new(RecordingConnection::new());
         let connection: Arc<dyn wire::AgentConnection> = recorder.clone();
-        let (send, receive) = mpsc::channel();
+        let (send, receive) = host_event_channel(64 * 1024);
         let output = run_builtin_command(&connection, &send, "/reload", "reload", "")
             .await
             .expect("reload must succeed");
@@ -8414,7 +8961,7 @@ fn apply_event_legacy_for_speed(
     async fn t14_a13_new_with_prompt_prompts_verbatim() {
         let recorder = Arc::new(RecordingConnection::new());
         let connection: Arc<dyn wire::AgentConnection> = recorder.clone();
-        let (send, receive) = mpsc::channel();
+        let (send, receive) = host_event_channel(64 * 1024);
         let output = run_builtin_command(
             &connection,
             &send,
@@ -8477,7 +9024,7 @@ fn apply_event_legacy_for_speed(
             editor_theme(),
             CustomEditorOptions::default(),
         )));
-        let (send, _receive) = mpsc::channel();
+        let (send, _receive) = host_event_channel(64 * 1024);
         handle_prompt_session(&mode, &editor, &connection, &send, "/model");
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         let prompt = recorder.only_call("prompt");
@@ -8887,7 +9434,7 @@ fn apply_event_legacy_for_speed(
         let scope = ScopedAgentDir::in_temp("set");
         let recorder = Arc::new(RecordingConnection::new());
         let connection: Arc<dyn wire::AgentConnection> = recorder.clone();
-        let (send, _receive) = mpsc::channel();
+        let (send, _receive) = host_event_channel(64 * 1024);
         let raw = "/jev model set jev-two";
         let parsed = crate::core::slash_commands::parse_slash_command(raw)
             .expect("the real slash boundary parses /jev");
@@ -8971,7 +9518,7 @@ fn apply_event_legacy_for_speed(
         let scope = ScopedAgentDir::in_temp("refuse");
         let recorder = Arc::new(RecordingConnection::new());
         let connection: Arc<dyn wire::AgentConnection> = recorder.clone();
-        let (send, _receive) = mpsc::channel();
+        let (send, _receive) = host_event_channel(64 * 1024);
         for (label, args, raw_id) in [
             ("tab-prefixed", "model set \tjev-latest", "\tjev-latest"),
             ("leading space", "model set  jev-latest", " jev-latest"),
@@ -9032,7 +9579,7 @@ fn apply_event_legacy_for_speed(
         let scope = ScopedAgentDir::in_temp("models-success");
         let recorder = Arc::new(RecordingConnection::new());
         let connection: Arc<dyn wire::AgentConnection> = recorder.clone();
-        let (send, _receive) = mpsc::channel();
+        let (send, _receive) = host_event_channel(64 * 1024);
         let mock = Arc::new(pi_jev::mock::MockJevTransport::scripted(vec![
             pi_jev::mock::MockStep::ModelsBody(
                 serde_json::json!({
@@ -9081,7 +9628,7 @@ fn apply_event_legacy_for_speed(
         let scope = ScopedAgentDir::in_temp("models");
         let recorder = Arc::new(RecordingConnection::new());
         let connection: Arc<dyn wire::AgentConnection> = recorder.clone();
-        let (send, _receive) = mpsc::channel();
+        let (send, _receive) = host_event_channel(64 * 1024);
         let output = run_builtin_command(&connection, &send, "/jev models", "jev", "models")
             .await
             .unwrap();
@@ -9106,7 +9653,7 @@ fn apply_event_legacy_for_speed(
         let scope = ScopedAgentDir::in_temp("reset");
         let recorder = Arc::new(RecordingConnection::new());
         let connection: Arc<dyn wire::AgentConnection> = recorder.clone();
-        let (send, _receive) = mpsc::channel();
+        let (send, _receive) = host_event_channel(64 * 1024);
         run_builtin_command(
             &connection,
             &send,

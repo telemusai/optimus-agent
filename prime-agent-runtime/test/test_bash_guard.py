@@ -42,6 +42,30 @@ class GuardTests(unittest.TestCase):
                     self.check(command)
             probe.assert_not_called()
 
+    def test_checkout_branch_option_values_are_not_path_discards(self):
+        safe = [
+            "git checkout -b topic main",
+            "git checkout -B topic origin/main",
+            "git checkout --orphan fresh",
+        ]
+        destructive = [
+            "git checkout -b topic main -- tracked",
+            "git checkout -B topic main tracked",
+            "git checkout -t main tracked",
+            "git checkout --track main tracked",
+            "git checkout main -- tracked",
+            "git checkout --conflict merge HEAD tracked",
+        ]
+        with mock.patch.object(guard, "_probe", return_value=[" M tracked"]) as probe:
+            for command in safe:
+                with self.subTest(command=command, safe=True):
+                    self.check(command)
+            probe.assert_not_called()
+            for command in destructive:
+                with self.subTest(command=command, destructive=True), self.assertRaises(
+                        DestructiveGitRefusalError):
+                    self.check(command)
+
     def test_git_taxonomy_detects_direct_literal_discard_forms(self):
         commands = ["git reset --hard", "git reset -q HEAD --hard", "git restore .", "git restore --staged tracked",
                     "git checkout -- .", "git checkout HEAD -- tracked", "git checkout HEAD tracked",

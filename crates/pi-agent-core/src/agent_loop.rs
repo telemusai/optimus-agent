@@ -5159,6 +5159,23 @@ mod stream_watchdog_loop_tests {
         terminal.expect("the run must produce a terminal assistant message")
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn ended_stream_without_a_result_returns_bounded_error_to_agent_loop() {
+        let _guard = ENV_TESTS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _gap = EnvVarGuard::set(STREAM_EVENT_GAP_MS_ENV, "0".to_string());
+        let _deadline = EnvVarGuard::set(STREAM_DEADLINE_MS_ENV, "0".to_string());
+        let stream_fn: StreamFn = Arc::new(|_model, _context, _options| {
+            let stream = AssistantMessageEventStream::new();
+            stream.end(None);
+            Box::pin(async move { stream })
+        });
+        let terminal = tokio::time::timeout(Duration::from_secs(1), run_turn(stream_fn))
+            .await
+            .expect("agent fallback must not wait forever for a missing result");
+        assert_eq!(terminal.stop_reason, pi_ai::types::STOP_REASON_ERROR);
+        assert!(terminal.error_message.as_deref().is_some_and(|message| message.contains("without a terminal result")));
+    }
+
     /// A stream function whose stream never yields an event.
     fn never_yielding_stream_fn() -> StreamFn {
         Arc::new(|_model, _context, _options| {

@@ -12,7 +12,7 @@ use crate::types::{
 	Api, AssistantMessage, AssistantMessageEvent, Context, Model, ProviderResponse, SimpleStreamOptions,
 	StreamFunction, StreamOptions, Usage,
 };
-use crate::utils::event_stream::{create_assistant_message_event_stream, AssistantMessageEventStream};
+use crate::utils::event_stream::AssistantMessageEventStream;
 use crate::utils::stream_failure::{
 	format_stream_failure_message, record_stream_failure, stream_failure_from_stop_reason, ThrownStreamError,
 };
@@ -169,12 +169,12 @@ pub fn stream_azure_openai_responses(
 	context: &Context,
 	options: Option<AzureOpenAIResponsesOptions>,
 ) -> AssistantMessageEventStream {
-	let stream = create_assistant_message_event_stream();
-	let out = stream.clone();
+	let stream = AssistantMessageEventStream::new_owned();
+	let out = stream.producer_handle();
 	let model = model.clone();
 	let context = context.clone();
 	let options = options.unwrap_or_default();
-	tokio::spawn(async move {
+	stream.spawn(async move {
 		let deployment_name = resolve_deployment_name(&model, Some(&options));
 
 		let mut output = AssistantMessage::new(
@@ -288,22 +288,32 @@ async fn run_azure_openai_responses(
 	);
 	let observation_options = options.stream.clone();
 	let events = Box::pin(events.inspect(move |event| super::responses_transport::observe_event(&observation_options, event)));
-	process_responses_stream(
+	let stream_options = OpenAIResponsesStreamOptions {
+		on_usage_observation: options.stream.on_usage_observation.clone(),
+		idle_timeout: Some(crate::utils::sse_frames::resolve_sse_idle_timeout()),
+		..Default::default()
+	};
+	let parse = process_responses_stream(
 		events,
 		output,
 		stream,
 		model,
-		Some(&OpenAIResponsesStreamOptions {
-			on_usage_observation: options.stream.on_usage_observation.clone(),
-			..Default::default()
-		}),
-	)
-	.await?;
-
-	// A truncated response must never be reported as a complete one.
+		Some(&stream_options),
+	);
+	let parsed = match options.stream.signal.as_ref() {
+		Some(signal) => tokio::select! {
+			biased;
+			_ = signal.cancelled() => return Err(AzureRunError::message("Request was aborted")),
+			result = parse => result,
+		},
+		None => parse.await,
+	};
+	// A transport error is the cause of an early EOF. Preserve it instead of
+	// overwriting the useful underlying error with the shared missing-terminal error.
 	if let Some(message) = body_error.lock().ok().and_then(|slot| slot.clone()) {
 		return Err(AzureRunError::message(message));
 	}
+	parsed?;
 
 	if options
 		.stream
@@ -335,12 +345,12 @@ pub fn stream_simple_azure_openai_responses(
 	context: &Context,
 	options: Option<SimpleStreamOptions>,
 ) -> AssistantMessageEventStream {
-	let stream = create_assistant_message_event_stream();
-	let out = stream.clone();
+	let stream = AssistantMessageEventStream::new_owned();
+	let out = stream.producer_handle();
 	let model_owned = model.clone();
 	let context_owned = context.clone();
 	let options = options.unwrap_or_default();
-	tokio::spawn(async move {
+	stream.spawn(async move {
 		let api_key = options
 			.stream
 			.api_key

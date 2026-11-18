@@ -57,6 +57,10 @@ _STREAM_FRAME_TEXT_CAP = 64 * 1024
 _RESULT_TEXT_CAP = 1024 * 1024
 _RESULT_TRUNCATION_MARKER = f"\n[... text truncated at {_RESULT_TEXT_CAP} characters ...]"
 _PAYLOAD_CAP = 16 * 1024 * 1024
+# NDJSON request frames are bounded independently of the output payload cap.
+# readline(cap + 1) lets the reader reject an overlong frame without ever
+# buffering the whole line, then drain through the newline in bounded chunks.
+_MAX_REQUEST_LINE_BYTES = 16 * 1024 * 1024
 
 
 def _check_payload(event: str, data: dict[str, Any]) -> None:
@@ -1112,13 +1116,38 @@ def _restore_state(
         import dill
     except Exception as err:  # noqa: BLE001
         return {"error": f"dill unavailable: {err}"}
+    if isinstance(max_bytes, bool) or not isinstance(max_bytes, int) or max_bytes < 0:
+        return {"error": "legacy restore aggregate size cap is invalid"}
+    if isinstance(max_variable_bytes, bool) or not isinstance(max_variable_bytes, int) or max_variable_bytes < 0:
+        return {"error": "legacy restore per-variable size cap is invalid"}
     try:
+        # Read once from one descriptor. The fstat check rejects the usual
+        # oversize file before allocation; the bounded read also closes the
+        # grow-after-fstat race and avoids a path-stat/open TOCTOU pair.
         with open(path, "rb") as fh:
-            payload = load_snapshot_value(dill, fh)
+            if os.fstat(fh.fileno()).st_size > max_bytes:
+                return {"error": "legacy snapshot exceeds aggregate restore cap"}
+            outer = fh.read(max_bytes + 1)
+        if len(outer) > max_bytes:
+            return {"error": "legacy snapshot exceeds aggregate restore cap"}
+        payload = load_snapshot_value(dill, outer)
     except Exception as err:  # noqa: BLE001 - a corrupt snapshot yields an empty restore
         return {"error": f"load failed: {_safe_str(err)}"}
     if not isinstance(payload, dict):
         return {"error": "corrupt snapshot: not a dict"}
+    # Validate the complete envelope before loading any per-name pickle. In
+    # particular, a late invalid entry must not allow earlier dill loads.
+    logical_bytes = 0
+    for name, blob in payload.items():
+        if not isinstance(name, str):
+            return {"error": "corrupt snapshot: variable name is not a string"}
+        if not isinstance(blob, (bytes, bytearray, memoryview)):
+            return {"error": f"corrupt snapshot: variable blob is not bytes: {name}"}
+        if len(blob) > max_variable_bytes:
+            return {"error": f"legacy snapshot variable exceeds per-variable restore cap: {name}"}
+        logical_bytes += len(blob)
+        if logical_bytes > max_bytes:
+            return {"error": "legacy snapshot variables exceed aggregate restore cap"}
     # Seed the unchanged-skip record from the payload just read: the next save
     # skips only when it re-serializes to exactly these bytes (round-trip
     # stability), and the manifest supplies the recorded outcome's metadata.
@@ -1534,21 +1563,47 @@ def _handle_request_line(raw: bytes, queue: asyncio.Queue[dict[str, Any]]) -> No
 
 def _read_requests(stdin_fd: int, queue: asyncio.Queue[dict[str, Any]]) -> None:
     assert _loop is not None
-    with os.fdopen(stdin_fd, "rb") as stream:
-        for raw in stream:
-            raw = raw.strip()
-            if not raw:
-                continue
-            try:
-                # The whole per-line handling sits inside the backstop: hostile
-                # input (RecursionError from pathological nesting, unhashable
-                # field types, ...) must never kill the reader thread.
-                _handle_request_line(raw, queue)
-            except BaseException as err:  # noqa: BLE001
-                _protocol_error(f"{type(err).__name__}: {_safe_str(err)}")
-    # Host closed stdin: shut the runtime down.
-    _loop.call_soon_threadsafe(_fail_pending_host_requests)
-    _loop.call_soon_threadsafe(queue.put_nowait, {"type": "shutdown"})
+    loop = _loop
+    try:
+        with os.fdopen(stdin_fd, "rb") as stream:
+            while True:
+                raw = stream.readline(_MAX_REQUEST_LINE_BYTES + 1)
+                if not raw:
+                    break
+                if len(raw) > _MAX_REQUEST_LINE_BYTES:
+                    _protocol_error(
+                        f"request frame exceeds {_MAX_REQUEST_LINE_BYTES} bytes; frame discarded"
+                    )
+                    # Discard only this frame. Never accumulate its chunks, and
+                    # leave the following newline-delimited request serviceable.
+                    while not raw.endswith(b"\n"):
+                        raw = stream.readline(_MAX_REQUEST_LINE_BYTES + 1)
+                        if not raw:
+                            break
+                    if not raw:
+                        break
+                    continue
+                raw = raw.strip()
+                if not raw:
+                    continue
+                try:
+                    # The whole per-line handling sits inside the backstop: hostile
+                    # input (RecursionError from pathological nesting, unhashable
+                    # field types, ...) must never kill the reader thread.
+                    _handle_request_line(raw, queue)
+                except BaseException as err:  # noqa: BLE001
+                    _protocol_error(f"{type(err).__name__}: {_safe_str(err)}")
+    except BaseException as err:  # noqa: BLE001 - read failures still terminate cleanly
+        try:
+            _protocol_error(f"stdin read failed: {type(err).__name__}: {_safe_str(err)}")
+        except BaseException:
+            pass
+    finally:
+        # EOF, fdopen/read failures, and protocol-output failures all settle
+        # awaiters before queuing shutdown; otherwise a pending host request
+        # would prevent the serve loop from ever consuming that shutdown.
+        loop.call_soon_threadsafe(_fail_pending_host_requests)
+        loop.call_soon_threadsafe(queue.put_nowait, {"type": "shutdown"})
 
 
 def _resolve_owner_pid() -> int:

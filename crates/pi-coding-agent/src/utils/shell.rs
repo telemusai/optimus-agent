@@ -4,7 +4,7 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Mutex;
 
-use super::child_process::{spawn_hidden, spawn_sync_hidden, SpawnOptions};
+use super::child_process::{spawn_sync_hidden, SpawnOptions};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShellConfig {
@@ -293,19 +293,40 @@ pub fn untrack_detached_child_pid(pid: i32) {
 }
 
 pub fn kill_tracked_detached_children() {
-    let pids: Vec<i32> = {
-        let guard = tracked_pids();
-        guard
-            .as_ref()
-            .map(|set| set.iter().copied().collect())
-            .unwrap_or_default()
-    };
-    for pid in pids {
-        kill_process_tree(pid);
-        record_orphan_process_state(pid, false);
+    kill_tracked_detached_children_with(kill_process_tree);
+}
+
+fn kill_tracked_detached_children_with(mut kill: impl FnMut(i32) -> bool) {
+    let mut failed = Vec::new();
+    // One initial pending snapshot and one settling pass. Continuous
+    // registration cannot keep process shutdown in an unbounded loop; entries
+    // arriving after the second snapshot remain pending for external cleanup.
+    for _ in 0..2 {
+        let pids: Vec<i32> = {
+            let mut guard = tracked_pids();
+            guard
+                .as_mut()
+                .map(|set| set.drain().collect())
+                .unwrap_or_default()
+        };
+        for pid in pids {
+            if kill(pid) {
+                record_orphan_process_state(pid, false);
+            } else {
+                failed.push(pid);
+            }
+        }
     }
-    if let Some(set) = tracked_pids().as_mut() {
-        set.clear();
+    // Keep active evidence for failed kills so a later recovered teardown
+    // retries them without repeating an immutable failure forever here.
+    if !failed.is_empty() {
+        let mut guard = tracked_pids();
+        if let Some(set) = guard.as_mut() {
+            set.extend(failed.iter().copied());
+        }
+    }
+    for pid in failed {
+        record_orphan_process_state(pid, true);
     }
 }
 
@@ -329,12 +350,98 @@ fn windows_taskkill_program_for(system_root: Option<&str>) -> String {
     format!("{}\\System32\\taskkill.exe", system_root.trim_end_matches('\\'))
 }
 
-/// Kill a process and all its children (cross-platform)
-pub fn kill_process_tree(pid: i32) {
+const PROCESS_EXIT_VERIFY_MS: u64 = 1_000;
+const WINDOWS_TASKKILL_TIMEOUT_MS: u64 = 3_000;
+
+fn wait_for_process_exit_with(mut alive: impl FnMut() -> bool, timeout: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if !alive() {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10).min(
+            deadline.saturating_duration_since(std::time::Instant::now()),
+        ));
+    }
+}
+
+#[cfg(windows)]
+const STILL_ACTIVE: u32 = 259;
+
+#[cfg(windows)]
+fn windows_exit_code_is_running(exit_code: u32) -> bool {
+    exit_code == STILL_ACTIVE
+}
+
+/// Windows OpenProcess success alone is not liveness: another handle can keep
+/// an exited process object open. Query the real status and fail conservative.
+#[cfg(windows)]
+fn process_target_running_status(pid: i32) -> Option<bool> {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid as u32);
+        if handle.is_null() {
+            return match std::io::Error::last_os_error().raw_os_error() {
+                // Windows reports a nonexistent PID as ERROR_INVALID_PARAMETER.
+                Some(87) => Some(false),
+                _ => None,
+            };
+        }
+        let mut exit_code = 0;
+        let queried = GetExitCodeProcess(handle, &mut exit_code);
+        CloseHandle(handle);
+        (queried != 0).then(|| windows_exit_code_is_running(exit_code))
+    }
+}
+
+#[cfg(not(windows))]
+fn process_target_running_status(pid: i32) -> Option<bool> {
+    Some(super::child_process::is_process_alive(pid))
+}
+
+fn process_target_running(pid: i32) -> bool {
+    process_target_running_status(pid).unwrap_or(true)
+}
+
+fn process_exited(pid: i32) -> bool {
+    process_exited_with(
+        || process_target_running_status(pid),
+        std::time::Duration::from_millis(PROCESS_EXIT_VERIFY_MS),
+    )
+}
+
+fn process_exited_with(
+    mut running: impl FnMut() -> Option<bool>,
+    timeout: std::time::Duration,
+) -> bool {
+    wait_for_process_exit_with(|| running().unwrap_or(true), timeout)
+}
+
+fn taskkill_delivered(result: std::io::Result<std::process::Output>) -> bool {
+    result.is_ok_and(|output| output.status.success())
+}
+
+fn checked_signal_kill(pid: i32, signalled: bool) -> bool {
+    signalled && process_exited(pid)
+}
+
+/// Kill a process and all its children. `true` means the target was already
+/// gone or was observed exited inside the verification bound. False keeps
+/// detached tracking and journal evidence active for a later retry.
+pub fn kill_process_tree(pid: i32) -> bool {
+    if !process_target_running(pid) {
+        return true;
+    }
     if super::pi_user_agent::process_platform() == "win32" {
-        // Use the absolute System32 taskkill on Windows to kill the process tree
-        // (audit A4: the bare-name spawn was the one unhardened sibling site).
-        let _ = spawn_hidden(
+        // Capture and drain taskkill under the same bounded sync helper as
+        // other children; a failed spawn/status or a live target fails closed.
+        let result = super::child_process::spawn_sync_hidden_with_timeout(
             &windows_taskkill_program(),
             &[
                 "/F".to_string(),
@@ -343,21 +450,30 @@ pub fn kill_process_tree(pid: i32) {
                 pid.to_string(),
             ],
             SpawnOptions {
-                detached: true,
                 env: Some(vec![("NoDefaultCurrentDirectoryInExePath".to_string(), "1".to_string())]),
+                capture_stdout: true,
+                capture_stderr: true,
                 ..Default::default()
             },
+            WINDOWS_TASKKILL_TIMEOUT_MS,
         );
+        taskkill_delivered(result) && process_exited(pid)
     } else {
         // Use SIGKILL on Unix/Linux/Mac: the helper already falls back to a
         // single-pid kill when the process group is unavailable.
-        super::child_process::signal_process_group_or_process(pid, super::child_process::Signal::Kill);
+        let signalled = super::child_process::signal_process_group_or_process(
+            pid,
+            super::child_process::Signal::Kill,
+        );
+        checked_signal_kill(pid, signalled)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    static DETACHED_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn sanitize_binary_output_keeps_printable_characters() {
@@ -500,10 +616,138 @@ mod tests {
 
     #[test]
     fn detached_child_tracking_is_idempotent() {
+        let _serial = DETACHED_TEST_LOCK.lock().unwrap();
         untrack_detached_child_pid(999_991);
         track_detached_child_pid(999_991);
         track_detached_child_pid(999_991);
         untrack_detached_child_pid(999_991);
         assert!(tracked_pids().as_ref().map(|set| set.is_empty()).unwrap_or(true));
     }
+
+    #[test]
+    fn failed_kill_and_spawn_results_are_not_delivered() {
+        assert!(!checked_signal_kill(999_990, false));
+        let spawn_failure: std::io::Result<std::process::Output> = Err(
+            std::io::Error::new(std::io::ErrorKind::PermissionDenied, "injected spawn failure"),
+        );
+        assert!(!taskkill_delivered(spawn_failure));
+    }
+
+    #[test]
+    fn process_exit_verification_is_bounded_and_observes_late_exit() {
+        let mut probes = 0;
+        assert!(wait_for_process_exit_with(
+            || {
+                probes += 1;
+                probes < 3
+            },
+            std::time::Duration::from_secs(1),
+        ));
+        assert_eq!(probes, 3);
+        let started = std::time::Instant::now();
+        assert!(!wait_for_process_exit_with(
+            || true,
+            std::time::Duration::from_millis(15),
+        ));
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    #[test]
+    fn failed_detached_kill_stays_registered_for_retry() {
+        let _serial = DETACHED_TEST_LOCK.lock().unwrap();
+        let first = 999_970;
+        let retry = 999_971;
+        untrack_detached_child_pid(first);
+        untrack_detached_child_pid(retry);
+        track_detached_child_pid(first);
+        track_detached_child_pid(retry);
+        kill_tracked_detached_children_with(|pid| pid != retry);
+        let guard = tracked_pids();
+        let set = guard.as_ref().unwrap();
+        assert!(!set.contains(&first));
+        assert!(set.contains(&retry));
+        drop(guard);
+        untrack_detached_child_pid(retry);
+    }
+
+    #[test]
+    fn registration_during_shutdown_is_processed_in_the_next_round() {
+        let _serial = DETACHED_TEST_LOCK.lock().unwrap();
+        let first = 999_960;
+        let second = 999_961;
+        untrack_detached_child_pid(first);
+        untrack_detached_child_pid(second);
+        track_detached_child_pid(first);
+        let (entered_sender, entered_receiver) = std::sync::mpsc::channel();
+        let (continue_sender, continue_receiver) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let mut killed = Vec::new();
+            kill_tracked_detached_children_with(|pid| {
+                killed.push(pid);
+                if pid == first {
+                    entered_sender.send(()).unwrap();
+                    continue_receiver.recv().unwrap();
+                }
+                true
+            });
+            killed
+        });
+        entered_receiver.recv().unwrap();
+        track_detached_child_pid(second);
+        continue_sender.send(()).unwrap();
+        let killed = worker.join().unwrap();
+        assert!(killed.contains(&first));
+        assert!(killed.contains(&second));
+        let guard = tracked_pids();
+        let set = guard.as_ref().unwrap();
+        assert!(!set.contains(&first));
+        assert!(!set.contains(&second));
+    }
+
+
+    #[test]
+    fn continuous_registration_is_left_pending_after_two_bounded_passes() {
+        let _serial = DETACHED_TEST_LOCK.lock().unwrap();
+        let first = 999_950;
+        untrack_detached_child_pid(first);
+        track_detached_child_pid(first);
+        let mut killed = Vec::new();
+        kill_tracked_detached_children_with(|pid| {
+            killed.push(pid);
+            // Register exactly one successor per pass, forever in principle.
+            // The second registration must survive the bounded shutdown call.
+            track_detached_child_pid(pid + 1);
+            true
+        });
+        assert_eq!(killed, vec![first, first + 1]);
+        let guard = tracked_pids();
+        let set = guard.as_ref().unwrap();
+        assert!(!set.contains(&first));
+        assert!(!set.contains(&(first + 1)));
+        assert!(set.contains(&(first + 2)));
+        drop(guard);
+        untrack_detached_child_pid(first + 2);
+    }
+
+
+    #[test]
+    fn process_exit_probe_honors_status_and_conserves_query_errors() {
+        assert!(process_exited_with(
+            || Some(false),
+            std::time::Duration::ZERO,
+        ));
+        assert!(!process_exited_with(
+            || None,
+            std::time::Duration::ZERO,
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_exit_status_distinguishes_running_from_exited_handles() {
+        assert!(windows_exit_code_is_running(STILL_ACTIVE));
+        assert!(!windows_exit_code_is_running(0));
+        assert!(!windows_exit_code_is_running(1));
+    }
+
 }

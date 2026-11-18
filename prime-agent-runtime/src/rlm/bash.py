@@ -322,7 +322,10 @@ class BashHandle:
         # Descendants that left the command's process group/session (GNU
         # timeout, setsid, detached browsers); _group_alive probes them and
         # _reap_group re-kills them so they cannot outlive the journal record.
-        self._escaped: set[int] = set()
+        # pid -> start identity at discovery. A bare pid is unsafe after the
+        # original escaped child exits: the OS may recycle it for an unrelated
+        # process before a later KILL or liveness probe.
+        self._escaped: dict[int, str | None] = {}
         self._started = time.monotonic()
         # POSIX: own process group so kill() signals the whole pipeline; Windows
         # contains the tree in a kill-on-close job object.
@@ -482,11 +485,20 @@ class BashHandle:
             timer.daemon = True
             timer.start()
 
+    def _remember_escaped(self, descendants: list[int]) -> None:
+        for child in descendants:
+            if child not in self._escaped:
+                # Keep the original identity even if this pid is rediscovered;
+                # replacing it would legitimize a recycled process.
+                self._escaped[child] = _process_start_id(child)
+
     def _signal_own_tree(self, sig: int) -> bool:
         """Signal the group plus every descendant, remembering the escapes."""
         descendants = _descendant_pids(self._pid) if _IS_POSIX else []
-        self._escaped.update(descendants)
-        return _signal_tree(self._pid, sig, descendants)
+        self._remember_escaped(descendants)
+        return _signal_tree(
+            self._pid, sig, {child: self._escaped[child] for child in descendants}
+        )
 
     def _force_kill(self) -> None:
         if not self._reaped:
@@ -636,7 +648,7 @@ class BashHandle:
                 job, self._job = self._job, None
                 _winjob.close(job)
             return delivered or _taskkill_tree(self._pid)
-        return _signal_tree(self._pid, signal.SIGKILL, sorted(self._escaped))
+        return _signal_tree(self._pid, signal.SIGKILL, self._escaped)
 
     def _read_status(self) -> int | None:
         if self._status_read < 0:
@@ -859,13 +871,19 @@ class BashHandle:
                 if empty is not None:
                     return not empty
             return self._proc.poll() is None
-        for child in self._escaped:
-            try:
-                os.kill(child, 0)
-            except ProcessLookupError:
+        for child, start_id in self._escaped.items():
+            present, current_id = _probe_escaped_identity(child)
+            if present is False:
+                # Only ProcessLookupError is positive absence; a failed start
+                # lookup alone is not enough to retire the original child.
                 continue
-            except OSError:
-                pass
+            if start_id is not None and current_id is not None and current_id != start_id:
+                # A positively different identity proves that this numeric pid
+                # was recycled and the original child is gone.
+                continue
+            # Unknown presence/identity remains live. For an initially unknown
+            # entry, never adopt a later start id: it may belong to a recycled
+            # process, so only positive absence can retire this entry.
             return True
         try:
             os.killpg(self._pid, 0)
@@ -1129,8 +1147,49 @@ def _descendant_pids(root: int) -> list[int]:
     return result
 
 
-def _signal_tree(pid: int, sig: int, descendants: list[int]) -> bool:
-    """Signal the command's process group plus descendants that escaped it.
+def _probe_escaped_identity(pid: int) -> tuple[bool | None, str | None]:
+    """Return (presence, start-id), with three-valued presence.
+
+    False is reserved for a positive ProcessLookupError absence probe. None
+    means the process may still exist but its current identity is unavailable
+    (including proc/ps failure or an unprivileged liveness probe). A start-id
+    lookup returning None is therefore never, by itself, treated as exit.
+    """
+    current_id = _process_start_id(pid)
+    if current_id is not None:
+        return True, current_id
+    try:
+        # This is only an absence check, never authority to send the cleanup
+        # signal: a live numeric pid still needs a matching start identity.
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False, None
+    except OSError:
+        pass  # EPERM and transient probe failures remain conservatively live.
+    return None, None
+
+
+def _signal_escaped_pid(pid: int, start_id: str | None, sig: int) -> bool:
+    """Signal an escaped child only while its recorded identity still matches."""
+    present, current_id = _probe_escaped_identity(pid)
+    if present is False:
+        # The original is positively absent, so no delivery remains necessary.
+        return True
+    if start_id is not None and current_id is not None and current_id != start_id:
+        # A different identity proves reuse: do not signal the replacement, but
+        # do not strand the original child's journal record either.
+        return True
+    if start_id is None or current_id != start_id:
+        # Unknown identity or transient lookup failure is unverifiable, not
+        # gone: remain live/undelivered and retry on a later cleanup pass.
+        return False
+    # A confirmed match is immediately beside the signal; no kill-0-only path
+    # can authorize SIGKILL of a possibly recycled numeric pid.
+    return _signal_pid(pid, sig)
+
+
+def _signal_tree(pid: int, sig: int, descendants: dict[int, str | None]) -> bool:
+    """Signal the command's process group plus identity-verified escaped children.
 
     Callers collect the descendants before any signal is sent: once the leader
     dies the survivors are reparented and can no longer be found from it. Only
@@ -1139,8 +1198,8 @@ def _signal_tree(pid: int, sig: int, descendants: list[int]) -> bool:
     if not _IS_POSIX:
         return True
     delivered = _signal_group(pid, sig)
-    for child in descendants:
-        if not _signal_pid(child, sig):
+    for child, start_id in descendants.items():
+        if not _signal_escaped_pid(child, start_id, sig):
             delivered = False
     return delivered
 
@@ -1295,8 +1354,8 @@ def _kill_live_handles() -> None:
         handles = list(_live_handles)
     for handle in handles:
         if _IS_POSIX:
-            handle._escaped.update(_descendant_pids(handle._pid))
-            delivered = _signal_tree(handle._pid, signal.SIGKILL, sorted(handle._escaped))
+            handle._remember_escaped(_descendant_pids(handle._pid))
+            delivered = _signal_tree(handle._pid, signal.SIGKILL, handle._escaped)
         else:
             with handle._kill_lock:
                 if handle._reaped:

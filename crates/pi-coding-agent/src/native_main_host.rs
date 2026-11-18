@@ -351,6 +351,40 @@ fn print_options(options: PrintModeSeamOptions) -> PrintModeOptions {
     }
 }
 
+#[cfg(any(not(unix), test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NonUnixPrintSignal {
+    CtrlC,
+    CtrlClose,
+}
+
+#[cfg(any(not(unix), test))]
+fn nonunix_print_signal(signal: &str, windows: bool) -> Option<NonUnixPrintSignal> {
+    match signal {
+        "SIGINT" => Some(NonUnixPrintSignal::CtrlC),
+        "SIGTERM" if windows => Some(NonUnixPrintSignal::CtrlClose),
+        _ => None,
+    }
+}
+
+#[cfg(any(not(unix), test))]
+fn listen_for_nonunix_print_signal_with(
+    signal: &str,
+    windows: bool,
+    handler: Arc<dyn Fn() + Send + Sync>,
+    subscribe: impl FnOnce(NonUnixPrintSignal) -> BoxFuture<bool> + Send + 'static,
+) -> Arc<dyn Fn() + Send + Sync> {
+    let Some(event) = nonunix_print_signal(signal, windows) else {
+        return Arc::new(|| {});
+    };
+    let task = tokio::spawn(async move {
+        if subscribe(event).await {
+            handler();
+        }
+    });
+    Arc::new(move || task.abort())
+}
+
 struct NativePrintHost;
 
 impl PrintModeHost for NativePrintHost {
@@ -359,10 +393,10 @@ impl PrintModeHost for NativePrintHost {
         signal: &str,
         handler: Arc<dyn Fn() + Send + Sync>,
     ) -> Arc<dyn Fn() + Send + Sync> {
-        let signal = signal.to_string();
-        let task = tokio::spawn(async move {
-            #[cfg(unix)]
-            {
+        #[cfg(unix)]
+        {
+            let signal = signal.to_string();
+            let task = tokio::spawn(async move {
                 use tokio::signal::unix::{signal as subscribe, SignalKind};
                 let kind = match signal.as_str() {
                     "SIGINT" => SignalKind::interrupt(),
@@ -374,21 +408,91 @@ impl PrintModeHost for NativePrintHost {
                         handler();
                     }
                 }
-            }
-            #[cfg(not(unix))]
-            {
-                let _ = signal;
-                if tokio::signal::ctrl_c().await.is_ok() {
-                    handler();
-                }
-            }
-        });
-        Arc::new(move || task.abort())
+            });
+            Arc::new(move || task.abort())
+        }
+        #[cfg(not(unix))]
+        {
+            listen_for_nonunix_print_signal_with(signal, cfg!(windows), handler, |event| {
+                Box::pin(async move {
+                    match event {
+                        NonUnixPrintSignal::CtrlC => tokio::signal::ctrl_c().await.is_ok(),
+                        NonUnixPrintSignal::CtrlClose => {
+                            #[cfg(windows)]
+                            {
+                                match tokio::signal::windows::ctrl_close() {
+                                    Ok(mut stream) => stream.recv().await.is_some(),
+                                    Err(_) => false,
+                                }
+                            }
+                            #[cfg(not(windows))]
+                            {
+                                false
+                            }
+                        }
+                    }
+                })
+            })
+        }
     }
     fn exit(&self, code: i32) {
         std::process::exit(code);
     }
     fn platform(&self) -> String {
         crate::utils::pi_user_agent::process_platform().to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::Mutex;
+
+    #[tokio::test]
+    async fn windows_print_signals_use_only_their_matching_console_events() {
+        for (signal, expected) in [
+            ("SIGINT", NonUnixPrintSignal::CtrlC),
+            ("SIGTERM", NonUnixPrintSignal::CtrlClose),
+        ] {
+            let subscriptions = Arc::new(Mutex::new(Vec::new()));
+            let calls = Arc::new(AtomicUsize::new(0));
+            let source = subscriptions.clone();
+            let handler_calls = calls.clone();
+            let cleanup = listen_for_nonunix_print_signal_with(
+                signal,
+                true,
+                Arc::new(move || {
+                    handler_calls.fetch_add(1, Ordering::SeqCst);
+                }),
+                move |event| {
+                    source.lock().unwrap().push(event);
+                    Box::pin(async { true })
+                },
+            );
+            tokio::task::yield_now().await;
+            assert_eq!(*subscriptions.lock().unwrap(), vec![expected]);
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            cleanup();
+        }
+    }
+
+    #[tokio::test]
+    async fn unsupported_nonunix_print_signals_install_no_listener() {
+        for (signal, windows) in [("SIGHUP", true), ("SIGTERM", false), ("SIGBOGUS", true)] {
+            let subscriptions = Arc::new(AtomicUsize::new(0));
+            let source = subscriptions.clone();
+            let cleanup = listen_for_nonunix_print_signal_with(
+                signal,
+                windows,
+                Arc::new(|| panic!("unsupported signal invoked the handler")),
+                move |_| {
+                    source.fetch_add(1, Ordering::SeqCst);
+                    Box::pin(async { true })
+                },
+            );
+            cleanup();
+            assert_eq!(subscriptions.load(Ordering::SeqCst), 0);
+        }
     }
 }

@@ -100,7 +100,7 @@ pub(super) fn create(
     search: Option<String>,
     rows: Rc<Cell<f64>>,
     selection: mpsc::Sender<Option<String>>,
-    send: mpsc::Sender<HostEvent>,
+    send: HostEventSender,
 ) -> Result<ConfigurationMenuComponent, String> {
     let auth = Rc::new(RefCell::new(AuthStorage::create(None, None)));
     let registry = Rc::new(RefCell::new(ModelRegistry::create(

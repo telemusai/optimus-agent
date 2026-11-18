@@ -266,7 +266,7 @@ pub(super) fn configure(editor: &mut CustomEditor, mode: Rc<RefCell<InteractiveM
     let connection = mode.borrow().agent_connection
         .downcast_ref::<Arc<dyn wire::AgentConnection>>().cloned();
     if let (Some(connection), Ok(runtime)) = (connection, tokio::runtime::Handle::try_current()) {
-        let (send, receive) = mpsc::channel();
+        let (send, receive) = mpsc::sync_channel(64 * 1024);
         let task = runtime.spawn(async move {
             let result = tokio::time::timeout(Duration::from_secs(5), connection.get_commands())
                 .await.unwrap_or_else(|_| Err("command catalogue timed out".into()));
@@ -309,7 +309,7 @@ mod tests {
     #[tokio::test]
     async fn live_catalogue_adds_telegram_without_hiding_builtins_or_blocking_input() {
         let mode = test_mode();
-        let (send, receive) = mpsc::channel();
+        let (send, receive) = mpsc::sync_channel(64 * 1024);
         let mut provider = NativeAutocomplete::new(CombinedAutocompleteProvider::new(
             command_entries(mode.clone()), ".", None));
         provider.catalogue = Some(PendingCatalogue {

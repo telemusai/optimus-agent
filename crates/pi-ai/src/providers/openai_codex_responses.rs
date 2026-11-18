@@ -749,12 +749,12 @@ pub fn stream_openai_codex_responses(
     // TS: `registerSessionResourceCleanup(closeOpenAICodexWebSocketSessions)` runs at
     // module load; Rust registers it on first use.
     ensure_web_socket_session_cleanup_registered();
-    let stream = create_assistant_message_event_stream();
-    let out = stream.clone();
+    let stream = AssistantMessageEventStream::new_owned();
+    let out = stream.producer_handle();
     let model = model.clone();
     let context = context.clone();
     let options = options.unwrap_or_default();
-    tokio::spawn(async move {
+    stream.spawn(async move {
         let mut output = AssistantMessage::new(
             "openai-codex-responses".to_string(),
             model.provider.clone(),
@@ -1121,6 +1121,7 @@ async fn process_stream(
             }
         })),
         on_usage_observation: options.stream.on_usage_observation.clone(),
+        idle_timeout: Some(crate::utils::sse_frames::resolve_sse_idle_timeout()),
     };
     // The response headers may arrive long before another body chunk. Dropping
     // this future on cancellation releases the SSE body and retains partial output.
@@ -1290,7 +1291,14 @@ where
                     });
                     let mut output = event;
                     if let Some(object) = output.as_object_mut() {
-                        object.insert("type".to_string(), Value::String("response.completed".to_string()));
+                        object.insert(
+                            "type".to_string(),
+                            Value::String(if type_ == "response.incomplete" {
+                                "response.incomplete".to_string()
+                            } else {
+                                "response.completed".to_string()
+                            }),
+                        );
                         object.insert("response".to_string(), normalized_response.unwrap_or(Value::Null));
                     }
                     return Some((output, (events, error_slot)));
@@ -2758,6 +2766,7 @@ async fn process_web_socket_stream(
             }
         })),
         on_usage_observation: options.stream.on_usage_observation.clone(),
+        idle_timeout: Some(crate::utils::sse_frames::resolve_sse_idle_timeout()),
     };
 
     let result = process_responses_stream(
@@ -3874,6 +3883,54 @@ mod tests {
         assert!(error.is_none());
         assert_eq!(mapped[0]["response"]["status"], "incomplete");
         assert_eq!(mapped[0]["response"]["incomplete_details"]["reason"], "max_output_tokens");
+    }
+
+    #[tokio::test]
+    async fn normalized_sse_and_websocket_incomplete_reach_shared_length_settlement() {
+        for transport in ["sse", "websocket"] {
+            let mut event = json!({
+                "type":"response.incomplete",
+                "response":{"status":"weird","incomplete_details":{"reason":"max_output_tokens"}}
+            });
+            if transport == "websocket" {
+                crate::providers::responses_transport::normalize_event(&mut event);
+            }
+            let slot: Arc<Mutex<Option<CodexThrown>>> = Arc::new(Mutex::new(None));
+            let mapped: Vec<Value> = map_codex_events(
+                futures::stream::iter(vec![Ok(event)]), slot,
+            ).collect().await;
+            assert_eq!(mapped[0]["type"], "response.incomplete", "{transport}");
+            let model = model();
+            let mut output = AssistantMessage::new(model.api.clone(), model.provider.clone(), model.id.clone(), 0);
+            let stream = AssistantMessageEventStream::new();
+            process_responses_stream(
+                Box::pin(futures::stream::iter(mapped)), &mut output, &stream, &model, None,
+            ).await.unwrap();
+            assert_eq!(output.stop_reason, "length", "{transport}");
+            assert_eq!(output.stop_reason_raw.as_deref(), Some("max_output_tokens"), "{transport}");
+        }
+    }
+
+    #[tokio::test]
+    async fn normalized_invalid_terminal_cannot_authorize_partial_tool_call() {
+        let slot: Arc<Mutex<Option<CodexThrown>>> = Arc::new(Mutex::new(None));
+        let mapped: Vec<Value> = map_codex_events(futures::stream::iter(vec![
+            Ok(json!({"type":"response.output_item.added","item":{
+                "type":"function_call","id":"fn","call_id":"call","name":"read"
+            }})),
+            Ok(json!({"type":"response.function_call_arguments.delta","delta":"{\"path\":\"/tmp"})),
+            Ok(json!({"type":"response.done","response":{"status":"in_progress"}})),
+        ]), slot).collect().await;
+        let model = model();
+        let mut output = AssistantMessage::new(model.api.clone(), model.provider.clone(), model.id.clone(), 0);
+        let stream = AssistantMessageEventStream::new();
+        let error = process_responses_stream(
+            Box::pin(futures::stream::iter(mapped)), &mut output, &stream, &model, None,
+        ).await.unwrap_err();
+        assert!(error.message().contains("expected completed"));
+        assert!(!stream.is_done());
+        let ContentBlock::ToolCall(call) = &output.content[0] else { panic!("partial tool call") };
+        assert_eq!(call.arguments["path"], "/tmp");
     }
 
     #[test]

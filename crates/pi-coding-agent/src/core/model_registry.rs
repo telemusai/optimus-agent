@@ -1083,11 +1083,11 @@ fn read_openai_codex_account_id(token: &str) -> Option<String> {
 /// Shipping a new Codex model takes two edits, and both are required:
 /// 1. Add reviewed metadata to `pi-ai/src/models.subscription.json`.
 /// 2. Raise this constant to a Codex CLI release whose catalog includes that
-///    model. GPT-6.1 Sol discovery was verified with rust-v0.159.1 on
-///    2026-09-30. Account rollout is still provider-owned.
+///    model. GPT-6.2 Astra discovery was verified with client version 0.169.0 on
+///    2026-11-18. Account rollout is still provider-owned.
 ///
 /// Catalog behaviour measured 2026-08-13; see #702.
-const OPENAI_CODEX_CLIENT_VERSION: &str = "0.159.1";
+const OPENAI_CODEX_CLIENT_VERSION: &str = "0.169.0";
 
 fn openai_codex_models_url(base_url: &str) -> String {
     let normalized = base_url.trim_end_matches('/');
@@ -4508,6 +4508,7 @@ mod tests {
         for (status, body, expected) in [
             (200, json!({"models": [{"slug": "gpt-6.1-sol"}, {"slug": "gpt-6-sol"}, {"slug": "gpt-6-luna"}]}),
                 vec!["gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna"]),
+            (200, json!({"models": [{"slug": "gpt-6.2-astra"}]}), vec!["gpt-6.2-astra"]),
             (200, json!({"models": [{"slug": "gpt-6.1-sol"}]}), vec!["gpt-6.1-sol"]),
             (200, json!({"models": [{"slug": "gpt-6-sol"}]}), vec!["gpt-6-sol"]),
             (200, json!({"models": []}), vec![]),
@@ -4530,7 +4531,7 @@ mod tests {
                 observed_calls.fetch_add(1, Ordering::SeqCst);
                 assert_eq!(request.method, "GET");
                 assert_eq!(request.url,
-                    "https://chatgpt.com/backend-api/codex/models?client_version=0.159.1");
+                    "https://chatgpt.com/backend-api/codex/models?client_version=0.169.0");
                 assert!(request.body.is_none());
                 assert!(request.headers.contains(&(
                     "Authorization".to_string(), format!("Bearer {}", expected_token),

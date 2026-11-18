@@ -151,6 +151,25 @@ def _unwrap(words: list[str]) -> tuple[list[str], bool]:
     return words[index:], uncertain
 
 
+def _checkout_operands(args: list[str]) -> list[str]:
+    """Return checkout tree-ish/path operands, excluding option arguments."""
+    takes_value = {
+        "-b", "-B", "-C", "-c",
+        "--orphan", "--conflict", "--pathspec-from-file",
+    }
+    operands: list[str] = []
+    index = 0
+    while index < len(args):
+        word = args[index]
+        if word in takes_value:
+            index += 2
+        else:
+            if not word.startswith("-"):
+                operands.append(word)
+            index += 1
+    return operands
+
+
 def _git_site(words: list[str], cwd: Path) -> tuple[Path, bool, bool] | None:
     """Return target, ignored-file mode and unresolved-global-option flag."""
     args = words[1:]
@@ -199,8 +218,10 @@ def _git_site(words: list[str], cwd: Path) -> tuple[Path, bool, bool] | None:
         # Include named pathspecs, not only the upstream whole-tree '.' idiom.
         destructive = ("--" in tail or any(flag in flags for flag in ("--force", "--ours", "--theirs", "--merge"))
                        or any(c in short for c in "fm") or any(flag.startswith("--conflict") for flag in flags))
-        # A tree-ish followed by a path can discard without '--'.
-        destructive |= len([word for word in options if not word.startswith("-")]) >= 2
+        # A tree-ish followed by a path can discard without '--'. Option values
+        # are not operands: `checkout -b topic main` creates a branch at main,
+        # while `checkout main tracked` can discard the tracked path.
+        destructive |= len(_checkout_operands(options)) >= 2
     if not destructive:
         return None
     return cwd, subcommand == "clean" and ("x" in short or "X" in short), unknown

@@ -3057,50 +3057,52 @@ impl DefaultPackageManager {
         )
         .map_err(|error| error.to_string())?;
         let mut child = handle.child;
-
-        // `child.stdout?.on("data", ...)` / `child.stderr?.on("data", ...)` stream both pipes
-        // concurrently and the promise settles on `close` (package-manager.ts:2389-2413), so a
-        // child that fills stderr while stdout stays open must not block and the timeout covers
-        // the whole run. Reading the pipes one after the other deadlocks that case.
-        let stdout_pipe = child.stdout.take();
-        let stderr_pipe = child.stderr.take();
-        // Both `"data"` listeners drain their pipe at the same time (package-manager.ts:2389-2394).
-        let read_stdout = async move {
-            use tokio::io::AsyncReadExt;
-            let mut buffer = Vec::new();
-            if let Some(mut pipe) = stdout_pipe {
-                let _ = pipe.read_to_end(&mut buffer).await;
-            }
-            String::from_utf8_lossy(&buffer).to_string()
-        };
-        let read_stderr = async move {
-            use tokio::io::AsyncReadExt;
-            let mut buffer = Vec::new();
-            if let Some(mut pipe) = stderr_pipe {
-                let _ = pipe.read_to_end(&mut buffer).await;
-            }
-            String::from_utf8_lossy(&buffer).to_string()
-        };
-        // Read the pid before the capture future borrows the child.
         let pid = child.id().map(|pid| pid as i32);
+        // The owner takes and drains both pipes while waiting. Borrowing the
+        // owner also prevents cancellation of the first timeout from dropping
+        // and force-killing the child before the documented SIGTERM path.
         let capture = async {
-            let (stdout, stderr, status) = tokio::join!(read_stdout, read_stderr, wait_for_child_process(child));
-            (stdout, stderr, status)
+            let output = crate::utils::child_process::wait_for_child_process_with_output(&mut child).await?;
+            let status = crate::utils::child_process::exit_code_for_status(&output.status);
+            Ok::<_, std::io::Error>((
+                String::from_utf8_lossy(&output.stdout).to_string(),
+                String::from_utf8_lossy(&output.stderr).to_string(),
+                status,
+            ))
         };
+        tokio::pin!(capture);
+
 
         // `const timeout = setTimeout(() => { timedOut = true; child.kill(); }, timeoutMs)`
         // (package-manager.ts:2381-2387); the `close` handler then rejects with
         // `${command} ${args.join(" ")} timed out after ${options?.timeoutMs}ms` (2392-2397).
         let outcome = match capture_timeout_duration(timeout_ms) {
-            Some(duration) => tokio::time::timeout(duration, capture).await,
-            None => Ok(capture.await),
+            Some(duration) => tokio::time::timeout(duration, &mut capture).await,
+            None => Ok((&mut capture).await),
         };
         let (stdout, stderr, code) = match outcome {
-            Ok((stdout, stderr, status)) => (stdout, stderr, status.map_err(|error| error.to_string())?),
+            Ok(result) => result.map_err(|error| error.to_string())?,
             Err(_) => {
                 // `child.kill()`: SIGTERM on POSIX, TerminateProcess on Windows.
                 if let Some(pid) = pid {
                     signal_process_group_or_process(pid, Signal::Term);
+                    // Resume the same capture so its readers and wait remain
+                    // intact. Escalate only after the graceful bound expires,
+                    // then bound the final kill/reap wait as well.
+                    if tokio::time::timeout(
+                        std::time::Duration::from_secs(1),
+                        &mut capture,
+                    )
+                    .await
+                    .is_err()
+                    {
+                        signal_process_group_or_process(pid, Signal::Kill);
+                        let _ = tokio::time::timeout(
+                            std::time::Duration::from_secs(3),
+                            &mut capture,
+                        )
+                        .await;
+                    }
                 }
                 return Err(format!(
                     "{} {} timed out after {}ms",

@@ -37,9 +37,6 @@ const MAX_MISTRAL_ERROR_BODY_CHARS: usize = 4000;
 const MISTRAL_USER_AGENT: &str = "speakeasy-sdk/typescript 2.2.1 2.881.4 1.0.0 @mistralai/mistralai";
 /// `ServerList[ServerEu]` - the SDK default when `serverURL` is not set.
 const MISTRAL_DEFAULT_SERVER_URL: &str = "https://api.mistral.ai";
-/// `timeoutMs: options?.timeoutMs || client._options.timeoutMs || 30000`.
-const MISTRAL_DEFAULT_TIMEOUT_MS: u64 = 30000;
-
 /// Mistral reasoning-effort values.
 pub type MistralReasoningEffort = String;
 
@@ -145,12 +142,12 @@ pub fn stream_mistral(
 	context: &Context,
 	options: Option<MistralOptions>,
 ) -> AssistantMessageEventStream {
-	let stream = create_assistant_message_event_stream();
-	let out = stream.clone();
+	let stream = AssistantMessageEventStream::new_owned();
+	let out = stream.producer_handle();
 	let model = model.clone();
 	let context = context.clone();
 	let options = options.unwrap_or_default();
-	tokio::spawn(async move {
+	stream.spawn(async move {
 		let mut output = create_output(&model);
 
 		match run_stream_mistral(&model, &context, &options, &mut output, &out).await {
@@ -529,22 +526,11 @@ async fn send_request(
 		.headers(headers)
 		.json(&Value::Object(payload.clone()));
 	let timeout_ms = options.stream.timeout_ms.map(|value| value.max(0.0) as u64);
-	// TS SDK (`@mistralai/mistralai` sdks.ts `_createRequest`) arms its default
-	// request timeout only when the caller supplies no signal:
-	// `if (!fetchOptions?.signal && conf.timeoutMs > 0)`. A live caller signal
-	// therefore suppresses the 30 s default; an explicit timeout_ms still applies.
-	let effective_timeout = match timeout_ms {
-		Some(explicit) => Some(explicit),
-		None => {
-			if options.stream.signal.is_some() {
-				None
-			} else {
-				Some(MISTRAL_DEFAULT_TIMEOUT_MS)
-			}
-		}
-	};
-	if let Some(effective_timeout) = effective_timeout {
-		request = request.timeout(std::time::Duration::from_millis(effective_timeout));
+	// A streaming response may legitimately stay quiet beyond the SDK's former
+	// 30 s default. Only an explicit caller deadline applies to the whole request;
+	// body reads have their own cancellation and idle backstop below.
+	if let Some(timeout_ms) = timeout_ms {
+		request = request.timeout(std::time::Duration::from_millis(timeout_ms));
 	}
 
 	let send = request.send();
@@ -1364,7 +1350,29 @@ impl MistralChunkStream {
 					return Err(MistralStreamError::Message("Request was aborted".to_string()));
 				}
 			}
-			match self.chunks.next().await {
+			let next_chunk = self.chunks.next();
+			tokio::pin!(next_chunk);
+			let idle_timeout = crate::utils::sse_frames::resolve_sse_idle_timeout();
+			let idle = tokio::time::sleep(idle_timeout);
+			tokio::pin!(idle);
+			let read = if let Some(signal) = &self.signal {
+				tokio::select! {
+					biased;
+					_ = signal.cancelled() => return Err(MistralStreamError::Message("Request was aborted".to_string())),
+					_ = idle.as_mut() => return Err(MistralStreamError::Message(format!(
+						"SSE stream stalled: no data received within {}ms", idle_timeout.as_millis()
+					))),
+					read = next_chunk.as_mut() => read,
+				}
+			} else {
+				tokio::select! {
+					_ = idle.as_mut() => return Err(MistralStreamError::Message(format!(
+						"SSE stream stalled: no data received within {}ms", idle_timeout.as_millis()
+					))),
+					read = next_chunk.as_mut() => read,
+				}
+			};
+			match read {
 				None => {
 					self.finished = true;
 					// `findBoundary` failed and `upstream.read()` reported `done`, so the SDK calls
@@ -1999,8 +2007,16 @@ async fn consume_chat_stream(
 	// deletes before the block is persisted; the Rust `ToolCall` has no such field, so the
 	// buffer lives beside it, keyed by the block index.
 	let mut partial_args_by_index: HashMap<usize, String> = HashMap::new();
+	let mut finish_reason_received = false;
 
 	while let Some(chunk) = mistral_stream.next().await? {
+		let chunk_has_finish_reason = match &chunk {
+			MistralChunkEvent::Typed(typed) => typed.choices.iter().any(|choice| choice.finish_reason.as_deref().is_some_and(|reason| !reason.is_empty())),
+			MistralChunkEvent::Value(chunk) => chunk.get("choices").and_then(Value::as_array).is_some_and(|choices| {
+				choices.iter().any(|choice| choice.get("finishReason").and_then(Value::as_str).is_some_and(|reason| !reason.is_empty()))
+			}),
+		};
+		finish_reason_received |= chunk_has_finish_reason;
 		match chunk {
 			MistralChunkEvent::Typed(typed) => handle_mistral_typed_chunk(
 				&typed,
@@ -2021,6 +2037,12 @@ async fn consume_chat_stream(
 				&mut partial_args_by_index,
 			),
 		}
+	}
+
+	if !mistral_stream.done && !finish_reason_received {
+		return Err(MistralStreamError::Message(
+			"Mistral stream ended before [DONE] or a finish reason was received".to_string(),
+		));
 	}
 
 	if let Some(block) = current_block.take() {
@@ -2612,6 +2634,83 @@ mod tests {
 		explicit.stream.session_id = Some("session-1".to_string());
 		let request_options = build_request_options(&model, &explicit);
 		assert_eq!(request_options.headers.get("x-affinity").map(String::as_str), Some("caller"));
+	}
+
+	fn consume_chunks_for_test(body: &'static str) -> (MistralChunkStream, AssistantMessage, AssistantMessageEventStream) {
+		let mut stream = MistralChunkStream {
+			chunks: Box::pin(futures::stream::empty()),
+			buffer: body.to_string(),
+			pending: Vec::new(),
+			pending_bytes: Vec::new(),
+			done: false,
+			finished: false,
+			signal: None,
+		};
+		stream.drain_events().unwrap();
+		let output = create_output(&model("mistral-large-latest"));
+		let events = AssistantMessageEventStream::new();
+		(stream, output, events)
+	}
+
+	#[tokio::test]
+	async fn clean_eof_without_done_or_finish_reason_is_an_error_before_tool_call_end() {
+		let body = concat!(
+			"data: {\"id\":\"call-1\",\"choices\":[{\"delta\":{\"tool_calls\":[",
+			"{\"id\":\"abc\",\"index\":0,\"function\":{\"name\":\"read\",\"arguments\":\"{\\\"path\\\":\\\"/tmp\"}}]}}]}\n\n"
+		);
+		let (mut chunks, mut output, events) = consume_chunks_for_test(body);
+		let error = consume_chat_stream(&model("mistral-large-latest"), &mut output, &events, &mut chunks)
+			.await
+			.unwrap_err();
+		assert!(error.error_message().contains("[DONE] or a finish reason"));
+		assert!(!events.is_done(), "the caller, not the consumer, owns the terminal error");
+		assert!(matches!(output.content.first(), Some(ContentBlock::ToolCall(_))));
+	}
+
+	#[tokio::test]
+	async fn valid_done_sentinel_still_finalizes_streamed_tool_calls() {
+		let body = concat!(
+			"data: {\"id\":\"call-1\",\"choices\":[{\"delta\":{\"tool_calls\":[",
+			"{\"id\":\"abc\",\"index\":0,\"function\":{\"name\":\"read\",\"arguments\":\"{}\"}}]}}]}\n\n",
+			"data: [DONE]\n\n"
+		);
+		let (mut chunks, mut output, events) = consume_chunks_for_test(body);
+		consume_chat_stream(&model("mistral-large-latest"), &mut output, &events, &mut chunks)
+			.await
+			.unwrap();
+		assert!(chunks.done);
+		let event = events.next().await.unwrap();
+		assert!(matches!(event, AssistantMessageEvent::ToolCallStart { .. }));
+		let event = events.next().await.unwrap();
+		assert!(matches!(event, AssistantMessageEvent::ToolCallDelta { .. }));
+		let event = events.next().await.unwrap();
+		assert!(matches!(event, AssistantMessageEvent::ToolCallEnd { .. }));
+	}
+
+	#[tokio::test]
+	async fn pending_body_read_responds_to_cancellation() {
+		let signal = tokio_util::sync::CancellationToken::new();
+		let stream = MistralChunkStream {
+			chunks: Box::pin(futures::stream::pending()),
+			buffer: String::new(),
+			pending: Vec::new(),
+			pending_bytes: Vec::new(),
+			done: false,
+			finished: false,
+			signal: Some(signal.clone()),
+		};
+		let reader = tokio::spawn(async move {
+			let mut stream = stream;
+			stream.next().await
+		});
+		tokio::task::yield_now().await;
+		signal.cancel();
+		let error = tokio::time::timeout(std::time::Duration::from_secs(1), reader)
+			.await
+			.expect("body read must settle")
+			.unwrap()
+			.unwrap_err();
+		assert_eq!(error.error_message(), "Request was aborted");
 	}
 
 	#[test]
