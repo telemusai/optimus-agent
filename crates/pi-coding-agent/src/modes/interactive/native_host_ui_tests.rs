@@ -338,6 +338,53 @@ fn tool_render_cache_nested_ipython_images_and_setting_transitions_bypass_cache(
 }
 
 #[test]
+fn nested_ipython_and_image_restyle_and_remap_without_invalidate() {
+    use crate::modes::interactive::theme::theme::set_theme;
+    use pi_tui::keybindings::{
+        get_keybindings, set_keybindings, KeybindingDefinition, KeybindingsManager,
+    };
+    use pi_tui::terminal_image::{
+        reset_capabilities_cache, set_capabilities, TerminalCapabilities,
+    };
+
+    set_theme("neon", false);
+    set_capabilities(TerminalCapabilities {
+        images: None,
+        true_color: false,
+        hyperlinks: true,
+    });
+    let component = settled_image_tool("ipython");
+    let mut row: Box<dyn TuiComponent> = Box::new(ToolRow(component));
+    let mut cache = Vec::new();
+    let neon = render_row_cached(&mut cache, 0, &mut row, 120.0, 1);
+    assert!(neon.iter().any(|line| line.contains("Cannot display image")));
+
+    set_theme("prime", false);
+    let prime = render_row_cached(&mut cache, 0, &mut row, 120.0, 1);
+    assert_ne!(neon, prime, "theme must reach both settled cell and image fallback");
+
+    let previous_bindings = get_keybindings();
+    let mut definitions = indexmap::IndexMap::new();
+    definitions.insert(
+        "app.tools.expand".to_string(),
+        KeybindingDefinition {
+            default_keys: vec!["f9".to_string()],
+            default_keys_is_single: true,
+            description: Some("Expand tool output".to_string()),
+            default_key_scope: None,
+        },
+    );
+    set_keybindings(KeybindingsManager::new(definitions, Default::default()));
+    let remapped = render_row_cached(&mut cache, 0, &mut row, 120.0, 1);
+    assert!(
+        remapped.iter().any(|line| line.contains("F9")),
+        "remapped hint must replace the settled cell cache: {remapped:?}"
+    );
+    set_keybindings(previous_bindings);
+    reset_capabilities_cache();
+}
+
+#[test]
 fn tool_render_cache_bypasses_running_and_partial_rows_then_tracks_width_and_style() {
     crate::modes::interactive::theme::theme::init_theme(Some("neon"), false);
     let mut component = ToolExecutionComponent::new(

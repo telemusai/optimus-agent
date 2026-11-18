@@ -52,13 +52,13 @@ use super::jev_menu_component::JevMenuComponent;
 // `CommandOutput` and `HostEvent` are declared by the host module that owns this
 // one (`native_host.rs`); the explicit path keeps this file independent of the
 // host's own glob imports.
-use super::super::{CommandOutput, HostEvent};
+use super::super::{host_event_channel, CommandOutput, HostEvent, HostEventReceiver, HostEventSender};
 use pi_jev::credential::{default_credential_store, CredentialStore, CredentialWriteGate};
 use pi_jev::types::JevMode;
 
 /// One menu action, sent from the overlay component back to this handler.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) enum JevMenuEvent {
+pub(in crate::modes::interactive::interactive_mode::native_host) enum JevMenuEvent {
     Action(JevMenuAction),
 }
 
@@ -71,16 +71,16 @@ pub(super) enum JevKeyEvent {
 
 /// The `/jev` menu overlay. It routes keys and reports actions; all decisions
 /// live in the pure [`JevMenuState`](super::jev_menu::JevMenuState).
-pub(super) struct JevMenuOverlay {
+pub(in crate::modes::interactive::interactive_mode::native_host) struct JevMenuOverlay {
     component: JevMenuComponent,
-    send: mpsc::Sender<HostEvent>,
+    send: HostEventSender,
 }
 
 impl JevMenuOverlay {
-    pub(super) fn new(
+    pub(in crate::modes::interactive::interactive_mode::native_host) fn new(
         mode: JevMode,
         events: async_mpsc::UnboundedSender<JevMenuEvent>,
-        send: mpsc::Sender<HostEvent>,
+        send: HostEventSender,
     ) -> Self {
         let component = JevMenuComponent::new(
             mode,
@@ -114,13 +114,13 @@ impl TuiComponent for JevMenuOverlay {
 pub(super) struct JevKeyOverlay {
     component: JevKeyInputComponent,
     events: Rc<RefCell<Option<async_mpsc::UnboundedSender<JevKeyEvent>>>>,
-    send: mpsc::Sender<HostEvent>,
+    send: HostEventSender,
 }
 
 impl JevKeyOverlay {
     pub(super) fn new(
         events: async_mpsc::UnboundedSender<JevKeyEvent>,
-        send: mpsc::Sender<HostEvent>,
+        send: HostEventSender,
     ) -> Self {
         Self {
             component: JevKeyInputComponent::new(),
@@ -215,7 +215,7 @@ pub(super) fn footer_snapshot(
 /// }`). `native_host_extensions::Statuses` renders them ON the model/effort tray
 /// row and truncates to the live width. No new host surface, no RPC.
 fn publish_footer(
-    send: &mpsc::Sender<HostEvent>,
+    send: &HostEventSender,
     bridge: &JevModeBridge,
     session_id: &str,
     credential: CredentialStatus,
@@ -227,7 +227,7 @@ fn publish_footer(
 /// Publish from one already-loaded settings snapshot, so the decision mode and
 /// the compaction state always come from the same read.
 fn publish_footer_from_settings(
-    send: &mpsc::Sender<HostEvent>,
+    send: &HostEventSender,
     settings: &pi_jev::config::JevSettings,
     session_id: &str,
     credential: CredentialStatus,
@@ -247,7 +247,7 @@ fn publish_footer_from_settings(
 /// per-session settings (overrides included) before any `/jev` command runs.
 /// One local settings read plus one credential-presence probe; no RPC, no
 /// network, and no settings change.
-pub(crate) fn publish_session_footer(send: &mpsc::Sender<HostEvent>, session_id: &str) {
+pub(crate) fn publish_session_footer(send: &HostEventSender, session_id: &str) {
     let bridge = JevModeBridge::new(&agent_dir());
     let store = default_credential_store(agent_dir());
     let credential = credential_status(saved_credential_present(store.as_ref()));
@@ -284,7 +284,7 @@ pub(super) async fn status_panel(
 
 const DISCLOSURE_DURATION: Duration = Duration::from_secs(5);
 
-fn automatic_status(send: &mpsc::Sender<HostEvent>, message: String) -> CommandOutput {
+fn automatic_status(send: &HostEventSender, message: String) -> CommandOutput {
     if message.contains(JEV_DISCLOSURE_NOTICE) || message.contains(JEV_ACTIVE_NOTICE) {
         show_disclosure(send, message, DISCLOSURE_DURATION);
         CommandOutput::Nothing
@@ -307,7 +307,7 @@ fn disclosure_widget(key: &str, lines: Option<Vec<String>>) -> HostEvent {
     })
 }
 
-fn show_disclosure(send: &mpsc::Sender<HostEvent>, message: String, duration: Duration) {
+fn show_disclosure(send: &HostEventSender, message: String, duration: Duration) {
     // Each expiry owns only its notice, even across another command or session switch.
     let key = format!("jev-disclosure-{}", uuid::Uuid::new_v4());
     let lines = message
@@ -333,7 +333,7 @@ fn show_disclosure(send: &mpsc::Sender<HostEvent>, message: String, duration: Du
 /// implements the narrow-terminal rule for a caller that can measure first.
 pub(super) async fn run(
     connection: &Arc<dyn wire::AgentConnection>,
-    send: &mpsc::Sender<HostEvent>,
+    send: &HostEventSender,
     args: &str,
 ) -> Result<CommandOutput, String> {
     let state = connection.get_state().await?;
@@ -562,7 +562,7 @@ async fn menu_dialog(
     bridge: &JevModeBridge,
     session_id: &str,
     credential: CredentialStatus,
-    send: &mpsc::Sender<HostEvent>,
+    send: &HostEventSender,
 ) -> Result<CommandOutput, String> {
     let mode = bridge.effective_mode(session_id);
     let (events, mut receive) = async_mpsc::unbounded_channel();
@@ -619,7 +619,7 @@ async fn key_dialog(
     store: Arc<dyn CredentialStore>,
     credential: CredentialStatus,
     session_id: &str,
-    send: &mpsc::Sender<HostEvent>,
+    send: &HostEventSender,
 ) -> Result<CommandOutput, String> {
     let (events, mut receive) = async_mpsc::unbounded_channel();
     send.send(HostEvent::CommandDialog(Dialog::JevKey(events)))
@@ -711,7 +711,7 @@ mod disclosure_tests {
         Widgets(surfaces.clone(), false).render(160.0).join("\n")
     }
 
-    async fn expiry(receive: &mpsc::Receiver<HostEvent>) -> HostEvent {
+    async fn expiry(receive: &HostEventReceiver) -> HostEvent {
         tokio::time::timeout(Duration::from_secs(6), async {
             loop {
                 match receive.try_recv() {
@@ -730,7 +730,7 @@ mod disclosure_tests {
     #[tokio::test]
     async fn automatic_disclosure_disappears_after_five_seconds_without_input() {
         crate::modes::interactive::theme::theme::init_theme(Some("dark"), false);
-        let (send, receive) = mpsc::channel();
+        let (send, receive) = host_event_channel(64 * 1024);
         let surfaces = Rc::new(RefCell::new(Surfaces::default()));
         surfaces.borrow_mut().set_widget(
             "unrelated".into(),
@@ -759,7 +759,7 @@ mod disclosure_tests {
     #[tokio::test]
     async fn older_expiry_does_not_remove_a_newer_notice_after_session_reset() {
         crate::modes::interactive::theme::theme::init_theme(Some("dark"), false);
-        let (send, receive) = mpsc::channel();
+        let (send, receive) = host_event_channel(64 * 1024);
         let surfaces = Rc::new(RefCell::new(Surfaces::default()));
         show_disclosure(&send, "Old notice".into(), Duration::from_millis(20));
         apply_widget(receive.try_recv().unwrap(), &surfaces);
@@ -774,7 +774,7 @@ mod disclosure_tests {
 
     #[test]
     fn brief_status_messages_keep_their_existing_lifetime() {
-        let (send, receive) = mpsc::channel();
+        let (send, receive) = host_event_channel(64 * 1024);
         let output = automatic_status(&send, "Jev mode: Off".into());
         assert!(matches!(output, CommandOutput::Status(message) if message == "Jev mode: Off"));
         assert!(matches!(receive.try_recv(), Err(mpsc::TryRecvError::Empty)));

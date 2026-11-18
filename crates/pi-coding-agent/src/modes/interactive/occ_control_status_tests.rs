@@ -65,7 +65,7 @@ async fn confirmed_occ2_and_latent_writes_survive_unavailable_textmas_metadata()
     for (args, saved) in [("2 off", "OCC-2 preference saved: OFF"), ("3.2 off", "OCC3.2 preference saved: OFF")] {
         let host = OptionalFailureHost::new(true, false);
         let connection: Arc<dyn wire::AgentConnection> = Arc::new(DaemonAgentConnection::new(host.clone(), "active-a".into(), Default::default()));
-        let (send, _receive) = mpsc::channel();
+        let (send, _receive) = host_event_channel(MAX_PENDING_HOST_EVENTS);
         let output = run(&connection, &send, args).await.unwrap();
         let CommandOutput::TransientStatus(panel) = output else { panic!("successful mutation must remain acknowledged") };
         assert!(panel.contains(saved));
@@ -81,7 +81,7 @@ async fn confirmed_occ2_and_latent_writes_survive_unavailable_textmas_metadata()
 async fn occ_status_preserves_available_lanes_and_own_echo_validation_stays_strict() {
     let host = OptionalFailureHost::new(true, false);
     let connection: Arc<dyn wire::AgentConnection> = Arc::new(DaemonAgentConnection::new(host, "active-a".into(), Default::default()));
-    let (send, _receive) = mpsc::channel();
+    let (send, _receive) = host_event_channel(MAX_PENDING_HOST_EVENTS);
     let CommandOutput::Panel(panel) = run(&connection, &send, "status").await.unwrap() else { panic!("partial status panel expected") };
     assert!(panel.contains("OCC-2: ON"));
     assert!(panel.contains("OCC3.1: unavailable"));
@@ -99,7 +99,7 @@ async fn unsupported_textmas_commands_do_not_probe_or_write_any_host() {
     for args in ["3", "3.1", "3 off", "3 sequential", "3.1 hierarchical"] {
         let host = OptionalFailureHost::new(false, false);
         let connection: Arc<dyn wire::AgentConnection> = Arc::new(DaemonAgentConnection::new(host.clone(), "active-a".into(), Default::default()));
-        let (send, _receive) = mpsc::channel();
+        let (send, _receive) = host_event_channel(MAX_PENDING_HOST_EVENTS);
         assert!(matches!(run(&connection, &send, args).await.unwrap(), CommandOutput::Warning(_)));
         assert!(host.requests.lock().unwrap().is_empty());
     }

@@ -1,6 +1,6 @@
 //! Port of packages/coding-agent/src/modes/interactive/components/ipython-cell.ts
 
-use pi_tui::render_cache::VersionedRenderCache;
+use pi_tui::render_cache::StyledRenderCache;
 use pi_tui::tui::Component;
 use pi_tui::utils::{truncate_to_width, visible_width, wrap_text_with_ansi};
 use regex::Regex;
@@ -28,7 +28,7 @@ use crate::modes::interactive::components::edit_summary::{
     count_changed_lines, format_file_change_summary_line, FILE_CHANGE_DIFF_INDENT,
 };
 use crate::modes::interactive::components::keybinding_hints::expand_collapse_hint;
-use crate::modes::interactive::theme::theme::theme;
+use crate::modes::interactive::theme::theme::{render_style_revision, theme};
 use crate::modes::interactive::theme::theme::{get_language_from_path, highlight_code};
 use crate::modes::interactive::theme::working_icon::{
     get_working_pulse_frame, working_icon_frame, WORKING_ICON_FRAMES,
@@ -495,7 +495,7 @@ enum StatusKind {
 
 /// Port of `IPythonCellComponent`.
 pub struct IPythonCellComponent {
-    render_cache: VersionedRenderCache,
+    render_cache: StyledRenderCache,
     state: IPythonCellState,
     state_version: u64,
 }
@@ -504,7 +504,7 @@ impl IPythonCellComponent {
     /// Port of the `IPythonCellComponent` constructor.
     pub fn new(state: IPythonCellState) -> Self {
         Self {
-            render_cache: VersionedRenderCache::new(),
+            render_cache: StyledRenderCache::new(),
             state,
             state_version: 0,
         }
@@ -1312,7 +1312,8 @@ impl Component for IPythonCellComponent {
         } else {
             self.state_version * frames
         };
-        if let Some(cached) = self.render_cache.get(safe_width, cache_version) {
+        let style = render_style_revision();
+        if let Some(cached) = self.render_cache.get(safe_width, cache_version, style) {
             return cached;
         }
 
@@ -1359,11 +1360,11 @@ impl Component for IPythonCellComponent {
         }
 
         if self.state.expanded != Some(true) {
-            return self.render_cache.set(safe_width, cache_version, lines);
+            return self.render_cache.set(safe_width, cache_version, style, lines);
         }
 
         self.render_output(&mut lines, safe_width as f64, &details, has_code);
-        self.render_cache.set(safe_width, cache_version, lines)
+        self.render_cache.set(safe_width, cache_version, style, lines)
     }
 
     fn invalidate(&mut self) {

@@ -1,6 +1,6 @@
 //! Port of packages/tui/src/render-cache.ts.
 
-use std::{borrow::Borrow, cell::OnceCell, fmt, ops::Deref, rc::Rc};
+use std::{borrow::Borrow, cell::{Cell, OnceCell}, fmt, ops::Deref, rc::Rc};
 
 /// Immutable transcript text shared across component, wrapping and viewport caches.
 /// Cloning a line retains its allocation; graphics metadata is scanned only once.
@@ -12,6 +12,11 @@ struct RenderedLineData {
     text: String,
     image: OnceCell<bool>,
     image_rows: OnceCell<Option<usize>>,
+    terminal_plain: OnceCell<RenderedLine>,
+    terminal_hyperlinks: OnceCell<RenderedLine>,
+    terminal_normalizations: Cell<u8>,
+    #[cfg(test)]
+    text_comparisons: Cell<u32>,
 }
 
 impl RenderedLine {
@@ -35,6 +40,37 @@ impl RenderedLine {
             .0
             .image_rows
             .get_or_init(|| crate::terminal_image::image_row_count(self))
+    }
+
+    /// Return shared, terminal-normalized text for the inline differ. The
+    /// original line owns the normalized allocation, so an unchanged line is
+    /// never formatted or copied again on editor-only repaints.
+    pub fn terminal_normalized(&self, hyperlinks: bool, reset: &str) -> Self {
+        if self.is_image() {
+            return self.clone();
+        }
+        let slot = if hyperlinks {
+            &self.0.terminal_hyperlinks
+        } else {
+            &self.0.terminal_plain
+        };
+        slot.get_or_init(|| {
+            self.0
+                .terminal_normalizations
+                .set(self.0.terminal_normalizations.get().saturating_add(1));
+            format!("{}{reset}", crate::utils::normalize_terminal_output(self.as_str())).into()
+        })
+        .clone()
+    }
+
+    #[cfg(test)]
+    pub fn terminal_normalization_count(&self) -> u8 {
+        self.0.terminal_normalizations.get()
+    }
+
+    #[cfg(test)]
+    pub fn text_comparison_count(&self) -> u32 {
+        self.0.text_comparisons.get()
     }
 }
 
@@ -66,6 +102,12 @@ impl Borrow<str> for RenderedLine {
     }
 }
 
+impl AsRef<str> for RenderedLine {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
 impl fmt::Display for RenderedLine {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self)
@@ -74,7 +116,14 @@ impl fmt::Display for RenderedLine {
 
 impl PartialEq for RenderedLine {
     fn eq(&self, other: &Self) -> bool {
-        self.ptr_eq(other) || self.as_str() == other.as_str()
+        if self.ptr_eq(other) {
+            return true;
+        }
+        #[cfg(test)]
+        self.0
+            .text_comparisons
+            .set(self.0.text_comparisons.get().saturating_add(1));
+        self.as_str() == other.as_str()
     }
 }
 

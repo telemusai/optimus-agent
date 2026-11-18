@@ -23,7 +23,7 @@ async fn long_chat_paints_submitted_text_before_a_held_daemon_request() {
     h.paint();
     let (reply, wait) = tokio::sync::oneshot::channel();
     fake.prompt_replies.lock().unwrap().push_back(wait);
-    let (send, receive) = mpsc::channel();
+    let (send, receive) = host_event_channel(64 * 1024);
     let recorder = Arc::new(SpeedRecorder::default());
     let mut metrics = native_metrics::UiMetrics::with_recorder("immediate-long-chat", recorder.clone());
     let started = Instant::now();
@@ -57,7 +57,7 @@ async fn identical_prompts_reconcile_once_with_messages_before_or_after_ack() {
     let h = ui_tests::FrameHarness::new("receipt-order");
     let fake = Arc::new(RecordingConnection::default());
     let connection: Arc<dyn wire::AgentConnection> = fake.clone();
-    let (send, receive) = mpsc::channel();
+    let (send, receive) = host_event_channel(64 * 1024);
     let mut metrics = native_metrics::UiMetrics::with_recorder("receipt-order", Arc::new(SpeedRecorder::default()));
     let mut replies = Vec::new();
     for _ in 0..2 {

@@ -477,7 +477,7 @@ fn resolution_summary(value: &serde_json::Value, queue_id: &str, reemit: bool, r
 /// choose; a dismissed dialog resolves nothing.
 async fn queue_resolution(
     connection: &Arc<dyn wire::AgentConnection>,
-    send: &mpsc::Sender<HostEvent>,
+    send: &HostEventSender,
     queue_id: &str,
     reemit: bool,
 ) -> Result<CommandOutput, String> {
@@ -565,7 +565,7 @@ async fn write_textmas(connection: &Arc<dyn wire::AgentConnection>, mode: TextMa
 
 pub(super) async fn run(
     connection: &Arc<dyn wire::AgentConnection>,
-    send: &mpsc::Sender<HostEvent>,
+    send: &HostEventSender,
     args: &str,
 ) -> Result<CommandOutput, String> {
     let choice = match parse(args)? {

@@ -1,11 +1,12 @@
+use crate::modes::interactive::native_host::{host_event_channel, HostEventReceiver};
 use super::super::stats_data::account;
 use super::*;
 use serde_json::json;
 
-fn panel() -> (StatsPanel, mpsc::Receiver<HostEvent>) {
+fn panel() -> (StatsPanel, HostEventReceiver) {
     crate::core::keybindings::KeybindingsManager::new(Default::default(), None).install();
     crate::modes::interactive::theme::theme::init_theme(Some("neon"), false);
-    let (send, receive) = mpsc::channel();
+    let (send, receive) = host_event_channel(64 * 1024);
     let mut usage = crate::core::usage::empty_usage();
     usage.input = 2000.0;
     usage.output = 100.0;
