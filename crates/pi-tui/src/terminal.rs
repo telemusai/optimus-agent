@@ -80,20 +80,38 @@ fn cancel_input_handoff(token: u64) {
 ///
 /// The pending record existing is the token match: `beginInputHandoff()` sets it
 /// and only `consumeInputHandoff()` or `cancelInputHandoff(token)` clear it.
-/// Returns true when handoff data was drained.
-fn drain_pending_handoff_input() -> bool {
-    if PENDING_INPUT_HANDOFF.lock().unwrap().is_none() {
-        return false;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HandoffDrain {
+    /// Bytes were discarded; keep draining the native queue.
+    Continue,
+    /// No bytes were discarded, or there is no pending handoff. Wait for the
+    /// next poll without treating this as EOF.
+    Wait,
+    Closed,
+}
+
+fn drain_pending_handoff_input_from(
+    pending: bool,
+    mut read: impl FnMut() -> std::io::Result<NativeInput>,
+) -> std::io::Result<HandoffDrain> {
+    if !pending {
+        return Ok(HandoffDrain::Wait);
     }
-    match read_available_input() {
-        Ok(NativeInput::Bytes(_)) | Ok(NativeInput::Ignored) => true,
-        _ => false,
-    }
+    Ok(match read()? {
+        NativeInput::Bytes(_) => HandoffDrain::Continue,
+        NativeInput::Pending | NativeInput::Ignored => HandoffDrain::Wait,
+        NativeInput::Closed => HandoffDrain::Closed,
+    })
+}
+
+fn drain_pending_handoff_input() -> std::io::Result<HandoffDrain> {
+    let pending = PENDING_INPUT_HANDOFF.lock().unwrap().is_some();
+    drain_pending_handoff_input_from(pending, read_available_input)
 }
 
 pub(crate) fn stdout_write(data: &str) {
     #[cfg(windows)]
-    ensure_windows_console_output();
+    let _windows_console = WindowsConsoleOutputGuard::new();
     let stdout = std::io::stdout();
     let mut lock = stdout.lock();
     let conpty = cfg!(windows) || std::env::var_os("WSL_INTEROP").is_some()
@@ -115,27 +133,164 @@ fn write_terminal_output(writer: &mut impl Write, mut data: &str, conpty: bool) 
     writer.write_all(data.as_bytes())
 }
 
-#[cfg(windows)]
-fn ensure_windows_console_output() {
-    use windows_sys::Win32::System::Console::{
-        GetConsoleCP, GetConsoleMode, GetConsoleOutputCP, GetStdHandle, SetConsoleCP,
-        SetConsoleMode, SetConsoleOutputCP, ENABLE_PROCESSED_OUTPUT,
-        ENABLE_VIRTUAL_TERMINAL_PROCESSING, STD_OUTPUT_HANDLE,
-    };
-    // A console-sharing child can change these. Invalid/non-console handles
-    // return zero; leave redirected streams alone.
-    unsafe {
-        let input = GetConsoleCP();
-        let output = GetConsoleOutputCP();
-        if input != 0 && input != 65001 { let _ = SetConsoleCP(65001); }
-        if output != 0 && output != 65001 { let _ = SetConsoleOutputCP(65001); }
-        // Plain cmd.exe consoles start with VT output processing disabled.
-        let handle = GetStdHandle(STD_OUTPUT_HANDLE);
-        let mut mode = 0;
-        if GetConsoleMode(handle, &mut mode) != 0 {
-            let vt_mode = mode | ENABLE_PROCESSED_OUTPUT | ENABLE_VIRTUAL_TERMINAL_PROCESSING;
-            if mode != vt_mode { let _ = SetConsoleMode(handle, vt_mode); }
+#[cfg(any(windows, test))]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct WindowsConsoleOutputState {
+    input_code_page: Option<u32>,
+    output_code_page: Option<u32>,
+    output_mode: Option<u32>,
+}
+
+#[cfg(any(windows, test))]
+trait WindowsConsoleOutputApi {
+    fn capture(&mut self) -> WindowsConsoleOutputState;
+    fn apply_working(&mut self);
+    fn restore(&mut self, original: &WindowsConsoleOutputState);
+}
+
+/// The initial console state belongs to the whole active TUI, not to one
+/// ProcessTerminal value. A preserved-screen handoff transfers only its token;
+/// it must not replace the snapshot with our working UTF-8/VT state.
+#[cfg(any(windows, test))]
+#[derive(Default)]
+struct WindowsConsoleOutputOwnership {
+    original: Option<WindowsConsoleOutputState>,
+    token: Option<u64>,
+}
+
+#[cfg(any(windows, test))]
+impl WindowsConsoleOutputOwnership {
+    fn acquire(&mut self, token: u64, api: &mut impl WindowsConsoleOutputApi) {
+        if self.original.is_none() {
+            self.original = Some(api.capture());
         }
+        self.token = Some(token);
+        api.apply_working();
+    }
+
+    fn release(&mut self, token: u64, api: &mut impl WindowsConsoleOutputApi) {
+        if self.token != Some(token) {
+            return;
+        }
+        self.token = None;
+        if let Some(original) = self.original.take() {
+            api.restore(&original);
+        }
+    }
+
+    fn begin_write(&mut self, api: &mut impl WindowsConsoleOutputApi) -> Option<WindowsConsoleOutputState> {
+        // Writes outside an active TUI still need UTF-8/VT output, but their
+        // temporary state is restored immediately after the write and flush.
+        let temporary = if self.original.is_none() { Some(api.capture()) } else { None };
+        api.apply_working();
+        temporary
+    }
+
+    fn end_write(
+        &mut self,
+        temporary: Option<WindowsConsoleOutputState>,
+        api: &mut impl WindowsConsoleOutputApi,
+    ) {
+        if let Some(original) = temporary {
+            api.restore(&original);
+        }
+    }
+}
+
+#[cfg(windows)]
+struct NativeWindowsConsoleOutput;
+
+#[cfg(windows)]
+impl WindowsConsoleOutputApi for NativeWindowsConsoleOutput {
+    fn capture(&mut self) -> WindowsConsoleOutputState {
+        use windows_sys::Win32::System::Console::{
+            GetConsoleCP, GetConsoleMode, GetConsoleOutputCP, GetStdHandle, STD_OUTPUT_HANDLE,
+        };
+        unsafe {
+            let input = GetConsoleCP();
+            let output = GetConsoleOutputCP();
+            let mut mode = 0;
+            let output_mode = (GetConsoleMode(GetStdHandle(STD_OUTPUT_HANDLE), &mut mode) != 0)
+                .then_some(mode);
+            WindowsConsoleOutputState {
+                input_code_page: (input != 0).then_some(input),
+                output_code_page: (output != 0).then_some(output),
+                output_mode,
+            }
+        }
+    }
+
+    fn apply_working(&mut self) {
+        use windows_sys::Win32::System::Console::{
+            GetConsoleCP, GetConsoleMode, GetConsoleOutputCP, GetStdHandle, SetConsoleCP,
+            SetConsoleMode, SetConsoleOutputCP, ENABLE_PROCESSED_OUTPUT,
+            ENABLE_VIRTUAL_TERMINAL_PROCESSING, STD_OUTPUT_HANDLE,
+        };
+        // A console-sharing child can change these. Invalid/non-console handles
+        // return zero; leave redirected streams alone.
+        unsafe {
+            let input = GetConsoleCP();
+            let output = GetConsoleOutputCP();
+            if input != 0 && input != 65001 { let _ = SetConsoleCP(65001); }
+            if output != 0 && output != 65001 { let _ = SetConsoleOutputCP(65001); }
+            let handle = GetStdHandle(STD_OUTPUT_HANDLE);
+            let mut mode = 0;
+            if GetConsoleMode(handle, &mut mode) != 0 {
+                let vt_mode = mode | ENABLE_PROCESSED_OUTPUT | ENABLE_VIRTUAL_TERMINAL_PROCESSING;
+                if mode != vt_mode { let _ = SetConsoleMode(handle, vt_mode); }
+            }
+        }
+    }
+
+    fn restore(&mut self, original: &WindowsConsoleOutputState) {
+        use windows_sys::Win32::System::Console::{
+            GetStdHandle, SetConsoleCP, SetConsoleMode, SetConsoleOutputCP, STD_OUTPUT_HANDLE,
+        };
+        unsafe {
+            if let Some(code_page) = original.input_code_page { let _ = SetConsoleCP(code_page); }
+            if let Some(code_page) = original.output_code_page { let _ = SetConsoleOutputCP(code_page); }
+            if let Some(mode) = original.output_mode {
+                let _ = SetConsoleMode(GetStdHandle(STD_OUTPUT_HANDLE), mode);
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+static WINDOWS_CONSOLE_OUTPUT: Lazy<Mutex<WindowsConsoleOutputOwnership>> =
+    Lazy::new(|| Mutex::new(WindowsConsoleOutputOwnership::default()));
+
+#[cfg(windows)]
+fn acquire_windows_console_output(token: u64) {
+    let mut ownership = WINDOWS_CONSOLE_OUTPUT.lock().unwrap();
+    ownership.acquire(token, &mut NativeWindowsConsoleOutput);
+}
+
+#[cfg(windows)]
+fn release_windows_console_output(token: u64) {
+    let mut ownership = WINDOWS_CONSOLE_OUTPUT.lock().unwrap();
+    ownership.release(token, &mut NativeWindowsConsoleOutput);
+}
+
+#[cfg(windows)]
+struct WindowsConsoleOutputGuard {
+    ownership: std::sync::MutexGuard<'static, WindowsConsoleOutputOwnership>,
+    temporary: Option<WindowsConsoleOutputState>,
+}
+
+#[cfg(windows)]
+impl WindowsConsoleOutputGuard {
+    fn new() -> Self {
+        let mut ownership = WINDOWS_CONSOLE_OUTPUT.lock().unwrap();
+        let temporary = ownership.begin_write(&mut NativeWindowsConsoleOutput);
+        Self { ownership, temporary }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for WindowsConsoleOutputGuard {
+    fn drop(&mut self) {
+        self.ownership.end_write(self.temporary, &mut NativeWindowsConsoleOutput);
     }
 }
 
@@ -195,9 +350,9 @@ fn read_available_input() -> std::io::Result<NativeInput> {
         }
         let key = record.Event.KeyEvent;
         let mut surrogate = WINDOWS_PENDING_SURROGATE.lock().unwrap();
-        Ok(match windows_record_sequence(
+        Ok(match windows_record_sequence_repeated(
             key.bKeyDown != 0, key.wVirtualKeyCode, key.uChar.UnicodeChar,
-            key.dwControlKeyState, &mut surrogate,
+            key.dwControlKeyState, key.wRepeatCount, &mut surrogate,
         ) {
             Some(sequence) => NativeInput::Bytes(sequence.into_bytes()),
             None => NativeInput::Ignored,
@@ -213,6 +368,21 @@ fn read_available_input() -> std::io::Result<NativeInput> {
         Some(sequence) => NativeInput::Bytes(sequence.into_bytes()),
         None => NativeInput::Ignored,
     })
+}
+
+#[cfg(any(windows, test))]
+fn windows_record_sequence_repeated(
+    down: bool,
+    virtual_key: u16,
+    code_unit: u16,
+    control: u32,
+    repeat_count: u16,
+    pending_surrogate: &mut Option<u16>,
+) -> Option<String> {
+    let repeated = (0..repeat_count).filter_map(|_| {
+        windows_record_sequence(down, virtual_key, code_unit, control, pending_surrogate)
+    }).collect::<String>();
+    (!repeated.is_empty()).then_some(repeated)
 }
 
 #[cfg(any(windows, test))]
@@ -246,6 +416,14 @@ fn windows_record_sequence(
     // UTF-16 here: crossterm's record reader drops these controls and can pair
     // surrogate key releases rather than the two key-down code units.
     if virtual_key == 0 { return Some(decoded); }
+
+    // Windows reports AltGr as RIGHT_ALT + CTRL. A layout-generated printable
+    // character is text, not a Ctrl+Alt shortcut. Left Alt + Ctrl remains an
+    // ordinary modified key binding, as do Ctrl+Alt records without text.
+    let alt_gr = control & 0x01 != 0 && control & 0x0c != 0;
+    if alt_gr && decoded.chars().last().is_some_and(|ch| ch != '\0' && !ch.is_control()) {
+        return Some(decoded);
+    }
 
     let mut modifiers = KeyModifiers::NONE;
     if control & 0x10 != 0 { modifiers |= KeyModifiers::SHIFT; }
@@ -891,8 +1069,13 @@ impl Terminal for ProcessTerminal {
             // stdin attached to a discard handler (terminal.ts:48-51) so gap keys
             // are consumed and dropped here instead of staying buffered for the
             // next TUI's first `pollInput()` calls.
-            while drain_pending_handoff_input() {}
-            return Ok(true);
+            loop {
+                match drain_pending_handoff_input()? {
+                    HandoffDrain::Continue => {}
+                    HandoffDrain::Wait => return Ok(true),
+                    HandoffDrain::Closed => return Ok(false),
+                }
+            }
         }
         if !self.poll_input_from(read_available_input, cfg!(windows))? {
             return Ok(false);
@@ -918,6 +1101,8 @@ impl Terminal for ProcessTerminal {
     }
 
     fn start(&mut self, on_input: Box<dyn Fn(String)>, on_resize: Box<dyn Fn()>) {
+        #[cfg(windows)]
+        acquire_windows_console_output(self.alt_screen_handoff_token);
         self.started = true;
         self.started_at = Some(std::time::Instant::now());
         self.last_size = Some((self.columns(), self.rows()));
@@ -1016,6 +1201,15 @@ impl Terminal for ProcessTerminal {
             // Pause stdin to prevent any buffered input (e.g., Ctrl+D) from being
             // re-interpreted after raw mode is disabled.
             let _ = set_raw_mode(self.was_raw);
+        }
+
+        // A preserved-screen handoff keeps the one original snapshot and its
+        // ownership alive for the next ProcessTerminal. Final stops (including
+        // the teardown around an external editor) restore only after all stop
+        // writes above have completed. A later start captures any editor changes.
+        #[cfg(windows)]
+        if !(options.preserve_alt_screen && was_started) {
+            release_windows_console_output(self.alt_screen_handoff_token);
         }
     }
 
@@ -1196,7 +1390,7 @@ mod tests {
                     CreateConsoleScreenBuffer, GetConsoleMode, GetStdHandle,
                     ReadConsoleOutputCharacterW, SetConsoleMode, SetStdHandle,
                     CONSOLE_TEXTMODE_BUFFER, COORD, ENABLE_PROCESSED_OUTPUT,
-                    ENABLE_VIRTUAL_TERMINAL_PROCESSING, ENABLE_WRAP_AT_EOL_OUTPUT,
+                    ENABLE_WRAP_AT_EOL_OUTPUT,
                     STD_OUTPUT_HANDLE,
                 },
                 Threading::CREATE_NO_WINDOW,
@@ -1236,12 +1430,118 @@ mod tests {
             assert_ne!(SetStdHandle(STD_OUTPUT_HANDLE, original), 0);
             CloseHandle(buffer);
             assert_ne!(mode_ok, 0);
-            assert_eq!(mode, plain_mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+            assert_eq!(mode, ENABLE_WRAP_AT_EOL_OUTPUT, "temporary writes restore the child's pre-write mode");
             assert_ne!(first_ok, 0);
             assert_ne!(second_ok, 0);
             assert_eq!(String::from_utf16_lossy(&first), "fixed ");
             assert_eq!(String::from_utf16_lossy(&second), "second");
         }
+    }
+
+    #[derive(Default)]
+    struct FakeWindowsConsoleOutput {
+        state: WindowsConsoleOutputState,
+        captures: usize,
+        applications: usize,
+        restorations: Vec<WindowsConsoleOutputState>,
+    }
+
+    impl WindowsConsoleOutputApi for FakeWindowsConsoleOutput {
+        fn capture(&mut self) -> WindowsConsoleOutputState {
+            self.captures += 1;
+            self.state
+        }
+
+        fn apply_working(&mut self) {
+            self.applications += 1;
+            if self.state.input_code_page.is_some() { self.state.input_code_page = Some(65001); }
+            if self.state.output_code_page.is_some() { self.state.output_code_page = Some(65001); }
+            if let Some(mode) = self.state.output_mode {
+                self.state.output_mode = Some(mode | 0x0001 | 0x0004);
+            }
+        }
+
+        fn restore(&mut self, original: &WindowsConsoleOutputState) {
+            self.state = *original;
+            self.restorations.push(*original);
+        }
+    }
+
+    fn fake_console_state() -> WindowsConsoleOutputState {
+        WindowsConsoleOutputState {
+            input_code_page: Some(1252),
+            output_code_page: Some(437),
+            output_mode: Some(0x0002),
+        }
+    }
+
+    #[test]
+    fn windows_console_original_state_survives_handoff_until_final_owner_release() {
+        let original = fake_console_state();
+        let mut api = FakeWindowsConsoleOutput { state: original, ..Default::default() };
+        let mut ownership = WindowsConsoleOutputOwnership::default();
+
+        ownership.acquire(10, &mut api);
+        assert_eq!(api.captures, 1);
+        assert_eq!(api.state.input_code_page, Some(65001));
+        assert_eq!(api.state.output_code_page, Some(65001));
+        assert_eq!(api.state.output_mode, Some(0x0007));
+
+        // A sharing child changes live state without changing the saved original.
+        api.state = WindowsConsoleOutputState {
+            input_code_page: Some(932),
+            output_code_page: Some(932),
+            output_mode: Some(0),
+        };
+        let temporary = ownership.begin_write(&mut api);
+        ownership.end_write(temporary, &mut api);
+        assert_eq!(temporary, None, "owned writes do not restore after each frame");
+        assert!(api.restorations.is_empty());
+
+        ownership.acquire(11, &mut api);
+        assert_eq!(api.captures, 1, "a preserved-screen handoff keeps the first snapshot");
+        assert_eq!(api.applications, 3, "a new owner reapplies the working mode at start");
+        assert_eq!(api.state.input_code_page, Some(65001));
+        assert_eq!(api.state.output_code_page, Some(65001));
+        assert_eq!(api.state.output_mode, Some(0x0005));
+        assert_eq!(ownership.original, Some(original));
+        ownership.release(10, &mut api);
+        assert!(api.restorations.is_empty(), "the old handoff owner cannot restore prematurely");
+        ownership.release(11, &mut api);
+        assert_eq!(api.restorations, vec![original]);
+        assert_eq!(api.state, original);
+        assert_eq!(ownership.original, None);
+        assert_eq!(ownership.token, None);
+
+        // An external editor runs after final release. The next start snapshots
+        // its state rather than restoring the pre-TUI snapshot over editor changes.
+        let after_editor = WindowsConsoleOutputState {
+            input_code_page: Some(850),
+            output_code_page: Some(850),
+            output_mode: Some(0x0006),
+        };
+        api.state = after_editor;
+        ownership.acquire(12, &mut api);
+        assert_eq!(api.captures, 2);
+        assert_eq!(ownership.original, Some(after_editor));
+        ownership.release(12, &mut api);
+        assert_eq!(api.state, after_editor);
+    }
+
+    #[test]
+    fn windows_console_temporary_write_restores_without_taking_ownership() {
+        let original = fake_console_state();
+        let mut api = FakeWindowsConsoleOutput { state: original, ..Default::default() };
+        let mut ownership = WindowsConsoleOutputOwnership::default();
+        let temporary = ownership.begin_write(&mut api);
+        assert_eq!(temporary, Some(original));
+        assert_eq!(api.state.output_code_page, Some(65001));
+        ownership.end_write(temporary, &mut api);
+        assert_eq!(api.state, original);
+        assert_eq!(api.captures, 1);
+        assert_eq!(api.restorations, vec![original]);
+        assert_eq!(ownership.original, None);
+        assert_eq!(ownership.token, None);
     }
 
     #[test]
@@ -1393,6 +1693,40 @@ mod tests {
     }
 
     #[test]
+    fn windows_alt_gr_text_stays_literal_and_real_ctrl_alt_stays_modified() {
+        let mut surrogate = None;
+        // German-style AltGr+2 produces '@'. Windows marks it RIGHT_ALT + LEFT_CTRL.
+        assert_eq!(windows_record_sequence(true, 0x32, '@' as u16, 0x01 | 0x08, &mut surrogate), Some("@".into()));
+        // Other layouts use RIGHT_ALT + RIGHT_CTRL and produce different text.
+        assert_eq!(windows_record_sequence(true, 0xdb, '[' as u16, 0x01 | 0x04, &mut surrogate), Some("[".into()));
+        assert_eq!(windows_record_sequence(true, 0x45, 0x20ac, 0x01 | 0x08, &mut surrogate), Some("€".into()));
+
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+        let sequence = windows_record_sequence(true, 0x32, '2' as u16, 0x02 | 0x08, &mut surrogate).unwrap();
+        let expected = native_event_sequence(Event::Key(KeyEvent::new(
+            KeyCode::Char('2'), KeyModifiers::ALT | KeyModifiers::CONTROL,
+        ))).unwrap();
+        assert_eq!(sequence, expected);
+        assert_ne!(sequence, "2");
+        let binding = windows_record_sequence(true, 0x43, 3, 0x01 | 0x08, &mut surrogate).unwrap();
+        let expected_binding = native_event_sequence(Event::Key(KeyEvent::new(
+            KeyCode::Char('c'), KeyModifiers::ALT | KeyModifiers::CONTROL,
+        ))).unwrap();
+        assert_eq!(binding, expected_binding, "a non-text Ctrl+Alt record remains a binding");
+    }
+
+    #[test]
+    fn windows_key_repeat_count_expands_only_key_down_records() {
+        let mut surrogate = None;
+        assert_eq!(windows_record_sequence_repeated(true, 0x41, 'a' as u16, 0, 3, &mut surrogate), Some("aaa".into()));
+        assert_eq!(windows_record_sequence_repeated(true, 0x08, 8, 0, 3, &mut surrogate), Some("\x7f\x7f\x7f".into()));
+        let left = windows_record_sequence(true, 0x25, 0, 0, &mut surrogate).unwrap();
+        assert_eq!(windows_record_sequence_repeated(true, 0x25, 0, 0, 3, &mut surrogate), Some(left.repeat(3)));
+        assert_eq!(windows_record_sequence_repeated(false, 0x41, 'a' as u16, 0, 3, &mut surrogate), None);
+        assert_eq!(surrogate, None);
+    }
+
+    #[test]
     fn windows_native_paste_ignores_releases_and_keeps_newlines_in_one_paste() {
         let (mut terminal, received) = native_input_fixture();
         let text = "Do not build\rDo not run tests\rReview only: café 世界";
@@ -1483,18 +1817,21 @@ mod tests {
     }
 
     #[test]
-    fn handoff_drain_requires_a_pending_token() {
-        // Only the handoff gap drains stdin (terminal.ts:48-51); once
-        // consumeInputHandoff() runs (terminal.ts:54-62) the discard handler is
-        // gone and the next TUI receives user input normally.
-        let _ = consume_input_handoff();
-        begin_input_handoff(7, true);
-        // The handoff record is armed: data arriving in the gap is discarded.
-        assert!(PENDING_INPUT_HANDOFF.lock().unwrap().is_some());
-        assert!(!drain_pending_handoff_input()); // nothing available right now
-        assert_eq!(consume_input_handoff(), Some(true));
-        // consumeInputHandoff() removed the discard handler (terminal.ts:59).
-        assert!(!drain_pending_handoff_input());
+    fn handoff_drain_distinguishes_waiting_continuation_and_eof() {
+        let mut reads = 0;
+        let outcome = drain_pending_handoff_input_from(false, || {
+            reads += 1;
+            Ok(NativeInput::Bytes(vec![b'x']))
+        }).unwrap();
+        assert_eq!(outcome, HandoffDrain::Wait);
+        assert_eq!(reads, 0, "no pending token means no discard reader");
+
+        assert_eq!(drain_pending_handoff_input_from(true, || Ok(NativeInput::Pending)).unwrap(), HandoffDrain::Wait);
+        assert_eq!(drain_pending_handoff_input_from(true, || Ok(NativeInput::Ignored)).unwrap(), HandoffDrain::Wait);
+        assert_eq!(drain_pending_handoff_input_from(true, || Ok(NativeInput::Bytes(vec![b'x']))).unwrap(), HandoffDrain::Continue);
+        assert_eq!(drain_pending_handoff_input_from(true, || Ok(NativeInput::Closed)).unwrap(), HandoffDrain::Closed);
+        let error = drain_pending_handoff_input_from(true, || Err(std::io::ErrorKind::BrokenPipe.into())).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
     }
 
     #[test]

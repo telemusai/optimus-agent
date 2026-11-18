@@ -1,0 +1,3 @@
+- Fixed Windows AltGr text being encoded as Ctrl+Alt shortcuts, expanded native key-repeat counts without replaying key releases, and made preserved-screen input draining propagate EOF and read errors.
+- Fixed native print-mode Windows signal handling so SIGINT uses Ctrl+C and SIGTERM uses the matching console-close event instead of registering duplicate Ctrl+C listeners.
+- Fixed Windows console UTF-8 code pages and VT output mode leaking after the TUI stopped; the original state now survives preserved-screen handoffs and is restored after final stop writes or external-editor teardown.
