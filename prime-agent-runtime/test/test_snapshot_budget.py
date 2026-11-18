@@ -6,6 +6,9 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
+
+import dill
 
 SRC = os.path.join(os.path.dirname(__file__), "..", "src")
 if SRC not in sys.path:
@@ -268,6 +271,72 @@ class BudgetAwarePartialSnapshotTest(BudgetTestCase):
         # The median of (1.0, 2.0, 500.0) is 2.0, so the unknown name ties with
         # quick_b and the name breaks the tie.
         self.assertEqual(ordered, ["quick_a", "new_name", "quick_b", "slow"])
+
+
+class LegacyRestoreBudgetTest(BudgetTestCase):
+    def write_payload(self, payload: dict[object, object]) -> int:
+        encoded = dill.dumps(payload)
+        with open(self.legacy_path, "wb") as handle:
+            handle.write(encoded)
+        return len(encoded)
+
+    def restore_with_caps(self, max_bytes: int, max_variable_bytes: int) -> tuple[dict, dict]:
+        target: dict = {}
+        result = repl._restore_state(
+            target,
+            self.legacy_path,
+            cas_root=self.cas_root,
+            source="legacy",
+            max_bytes=max_bytes,
+            max_variable_bytes=max_variable_bytes,
+        )
+        return target, result
+
+    def test_oversize_outer_file_is_rejected_before_unpickling(self) -> None:
+        outer_size = self.write_payload({"value": dill.dumps("too large")})
+        with mock.patch.object(repl, "load_snapshot_value") as load:
+            target, result = self.restore_with_caps(outer_size - 1, 1 << 20)
+        self.assertEqual(target, {})
+        self.assertIn("aggregate restore cap", result["error"])
+        load.assert_not_called()
+
+    def test_oversize_blob_is_rejected_before_any_per_name_load(self) -> None:
+        blobs = {"small": dill.dumps("a"), "large": dill.dumps("a much larger value")}
+        outer_size = self.write_payload(blobs)
+        with mock.patch.object(repl, "load_snapshot_value", wraps=repl.load_snapshot_value) as load:
+            target, result = self.restore_with_caps(outer_size, min(map(len, blobs.values())))
+        self.assertEqual(target, {})
+        self.assertIn("per-variable restore cap", result["error"])
+        self.assertEqual(load.call_count, 1, "only the outer envelope was decoded")
+
+    def test_invalid_name_and_aggregate_blob_caps_precede_per_name_loads(self) -> None:
+        for payload, cap, error in (
+            ({7: b"not loaded"}, 100, "name is not a string"),
+            ({"a": b"x" * 15, "b": b"y" * 15}, 20, "variables exceed aggregate"),
+        ):
+            with self.subTest(error=error):
+                self.write_payload(payload)
+                stream = mock.MagicMock()
+                stream.__enter__.return_value = stream
+                stream.read.return_value = b""
+                with mock.patch.object(repl, "load_snapshot_value") as load, \
+                        mock.patch.object(repl.os, "fstat") as opened, \
+                        mock.patch("builtins.open", return_value=stream):
+                    opened.return_value.st_size = 0
+                    load.return_value = payload
+                    target, result = self.restore_with_caps(cap, 100)
+                self.assertEqual(target, {})
+                self.assertIn(error, result["error"])
+                self.assertEqual(load.call_count, 1)
+
+    def test_reduced_caps_restore_a_legitimate_fitting_payload(self) -> None:
+        values = {"text": "fits", "numbers": [1, 2, 3]}
+        blobs = {name: dill.dumps(value) for name, value in values.items()}
+        outer_size = self.write_payload(blobs)
+        target, result = self.restore_with_caps(outer_size, max(map(len, blobs.values())))
+        self.assertNotIn("error", result)
+        self.assertEqual(result["failed"], [])
+        self.assertEqual(target, values)
 
 
 if __name__ == "__main__":

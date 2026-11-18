@@ -6,8 +6,11 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import importlib
 from pathlib import Path
 from unittest import mock
+
+harness_module = importlib.import_module("rlm.harness")
 
 from rlm import harness as package_harness
 from rlm import rlm as callable_rlm
@@ -838,7 +841,11 @@ class HarnessStateTest(unittest.TestCase):
                 state.create_memory("Durable", "fsynced before the replace.", id="durable")
             finally:
                 os.fsync = original_fsync
-            self.assertEqual(len(fsynced), 1, "one fsync of the temp file per save")
+            expected_syncs = 1 if os.name == "nt" else 2
+            self.assertEqual(
+                len(fsynced), expected_syncs,
+                "one fsync of the temp file and, where supported, its parent directory",
+            )
 
             # A transient replace failure is retried instead of aborting the save.
             replacements: list[str] = []
@@ -868,6 +875,58 @@ class HarnessStateTest(unittest.TestCase):
                     state.create_memory("Lost", "Must raise.", id="lost")
             finally:
                 os.replace = original_replace
+
+    def test_directory_syncs_follow_quarantine_and_destination_renames(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "harness_state.json"
+            state_path.write_bytes(b"{torn state")
+            state = HarnessState(state_path)
+            events: list[tuple[str, str]] = []
+            real_replace = harness_module._replace_with_retry
+
+            def observed_replace(source: Path, destination: Path) -> None:
+                events.append(("replace", destination.name))
+                real_replace(source, destination)
+
+            with mock.patch.object(harness_module, "_replace_with_retry", side_effect=observed_replace), \
+                    mock.patch.object(
+                        harness_module, "_fsync_directory",
+                        side_effect=lambda parent: events.append(("fsync", Path(parent).name)),
+                    ):
+                state.create_memory("Durable", "After the durable quarantine.", id="durable")
+            self.assertEqual(events[0][0], "replace")
+            self.assertTrue(events[0][1].startswith("harness_state.corrupt-"))
+            self.assertEqual(events[1], ("fsync", state_path.parent.name))
+            self.assertEqual(events[2:], [
+                ("replace", state_path.name),
+                ("fsync", state_path.parent.name),
+            ])
+
+    def test_quarantine_directory_sync_failure_preserves_original_corrupt_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "harness_state.json"
+            original = b"{torn state"
+            state_path.write_bytes(original)
+            state = HarnessState(state_path)
+            with mock.patch.object(harness_module, "_fsync_directory", side_effect=OSError("power loss")):
+                with self.assertRaisesRegex(OSError, "power loss"):
+                    state.create_memory("Unsafe", "Must not replace the source.", id="unsafe")
+            self.assertEqual(state_path.read_bytes(), original)
+            self.assertFalse(list(state_path.parent.glob("*.tmp")))
+
+    def test_destination_directory_sync_failure_never_leaves_torn_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "harness_state.json"
+            state = HarnessState(state_path)
+            state.create_memory("Before", "Old state.", id="before")
+            with mock.patch.object(harness_module, "_fsync_directory", side_effect=OSError("power loss")):
+                with self.assertRaisesRegex(OSError, "power loss"):
+                    state.create_memory("After", "Atomically renamed new state.", id="after")
+            # The fault is after the atomic rename: readers see either complete
+            # generation, never a torn file, and no temporary artifact remains.
+            reloaded = HarnessState(state_path)
+            self.assertEqual(reloaded.get("memory", "after").content, "Atomically renamed new state.")
+            self.assertFalse(list(state_path.parent.glob("*.tmp")))
 
     def test_update_skill_preserves_omitted_arguments(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

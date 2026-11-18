@@ -22,6 +22,8 @@ from pathlib import Path
 from uuid import uuid4
 from typing import Any, Iterator, Literal
 
+from .snapshot import _fsync_directory
+
 if os.name == "nt":
     import msvcrt
 else:
@@ -627,6 +629,10 @@ class HarnessState:
             if existing_mode is not None:
                 os.chmod(temp_path, existing_mode)
             _replace_with_retry(temp_path, target_path)
+            # Persist the directory entry, not just the file contents. The
+            # platform-safe helper tolerates Windows' unsupported directory
+            # handles instead of opening one through an unsafe compatibility path.
+            _fsync_directory(str(target_path.parent))
         finally:
             temp_path.unlink(missing_ok=True)
         # The rewrite reconciled the file, so the status is healthy again.
@@ -674,6 +680,7 @@ class HarnessState:
                 f.flush()
                 os.fsync(f.fileno())
             _replace_with_retry(temp_path, backup_path)
+            _fsync_directory(str(backup_path.parent))
         finally:
             temp_path.unlink(missing_ok=True)
         return backup_path
@@ -709,6 +716,7 @@ class HarnessState:
                 f.flush()
                 os.fsync(f.fileno())
             _replace_with_retry(temp_path, backup_path)
+            _fsync_directory(str(backup_path.parent))
         finally:
             temp_path.unlink(missing_ok=True)
         return backup_path
