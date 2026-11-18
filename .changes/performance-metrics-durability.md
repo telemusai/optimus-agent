@@ -1,0 +1,3 @@
+- Fixed local performance JSONL persistence for native UI render, tick, and acknowledgement measurements.
+- Fixed timed-out metric drains so buffered batches are either completed or accurately reported as dropped without duplicate retries, including daemon lifecycle shutdown.
+- Fixed Unix recorder creation when unrelated process environment values are not Unicode.

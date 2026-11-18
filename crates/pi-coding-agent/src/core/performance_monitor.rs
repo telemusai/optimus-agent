@@ -220,3 +220,146 @@ pub fn attach_performance_monitor(
         ));
     }
 }
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pi_agent_core::performance_metrics::PerformanceMetricOperation;
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct TimeoutFileIo {
+        files: Arc<Mutex<HashMap<String, String>>>,
+        append_calls: Arc<AtomicUsize>,
+        first_append: Arc<tokio::sync::Semaphore>,
+    }
+
+    impl TimeoutFileIo {
+        fn new() -> (Arc<Self>, Arc<Mutex<HashMap<String, String>>>, Arc<AtomicUsize>) {
+            let io = Arc::new(Self {
+                files: Arc::new(Mutex::new(HashMap::new())),
+                append_calls: Arc::new(AtomicUsize::new(0)),
+                first_append: Arc::new(tokio::sync::Semaphore::new(0)),
+            });
+            let files = Arc::clone(&io.files);
+            let calls = Arc::clone(&io.append_calls);
+            (io, files, calls)
+        }
+    }
+
+    impl PerformanceMetricFileIo for TimeoutFileIo {
+        fn mkdir(&self, _path: &str) -> pi_ai::types::BoxFuture<Result<(), PerformanceMetricIoError>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn append(
+            &self,
+            path: &str,
+            data: &str,
+        ) -> pi_ai::types::BoxFuture<Result<(), PerformanceMetricIoError>> {
+            let path = path.to_string();
+            let data = data.to_string();
+            let files = Arc::clone(&self.files);
+            let calls = Arc::clone(&self.append_calls);
+            let first_append = Arc::clone(&self.first_append);
+            Box::pin(async move {
+                if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    first_append.acquire().await.unwrap().forget();
+                }
+                files.lock().unwrap().entry(path).or_default().push_str(&data);
+                Ok(())
+            })
+        }
+
+        fn size(
+            &self,
+            path: &str,
+        ) -> pi_ai::types::BoxFuture<Result<Option<u64>, PerformanceMetricIoError>> {
+            let path = path.to_string();
+            let files = Arc::clone(&self.files);
+            Box::pin(async move {
+                Ok(files.lock().unwrap().get(&path).map(|data| data.len() as u64))
+            })
+        }
+
+        fn rename(
+            &self,
+            source: &str,
+            destination: &str,
+        ) -> pi_ai::types::BoxFuture<Result<(), PerformanceMetricIoError>> {
+            let source = source.to_string();
+            let destination = destination.to_string();
+            let files = Arc::clone(&self.files);
+            Box::pin(async move {
+                let mut files = files.lock().unwrap();
+                let Some(data) = files.remove(&source) else {
+                    return Err(PerformanceMetricIoError::with_code("ENOENT", "missing"));
+                };
+                files.insert(destination, data);
+                Ok(())
+            })
+        }
+
+        fn remove(&self, path: &str) -> pi_ai::types::BoxFuture<Result<(), PerformanceMetricIoError>> {
+            let path = path.to_string();
+            let files = Arc::clone(&self.files);
+            Box::pin(async move {
+                files.lock().unwrap().remove(&path);
+                Ok(())
+            })
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn flush_pending_timeout_accounts_for_the_cancelled_batch() {
+        let temp = tempfile::tempdir().unwrap();
+        let live = PerformanceMonitor::new(temp.path(), true).recorder("flush-timeout".into());
+        let (io, files, append_calls) = TimeoutFileIo::new();
+        *live.recorder.lock().unwrap() = Some(LocalPerformanceMetricRecorder::new(
+            LocalPerformanceMetricRecorderOptions {
+                directory: temp.path().to_string_lossy().into_owned(),
+                session_id: "flush-timeout".into(),
+                flush_interval_ms: Some(60_000),
+                file_io: Some(io),
+                ..Default::default()
+            },
+        ));
+        PerformanceMetricRecorder::record(
+            &live,
+            PerformanceMetricEvent::new(PerformanceMetricOperation::UiTick),
+        );
+
+        live.flush_pending().await;
+        assert_eq!(append_calls.load(Ordering::SeqCst), 1);
+        assert!(files.lock().unwrap().is_empty());
+
+        let flush = live
+            .recorder
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(LocalPerformanceMetricRecorder::flush)
+            .expect("injected recorder");
+        flush.await;
+        let records: Vec<serde_json::Value> = files
+            .lock()
+            .unwrap()
+            .values()
+            .flat_map(|data| data.lines())
+            .map(|line| serde_json::from_str(line).expect("valid JSONL"))
+            .collect();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0]["operation"], "recorder");
+        assert_eq!(records[0]["measurements"]["dropped_count"], 1.0);
+
+        live.flush_pending().await;
+        let line_count: usize = files
+            .lock()
+            .unwrap()
+            .values()
+            .map(|data| data.lines().count())
+            .sum();
+        assert_eq!(line_count, 1, "retry does not duplicate records or drop reports");
+    }
+}
