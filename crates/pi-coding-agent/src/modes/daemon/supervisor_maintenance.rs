@@ -475,10 +475,10 @@ impl Supervisor {
             // for their own dequeue marker, bounding queued transcript memory while
             // unrelated events continue through the same FIFO.
             tokio::time::timeout(Duration::from_secs(30), async {
-                tokio::select! { _ = public.stopped.cancelled() => return Err("Snapshot client disconnected".to_string()), sent = public.output.send(bytes) => sent.map_err(|_| "Snapshot client disconnected".to_string())? }
+                tokio::select! { _ = public.stopped.cancelled() => return Err("Snapshot client disconnected".to_string()), sent = public.output.send(PublicFrame { bytes, before_snapshot: false }) => sent.map_err(|_| "Snapshot client disconnected".to_string())? }
                 if let Some(marker) = dequeue_marker {
                     let mut dequeued = public.snapshot_dequeue.subscribe();
-                    tokio::select! { _ = public.stopped.cancelled() => return Err("Snapshot client disconnected".to_string()), sent = public.output.send(marker.clone()) => sent.map_err(|_| "Snapshot client disconnected".to_string())? }
+                    tokio::select! { _ = public.stopped.cancelled() => return Err("Snapshot client disconnected".to_string()), sent = public.output.send(PublicFrame { bytes: marker.clone(), before_snapshot: false }) => sent.map_err(|_| "Snapshot client disconnected".to_string())? }
                     loop {
                         tokio::select! {
                             _ = public.stopped.cancelled() => return Err("Snapshot client disconnected".to_string()),
@@ -495,7 +495,11 @@ impl Supervisor {
             }).await.map_err(|_| "Snapshot client did not drain within 30 seconds".to_string())?
         };
         let result: Result<(), String> = async {
-        send(serde_json::to_vec(response).map_err(|error| error.to_string())?, None).await?;
+        let response_bytes = serde_json::to_vec(response).map_err(|error| error.to_string())?;
+        if !public.write_snapshot_response(response_bytes).await {
+            public.stopped.cancel();
+            return Err("Snapshot attach response could not be queued".into());
+        }
         send(serde_json::to_vec(&json!({"type":"session_snapshot_begin","activeSessionId":active,"snapshotId":snapshot_id,"snapshot":metadata,"messageCount":count,"targetChunkBytes":SNAPSHOT_TARGET_CHUNK_BYTES,"purpose":"attach"})).unwrap(), None).await?;
         for index in 0..cache.chunk_count() {
             let mut marker = SNAPSHOT_DEQUEUE_MARKER_PREFIX.to_vec();

@@ -847,11 +847,11 @@ async fn nine_supervisor_real_writer_never_exposes_snapshot_markers() {
     let (fixture, client, mut raw, hello) = real_public_connection("nine-real-writer-markers", 16 * 1024).await;
     let mut marker = SNAPSHOT_DEQUEUE_MARKER_PREFIX.to_vec();
     marker.extend_from_slice(b"direct-marker-test:0");
-    client.output.send(marker.clone()).await.unwrap();
+    client.output.send(PublicFrame { bytes: marker.clone(), before_snapshot: false }).await.unwrap();
     let notice = json!({"type":"test_notice","value":42});
     let mut expected = serde_json::to_vec(&notice).unwrap();
     expected.push(b'\n');
-    client.output.send(expected.clone()).await.unwrap();
+    client.output.send(PublicFrame { bytes: expected.clone(), before_snapshot: false }).await.unwrap();
     let mut wire = vec![0; expected.len()];
     tokio::time::timeout(Duration::from_secs(10), tokio::io::AsyncReadExt::read_exact(&mut raw, &mut wire)).await.unwrap().unwrap();
     assert_eq!(wire, expected);
