@@ -19,6 +19,11 @@
 //!       Read-only fresh-process reopen used by replay; report is outside the case root.
 //!   self-test-r1 --work DIR --out <json>
 //!       Deterministic positive and negative admission/reopen controls.
+//!   verify-local --fixture <dir|case> --out <json> --arm <reviewed-r1-baseline|r2-candidate>
+//!          --adapter-diff <complete-diff> [--expectation FROZEN_R1_BASELINE]
+//!       Non-timed full-output local-kernel capture or exact semantic comparison.
+//!   self-test-r2 --fixture <case> --work DIR --out <json>
+//!       Deterministic R2 rejection controls, including invalid numeric CLI values.
 //!   bench-local --fixture <dir|case> --iters N --out <json> [--warmup N]
 //!          [--stamp SHA256] [--git DESCRIBE] [--chunk-context-window N]
 //!       Microbenchmarks of the pure local kernels through their real entry
@@ -83,6 +88,11 @@ use rand::seq::SliceRandom;
 use rand::{Rng, SeedableRng};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
+
+#[path = "compaction_replay/local_parity.rs"]
+mod local_parity;
+#[path = "compaction_replay/candidate_review.rs"]
+mod candidate_review;
 
 // ---------------------------------------------------------------------------
 // Counting global allocator (std-only)
@@ -446,14 +456,18 @@ impl Cli {
                 continue;
             }
             if let Some(rest) = arg.strip_prefix("--") {
-                if let Some((key, value)) = rest.split_once('=') {
-                    options.insert(key.to_string(), value.to_string());
+                let (key, value) = if let Some((key, value)) = rest.split_once('=') {
+                    (key, value.to_string())
                 } else if index < args.len() && !args[index].starts_with("--") {
                     // `--key value` form.
-                    options.insert(rest.to_string(), args[index].clone());
+                    let value = args[index].clone();
                     index += 1;
+                    (rest, value)
                 } else {
-                    options.insert(rest.to_string(), String::new());
+                    (rest, String::new())
+                };
+                if options.insert(key.to_string(), value).is_some() {
+                    return Err(format!("[cli-parse] duplicate option --{key}"));
                 }
             } else {
                 return Err(format!("unexpected positional argument: {arg}"));
@@ -480,13 +494,52 @@ impl Cli {
             .filter(|value| !value.is_empty())
     }
 
-    fn number(&self, key: &str, default: f64) -> Result<f64, String> {
-        match self.optional(key) {
-            None => Ok(default),
+    fn integer(
+        &self,
+        key: &str,
+        default: usize,
+        minimum: usize,
+        maximum: usize,
+    ) -> Result<usize, String> {
+        let value = match self.options.get(key) {
+            None => default,
+            Some(raw) if raw.is_empty() => {
+                return Err(stage_error(
+                    &format!("cli-{key}"),
+                    format!("--{key} is present but empty; a numeric value is required"),
+                ))
+            }
+            Some(raw) => raw
+                .parse::<usize>()
+                .map_err(|error| stage_error(&format!("cli-{key}"), error.to_string()))?,
+        };
+        ensure_stage(
+            (minimum..=maximum).contains(&value),
+            &format!("cli-{key}"),
+            format!("--{key} must be an integer in {minimum}..={maximum}, got {value}"),
+        )?;
+        Ok(value)
+    }
+
+    fn positive_number(&self, key: &str, default: f64, maximum: f64) -> Result<f64, String> {
+        let value = match self.options.get(key) {
+            None => default,
+            Some(raw) if raw.is_empty() => {
+                return Err(stage_error(
+                    &format!("cli-{key}"),
+                    format!("--{key} is present but empty; a numeric value is required"),
+                ))
+            }
             Some(raw) => raw
                 .parse::<f64>()
-                .map_err(|error| format!("--{key}: {error}")),
-        }
+                .map_err(|error| stage_error(&format!("cli-{key}"), error.to_string()))?,
+        };
+        ensure_stage(
+            value.is_finite() && value > 0.0 && value <= maximum,
+            &format!("cli-{key}"),
+            format!("--{key} must be finite and in (0, {maximum}], got {value}"),
+        )?;
+        Ok(value)
     }
 }
 
@@ -3568,32 +3621,27 @@ async fn run_replay(cli: &Cli) -> Result<i32, String> {
     if expected_outcome == ReplayOutcomeExpectation::SummaryFailure && summary_failure.is_none() {
         return Err("--expect-outcome summary-failure requires --summary-failure MSG".to_string());
     }
-    let expected_summary_calls = cli
-        .optional("expect-summary-calls")
-        .ok_or_else(|| {
-            "--expect-summary-calls N is required with replay admission; it must come from the fixture/options baseline, never the observed call count".to_string()
-        })?
-        .parse::<usize>()
-        .map_err(|error| format!("invalid --expect-summary-calls: {error}"))?;
-    if expected_summary_calls == 0 {
-        return Err("--expect-summary-calls must be positive because this replay always fires compaction".to_string());
-    }
+    ensure_stage(
+        cli.options.contains_key("expect-summary-calls"),
+        "cli-expect-summary-calls",
+        "--expect-summary-calls N is required and must come from the fixture/options baseline, never the observed call count",
+    )?;
+    let expected_summary_calls = cli.integer("expect-summary-calls", 1, 1, 1_000_000)?;
     let options = ReplayOptions {
-        provider_delay_ms: cli.number("provider-delay-ms", 0.0)? as u64,
+        provider_delay_ms: cli.integer("provider-delay-ms", 0, 0, 3_600_000)? as u64,
         summary_failure,
         expected_outcome,
         expected_summary_calls,
-        context_window: cli.number("context-window", 1_000_000.0)?,
-        keep_recent: match cli.number("keep-recent", f64::NAN) {
-            Ok(value) if value.is_finite() => Some(value),
-            Ok(_) => None,
-            Err(error) => return Err(error),
+        context_window: cli.positive_number("context-window", 1_000_000.0, 1_000_000_000.0)?,
+        keep_recent: match cli.options.contains_key("keep-recent") {
+            true => Some(cli.positive_number("keep-recent", 1.0, 1_000_000_000.0)?),
+            false => None,
         },
         work: cli
             .optional("work")
             .map(PathBuf::from)
             .unwrap_or_else(|| std::env::temp_dir().join("compaction-replay-work")),
-        timeout_secs: cli.number("timeout-secs", 900.0)? as u64,
+        timeout_secs: cli.integer("timeout-secs", 900, 1, 86_400)? as u64,
     };
     std::fs::create_dir_all(&options.work).map_err(|error| format!("mkdir work: {error}"))?;
     let counter = AtomicU64::new(0);
@@ -3688,11 +3736,13 @@ fn bench_kernel(
         }
     }
     let (alloc_count, alloc_bytes) = allocs.unwrap_or((0, 0));
+    let stats = timing_stats(samples);
+    assert_eq!(stats["n"].as_u64(), Some(iters as u64), "timed sample count must equal requested iterations");
     json!({
         "name": name,
         "detail": detail,
         "warmup": warmup,
-        "stats": timing_stats(samples),
+        "stats": stats,
         "allocs_first_iter": {
             "count": alloc_count,
             "bytes": alloc_bytes,
@@ -3701,13 +3751,81 @@ fn bench_kernel(
     })
 }
 
+fn bench_kernel_fallible(
+    name: &str,
+    detail: Value,
+    warmup: usize,
+    iters: usize,
+    mut kernel: impl FnMut() -> Result<f64, String>,
+) -> Result<Value, String> {
+    ensure_stage(warmup > 0 && iters > 0, "bench-config", "warmup and iterations must be positive")?;
+    let mut checksum = 0.0f64;
+    for _ in 0..warmup {
+        checksum += kernel()?;
+    }
+    let mut samples = Vec::with_capacity(iters);
+    let mut allocs = None;
+    let before_first = alloc_snapshot();
+    for index in 0..iters {
+        let started = Instant::now();
+        checksum += kernel()?;
+        samples.push(elapsed_ms(started));
+        if index == 0 {
+            let after_first = alloc_snapshot();
+            allocs = Some((
+                after_first.0.saturating_sub(before_first.0),
+                after_first.1.saturating_sub(before_first.1),
+            ));
+        }
+    }
+    let (alloc_count, alloc_bytes) = allocs.unwrap_or((0, 0));
+    let stats = timing_stats(samples);
+    ensure_stage(stats["n"].as_u64() == Some(iters as u64), "timed-sample-count", "sample count differs from requested iterations")?;
+    Ok(json!({
+        "name": name,
+        "detail": detail,
+        "warmup": warmup,
+        "stats": stats,
+        "allocs_first_iter": {"count": alloc_count, "bytes": alloc_bytes},
+        "checksum": checksum,
+    }))
+}
+
+fn jev_expected_skip_value(
+    message_count: usize,
+    skip: pi_jev::compaction::CompactionSkip,
+) -> Value {
+    json!({
+        "name": "jev_prepare_context",
+        "detail": {"messages": message_count},
+        "outcome": "expected-skip",
+        "skip_class": skip.as_str(),
+        "stats": Value::Null,
+        "checksum": Value::Null,
+        "note": "Named expected-skip lane; no numeric timing or sentinel is admitted",
+    })
+}
+
 fn run_bench_local(cli: &Cli) -> Result<i32, String> {
     let fixture_path = PathBuf::from(cli.required("fixture")?);
     let out = PathBuf::from(cli.required("out")?);
-    let iters = cli.number("iters", 20.0)? as usize;
-    let warmup = cli.number("warmup", 3.0)? as usize;
-    let chunk_context_window = cli.number("chunk-context-window", 32_768.0)?;
+    let iters = cli.integer("iters", 20, 1, 100_000)?;
+    let warmup = cli.integer("warmup", 3, 1, 100_000)?;
+    let chunk_context_window = cli.positive_number("chunk-context-window", 32_768.0, 1_000_000_000.0)?;
     let cases = discover_fixtures(&fixture_path)?;
+    // All fallible production entries are validated for all cases before any
+    // timer starts. Full-output comparison is the separate verify-local gate.
+    let mut preflight = Vec::new();
+    for case_dir in &cases {
+        let fixture = load_fixture(case_dir)?;
+        let projection = local_parity::case_projection(&fixture, chunk_context_window)
+            .map_err(|error| format!("{}: non-timed preflight failed: {error}", fixture.name))?;
+        preflight.push(json!({
+            "case": fixture.name,
+            "full_output_sha256": semantic_sha256(&projection)?,
+            "note": "preflight digest only; use verify-local for exact full-output parity",
+        }));
+    }
 
     let mut results: Vec<Value> = Vec::new();
     for case_dir in &cases {
@@ -3817,7 +3935,7 @@ fn run_bench_local(cli: &Cli) -> Result<i32, String> {
             let entries = entries.clone();
             let settings = settings.clone();
             let messages = messages.clone();
-            kernels.push(bench_kernel(
+            kernels.push(bench_kernel_fallible(
                 "prepare_compaction",
                 json!({
                     "entries": entries.len(),
@@ -3827,17 +3945,15 @@ fn run_bench_local(cli: &Cli) -> Result<i32, String> {
                 warmup,
                 iters,
                 move || {
-                    // Mirrors the production context builder: the threshold
-                    // estimate over the live message list.
                     prepare_compaction(
                         &entries,
                         &settings,
                         &|_entries| estimate_context_tokens(&messages).tokens,
                     )
                     .map(|preparation| preparation.tokens_before)
-                    .unwrap_or(-1.0)
+                    .ok_or_else(|| stage_error("prepare-compaction", "production prepare_compaction returned None during timing; rejecting the run"))
                 },
-            ));
+            )?);
         }
         // 5. convert_to_llm.
         let llm = {
@@ -4028,24 +4144,24 @@ fn run_bench_local(cli: &Cli) -> Result<i32, String> {
         {
             let messages = messages.clone();
             let config = CompactionConfig::default();
-            let mut skip_note: Option<String> = None;
-            if let Err(skip) = prepare_context(&messages, &config) {
-                skip_note = Some(skip.to_string());
+            match prepare_context(&messages, &config) {
+                Err(skip @ (pi_jev::compaction::CompactionSkip::NoCandidates | pi_jev::compaction::CompactionSkip::InsufficientReduction)) => {
+                    kernels.push(jev_expected_skip_value(messages.len(), skip));
+                }
+                Err(skip) => return Err(stage_error("jev-prepare", format!("unexpected Jev error: {}", skip.as_str()))),
+                Ok(_) => {
+                    kernels.push(bench_kernel_fallible(
+                        "jev_prepare_context",
+                        json!({"messages": messages.len(), "outcome": "prepared"}),
+                        warmup,
+                        iters,
+                        move || match prepare_context(&messages, &config) {
+                            Ok(prepared) => Ok(prepared.baseline.estimated_tokens_before as f64),
+                            Err(skip) => Err(stage_error("jev-prepare", format!("unexpected Jev error during timing: {}", skip.as_str()))),
+                        },
+                    )?);
+                }
             }
-            let note = skip_note;
-            kernels.push(bench_kernel(
-                "jev_prepare_context",
-                json!({
-                    "messages": messages.len(),
-                    "skip_on_first_call": note,
-                }),
-                warmup,
-                iters,
-                move || match prepare_context(&messages, &config) {
-                    Ok(prepared) => prepared.baseline.estimated_tokens_before as f64,
-                    Err(_) => -1.0,
-                },
-            ));
         }
 
         results.push(json!({
@@ -4070,6 +4186,8 @@ fn run_bench_local(cli: &Cli) -> Result<i32, String> {
             "Peak RSS is not measured: sysinfo is not a dependency of pi-coding-agent and no new dependencies are allowed.",
             "Allocation counts are process-global deltas around the first measured iteration (counting global allocator, std-only).",
         ],
+        "non_timed_preflight": preflight,
+        "parity_gate": "verify-local; scalar checksums are auxiliary only",
         "cases": results,
     });
     write_json(&out, &output)?;
@@ -4658,6 +4776,10 @@ fn main() {
             runtime.block_on(run_replay(&cli))
         }
         "bench-local" => run_bench_local(&cli),
+        "verify-local" => local_parity::run_verify_local(&cli),
+        "capture-local" => candidate_review::run_capture(&cli),
+        "self-test-r2-review" => candidate_review::run_candidate_controls(&cli),
+        "self-test-r2" => local_parity::run_r2_self_test(&cli),
         "verify-reopen" => run_verify_reopen(&cli),
         "self-test-r1" => {
             let runtime = tokio::runtime::Builder::new_current_thread()
