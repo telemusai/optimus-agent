@@ -749,7 +749,7 @@ impl OwnedSessionWorkerHost for NativeOwnedWorkerHost {
     fn kill_process_group(&self, pid: i64, signal: &str) -> bool {
         #[cfg(unix)]
         {
-            pid > 0 && send_signal(-pid, signal)
+            pid > 0 && send_process_group_signal(-pid, signal)
         }
         #[cfg(not(unix))]
         {
@@ -819,6 +819,30 @@ fn signal_name(signal: i32) -> String {
         libc::SIGKILL => "SIGKILL".into(),
         _ => format!("SIG{signal}"),
     }
+}
+
+#[cfg(unix)]
+fn process_group_signal_succeeded(result: i32, error: Option<i32>) -> bool {
+    result == 0 || (result == -1 && error == Some(libc::ESRCH))
+}
+
+#[cfg(unix)]
+fn send_process_group_signal(pid: i64, signal: &str) -> bool {
+    let (Ok(pid), Some(signal)) = (i32::try_from(pid), signal_number(signal)) else {
+        return false;
+    };
+    // This adapter signals only a specific process group, never every permitted process.
+    if pid >= -1 {
+        return false;
+    }
+    let result = unsafe { libc::kill(pid, signal) };
+    let error = if result == 0 {
+        None
+    } else {
+        io::Error::last_os_error().raw_os_error()
+    };
+    // ESRCH proves the complete group is already gone; other errors remain retryable.
+    process_group_signal_succeeded(result, error)
 }
 
 fn send_signal(pid: i64, signal: &str) -> bool {
@@ -907,6 +931,15 @@ fn subscribe_signal(signal: &str, callback: Callback) -> Result<Callback, String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn process_group_esrch_is_success_but_other_failures_remain_retryable() {
+        assert!(process_group_signal_succeeded(0, None));
+        assert!(process_group_signal_succeeded(-1, Some(libc::ESRCH)));
+        assert!(!process_group_signal_succeeded(-1, Some(libc::EPERM)));
+        assert!(!process_group_signal_succeeded(-1, None));
+    }
 
     #[test]
     fn explicit_worker_requires_a_real_owner_channel() {

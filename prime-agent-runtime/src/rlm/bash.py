@@ -310,6 +310,9 @@ class BashHandle:
         self._status: int | None = None
         self._status_known = threading.Event()
         self._reaped = False
+        # Set only after the leader exited and the foreground result decision is
+        # complete. A failed reap leaves retry ownership with this handle.
+        self._reap_ready = threading.Event()
         self._result: BashResult | None = None
         self._callbacks: list[Callable[[], None]] = []
         # Every concurrent _wait_reaped() awaiter gets its own wakeup: a single
@@ -326,6 +329,7 @@ class BashHandle:
         # original escaped child exits: the OS may recycle it for an unrelated
         # process before a later KILL or liveness probe.
         self._escaped: dict[int, str | None] = {}
+        self._escaped_lock = threading.Lock()
         self._started = time.monotonic()
         # POSIX: own process group so kill() signals the whole pipeline; Windows
         # contains the tree in a kill-on-close job object.
@@ -470,16 +474,19 @@ class BashHandle:
             with self._kill_lock:
                 if self._reaped:  # re-check: _watch may have reaped while we waited
                     return
-                if self._job is not None and _winjob.terminate(self._job):
-                    return
-                # TerminateJobObject failed or reap raced: taskkill fallback.
-                if not _taskkill_tree(self._pid):
-                    try:
-                        self._proc.kill()
-                    except OSError:
-                        pass
+                delivered = self._job is not None and _winjob.terminate(self._job)
+                if not delivered:
+                    # TerminateJobObject failed or reap raced: taskkill fallback.
+                    delivered = _taskkill_tree(self._pid)
+                    if not delivered:
+                        try:
+                            self._proc.kill()
+                        except OSError:
+                            pass
+            self._retry_reap()
             return
         self._signal_own_tree(sig)
+        self._retry_reap()
         if sig == signal.SIGTERM:
             timer = threading.Timer(grace, self._force_kill)
             timer.daemon = True
@@ -487,22 +494,31 @@ class BashHandle:
 
     def _remember_escaped(self, descendants: list[int]) -> None:
         for child in descendants:
-            if child not in self._escaped:
+            with self._escaped_lock:
+                if child in self._escaped:
+                    continue
+            # Process-start lookup can spawn a helper and block. Never hold the
+            # dictionary lock across it; the first discovered identity wins.
+            start_id = _process_start_id(child)
+            with self._escaped_lock:
                 # Keep the original identity even if this pid is rediscovered;
                 # replacing it would legitimize a recycled process.
-                self._escaped[child] = _process_start_id(child)
+                self._escaped.setdefault(child, start_id)
+
+    def _escaped_snapshot(self) -> dict[int, str | None]:
+        with self._escaped_lock:
+            return dict(self._escaped)
 
     def _signal_own_tree(self, sig: int) -> bool:
         """Signal the group plus every descendant, remembering the escapes."""
         descendants = _descendant_pids(self._pid) if _IS_POSIX else []
         self._remember_escaped(descendants)
-        return _signal_tree(
-            self._pid, sig, {child: self._escaped[child] for child in descendants}
-        )
+        return _signal_tree(self._pid, sig, self._escaped_snapshot())
 
     def _force_kill(self) -> None:
         if not self._reaped:
             self._signal_own_tree(signal.SIGKILL)
+            self._retry_reap()
 
     def _pump(self) -> None:
         stdout = self._proc.stdout
@@ -618,21 +634,32 @@ class BashHandle:
             self._abandon_completion()
             self._drain_grace()
             self._finalize(exit_code)
+        self._reap_ready.set()
+        self._retry_reap()
+
+    def _retry_reap(self) -> bool:
+        """Settle an exited leader once; retain live ownership after failure."""
+        if not self._reap_ready.is_set() or self._reaped:
+            return self._reaped
         with self._kill_lock:
+            if self._reaped:
+                return True
             delivered = self._reap_group()
+            if not delivered:
+                return False
             self._reaped = True
             if not _IS_POSIX:
                 # Reaped: pid fallbacks are gone, so the handle may finally close.
                 cast("_winjob.JobProcess", self._proc).close()
+        _record_journal(self._pid, active=False)
         with self._callback_lock:
             callbacks = self._reap_callbacks
             self._reap_callbacks = []
         for callback in callbacks:
             callback()
-        if delivered:
-            _record_journal(self._pid, active=False)
         with _live_lock:
             _live_handles.discard(self)
+        return True
 
     def _reap_group(self) -> bool:
         # Tree liveness, not leader death, gates the inactive record: members
@@ -648,7 +675,7 @@ class BashHandle:
                 job, self._job = self._job, None
                 _winjob.close(job)
             return delivered or _taskkill_tree(self._pid)
-        return _signal_tree(self._pid, signal.SIGKILL, self._escaped)
+        return _signal_tree(self._pid, signal.SIGKILL, self._escaped_snapshot())
 
     def _read_status(self) -> int | None:
         if self._status_read < 0:
@@ -871,7 +898,7 @@ class BashHandle:
                 if empty is not None:
                     return not empty
             return self._proc.poll() is None
-        for child, start_id in self._escaped.items():
+        for child, start_id in self._escaped_snapshot().items():
             present, current_id = _probe_escaped_identity(child)
             if present is False:
                 # Only ProcessLookupError is positive absence; a failed start
@@ -1355,7 +1382,7 @@ def _kill_live_handles() -> None:
     for handle in handles:
         if _IS_POSIX:
             handle._remember_escaped(_descendant_pids(handle._pid))
-            delivered = _signal_tree(handle._pid, signal.SIGKILL, handle._escaped)
+            delivered = _signal_tree(handle._pid, signal.SIGKILL, handle._escaped_snapshot())
         else:
             with handle._kill_lock:
                 if handle._reaped:
@@ -1371,7 +1398,11 @@ def _kill_live_handles() -> None:
                     except OSError:
                         pass
         if delivered:
-            _record_journal(handle._pid, active=False)
+            reap_ready = getattr(handle, "_reap_ready", None)
+            if reap_ready is not None and reap_ready.is_set():
+                handle._retry_reap()
+            else:
+                _record_journal(handle._pid, active=False)
 
 
 def _install_shutdown_hook() -> None:

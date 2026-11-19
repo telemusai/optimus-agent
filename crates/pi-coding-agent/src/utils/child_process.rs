@@ -49,11 +49,21 @@ pub struct SpawnOptions {
 pub struct OwnedChild {
     child: tokio::process::Child,
     detached: bool,
+    process: Option<crate::utils::shell::OwnedChildProcess>,
 }
 
 impl OwnedChild {
     pub(crate) fn new(child: tokio::process::Child, detached: bool) -> Self {
-        Self { child, detached }
+        // Capture ownership at the real construction boundary, before a later
+        // detached-registry call or cancellation can act on a recycled PID.
+        let process = child
+            .id()
+            .and_then(|pid| crate::utils::shell::register_owned_child_process(pid as i32));
+        Self { child, detached, process }
+    }
+
+    pub(crate) fn owned_process(&self) -> Option<&crate::utils::shell::OwnedChildProcess> {
+        self.process.as_ref()
     }
 }
 
@@ -73,17 +83,20 @@ impl std::ops::DerefMut for OwnedChild {
 
 impl Drop for OwnedChild {
     fn drop(&mut self) {
+        let Some(process) = self.process.as_ref() else {
+            return;
+        };
         if self.detached {
+            crate::utils::shell::release_owned_child_process(process);
             return;
         }
-        if let Some(pid) = self.child.id() {
-            if !matches!(self.child.try_wait(), Ok(Some(_))) {
-                // Poll errors fail closed: the inner kill-on-drop still owns
-                // the root, while this path also reaches its descendants.
-                crate::utils::shell::kill_process_tree(pid as i32);
-                let _ = self.child.start_kill();
-            }
+        if !matches!(self.child.try_wait(), Ok(Some(_))) {
+            // Poll errors fail closed: the inner kill-on-drop still owns
+            // the root, while this path also reaches its descendants.
+            crate::utils::shell::kill_owned_child_process_tree(process);
+            let _ = self.child.start_kill();
         }
+        crate::utils::shell::release_owned_child_process(process);
     }
 }
 
@@ -95,10 +108,7 @@ pub fn spawn_hidden(command: &str, args: &[String], options: SpawnOptions) -> st
     let mut builder = build_tokio_command(command, args, &options);
     builder.kill_on_drop(!options.detached);
     Ok(ChildProcessHandle {
-        child: OwnedChild {
-            child: builder.spawn()?,
-            detached: options.detached,
-        },
+        child: OwnedChild::new(builder.spawn()?, options.detached),
     })
 }
 

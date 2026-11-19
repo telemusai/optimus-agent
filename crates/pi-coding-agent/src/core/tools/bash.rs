@@ -9,9 +9,9 @@ use pi_agent_core::types::ContentBlock as AgentContentBlock;
 #[cfg(windows)]
 use crate::utils::child_process::{spawn_kernel, KernelJob, KernelProcess, SpawnOptions};
 #[cfg(not(windows))]
-use crate::utils::shell::kill_process_tree;
+use crate::utils::shell::kill_owned_child_process_tree;
 use crate::utils::shell::{
-    get_shell_config, get_shell_env, track_detached_child_pid, untrack_detached_child_pid,
+    get_shell_config, get_shell_env, track_detached_child, untrack_detached_child, OwnedChildProcess,
 };
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
@@ -129,6 +129,7 @@ pub struct LocalBashOperations {
 // `taskkill /T` tree walk cannot reach because an intermediate parent
 // already exited.
 struct BashChild {
+    process: Option<OwnedChildProcess>,
     #[cfg(windows)]
     child: KernelProcess,
     #[cfg(not(windows))]
@@ -170,16 +171,47 @@ impl Drop for BashChild {
             let _ = self.child.containment.terminate();
         }
         #[cfg(not(windows))]
-        if let Some(pid) = self.child.id() {
-            kill_process_tree(pid as i32);
+        let tree_cleanup_complete = self
+            .process
+            .as_ref()
+            .map(|process| kill_owned_child_process_tree(process))
+            .unwrap_or(true);
+        #[cfg(windows)]
+        let tree_cleanup_complete = true;
+        #[cfg(not(windows))]
+        if self.process.is_some() {
             let _ = self.child.start_kill();
         }
-        if let Some(pid) = self.child.id() {
-            if !crate::utils::child_process::is_process_alive(pid as i32) {
-                untrack_detached_child_pid(pid as i32);
-            }
+        if let Some(process) = self.process.as_ref() {
+            untrack_bash_child_if_settled_with(
+                process,
+                false,
+                tree_cleanup_complete,
+                crate::utils::child_process::is_process_alive(process.pid()),
+                untrack_detached_child,
+            );
+            #[cfg(windows)]
+            crate::utils::shell::release_owned_child_process(process);
         }
     }
+}
+
+/// Apply the real registration decision with an injectable observer for
+/// synthetic generation tests. A normal direct wait retains its historical
+/// unconditional cleanup; cancellation keeps the exact generation whenever
+/// tree cleanup failed, even if the leader itself has exited.
+fn untrack_bash_child_if_settled_with(
+    process: &OwnedChildProcess,
+    direct_result_succeeded: bool,
+    tree_cleanup_complete: bool,
+    leader_alive: bool,
+    untrack: impl FnOnce(&OwnedChildProcess),
+) -> bool {
+    if !direct_result_succeeded && (!tree_cleanup_complete || leader_alive) {
+        return false;
+    }
+    untrack(process);
+    true
 }
 struct BashReaders(Vec<tokio::task::AbortHandle>);
 impl Drop for BashReaders {
@@ -237,7 +269,12 @@ impl BashOperations for LocalBashOperations {
                         ..Default::default()
                     },
                 ) {
-                    Ok(child) => BashChild { child, released: false },
+                    Ok(child) => {
+                        let process = child
+                            .id()
+                            .and_then(|pid| crate::utils::shell::register_owned_child_process(pid as i32));
+                        BashChild { child, released: false, process }
+                    },
                     Err(error) => return Err(error.to_string()),
                 }
             };
@@ -260,8 +297,10 @@ impl BashOperations for LocalBashOperations {
 
                 command_builder.kill_on_drop(true);
                 match command_builder.spawn() {
-                    Ok(child) => BashChild {
-                        child: crate::utils::child_process::OwnedChild::new(child, false),
+                    Ok(child) => {
+                        let child = crate::utils::child_process::OwnedChild::new(child, false);
+                        let process = child.owned_process().cloned();
+                        BashChild { child, process }
                     },
                     Err(error) => return Err(error.to_string()),
                 }
@@ -273,9 +312,9 @@ impl BashOperations for LocalBashOperations {
             drop(child.stdin.take());
 
             // TS bash.ts:80: `if (child.pid) trackDetachedChildPid(child.pid);`
-            let tracked_child_pid = child.id().map(|pid| pid as i32);
-            if let Some(pid) = tracked_child_pid {
-                track_detached_child_pid(pid);
+            let tracked_child_process = child.process.clone();
+            if let Some(process) = tracked_child_process.as_ref() {
+                track_detached_child(process);
             }
             let stdout = child.stdout.take();
             let stderr = child.stderr.take();
@@ -295,10 +334,6 @@ impl BashOperations for LocalBashOperations {
                 .filter_map(|task| task.as_ref().map(tokio::task::JoinHandle::abort_handle)).collect());
             let mut timed_out = false;
             let mut aborted = false;
-            // `wait` holds a mutable borrow of `child` for as long as it lives, so
-            // the pid is captured before the wait starts.
-            #[cfg(not(windows))]
-            let child_pid = child.id();
             let result = {
                 let wait = child.wait();
                 tokio::pin!(wait);
@@ -346,6 +381,10 @@ impl BashOperations for LocalBashOperations {
                 }
             };
 
+            #[cfg(not(windows))]
+            let mut tree_cleanup_complete = true;
+            #[cfg(windows)]
+            let tree_cleanup_complete = true;
             if result.is_none() {
                 #[cfg(windows)]
                 {
@@ -356,9 +395,8 @@ impl BashOperations for LocalBashOperations {
                     let _ = child.containment.terminate();
                 }
                 #[cfg(not(windows))]
-                if let Some(pid) = child_pid {
-                    // `utils/shell.ts killProcessTree(pid: number)`.
-                    kill_process_tree(pid as i32);
+                if let Some(process) = child.process.as_ref() {
+                    tree_cleanup_complete = kill_owned_child_process_tree(process);
                 }
             }
 
@@ -394,17 +432,17 @@ impl BashOperations for LocalBashOperations {
                 (options.on_data)(b"\n[Shell exited; closed output pipes held by a background process. Redirect background output to a file to retain it.]\n");
             }
 
-            // TS bash.ts:102/:116 clears settled children. A live child
-            // after a failed cancellation kill remains active for retry.
-            if let Some(pid) = tracked_child_pid {
-                // A normal wait has reaped the shell. After cancellation or a
-                // timeout, untrack only when exit is observed; otherwise retain
-                // active evidence for the detached shutdown/retry path.
-                if matches!(result, Some(Ok(_)))
-                    || !crate::utils::child_process::is_process_alive(pid)
-                {
-                    untrack_detached_child_pid(pid);
-                }
+            // TS bash.ts:102/:116 clears settled children. A failed tree kill
+            // retains the exact generation even when the leader exited but a
+            // same-pgid descendant remains, so detached shutdown can retry it.
+            if let Some(process) = tracked_child_process.as_ref() {
+                untrack_bash_child_if_settled_with(
+                    process,
+                    matches!(result, Some(Ok(_))),
+                    tree_cleanup_complete,
+                    crate::utils::child_process::is_process_alive(process.pid()),
+                    untrack_detached_child,
+                );
             }
 
             if aborted {
@@ -1109,6 +1147,51 @@ mod tests {
 
     fn recording(calls: Arc<AtomicUsize>) -> Arc<dyn BashOperations> {
         Arc::new(RecordingOperations { calls })
+    }
+
+    #[test]
+    fn failed_bash_tree_cleanup_retains_the_exact_generation_for_retry() {
+        let process = crate::utils::shell::register_owned_child_process(i32::MAX)
+            .expect("synthetic process registration");
+
+        // Cleanup failed and only the leader is gone: a descendant can remain
+        // in its process group, so the dead leader must not trigger untracking.
+        assert!(!untrack_bash_child_if_settled_with(
+            &process,
+            false,
+            false,
+            false,
+            |_| panic!("failed cleanup must retain its generation"),
+        ));
+        assert!(!untrack_bash_child_if_settled_with(
+            &process,
+            false,
+            true,
+            true,
+            |_| panic!("a live leader must remain tracked"),
+        ));
+
+        let mut untracked = Vec::new();
+        assert!(untrack_bash_child_if_settled_with(
+            &process,
+            false,
+            true,
+            false,
+            |candidate| untracked.push(candidate.clone()),
+        ));
+        assert_eq!(untracked, vec![process.clone()]);
+
+        // A successful direct wait keeps the pre-existing unconditional
+        // untrack semantics, independent of cleanup/probe outcomes.
+        assert!(untrack_bash_child_if_settled_with(
+            &process,
+            true,
+            false,
+            true,
+            |candidate| untracked.push(candidate.clone()),
+        ));
+        assert_eq!(untracked, vec![process.clone(), process.clone()]);
+        crate::utils::shell::release_owned_child_process(&process);
     }
 
     #[test]

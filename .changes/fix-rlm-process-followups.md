@@ -1,0 +1,1 @@
+- Fixed bounded process-tree recovery, retryable cleanup ownership, and snapshot restoration of callable dictionary keys.

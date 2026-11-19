@@ -97,6 +97,24 @@ class SnapshotRestoreFunctionsTest(unittest.TestCase):
             "(2, True, True, True)",
         )
 
+    def test_direct_function_dictionary_key_is_revived(self):
+        self.roundtrip(
+            "G = 1\ndef reader():\n    return G\n"
+            "bundle = {reader: reader}",
+            "G = 2\nkey = next(k for k in bundle if callable(k))\n"
+            "(key(), key.__globals__ is globals(), bundle[key] is key)",
+            "(2, True, True)",
+        )
+
+    def test_unaliased_function_tuple_dictionary_key_is_revived(self):
+        self.roundtrip(
+            "G = 1\ndef reader():\n    return G\n"
+            "bundle = {(reader,): 'tuple-key'}",
+            "G = 2\nkey = next(k for k in bundle if isinstance(k, tuple))\n"
+            "(bundle[key], key[0](), key[0].__globals__ is globals())",
+            "('tuple-key', 2, True)",
+        )
+
     def test_function_tuple_dictionary_key_keeps_value_alias_identity(self):
         self.roundtrip(
             "def reader():\n    return 1\n"

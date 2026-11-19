@@ -423,7 +423,8 @@ pub trait OwnedSessionWorkerHost: Send + Sync {
         options: OwnedWorkerSpawnOptions,
     ) -> Result<Arc<dyn OwnedWorkerChild>, String>;
 
-    /// `process.kill(-pid, "SIGKILL")`; `false` when the call throws.
+    /// `process.kill(-pid, "SIGKILL")`; `true` also when the group is already absent.
+    /// `false` means delivery failed or the outcome is unknown.
     fn kill_process_group(&self, pid: i64, signal: &str) -> bool;
     /// `setTimeout(handler, ms).unref()`.
     fn schedule_unref_timeout(&self, ms: u64, handler: Arc<dyn Fn() + Send + Sync>);
@@ -550,7 +551,8 @@ pub async fn run_owned_session_worker_frontend(
 ) -> Result<i32, String> {
     let frontend = Arc::new(OwnedSessionWorkerFrontend::new(args, profile, host));
     let result = frontend.clone().run().await;
-    // `finally`: detach the readers, drop the descriptor and clear the journal.
+    // `finally`: detach the readers and drop the descriptor. Resource reaping
+    // clears the journal only after all required kills have succeeded.
     frontend.cleanup();
     result
 }
@@ -741,25 +743,44 @@ impl OwnedSessionWorkerFrontend {
 
     /// `reapWorkerResources(workerPid)`.
     fn reap_worker_resources(&self, worker_pid: Option<i64>) {
+        self.reap_worker_resources_with_kill(worker_pid, kill_orphan_process);
+    }
+
+    fn reap_worker_resources_with_kill<F>(&self, worker_pid: Option<i64>, kill_orphan: F)
+    where
+        F: Fn(i64) -> bool,
+    {
         let Some(worker_pid) = worker_pid.filter(|pid| *pid != 0) else {
             return;
         };
-        if self.host.platform() != "win32" {
-            // The worker process group may already be fully reaped.
-            let _ = self.host.kill_process_group(worker_pid, "SIGKILL");
+        let mut cleanup_complete = true;
+        if self.host.platform() != "win32"
+            && !self.host.kill_process_group(worker_pid, "SIGKILL")
+        {
+            cleanup_complete = false;
         }
         match read_active_orphan_processes(&self.orphan_process_journal_path, worker_pid) {
             Ok(orphans) => {
                 for orphan in orphans {
                     if !should_reap_orphan_process(&orphan) {
+                        if orphan.process_start_id.is_none() {
+                            // Identity-free evidence cannot prove the original process is absent.
+                            cleanup_complete = false;
+                        }
+                        // A known start id that no longer matches retires the original record.
                         continue;
                     }
-                    let _ = kill_orphan_process(orphan.pid);
+                    if !kill_orphan(orphan.pid) {
+                        cleanup_complete = false;
+                    }
                 }
             }
-            Err(_) => {}
+            // An unreadable journal can still name surviving processes.
+            Err(_) => cleanup_complete = false,
         }
-        clear_orphan_process_journal(&self.orphan_process_journal_path);
+        if cleanup_complete {
+            clear_orphan_process_journal(&self.orphan_process_journal_path);
+        }
     }
 
     /// `spawnWorker(workerArgs)`.
@@ -1017,7 +1038,7 @@ impl OwnedSessionWorkerFrontend {
         }
     }
 
-    /// The `finally` block: detach the readers, drop the descriptor, clear the journal.
+    /// The `finally` block: detach the readers and drop the descriptor.
     fn cleanup(&self) {
         if let Some(detach) = self.detach_rpc_input.lock().expect("rpc detach poisoned").take() {
             detach();
@@ -1026,7 +1047,7 @@ impl OwnedSessionWorkerFrontend {
             detach();
         }
         let _ = std::fs::remove_file(&self.recovery_descriptor_path);
-        clear_orphan_process_journal(&self.orphan_process_journal_path);
+        // A failed or incomplete reap must leave readable evidence for a retry.
     }
 }
 
@@ -1437,6 +1458,209 @@ mod tests {
         assert_eq!(second.get("command").unwrap().as_str(), Some("get_state"));
     }
 
+    fn write_orphan_record(
+        path: &std::path::Path,
+        owner_pid: i64,
+        pid: i64,
+        process_start_id: Option<String>,
+    ) {
+        std::fs::write(
+            path,
+            format!(
+                "{}\n",
+                serde_json::json!({
+                    "version": 1,
+                    "pid": pid,
+                    "ownerPid": owner_pid,
+                    "processStartId": process_start_id,
+                    "active": true,
+                    "recordedAt": "2026-01-01T00:00:00.000Z"
+                })
+            ),
+        )
+        .unwrap();
+    }
+
+    fn write_active_orphan(path: &std::path::Path, owner_pid: i64, pid: i64) {
+        let process_start_id = crate::core::session_lease::get_process_start_id(pid)
+            .expect("the current test process must have an observable start id");
+        write_orphan_record(path, owner_pid, pid, Some(process_start_id));
+    }
+
+    #[test]
+    fn failed_orphan_kill_keeps_the_journal_until_a_later_kill_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = dir.path().join("orphans.jsonl");
+        let host = RecordingHost::default();
+        let worker_pid = 4242;
+        let orphan_pid = std::process::id() as i64;
+        let mut frontend = OwnedSessionWorkerFrontend::new(
+            &[],
+            OwnedSessionWorkerProfile::Print,
+            Arc::new(host),
+        );
+        frontend.recovery_descriptor_path = dir.path().join("recovery.json").to_string_lossy().into_owned();
+        frontend.orphan_process_journal_path = journal.to_string_lossy().into_owned();
+        write_active_orphan(&journal, worker_pid, orphan_pid);
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let results = Arc::new(Mutex::new(std::collections::VecDeque::from([false, true])));
+        let kill_orphan = {
+            let calls = calls.clone();
+            let results = results.clone();
+            move |pid| {
+                calls.lock().unwrap().push(pid);
+                results.lock().unwrap().pop_front().unwrap()
+            }
+        };
+
+        frontend.reap_worker_resources_with_kill(Some(worker_pid), &kill_orphan);
+        assert_eq!(*calls.lock().unwrap(), vec![orphan_pid]);
+        assert!(journal.exists(), "a false kill result must retain recovery evidence");
+        assert_eq!(
+            read_active_orphan_processes(&frontend.orphan_process_journal_path, worker_pid)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        frontend.cleanup();
+        assert!(journal.exists(), "frontend cleanup must not erase a failed reap");
+
+        frontend.reap_worker_resources_with_kill(Some(worker_pid), &kill_orphan);
+        assert_eq!(*calls.lock().unwrap(), vec![orphan_pid, orphan_pid]);
+        assert!(!journal.exists(), "a successful retry must clear the journal");
+    }
+
+    #[test]
+    fn failed_group_kill_still_reaches_orphans_and_allows_a_complete_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = dir.path().join("orphans.jsonl");
+        let host = RecordingHost::default();
+        *host.platform.lock().unwrap() = Some("linux".to_string());
+        *host.process_group_kill_results.lock().unwrap() =
+            std::collections::VecDeque::from([false, true]);
+        let worker_pid = 4242;
+        let orphan_pid = std::process::id() as i64;
+        let mut frontend = OwnedSessionWorkerFrontend::new(
+            &[],
+            OwnedSessionWorkerProfile::Print,
+            Arc::new(host.clone()),
+        );
+        frontend.orphan_process_journal_path = journal.to_string_lossy().into_owned();
+        write_active_orphan(&journal, worker_pid, orphan_pid);
+
+        let orphan_calls = Arc::new(Mutex::new(Vec::new()));
+        let kill_orphan = {
+            let orphan_calls = orphan_calls.clone();
+            move |pid| {
+                orphan_calls.lock().unwrap().push(pid);
+                true
+            }
+        };
+
+        frontend.reap_worker_resources_with_kill(Some(worker_pid), &kill_orphan);
+        assert_eq!(host.process_group_kills.lock().unwrap().len(), 1);
+        assert_eq!(*orphan_calls.lock().unwrap(), vec![orphan_pid]);
+        assert!(journal.exists(), "a false group kill must retain the journal");
+
+        frontend.reap_worker_resources_with_kill(Some(worker_pid), &kill_orphan);
+        assert_eq!(host.process_group_kills.lock().unwrap().len(), 2);
+        assert_eq!(*orphan_calls.lock().unwrap(), vec![orphan_pid, orphan_pid]);
+        assert!(!journal.exists(), "a complete retry must clear the journal");
+    }
+
+    #[test]
+    fn absent_process_group_and_no_orphans_clear_the_journal() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = dir.path().join("orphans.jsonl");
+        std::fs::write(&journal, "").unwrap();
+        let host = RecordingHost::default();
+        *host.platform.lock().unwrap() = Some("linux".to_string());
+        *host.process_group_kill_results.lock().unwrap() =
+            std::collections::VecDeque::from([true]);
+        let worker_pid = 4242;
+        let mut frontend = OwnedSessionWorkerFrontend::new(
+            &[],
+            OwnedSessionWorkerProfile::Print,
+            Arc::new(host.clone()),
+        );
+        frontend.orphan_process_journal_path = journal.to_string_lossy().into_owned();
+
+        frontend.reap_worker_resources_with_kill(Some(worker_pid), |_| {
+            panic!("an empty journal must not reach the orphan kill path")
+        });
+
+        assert_eq!(
+            *host.process_group_kills.lock().unwrap(),
+            vec![(worker_pid, "SIGKILL".to_string())]
+        );
+        assert!(!journal.exists(), "an absent group and no orphans are a successful no-op");
+    }
+
+    #[test]
+    fn stale_and_dead_known_identity_orphans_retire_without_kills() {
+        let dir = tempfile::tempdir().unwrap();
+        let worker_pid = 4242;
+        for orphan_pid in [std::process::id() as i64, i64::MAX] {
+            let journal = dir.path().join(format!("orphans-{orphan_pid}.jsonl"));
+            write_orphan_record(
+                &journal,
+                worker_pid,
+                orphan_pid,
+                Some(format!("not-the-current-start-id-{orphan_pid}")),
+            );
+            let host = RecordingHost::default();
+            let mut frontend = OwnedSessionWorkerFrontend::new(
+                &[],
+                OwnedSessionWorkerProfile::Print,
+                Arc::new(host),
+            );
+            frontend.orphan_process_journal_path = journal.to_string_lossy().into_owned();
+
+            frontend.reap_worker_resources_with_kill(Some(worker_pid), |pid| {
+                panic!("absent known identity {pid} must not reach the kill path")
+            });
+
+            assert!(
+                !journal.exists(),
+                "stale or dead known identity {orphan_pid} must retire its record"
+            );
+        }
+    }
+
+    #[test]
+    fn identity_free_orphan_with_unknown_outcome_is_retained() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = dir.path().join("orphans.jsonl");
+        let host = RecordingHost::default();
+        let worker_pid = 4242;
+        let orphan_pid = i64::MAX;
+        let mut frontend = OwnedSessionWorkerFrontend::new(
+            &[],
+            OwnedSessionWorkerProfile::Print,
+            Arc::new(host),
+        );
+        frontend.orphan_process_journal_path = journal.to_string_lossy().into_owned();
+        write_orphan_record(&journal, worker_pid, orphan_pid, None);
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let kill_orphan = {
+            let calls = calls.clone();
+            move |pid| {
+                calls.lock().unwrap().push(pid);
+                false
+            }
+        };
+
+        frontend.reap_worker_resources_with_kill(Some(worker_pid), kill_orphan);
+
+        #[cfg(windows)]
+        assert!(calls.lock().unwrap().is_empty());
+        #[cfg(not(windows))]
+        assert_eq!(*calls.lock().unwrap(), vec![orphan_pid]);
+        assert!(journal.exists(), "unknown identity and kill evidence must remain retryable");
+    }
+
     #[test]
     fn forwards_a_signal_only_while_the_child_is_still_running() {
         let running = RecordingChild::default();
@@ -1463,6 +1687,9 @@ mod tests {
         stdout: Arc<Mutex<Vec<String>>>,
         stderr: Arc<Mutex<Vec<String>>>,
         exit_codes: Arc<Mutex<Vec<i32>>>,
+        platform: Arc<Mutex<Option<String>>>,
+        process_group_kills: Arc<Mutex<Vec<(i64, String)>>>,
+        process_group_kill_results: Arc<Mutex<std::collections::VecDeque<bool>>>,
     }
 
     impl RecordingHost {
@@ -1473,7 +1700,11 @@ mod tests {
 
     impl OwnedSessionWorkerHost for RecordingHost {
         fn platform(&self) -> String {
-            "win32".to_string()
+            self.platform
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or_else(|| "win32".to_string())
         }
         fn stdin_is_tty(&self) -> Option<bool> {
             Some(true)
@@ -1531,8 +1762,16 @@ mod tests {
         ) -> Result<Arc<dyn OwnedWorkerChild>, String> {
             Ok(Arc::new(RecordingChild::default()))
         }
-        fn kill_process_group(&self, _pid: i64, _signal: &str) -> bool {
-            false
+        fn kill_process_group(&self, pid: i64, signal: &str) -> bool {
+            self.process_group_kills
+                .lock()
+                .unwrap()
+                .push((pid, signal.to_string()));
+            self.process_group_kill_results
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(false)
         }
         fn schedule_unref_timeout(&self, _ms: u64, _handler: Arc<dyn Fn() + Send + Sync>) {}
         fn exit(&self, code: i32) {

@@ -78,15 +78,28 @@ def _revive(
             {key: revive(attr) for key, attr in value.__dict__.items()},
         ))
         return rebuilt
-    if isinstance(value, (list, dict)):
+    if isinstance(value, list):
+        memo[id(value)] = value
+        for key, item in enumerate(value):
+            revived = revive(item)
+            if revived is not item:
+                value[key] = revived
+        return value
+    if isinstance(value, dict):
         memo[id(value)] = value
         # Dict backpatching may replace a rebuilt tuple key during revival.
         # Iterate over a snapshot so that legal key replacement cannot mutate
         # the live iterator and drop the entire restored dictionary.
-        for key, item in enumerate(value) if isinstance(value, list) else list(value.items()):
-            revived = revive(item)
-            if revived is not item:
-                value[key] = revived
+        for key, item in list(value.items()):
+            revived_key = revive(key)
+            revived_item = revive(item)
+            if revived_key is not key:
+                # Recursive tuple revival can already have backpatched this key.
+                if key in value:
+                    del value[key]
+                value[revived_key] = revived_item
+            elif revived_item is not item:
+                value[key] = revived_item
         return value
     if type(value) is tuple:
         # Seed before descent: tuple -> list/dict -> tuple cycles otherwise
