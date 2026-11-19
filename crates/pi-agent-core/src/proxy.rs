@@ -9,15 +9,18 @@ use pi_ai::types::{
     AssistantMessage, AssistantMessageEvent, ContentBlock, Context, Model, SimpleStreamOptions,
     TextContent, ThinkingContent, ToolCall, Usage,
 };
-use pi_ai::utils::event_stream::EventStream;
+use pi_ai::utils::event_stream::{AssistantMessageEventStream, StreamTaskReceipt};
 use pi_ai::utils::json_parse::parse_streaming_json;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use tokio_util::sync::CancellationToken;
 
+const PROXY_HEADER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+const PROXY_ERROR_BODY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// `class ProxyMessageEventStream extends EventStream<AssistantMessageEvent, AssistantMessage>`.
 #[derive(Clone)]
-pub struct ProxyMessageEventStream(EventStream<AssistantMessageEvent, AssistantMessage>);
+pub struct ProxyMessageEventStream(AssistantMessageEventStream);
 
 impl Default for ProxyMessageEventStream {
     fn default() -> Self {
@@ -27,19 +30,15 @@ impl Default for ProxyMessageEventStream {
 
 impl ProxyMessageEventStream {
     pub fn new() -> Self {
-        Self(EventStream::new(
-            Box::new(|event: &AssistantMessageEvent| {
-                matches!(
-                    event,
-                    AssistantMessageEvent::Done { .. } | AssistantMessageEvent::Error { .. }
-                )
-            }),
-            Box::new(|event: &AssistantMessageEvent| match event {
-                AssistantMessageEvent::Done { message, .. } => message.clone(),
-                AssistantMessageEvent::Error { error, .. } => error.clone(),
-                _ => panic!("Unexpected event type"),
-            }),
-        ))
+        Self(AssistantMessageEventStream::new_owned())
+    }
+
+    fn producer_handle(&self) -> Self {
+        Self(self.0.producer_handle())
+    }
+
+    pub fn task_receipt(&self) -> StreamTaskReceipt {
+        self.0.task_receipt()
     }
 
     pub fn push(&self, event: AssistantMessageEvent) {
@@ -55,7 +54,8 @@ impl ProxyMessageEventStream {
     }
 
     pub async fn result(&self) -> AssistantMessage {
-        self.0.result().await.unwrap_or_else(|_| {
+        let result = self.0.result_or_end().await;
+        result.unwrap_or_else(|| {
             let mut error = AssistantMessage::default();
             error.stop_reason = pi_ai::types::STOP_REASON_ERROR.to_string();
             error.error_message = Some(
@@ -493,9 +493,9 @@ struct ProxyRequestBody {
 /// through a proxy.
 pub fn stream_proxy(model: Model, context: Context, options: ProxyStreamOptions) -> ProxyMessageEventStream {
     let stream = ProxyMessageEventStream::new();
-    let stream_for_task = stream.clone();
+    let stream_for_task = stream.producer_handle();
 
-    tokio::spawn(async move {
+    stream.0.spawn(async move {
         let mut state = ProxyPartialState::new(&model);
         let signal = options.signal.clone();
 
@@ -513,12 +513,28 @@ pub fn stream_proxy(model: Model, context: Context, options: ProxyStreamOptions)
             .header("Content-Type", "application/json")
             .json(&body);
 
-        let response = match request
-            .send()
-            .await
-        {
-            Ok(response) => response,
-            Err(error) => {
+        // Bound response-header wait without applying a total timeout to the body.
+        let send = request.send();
+        let response = match signal {
+            Some(ref signal) => tokio::select! {
+                biased;
+                _ = signal.cancelled() => {
+                    state.partial.stop_reason = pi_ai::types::STOP_REASON_ABORTED.to_string();
+                    state.partial.error_message = Some("Request aborted by user".to_string());
+                    stream_for_task.push(AssistantMessageEvent::Error {
+                        reason: pi_ai::types::STOP_REASON_ABORTED.to_string(),
+                        error: state.partial.clone(),
+                    });
+                    stream_for_task.end(None);
+                    return;
+                }
+                result = tokio::time::timeout(PROXY_HEADER_TIMEOUT, send) => result,
+            },
+            None => tokio::time::timeout(PROXY_HEADER_TIMEOUT, send).await,
+        };
+        let response = match response {
+            Ok(Ok(response)) => response,
+            Ok(Err(error)) => {
                 let error_message = error.to_string();
                 let reason = if signal.as_ref().map(|signal| signal.is_cancelled()).unwrap_or(false) {
                     pi_ai::types::STOP_REASON_ABORTED
@@ -534,13 +550,46 @@ pub fn stream_proxy(model: Model, context: Context, options: ProxyStreamOptions)
                 stream_for_task.end(None);
                 return;
             }
+            Err(_) => {
+                state.partial.stop_reason = pi_ai::types::STOP_REASON_ERROR.to_string();
+                state.partial.error_message = Some("Proxy request timed out waiting for response headers".to_string());
+                stream_for_task.push(AssistantMessageEvent::Error {
+                    reason: pi_ai::types::STOP_REASON_ERROR.to_string(),
+                    error: state.partial.clone(),
+                });
+                stream_for_task.end(None);
+                return;
+            }
         };
 
         if !response.status().is_success() {
             let status = response.status();
             let status_text = status.canonical_reason().unwrap_or_default().to_string();
             let mut error_message = format!("Proxy error: {} {}", status.as_u16(), status_text);
-            if let Ok(error_data) = response.json::<Value>().await {
+            let error_body = response.json::<Value>();
+            let error_data = match signal {
+                Some(ref signal) => tokio::select! {
+                    biased;
+                    _ = signal.cancelled() => {
+                        state.partial.stop_reason = pi_ai::types::STOP_REASON_ABORTED.to_string();
+                        state.partial.error_message = Some("Request aborted by user".to_string());
+                        stream_for_task.push(AssistantMessageEvent::Error {
+                            reason: pi_ai::types::STOP_REASON_ABORTED.to_string(),
+                            error: state.partial.clone(),
+                        });
+                        stream_for_task.end(None);
+                        return;
+                    }
+                    result = tokio::time::timeout(PROXY_ERROR_BODY_TIMEOUT, error_body) => {
+                        result.ok().and_then(Result::ok)
+                    }
+                },
+                None => tokio::time::timeout(PROXY_ERROR_BODY_TIMEOUT, error_body)
+                    .await
+                    .ok()
+                    .and_then(Result::ok),
+            };
+            if let Some(error_data) = error_data {
                 if let Some(error) = error_data.get("error").and_then(Value::as_str) {
                     error_message = format!("Proxy error: {error}");
                 }
@@ -704,29 +753,52 @@ mod tests {
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+    async fn read_request(socket: &mut tokio::net::TcpStream) -> Value {
+        let mut bytes = Vec::new();
+        loop {
+            let mut chunk = [0u8; 4096];
+            let count = socket.read(&mut chunk).await.unwrap();
+            assert_ne!(count, 0);
+            bytes.extend_from_slice(&chunk[..count]);
+            if let Some(end) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+                let headers = String::from_utf8_lossy(&bytes[..end]);
+                let length: usize = headers.lines().find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length").then(|| value.trim().parse().unwrap())
+                }).unwrap();
+                if bytes.len() >= end + 4 + length {
+                    return serde_json::from_slice(&bytes[end + 4..end + 4 + length]).unwrap();
+                }
+            }
+        }
+    }
+
+    async fn assert_cancelled(stream: ProxyMessageEventStream, closed: tokio::sync::oneshot::Receiver<()>) {
+        let tasks = stream.task_receipt();
+        let (events, result) = finish(&stream).await;
+        assert_eq!(events.len(), 1);
+        assert!(matches!(&events[0], AssistantMessageEvent::Error { .. }));
+        assert_eq!(result.stop_reason, "aborted");
+        assert_eq!(result.error_message.as_deref(), Some("Request aborted by user"));
+        tokio::time::timeout(Duration::from_secs(3), closed)
+            .await
+            .expect("cancelled request must close its connection")
+            .unwrap();
+        drop(stream);
+        let joined = tasks.settle(Duration::from_secs(3)).await;
+        assert!(joined.supported);
+        assert_eq!(joined.pending_tasks, 0);
+        assert_eq!(joined.completed_tasks, 1);
+        assert!(tasks.request_cancel().settled);
+    }
+
     async fn fixture(body: String, hold_open: bool) -> (String, tokio::sync::oneshot::Receiver<Value>, tokio::task::JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let (sender, receiver) = tokio::sync::oneshot::channel();
         let task = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
-            let mut bytes = Vec::new();
-            let request = loop {
-                let mut chunk = [0u8; 4096];
-                let count = socket.read(&mut chunk).await.unwrap();
-                assert_ne!(count, 0);
-                bytes.extend_from_slice(&chunk[..count]);
-                if let Some(end) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
-                    let headers = String::from_utf8_lossy(&bytes[..end]);
-                    let length: usize = headers.lines().find_map(|line| {
-                        let (name, value) = line.split_once(':')?;
-                        name.eq_ignore_ascii_case("content-length").then(|| value.trim().parse().unwrap())
-                    }).unwrap();
-                    if bytes.len() >= end + 4 + length {
-                        break serde_json::from_slice(&bytes[end + 4..end + 4 + length]).unwrap();
-                    }
-                }
-            };
+            let request = read_request(&mut socket).await;
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len() + if hold_open { 1000 } else { 0 },
@@ -793,6 +865,63 @@ mod tests {
             assert_eq!(result.stop_reason, event["reason"].as_str().unwrap());
             assert_eq!(result.error_message.as_deref(), event["errorMessage"].as_str());
         }
+    }
+
+    #[tokio::test]
+    async fn cancellation_while_response_headers_are_held_settles_owned_task() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (request_sender, request_receiver) = tokio::sync::oneshot::channel();
+        let (closed_sender, closed_receiver) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let _ = read_request(&mut socket).await;
+            let _ = request_sender.send(());
+            let _ = socket.read(&mut [0u8; 1]).await;
+            let _ = closed_sender.send(());
+        });
+        let signal = CancellationToken::new();
+        let mut options = SimpleStreamOptions::default();
+        options.stream.signal = Some(signal.clone());
+        let stream = start(format!("http://{address}"), Some(options));
+        tokio::time::timeout(Duration::from_secs(3), request_receiver)
+            .await
+            .expect("proxy must send the request")
+            .unwrap();
+        signal.cancel();
+        assert_cancelled(stream, closed_receiver).await;
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancellation_while_non_success_body_is_held_settles_owned_task() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (headers_sender, headers_receiver) = tokio::sync::oneshot::channel();
+        let (closed_sender, closed_receiver) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let _ = read_request(&mut socket).await;
+            socket.write_all(
+                b"HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nContent-Length: 32\r\nConnection: close\r\n\r\n",
+            ).await.unwrap();
+            let _ = headers_sender.send(());
+            let _ = socket.read(&mut [0u8; 1]).await;
+            let _ = closed_sender.send(());
+        });
+        let signal = CancellationToken::new();
+        let mut options = SimpleStreamOptions::default();
+        options.stream.signal = Some(signal.clone());
+        let stream = start(format!("http://{address}"), Some(options));
+        tokio::time::timeout(Duration::from_secs(3), headers_receiver)
+            .await
+            .expect("proxy must receive non-success response headers")
+            .unwrap();
+        // Let reqwest resolve send() and enter the held response.json() wait.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        signal.cancel();
+        assert_cancelled(stream, closed_receiver).await;
+        server.await.unwrap();
     }
 
     #[tokio::test]

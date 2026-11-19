@@ -729,6 +729,75 @@ fn note_empty_completion(output: &mut AssistantMessage, reason: &str) {
     append_assistant_message_diagnostic(output, diagnostic);
 }
 
+/// Apply the terminal response's accounting before either returning its successful
+/// terminal message or surfacing its provider failure. Failed/cancelled aliases
+/// carry the same valid usage and service-tier fields as completed Responses.
+fn record_terminal_response(
+    response: &Value,
+    output: &mut AssistantMessage,
+    stream: &AssistantMessageEventStream,
+    model: &Model,
+    options: Option<&OpenAIResponsesStreamOptions>,
+) {
+    if let Some(id) = get_str(response, "id") {
+        output.response_id = Some(id.to_string());
+    }
+    if let Some(usage) = get(response, "usage") {
+        if !usage.is_null() {
+            let observation = ProviderUsageObservation {
+                input_tokens: Some(finite_token(get(usage, "input_tokens"))),
+                cached_input_tokens: Some(finite_token(
+                    get(usage, "input_tokens_details").and_then(|details| get(details, "cached_tokens")),
+                )),
+                output_tokens: Some(finite_token(get(usage, "output_tokens"))),
+                reasoning_tokens: Some(finite_token(
+                    get(usage, "output_tokens_details").and_then(|details| get(details, "reasoning_tokens")),
+                )),
+                total_tokens: Some(finite_token(get(usage, "total_tokens"))),
+                cached_input_included_in_input: Some(Some(true)),
+                reasoning_included_in_output: Some(Some(true)),
+            };
+            if let Some(observer) = options.and_then(|options| options.on_usage_observation.clone()) {
+                // A disposable local observer cannot change provider behavior.
+                let model_for_observer = model.clone();
+                let observed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    observer(observation, &model_for_observer)
+                }));
+                if let Ok(future) = observed {
+                    stream.try_spawn(async move {
+                        let _ = future.await;
+                    });
+                }
+            }
+
+            let cached_tokens =
+                number_or_zero(get(usage, "input_tokens_details").and_then(|details| get(details, "cached_tokens")));
+            output.usage = Usage {
+                // OpenAI includes cached tokens in input_tokens, so subtract to get
+                // non-cached input
+                input: (number_or_zero(get(usage, "input_tokens")) - cached_tokens).max(0.0),
+                output: number_or_zero(get(usage, "output_tokens")),
+                cache_read: cached_tokens,
+                cache_write: 0.0,
+                total_tokens: 0.0,
+                cost: Default::default(),
+            };
+            output.usage.total_tokens = output.usage.input + output.usage.output
+                + output.usage.cache_read + output.usage.cache_write;
+        }
+    }
+    calculate_cost(model, &mut output.usage, None);
+    if let Some(apply) = options.and_then(|options| options.apply_service_tier_pricing.clone()) {
+        let response_service_tier = get_str(response, "service_tier");
+        let request_service_tier = options.and_then(|options| options.service_tier.as_deref());
+        let service_tier = match options.and_then(|options| options.resolve_service_tier.clone()) {
+            Some(resolve) => resolve(response_service_tier, request_service_tier),
+            None => response_service_tier.or(request_service_tier).map(str::to_string),
+        };
+        apply(&mut output.usage, service_tier.as_deref());
+    }
+}
+
 /// The TypeScript `for await (const event of openaiStream) { ... }` body.
 pub async fn process_responses_stream(
     mut openai_stream: ResponsesEventStream,
@@ -1152,71 +1221,22 @@ pub async fn process_responses_stream(
                     "Invalid terminal response status for {event_type}: expected {expected_status}"
                 )));
             }
-            if let Some(id) = get_str(&response, "id") {
-                output.response_id = Some(id.to_string());
-            }
-            if let Some(usage) = get(&response, "usage") {
-                if !usage.is_null() {
-                    let observation = ProviderUsageObservation {
-                        input_tokens: Some(finite_token(get(usage, "input_tokens"))),
-                        cached_input_tokens: Some(finite_token(
-                            get(usage, "input_tokens_details").and_then(|details| get(details, "cached_tokens")),
-                        )),
-                        output_tokens: Some(finite_token(get(usage, "output_tokens"))),
-                        reasoning_tokens: Some(finite_token(
-                            get(usage, "output_tokens_details").and_then(|details| get(details, "reasoning_tokens")),
-                        )),
-                        total_tokens: Some(finite_token(get(usage, "total_tokens"))),
-                        cached_input_included_in_input: Some(Some(true)),
-                        reasoning_included_in_output: Some(Some(true)),
-                    };
-                    if let Some(observer) = options.and_then(|options| options.on_usage_observation.clone()) {
-                        // A disposable local observer cannot change provider behavior.
-                        let model_for_observer = model.clone();
-                        let observed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            observer(observation, &model_for_observer)
-                        }));
-                        if let Ok(future) = observed {
-                            stream.try_spawn(async move {
-                                let _ = future.await;
-                            });
-                        }
-                    }
-
-                    let cached_tokens =
-                        number_or_zero(get(usage, "input_tokens_details").and_then(|details| get(details, "cached_tokens")));
-                    output.usage = Usage {
-                        // OpenAI includes cached tokens in input_tokens, so subtract to get
-                        // non-cached input
-                        input: (number_or_zero(get(usage, "input_tokens")) - cached_tokens).max(0.0),
-                        output: number_or_zero(get(usage, "output_tokens")),
-                        cache_read: cached_tokens,
-                        cache_write: 0.0,
-                        total_tokens: 0.0,
-                        cost: Default::default(),
-                    };
-                    output.usage.total_tokens = output.usage.input + output.usage.output
-                        + output.usage.cache_read + output.usage.cache_write;
-                }
-            }
+            record_terminal_response(&response, output, stream, model, options);
             terminal_received = true;
-            calculate_cost(model, &mut output.usage, None);
-            if let Some(apply) = options.and_then(|options| options.apply_service_tier_pricing.clone()) {
-                let response_service_tier = get_str(&response, "service_tier");
-                let request_service_tier = options.and_then(|options| options.service_tier.as_deref());
-                let service_tier = match options.and_then(|options| options.resolve_service_tier.clone()) {
-                    Some(resolve) => resolve(response_service_tier, request_service_tier),
-                    None => response_service_tier.or(request_service_tier).map(str::to_string),
-                };
-                apply(&mut output.usage, service_tier.as_deref());
-            }
             let status = Some(expected_status);
-            output.stop_reason = map_stop_reason(status)?;
+            let incomplete_reason = (status == Some("incomplete"))
+                .then(|| response.get("incomplete_details")
+                    .and_then(|details| get_str(details, "reason")))
+                .flatten();
+            output.stop_reason = if incomplete_reason == Some("content_filter") {
+                "error".to_string()
+            } else {
+                map_stop_reason(status)?
+            };
             if status == Some("incomplete") && output.stop_reason_raw.is_none() {
                 // Keep the provider's explicit reason: generic incomplete is
                 // not proof of an output-token limit (it may be filtering).
-                output.stop_reason_raw = response.get("incomplete_details")
-                    .and_then(|details| get_str(details, "reason")).map(str::to_string);
+                output.stop_reason_raw = incomplete_reason.map(str::to_string);
             }
             if response.get("error").is_some_and(|error| !error.is_null()) {
                 output.stop_reason = "error".to_string();
@@ -1248,6 +1268,9 @@ pub async fn process_responses_stream(
             {
                 note_empty_completion(output, "completed_without_deliverable_content");
             }
+            // A valid terminal is complete without EOF or a later `[DONE]` frame.
+            // Dropping the transport here also releases a still-open response body.
+            break;
         } else if event_type == "error" {
             let code = get(&event, "code");
             let message = format!(
@@ -1260,6 +1283,8 @@ pub async fn process_responses_stream(
             return Err(stream_failure(message, kind, provider_error_type.as_deref()));
         } else if event_type == "response.failed" {
             let response = get(&event, "response").cloned().unwrap_or(Value::Null);
+            record_terminal_response(&response, output, stream, model, options);
+            output.stop_reason = "error".to_string();
             let error = get(&response, "error");
             let details = get(&response, "incomplete_details");
             let provider_error_type = error
@@ -1271,7 +1296,9 @@ pub async fn process_responses_stream(
                         .and_then(|details| get(details, "reason"))
                         .filter(|value| !value.is_null())
                         .map(|value| js_display(Some(value)))
-                });
+                })
+                .or_else(|| get_str(&response, "status").map(str::to_string));
+            output.stop_reason_raw = provider_error_type.clone();
             let message = if let Some(error) = error.filter(|error| !error.is_null()) {
                 format!(
                     "{}: {}",
@@ -2657,7 +2684,7 @@ mod tests {
                             "output_tokens_details": { "reasoning_tokens":4834 } } }
                 })];
                 process_responses_stream(event_stream(events), &mut output, &stream, &model, None).await.unwrap();
-                assert_eq!(output.stop_reason, "length");
+                assert_eq!(output.stop_reason, if reason == Some("content_filter") { "error" } else { "length" });
                 assert_eq!(output.stop_reason_raw.as_deref(), reason);
                 assert_eq!(output.usage.output, 13107.0);
                 assert_eq!(output.response_id.as_deref(), Some("bounded-summary"));
@@ -2720,12 +2747,20 @@ mod tests {
         let stream = AssistantMessageEventStream::new();
         let events = vec![json!({
             "type": "response.failed",
-            "response": { "error": { "code": "rate_limit_exceeded", "message": "slow down" } }
+            "response": {
+                "id":"direct-failed-control", "status":"failed",
+                "error": { "code": "rate_limit_exceeded", "message": "slow down" },
+                "usage":{"input_tokens":4,"output_tokens":6,"total_tokens":10}
+            }
         })];
         let error = process_responses_stream(event_stream(events), &mut output, &stream, &model, None)
             .await
             .unwrap_err();
         assert_eq!(error.message(), "rate_limit_exceeded: slow down");
+        assert_eq!(output.stop_reason, "error");
+        assert_eq!(output.stop_reason_raw.as_deref(), Some("rate_limit_exceeded"));
+        assert_eq!(output.response_id.as_deref(), Some("direct-failed-control"));
+        assert_eq!(output.usage.output, 6.0);
         match error {
             ResponsesStreamError::StreamFailure(failure) => assert_eq!(failure.info.kind, "rate_limit"),
             other => panic!("unexpected error {}", other.message()),

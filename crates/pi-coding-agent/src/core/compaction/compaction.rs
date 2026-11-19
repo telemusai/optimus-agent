@@ -3914,6 +3914,102 @@ mod summary_retry_safety_tests {
         (model, calls)
     }
 
+    fn register_native_compaction_fixture(
+        name: &'static str,
+        compact: pi_ai::types::CompactFunction,
+    ) -> (Model, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+        let native_calls = Arc::new(AtomicUsize::new(0));
+        let summary_calls = Arc::new(AtomicUsize::new(0));
+        let native_for_call = native_calls.clone();
+        let compact = Arc::new(move |model: &Model, context: &Context, options: Option<&CompactionOptions>| {
+            native_for_call.fetch_add(1, Ordering::SeqCst);
+            compact(model, context, options)
+        }) as pi_ai::types::CompactFunction;
+        let summary_for_call = summary_calls.clone();
+        pi_ai::api_registry::register_api_provider_simple(
+            pi_ai::api_registry::ApiProviderSimple {
+                api: name.into(),
+                stream: Arc::new(|_, _, _| panic!("unexpected base stream")),
+                stream_simple: Arc::new(move |_, _, _| {
+                    summary_for_call.fetch_add(1, Ordering::SeqCst);
+                    let stream = AssistantMessageEventStream::new();
+                    let message = AssistantMessage {
+                        content: vec![ContentBlock::Text(pi_ai::types::TextContent::new(FIXTURE_HISTORY))],
+                        stop_reason: "stop".into(),
+                        ..Default::default()
+                    };
+                    stream.push(pi_ai::types::AssistantMessageEvent::Done {
+                        reason: message.stop_reason.clone(), message,
+                    });
+                    stream
+                }),
+                compact: Some(compact),
+                supports_compaction: Some(Arc::new(|_| true)),
+            },
+            None,
+        );
+        let mut model = Model::new(name, name, name, "faux", "https://fixture.invalid");
+        model.context_window = 1_000_000.0;
+        model.max_tokens = 32_000.0;
+        (model, native_calls, summary_calls)
+    }
+
+    async fn run_native_compaction_fixture(
+        model: &Model,
+        retry: &ProviderRetryPolicy,
+    ) -> Result<CompactionResult, String> {
+        let context = Context::default();
+        let metrics = CompactionMetrics::new(None, model);
+        compact_with_metrics(
+            &fixture_preparation(false), model, "unused", None, None, None, None,
+            default_summary_call_runner(None), Some(retry), Some((&context, None)), &metrics,
+        ).await
+    }
+
+    #[tokio::test]
+    async fn native_compaction_typed_failures_never_silently_use_text_summary() {
+        for (name, message, status, retry_after_ms, expected_native_calls) in [
+            ("native-s1-429-retry-after", "Server compaction failed (HTTP 429)", 429, Some(1500.0), 1),
+            ("native-s1-500-retry", "Server compaction failed (HTTP 500)", 500, None, 2),
+            ("native-s1-transport", "fixture network transport failed", 0, None, 1),
+            ("native-s1-malformed", "fixture malformed successful response", 0, None, 1),
+            ("native-s1-decode", "fixture SSE decode failed", 0, None, 1),
+        ] {
+            let compact: pi_ai::types::CompactFunction = Arc::new(move |_, _, _| {
+                let error = pi_ai::compaction::CompactionRequestError::new(
+                    message, status, retry_after_ms,
+                );
+                Box::pin(async move { Err(error) })
+            });
+            let (model, native_calls, summary_calls) =
+                register_native_compaction_fixture(name, compact);
+            let retry = ProviderRetryPolicy {
+                enabled: true, max_retries: 1, base_delay_ms: 0.0, max_retry_delay_ms: 1000.0,
+            };
+            let error = run_native_compaction_fixture(&model, &retry).await.unwrap_err();
+            assert_eq!(error, message, "{name}: the provider error must reach core intact");
+            assert_eq!(native_calls.load(Ordering::SeqCst), expected_native_calls,
+                "{name}: status and Retry-After must reach the retry classifier");
+            assert_eq!(summary_calls.load(Ordering::SeqCst), 0,
+                "{name}: errors must never masquerade as unsupported and invoke text compaction");
+        }
+    }
+
+    #[tokio::test]
+    async fn native_compaction_explicit_unsupported_still_uses_text_summary() {
+        let compact: pi_ai::types::CompactFunction =
+            Arc::new(|_, _, _| Box::pin(async { Ok(None) }));
+        let (model, native_calls, summary_calls) =
+            register_native_compaction_fixture("native-s1-legitimate-unsupported", compact);
+        let retry = ProviderRetryPolicy {
+            enabled: true, max_retries: 1, base_delay_ms: 0.0, max_retry_delay_ms: 1000.0,
+        };
+        let result = run_native_compaction_fixture(&model, &retry).await.unwrap();
+        assert!(result.summary.contains("Critical Context"));
+        assert_eq!(native_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(summary_calls.load(Ordering::SeqCst), 1);
+    }
+
     const FIXTURE_HISTORY: &str = "## Goal\nComplete.\n## Constraints & Preferences\nNone.\n## Progress\nDone.\n## Key Decisions\nWait.\n## Next Steps\nReview.\n## Critical Context\nSaved.";
     const FIXTURE_PREFIX: &str =
         "## Original Request\nComplete.\n## Early Progress\nSaved.\n## Context for Suffix\nReady.";

@@ -18,42 +18,7 @@ const AZURE_ASTRA_MODEL: &str = "gpt-6-astra";
 const AZURE_GATEWAY_BASE_PATH: &str = "/azure-openai/v1";
 const RESPONSES_COMPACT_PROTOCOL: &str = "openai-responses-compact-v1";
 
-/// TS: `class CompactionRequestError extends Error`
-#[derive(Debug, Clone, PartialEq)]
-pub struct CompactionRequestError {
-	pub message: String,
-	pub name: &'static str,
-	pub status: i64,
-	pub retry_after_ms: Option<f64>,
-}
-
-impl CompactionRequestError {
-	pub fn new(message: impl Into<String>, status: i64, retry_after_ms: Option<f64>) -> Self {
-		Self {
-			message: message.into(),
-			name: "CompactionRequestError",
-			status,
-			retry_after_ms,
-		}
-	}
-
-	pub(crate) fn transport(message: impl Into<String>) -> Self {
-		Self {
-			message: message.into(),
-			name: "TypeError",
-			status: 0,
-			retry_after_ms: None,
-		}
-	}
-}
-
-impl std::fmt::Display for CompactionRequestError {
-	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-		write!(formatter, "{}", self.message)
-	}
-}
-
-impl std::error::Error for CompactionRequestError {}
+pub use crate::compaction::CompactionRequestError;
 
 /// TS: `normalizeEndpoint(value)`
 fn normalize_endpoint(value: &str) -> Option<String> {

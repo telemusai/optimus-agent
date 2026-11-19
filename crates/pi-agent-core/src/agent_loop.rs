@@ -4747,6 +4747,11 @@ mod tests {
                 !ran.load(Ordering::SeqCst),
                 "a terminal {stop_reason} must never execute a tool"
             );
+            assert_eq!(
+                run.events.iter().filter(|event| matches!(event, AgentEvent::ToolExecutionStart { .. })).count(),
+                0,
+                "a provider error carrying streamed Google tool details must emit no ToolExecutionStart"
+            );
             let results = tool_result_messages(&run.new_messages);
             assert_eq!(results.len(), 1);
             assert_eq!(
@@ -5510,5 +5515,24 @@ mod stream_watchdog_loop_tests {
             details.get("outputTokens").and_then(|tokens| tokens.as_f64()),
             Some(131_072.0)
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn content_filter_error_is_not_retried_as_length_when_opted_in() {
+        let _guard = ENV_TESTS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _flag = EnvVarGuard::set(RETRY_TRUNCATED_RESPONSE_ENV, "true".to_string());
+        let mut filtered = length_capped_message();
+        filtered.stop_reason = pi_ai::types::STOP_REASON_ERROR.to_string();
+        filtered.stop_reason_raw = Some("content_filter".to_string());
+        filtered.error_message = Some("Provider finish_reason: content_filter".to_string());
+
+        let terminal = run_turn(completed_stream_fn(filtered.clone())).await;
+
+        assert_eq!(terminal.stop_reason, pi_ai::types::STOP_REASON_ERROR);
+        assert_eq!(terminal.stop_reason_raw.as_deref(), Some("content_filter"));
+        assert_eq!(terminal.error_message, filtered.error_message);
+        assert_eq!(terminal.content, filtered.content, "filter failures are not truncated-response retries");
+        assert!(provider_stream_failure_details(&terminal).is_none(),
+            "watchdog must not add a retry conversion to an existing provider filter error");
     }
 }

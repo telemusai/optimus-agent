@@ -6,8 +6,7 @@ use crate::api_registry::{
     get_api_provider, get_api_provider_compaction_snapshot, get_api_providers, ApiProviderCompactionSnapshot,
     ApiProviderInternal,
 };
-use crate::compaction::{CompactionOptions, ProviderCompactionResult};
-use crate::providers::openai_compaction::CompactionRequestError;
+use crate::compaction::{CompactionOptions, CompactionRequestError, ProviderCompactionResult};
 use crate::types::{
     AssistantMessage, BoxFuture, Context, Model, ProviderStreamOptions, SimpleStreamOptions,
 };
@@ -63,9 +62,9 @@ pub fn compact_simple(
     model: &Model,
     context: &Context,
     options: Option<&CompactionOptions>,
-) -> BoxFuture<Option<ProviderCompactionResult>> {
+) -> BoxFuture<Result<Option<ProviderCompactionResult>, CompactionRequestError>> {
     if !supports_compaction(model) {
-        return Box::pin(async { None });
+        return Box::pin(async { Ok(None) });
     }
     let compact = resolve_api_provider(&model.api)
         .compact
@@ -100,7 +99,7 @@ pub fn try_compact_simple(
         if let Some(compact) = fallible_compact {
             compact(&model, &context, options.as_ref()).await
         } else {
-            Ok(compact(&model, &context, options.as_ref()).await)
+            compact(&model, &context, options.as_ref()).await
         }
     })
 }
@@ -235,7 +234,7 @@ mod tests {
         custom.supports_compaction = Some(Arc::new(|_| true));
         custom.compact = Some(Arc::new(move |_, _, _| {
             observed_calls.fetch_add(1, Ordering::SeqCst);
-            Box::pin(async { None })
+            Box::pin(async { Ok(None) })
         }));
         register_api_provider(custom, None);
         assert!(resolve_compaction_provider("openai-codex-responses").fallible_compact.is_none());

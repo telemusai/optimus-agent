@@ -174,7 +174,7 @@ fn register_api_provider_simple_inner(
                 move |model: &Model,
                       context: &Context,
                       options: Option<&CompactionOptions>|
-                      -> BoxFuture<Option<crate::compaction::ProviderCompactionResult>> {
+                      -> BoxFuture<Result<Option<crate::compaction::ProviderCompactionResult>, crate::compaction::CompactionRequestError>> {
                     if model.api != api {
                         panic!("Mismatched compaction api: {}", model.api);
                     }
@@ -225,7 +225,7 @@ pub fn register_api_provider(provider: ApiProvider, source_id: Option<String>) {
                 move |model: &Model,
                       context: &Context,
                       options: Option<&CompactionOptions>|
-                      -> BoxFuture<Option<crate::compaction::ProviderCompactionResult>> {
+                      -> BoxFuture<Result<Option<crate::compaction::ProviderCompactionResult>, crate::compaction::CompactionRequestError>> {
                     if model.api != api {
                         panic!("Mismatched compaction api: {}", model.api);
                     }

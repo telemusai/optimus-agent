@@ -21,6 +21,33 @@ pub struct ProviderCompactionCheckpoint {
     pub estimated_tokens: f64,
 }
 
+/// Typed unary provider-compaction failure. `status == 0` means no HTTP status.
+/// `Ok(None)` is reserved for a provider-declared unsupported compaction route.
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+#[error("{message}")]
+pub struct CompactionRequestError {
+    pub message: String,
+    pub name: &'static str,
+    pub status: i64,
+    pub retry_after_ms: Option<f64>,
+}
+
+impl CompactionRequestError {
+    pub(crate) fn transport(message: impl Into<String>) -> Self {
+        Self { name: "TypeError", ..Self::new(message, 0, None) }
+    }
+
+    pub fn new(message: impl Into<String>, status: i64, retry_after_ms: Option<f64>) -> Self {
+        Self { message: message.into(), name: "CompactionRequestError", status, retry_after_ms }
+    }
+}
+
+impl From<String> for CompactionRequestError {
+    fn from(message: String) -> Self {
+        Self::new(message, 0, None)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProviderCompactionResult {
     pub checkpoint: ProviderCompactionCheckpoint,

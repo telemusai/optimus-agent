@@ -38,7 +38,7 @@ use std::sync::Arc;
 
 use pi_agent_core::types::AgentMessage;
 use pi_ai::api_registry::{register_api_provider_simple, ApiProviderSimple};
-use pi_ai::compaction::{ProviderCompactionCheckpoint, ProviderCompactionResult};
+use pi_ai::compaction::{CompactionRequestError, ProviderCompactionCheckpoint, ProviderCompactionResult};
 use pi_ai::types::{
     AssistantMessage, ContentBlock, Context, Message, Model, TextContent, ToolResultMessage,
     UserContent, UserMessage,
@@ -793,7 +793,7 @@ fn native_fixture(api: &str) -> Model {
             compact: Some(Arc::new(|model, _context, _options| {
                 let model = model.clone();
                 Box::pin(async move {
-                    Some(ProviderCompactionResult {
+                    Ok(Some(ProviderCompactionResult {
                         checkpoint: ProviderCompactionCheckpoint {
                             api: model.api.clone(),
                             base_url: "https://fixture.invalid".into(),
@@ -811,9 +811,9 @@ fn native_fixture(api: &str) -> Model {
                             version: 1,
                         },
                         usage: None,
-                    })
+                    }))
                 })
-                    as Pin<Box<dyn std::future::Future<Output = Option<ProviderCompactionResult>> + Send>>
+                    as Pin<Box<dyn std::future::Future<Output = Result<Option<ProviderCompactionResult>, CompactionRequestError>> + Send>>
             })),
             supports_compaction: Some(Arc::new(|_| true)),
         },

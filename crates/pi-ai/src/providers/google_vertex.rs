@@ -253,6 +253,7 @@ async fn process_google_vertex_chunks(
 ) -> Result<(), GoogleVertexStreamError> {
 	let mut current_block: Option<CurrentBlock> = None;
 	let mut terminal_received = false;
+	let mut prompt_feedback_detail: Option<String> = None;
 
 	while let Some(chunk) = chunks.next().await? {
 		// Typed shape for the common chunk; Value fallback keeps the exact
@@ -276,22 +277,30 @@ async fn process_google_vertex_chunks(
 				}
 
 				if let Some(finish_reason) = candidate.and_then(|candidate| candidate.finish_reason.as_deref()) {
-					output.stop_reason = map_stop_reason(finish_reason).map_err(GoogleVertexStreamError::Message)?;
+					let stop_reason = map_stop_reason(finish_reason).map_err(GoogleVertexStreamError::Message)?;
 					terminal_received = true;
-					if output
-						.content
-						.iter()
-						.any(|block| matches!(block, ContentBlock::ToolCall(_)))
-					{
-						output.stop_reason = "toolUse".to_string();
-					}
-					if output.stop_reason == "error" {
+					if stop_reason == "error" {
+						output.stop_reason = stop_reason;
 						output.stop_reason_raw = Some(finish_reason.to_string());
+					} else if output.stop_reason != "error" {
+						output.stop_reason = stop_reason;
+						if output
+							.content
+							.iter()
+							.any(|block| matches!(block, ContentBlock::ToolCall(_)))
+						{
+							output.stop_reason = "toolUse".to_string();
+						}
 					}
 				}
 
-				if typed.prompt_feedback.as_ref().is_some_and(|feedback| !feedback.is_null()) {
-					terminal_received = true;
+				if let Some(feedback) = typed.prompt_feedback.as_ref().filter(|feedback| !feedback.is_null()) {
+					if let Some(detail) = apply_prompt_feedback(output, feedback) {
+						terminal_received = true;
+						if let Some(detail) = detail {
+							prompt_feedback_detail = Some(detail);
+						}
+					}
 				}
 				if let Some(usage_metadata) = &typed.usage_metadata {
 					output.usage = super::google_usage::normalize(usage_metadata);
@@ -323,22 +332,30 @@ async fn process_google_vertex_chunks(
 					.and_then(|candidate| candidate.get("finishReason"))
 					.and_then(Value::as_str)
 				{
-					output.stop_reason = map_stop_reason(finish_reason).map_err(GoogleVertexStreamError::Message)?;
+					let stop_reason = map_stop_reason(finish_reason).map_err(GoogleVertexStreamError::Message)?;
 					terminal_received = true;
-					if output
-						.content
-						.iter()
-						.any(|block| matches!(block, ContentBlock::ToolCall(_)))
-					{
-						output.stop_reason = "toolUse".to_string();
-					}
-					if output.stop_reason == "error" {
+					if stop_reason == "error" {
+						output.stop_reason = stop_reason;
 						output.stop_reason_raw = Some(finish_reason.to_string());
+					} else if output.stop_reason != "error" {
+						output.stop_reason = stop_reason;
+						if output
+							.content
+							.iter()
+							.any(|block| matches!(block, ContentBlock::ToolCall(_)))
+						{
+							output.stop_reason = "toolUse".to_string();
+						}
 					}
 				}
 
-				if chunk.get("promptFeedback").is_some_and(|feedback| !feedback.is_null()) {
-					terminal_received = true;
+				if let Some(feedback) = chunk.get("promptFeedback").filter(|feedback| !feedback.is_null()) {
+					if let Some(detail) = apply_prompt_feedback(output, feedback) {
+						terminal_received = true;
+						if let Some(detail) = detail {
+							prompt_feedback_detail = Some(detail);
+						}
+					}
 				}
 				if let Some(usage_metadata) = chunk.get("usageMetadata") {
 					output.usage = super::google_usage::normalize(usage_metadata);
@@ -368,10 +385,11 @@ async fn process_google_vertex_chunks(
 	}
 
 	if output.stop_reason == "aborted" || output.stop_reason == "error" {
-		return Err(GoogleVertexStreamError::Failure(stream_failure_from_stop_reason(
-			output.stop_reason_raw.as_deref(),
-			None,
-		)));
+		let mut failure = stream_failure_from_stop_reason(output.stop_reason_raw.as_deref(), None);
+		if let Some(detail) = prompt_feedback_detail {
+			failure.message = format!("{}: {}", failure.message, detail);
+		}
+		return Err(GoogleVertexStreamError::Failure(failure));
 	}
 
 	stream.push(AssistantMessageEvent::Done {
@@ -380,6 +398,36 @@ async fn process_google_vertex_chunks(
 	});
 	stream.end(None);
 	Ok(())
+}
+
+/// Preserve a blocked-prompt or prompt-level API failure as an error terminal.
+/// Outer `Some` marks a prompt failure; its inner value is provider detail for the classified message.
+fn apply_prompt_feedback(output: &mut AssistantMessage, feedback: &Value) -> Option<Option<String>> {
+	if let Some(reason) = feedback.get("blockReason").and_then(Value::as_str) {
+		output.stop_reason = "error".to_string();
+		output.stop_reason_raw = Some(reason.to_string());
+		return Some(
+			feedback
+				.get("blockReasonMessage")
+				.and_then(Value::as_str)
+				.map(str::to_string),
+		);
+	}
+
+	if let Some(error) = feedback.get("error").filter(|error| !error.is_null()) {
+		output.stop_reason = "error".to_string();
+		output.stop_reason_raw = Some(
+			error
+				.get("status")
+				.and_then(Value::as_str)
+				.or_else(|| error.as_str())
+				.map(str::to_string)
+				.unwrap_or_else(|| error.to_string()),
+		);
+		return Some(error.get("message").and_then(Value::as_str).map(str::to_string));
+	}
+
+	None
 }
 
 /// The block the streaming loop is currently filling.
@@ -1935,6 +1983,204 @@ mod tests {
 		StreamOptions::default()
 	}
 
+	async fn run_fixture_events(
+		events: Vec<GoogleVertexChunkEvent>,
+	) -> (Result<(), GoogleVertexStreamError>, AssistantMessage, AssistantMessageEventStream) {
+		let model = model("gemini-2.5-pro");
+		let options = GoogleVertexOptions::default();
+		let mut output = AssistantMessage::new(model.api.clone(), model.provider.clone(), model.id.clone(), 0);
+		output.stop_reason = "stop".to_string();
+		let stream = AssistantMessageEventStream::new_owned();
+		let chunks = SseChunkStream {
+			chunks: Box::pin(futures::stream::empty()),
+			buffer: String::new(),
+			pending: events,
+			byte_pending: Vec::new(),
+			finished: true,
+			signal: None,
+		};
+		let result = process_google_vertex_chunks(chunks, &model, &options, &mut output, &stream).await;
+		(result, output, stream)
+	}
+
+	async fn run_fixture_frames(
+		frames: &[&str],
+	) -> (Result<(), GoogleVertexStreamError>, AssistantMessage, AssistantMessageEventStream) {
+		let body = frames.iter().map(|frame| format!("data: {frame}\n\n")).collect::<String>();
+		let model = model("gemini-2.5-pro");
+		let options = GoogleVertexOptions::default();
+		let mut output = AssistantMessage::new(model.api.clone(), model.provider.clone(), model.id.clone(), 0);
+		output.stop_reason = "stop".to_string();
+		let stream = AssistantMessageEventStream::new_owned();
+		let chunks = SseChunkStream {
+			chunks: Box::pin(futures::stream::iter(vec![Ok::<_, reqwest::Error>(bytes::Bytes::from(body))])),
+			buffer: String::new(),
+			pending: Vec::new(),
+			byte_pending: Vec::new(),
+			finished: false,
+			signal: None,
+		};
+		let result = process_google_vertex_chunks(chunks, &model, &options, &mut output, &stream).await;
+		(result, output, stream)
+	}
+
+	/// Local mirror of agent_loop.rs:988-1028 for the provider-handoff contract only.
+	/// Real AgentEvent collection needs a pi-agent-core integration test outside this crate.
+	fn agent_loop_reachable_tool_call_count(output: &AssistantMessage) -> usize {
+		if matches!(output.stop_reason.as_str(), "error" | "aborted") {
+			return 0;
+		}
+		output.content.iter().filter(|block| matches!(block, ContentBlock::ToolCall(_))).count()
+	}
+
+	#[tokio::test]
+	async fn safety_after_tool_call_preserves_error_in_typed_and_value_paths() {
+		let tool = r#"{"candidates":[{"content":{"parts":[{"functionCall":{"id":"call-1","name":"read","args":{"path":"fixture.txt"}}}]}}]}"#;
+		let safety = r#"{"candidates":[{"finishReason":"SAFETY"}]}"#;
+		let cases = vec![
+			(
+				"typed",
+				vec![
+					GoogleVertexChunkEvent::Typed(parse_typed_google_vertex_chunk(tool).unwrap()),
+					GoogleVertexChunkEvent::Typed(parse_typed_google_vertex_chunk(safety).unwrap()),
+				],
+			),
+			(
+				"value",
+				vec![
+					GoogleVertexChunkEvent::Value(serde_json::from_str(tool).unwrap()),
+					GoogleVertexChunkEvent::Value(serde_json::from_str(safety).unwrap()),
+				],
+			),
+		];
+
+		for (path, events) in cases {
+			let (result, output, stream) = run_fixture_events(events).await;
+			let failure = match result.unwrap_err() {
+				GoogleVertexStreamError::Failure(failure) => failure,
+				other => panic!("{path}: expected classified failure, got {}", other.message()),
+			};
+			assert_eq!(output.stop_reason, "error", "{path}");
+			assert_eq!(output.stop_reason_raw.as_deref(), Some("SAFETY"), "{path}");
+			assert_eq!(failure.info.provider_error_type.as_deref(), Some("SAFETY"), "{path}");
+			assert!(failure.message.contains("SAFETY"), "{path}: {}", failure.message);
+			let ContentBlock::ToolCall(call) = &output.content[0] else {
+				panic!("{path}: provider tool details must remain attached")
+			};
+			assert_eq!(call.id, "call-1", "{path}");
+			assert_eq!(call.name, "read", "{path}");
+			assert_eq!(call.arguments.get("path").and_then(Value::as_str), Some("fixture.txt"), "{path}");
+			assert_eq!(agent_loop_reachable_tool_call_count(&output), 0, "{path}: provider handoff leaves no agent-reachable tool call");
+			assert!(!stream.is_done(), "{path}: an error terminal must not emit Done");
+		}
+
+		let (result, output, stream) = run_fixture_events(vec![
+			GoogleVertexChunkEvent::Typed(parse_typed_google_vertex_chunk(tool).unwrap()),
+			GoogleVertexChunkEvent::Typed(parse_typed_google_vertex_chunk(r#"{"candidates":[{"finishReason":"STOP"}]}"#).unwrap()),
+		])
+		.await;
+		assert!(result.is_ok());
+		assert_eq!(output.stop_reason, "toolUse");
+		assert_eq!(output.stop_reason_raw, None);
+		assert_eq!(agent_loop_reachable_tool_call_count(&output), 1, "legal tool call remains agent-reachable control");
+		assert!(stream.is_done());
+	}
+
+	#[tokio::test]
+	async fn blocked_prompt_feedback_is_an_error_in_typed_and_value_fixtures() {
+		for (path, frame, raw_reason, detail) in [
+			(
+				"typed",
+				r#"{"responseId":"resp-1","promptFeedback":{"blockReason":"SAFETY","blockReasonMessage":"policy details"}}"#,
+				"SAFETY",
+				Some("policy details"),
+			),
+			(
+				"value",
+				r#"{"promptFeedback":{"blockReason":"OTHER"}}"#,
+				"OTHER",
+				None,
+			),
+		] {
+			let (result, output, stream) = run_fixture_frames(&[frame]).await;
+			let failure = match result.unwrap_err() {
+				GoogleVertexStreamError::Failure(failure) => failure,
+				other => panic!("{path}: expected classified failure, got {}", other.message()),
+			};
+			assert!(output.content.is_empty(), "{path}: blocked prompt unexpectedly produced content");
+			assert_eq!(output.stop_reason, "error", "{path}");
+			assert_eq!(output.stop_reason_raw.as_deref(), Some(raw_reason), "{path}");
+			assert_eq!(failure.info.provider_error_type.as_deref(), Some(raw_reason), "{path}");
+			assert!(failure.message.contains(raw_reason), "{path}: {}", failure.message);
+			if let Some(detail) = detail {
+				assert!(failure.message.contains(detail), "{path}: provider detail lost: {}", failure.message);
+			}
+			assert!(!stream.is_done(), "{path}: blocked prompt must not become a successful empty Done");
+
+			let stop = r#"{"candidates":[{"content":{"parts":[{"text":"late legal text"}]},"finishReason":"STOP"}]}"#;
+			let events = match path {
+				"typed" => vec![
+					GoogleVertexChunkEvent::Typed(parse_typed_google_vertex_chunk(frame).unwrap()),
+					GoogleVertexChunkEvent::Typed(parse_typed_google_vertex_chunk(stop).unwrap()),
+				],
+				_ => vec![
+					GoogleVertexChunkEvent::Value(serde_json::from_str(frame).unwrap()),
+					GoogleVertexChunkEvent::Value(serde_json::from_str(stop).unwrap()),
+				],
+			};
+			let (result, output, stream) = run_fixture_events(events).await;
+			assert!(result.is_err(), "{path}: later STOP replaced an earlier blocked-prompt error");
+			assert_eq!(output.stop_reason, "error", "{path}: existing prompt error must win");
+			assert_eq!(output.stop_reason_raw.as_deref(), Some(raw_reason), "{path}");
+			assert!(!stream.is_done(), "{path}: later STOP must not emit Done after blocked feedback");
+		}
+	}
+
+	#[tokio::test]
+	async fn prompt_feedback_error_fails_and_nonblocking_feedback_keeps_legal_terminal() {
+		let (result, output, stream) = run_fixture_frames(&[
+			r#"{"promptFeedback":{"error":{"code":400,"message":"bad prompt","status":"INVALID_ARGUMENT"}}}"#,
+		])
+		.await;
+		let failure = match result.unwrap_err() {
+			GoogleVertexStreamError::Failure(failure) => failure,
+			other => panic!("expected classified prompt failure, got {}", other.message()),
+		};
+		assert_eq!(output.stop_reason, "error");
+		assert_eq!(output.stop_reason_raw.as_deref(), Some("INVALID_ARGUMENT"));
+		assert_eq!(failure.info.kind, "unknown", "prompt error keeps the raw provider status without inventing an HTTP status");
+		assert!(failure.message.contains("INVALID_ARGUMENT"), "{}", failure.message);
+		assert!(failure.message.contains("bad prompt"), "{}", failure.message);
+		assert!(!stream.is_done());
+
+		let (result, output, stream) = run_fixture_frames(&[
+			r#"{"promptFeedback":{"error":{"code":400,"message":"bad prompt","status":"INVALID_ARGUMENT"}}}"#,
+			r#"{"candidates":[{"finishReason":"STOP"}]}"#,
+		])
+		.await;
+		assert!(result.is_err(), "later STOP replaced a prompt-level API error");
+		assert_eq!(output.stop_reason, "error");
+		assert_eq!(output.stop_reason_raw.as_deref(), Some("INVALID_ARGUMENT"));
+		assert!(!stream.is_done());
+
+		let (result, output, stream) =
+			run_fixture_frames(&[r#"{"responseId":"resp-2","promptFeedback":{"blockReason":null,"error":null}}"#]).await;
+		assert!(result.is_err(), "nonblocking feedback alone must not settle a successful empty stream");
+		assert!(output.content.is_empty());
+		assert!(!stream.is_done());
+
+		let (result, output, stream) = run_fixture_frames(&[
+			r#"{"responseId":"resp-2","promptFeedback":{"blockReason":null,"error":null}}"#,
+			r#"{"candidates":[{"content":{"parts":[{"text":"legal"}]},"finishReason":"STOP"}]}"#,
+		])
+		.await;
+		assert!(result.is_ok());
+		assert_eq!(output.stop_reason, "stop");
+		assert_eq!(output.stop_reason_raw, None);
+		assert!(matches!(output.content.as_slice(), [ContentBlock::Text(text)] if text.text == "legal"));
+		assert!(stream.is_done());
+	}
+
 	#[test]
 	fn options_round_trip_through_serde() {
 		let mut options = GoogleVertexOptions::from_base(&base_options());
@@ -2507,9 +2753,9 @@ mod t15_controls_tests {
 			(r#"data: {"candidates":[{"content":{"parts":[{"text":"short"}]},"finishReason":"STOP"}]}
 
 "#, true),
-			(r#"data: {"promptFeedback":{"blockReason":"OTHER"}}
+			(r#"data: {"candidates":[{"content":{"parts":[{"text":"partial"}]}}],"promptFeedback":{"blockReason":null,"error":null}}
 
-"#, true),
+"#, false),
 		] {
 			let model = t15_model();
 			let options = GoogleVertexOptions::default();

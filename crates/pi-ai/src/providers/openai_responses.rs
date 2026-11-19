@@ -162,11 +162,7 @@ pub(crate) async fn try_compact_openai_responses_typed(
         .and_then(|options| options.simple.stream.api_key.clone())
         .or_else(|| get_env_api_key(&model.provider));
     let Some(api_key) = api_key else {
-        return Err(CompactionRequestError::new(
-            format!("No API key for provider: {}", model.provider),
-            0,
-            None,
-        ));
+        return Err(format!("No API key for provider: {}", model.provider).into());
     };
     let mut headers: IndexMap<String, String> = model.headers.clone().unwrap_or_default();
     if let Some(options_headers) = options.and_then(|options| options.simple.stream.headers.clone()) {
@@ -219,7 +215,8 @@ pub(crate) async fn try_compact_openai_responses_typed(
         None => {}
     }
 
-    let mut result = request_openai_compaction(model, &url, &headers, body, options, None).await?;
+    let mut result =
+        request_openai_compaction(model, &url, &headers, body, options, None).await?;
     if let Some(result) = result.as_mut() {
         if let Some(usage) = result.usage.as_mut() {
             let service_tier = options
@@ -957,6 +954,111 @@ mod tests {
         model
     }
 
+    async fn held_terminal_body_server(terminal: Value) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            loop {
+                let read = socket.read(&mut buffer).await.unwrap();
+                assert!(read > 0);
+                request.extend_from_slice(&buffer[..read]);
+                assert!(request.len() < 64 * 1024);
+                if let Some(header_end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&request[..header_end]);
+                    let length = headers.lines().find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length").then(|| value.trim().parse::<usize>().unwrap())
+                    }).unwrap();
+                    if request.len() >= header_end + 4 + length { break; }
+                }
+            }
+            let item = json!({"type":"response.output_item.done","item":{
+                "type":"function_call","id":"fn_terminal","call_id":"call_terminal",
+                "name":"read","arguments":"{\"path\":\"/tmp/final\"}"
+            }});
+            let added = json!({"type":"response.output_item.added","item":{
+                "type":"function_call","id":"fn_terminal","call_id":"call_terminal","name":"read","arguments":""
+            }});
+            let body = format!("data: {added}\n\ndata: {item}\n\ndata: {terminal}\n\ndata: [DONE]\n\n");
+            socket.write_all(format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n{}\r\n",
+                body.len(), body,
+            ).as_bytes()).await.unwrap();
+            // A valid terminal, not EOF, must end the parse and release this body.
+            let closed = tokio::time::timeout(Duration::from_secs(5), socket.read(&mut buffer))
+                .await.expect("terminal provider response left the held body open");
+            match closed {
+                Ok(0) => {}
+                Err(error) if matches!(error.kind(), std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted | std::io::ErrorKind::BrokenPipe) => {}
+                other => panic!("expected terminal body disconnect, got {other:?}"),
+            }
+        });
+        (format!("http://{address}"), server)
+    }
+
+    #[tokio::test]
+    async fn valid_terminal_settles_done_or_filter_error_and_drops_held_body() {
+        for (terminal, expected_reason, raw_reason) in [
+            (json!({"type":"response.completed","response":{
+                "id":"held-completed","status":"completed",
+                "usage":{"input_tokens":3,"output_tokens":4,"total_tokens":7}
+            }}), "toolUse", None),
+            (json!({"type":"response.incomplete","response":{
+                "id":"held-incomplete","status":"incomplete",
+                "incomplete_details":{"reason":"max_output_tokens"},
+                "usage":{"input_tokens":3,"output_tokens":4,"total_tokens":7}
+            }}), "length", Some("max_output_tokens")),
+            (json!({"type":"response.incomplete","response":{
+                "id":"held-filter","status":"incomplete",
+                "incomplete_details":{"reason":"content_filter"},
+                "usage":{"input_tokens":3,"output_tokens":4,"total_tokens":7}
+            }}), "error", Some("content_filter")),
+        ] {
+            let (base_url, server) = held_terminal_body_server(terminal).await;
+            let mut model = model();
+            model.base_url = base_url;
+            let options = OpenAIResponsesOptions { stream: StreamOptions {
+                api_key: Some("fake-test-key".into()), transport: Some("sse".into()),
+                ..Default::default()
+            }, ..Default::default() };
+            let events = stream_openai_responses(&model, &Context::default(), Some(options));
+            let receipt = events.task_receipt();
+            let (reason, message) = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    match events.next().await.expect("provider stream closed without a terminal") {
+                        AssistantMessageEvent::Done { reason, message } => break (reason, message),
+                        AssistantMessageEvent::Error { reason, error } => break (reason, error),
+                        _ => {}
+                    }
+                }
+            }).await.expect("valid terminal must not wait for EOF or [DONE]");
+            assert_eq!(reason, expected_reason);
+            assert_eq!(message.stop_reason, expected_reason);
+            assert_eq!(message.stop_reason_raw.as_deref(), raw_reason);
+            assert_eq!(message.usage.output, 4.0);
+            assert!(message.content.iter().any(|block| matches!(block,
+                crate::types::ContentBlock::ToolCall(call)
+                    if call.arguments.get("path").and_then(Value::as_str) == Some("/tmp/final"))));
+            if expected_reason == "error" {
+                let details = message.diagnostics.as_ref().unwrap().iter()
+                    .find(|diagnostic| diagnostic.type_ == "provider_stream_failure")
+                    .and_then(|diagnostic| diagnostic.details.as_ref()).unwrap();
+                assert_eq!(details.get("providerErrorType").and_then(Value::as_str), Some("content_filter"));
+                assert_eq!(details.get("kind").and_then(Value::as_str), Some("safety"));
+            }
+            assert!(tokio::time::timeout(Duration::from_secs(5), events.next()).await.unwrap().is_none());
+            receipt.request_cancel();
+            let settled = receipt.settle(Duration::from_secs(5)).await;
+            assert!(settled.settled);
+            assert_eq!(settled.pending_tasks, 0);
+            server.await.unwrap();
+        }
+    }
+
     #[tokio::test]
     async fn sse_cancellation_disconnects_pending_body_without_replay() {
         for provider in ["azure-openai-managed", "github-copilot"] {
@@ -1457,5 +1559,113 @@ mod tests {
             .block_on(try_compact_openai_responses(&model, &Context::default(), None))
             .unwrap();
         assert!(result.is_none());
+    }
+
+    async fn native_compaction_http_response(
+        status: u16,
+        body: &str,
+        retry_after_ms: Option<u64>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let body = body.to_string();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = vec![0_u8; 4096];
+            let read = socket.read(&mut request).await.unwrap();
+            assert!(read > 0);
+            let request = String::from_utf8_lossy(&request[..read]);
+            assert!(request.starts_with("POST /responses/compact ")
+                || request.starts_with("POST /azure-openai/v1/responses/compact "));
+            let retry = retry_after_ms
+                .map(|value| format!("Retry-After-Ms: {value}\r\n"))
+                .unwrap_or_default();
+            socket.write_all(format!(
+                "HTTP/1.1 {status} Fixture\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{retry}Connection: close\r\n\r\n{body}",
+                body.len(),
+            ).as_bytes()).await.unwrap();
+        });
+        (format!("http://{address}"), server)
+    }
+
+    async fn compact_native_fixture(base_url: String) -> Result<Option<ProviderCompactionResult>, CompactionRequestError> {
+        let mut model = model();
+        model.id = "gpt-6-astra".into();
+        model.base_url = base_url;
+        let mut options = CompactionOptions::default();
+        options.simple.stream.api_key = Some("fake-test-key".into());
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            compact_openai_responses(&model, &Context::default(), Some(&options)),
+        ).await.expect("native compaction fixture must settle")
+    }
+
+    #[tokio::test]
+    async fn native_compaction_failures_remain_typed_and_unsupported_stays_none() {
+        for status in [404, 405, 501] {
+            let (url, server) = native_compaction_http_response(status, "", None).await;
+            assert!(compact_native_fixture(url).await.unwrap().is_none());
+            server.await.unwrap();
+        }
+        for (status, body) in [
+            (413, ""),
+            (400, r#"{"error":{"code":"context_length_exceeded"}}"#),
+        ] {
+            let (url, server) = native_compaction_http_response(status, body, None).await;
+            assert!(compact_native_fixture(url).await.unwrap().is_none());
+            server.await.unwrap();
+        }
+        for status in [400, 413] {
+            let (url, server) = native_compaction_http_response(status, "{}", None).await;
+            let mut model = model();
+            model.id = "gpt-6-astra".into();
+            model.provider = "azure-openai-managed".into();
+            model.base_url = format!("{url}/azure-openai/v1");
+            model.native_compaction = Some(crate::types::NativeCompactionCapability {
+                enabled: true,
+                protocol: "openai-responses-compact-v1".into(),
+                provider: model.provider.clone(),
+                model: model.id.clone(),
+                endpoint: format!("{url}/azure-openai/v1/responses/compact"),
+                api_version: crate::types::NATIVE_COMPACTION_API_VERSION_V1.into(),
+                validation: crate::types::NativeCompactionValidation::LiveVerified,
+            });
+            let mut options = CompactionOptions::default();
+            options.simple.stream.api_key = Some("fake-test-key".into());
+            let error = tokio::time::timeout(Duration::from_secs(5),
+                compact_openai_responses(&model, &Context::default(), Some(&options)))
+                .await.expect("validated gateway failure must settle").unwrap_err();
+            assert_eq!(error.status, i64::from(status), "validated gateway {status} is not unsupported");
+            server.await.unwrap();
+        }
+
+        let (url, server) = native_compaction_http_response(429, "{}", Some(1500)).await;
+        let error = compact_native_fixture(url).await.unwrap_err();
+        assert_eq!(error.status, 429);
+        assert_eq!(error.retry_after_ms, Some(1500.0));
+        assert_eq!(error.message, "Server compaction failed (HTTP 429)");
+        server.await.unwrap();
+
+        let (url, server) = native_compaction_http_response(500, "{}", None).await;
+        let error = compact_native_fixture(url).await.unwrap_err();
+        assert_eq!(error.status, 500);
+        assert_eq!(error.message, "Server compaction failed (HTTP 500)");
+        server.await.unwrap();
+
+        let (url, server) = native_compaction_http_response(200, "{}", None).await;
+        let error = compact_native_fixture(url).await.unwrap_err();
+        assert_eq!(error.status, 0);
+        assert_eq!(error.message, "Server compaction returned no valid encrypted checkpoint");
+        server.await.unwrap();
+
+        let (url, server) = native_compaction_http_response(200, "not-json", None).await;
+        let error = compact_native_fixture(url).await.unwrap_err();
+        assert_eq!(error.status, 0, "successful HTTP with a decode failure is not unsupported");
+        assert!(!error.message.is_empty());
+        server.await.unwrap();
+
+        let error = compact_native_fixture("http://127.0.0.1:1".into()).await.unwrap_err();
+        assert_eq!(error.status, 0, "transport failure must remain an error");
+        assert!(!error.message.is_empty());
     }
 }

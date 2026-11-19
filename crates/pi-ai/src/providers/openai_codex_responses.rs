@@ -42,7 +42,7 @@ use crate::utils::event_stream::{create_assistant_message_event_stream, Assistan
 use crate::utils::headers::header_map_to_record;
 use crate::utils::now_ms;
 use crate::utils::sse_frames::SseFrames;
-use crate::utils::stream_failure::{parse_retry_after_ms, record_stream_failure, ThrownStreamError};
+use crate::utils::stream_failure::{parse_retry_after_ms, record_stream_failure, stream_failure_from_stop_reason, ThrownStreamError};
 
 /// `const DEFAULT_CODEX_BASE_URL = "https://chatgpt.com/backend-api"`.
 pub const DEFAULT_CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api";
@@ -566,11 +566,7 @@ pub(crate) async fn try_compact_openai_codex_responses_typed(
         .and_then(|options| options.simple.stream.api_key.clone())
         .or_else(|| get_env_api_key(&model.provider));
     let Some(api_key) = api_key else {
-        return Err(CompactionRequestError::new(
-            format!("No API key for provider: {}", model.provider),
-            0,
-            None,
-        ));
+        return Err(format!("No API key for provider: {}", model.provider).into());
     };
     let headers = build_sse_headers(
         model.headers.as_ref(),
@@ -632,6 +628,7 @@ pub(crate) async fn try_compact_openai_codex_responses_typed(
             let observation_options = observation_options.clone();
             Box::pin(async move {
                 let mut checkpoints: Vec<Value> = Vec::new();
+                let mut terminal_seen = false;
                 let mut completed: Option<Value> = None;
                 let mut events = Box::pin(parse_sse_response(response));
                 while let Some(event) = events.next().await {
@@ -655,6 +652,7 @@ pub(crate) async fn try_compact_openai_codex_responses_typed(
                             }
                         }
                     } else if event_type == "response.completed" || event_type == "response.done" {
+                        terminal_seen = true;
                         completed = event.get("response").cloned();
                         break;
                     } else if ["error", "response.failed", "response.incomplete"].contains(&event_type.as_str()) {
@@ -671,7 +669,13 @@ pub(crate) async fn try_compact_openai_codex_responses_typed(
                             .map(str::to_string);
                         let code = error_code
                             .or(failed_response_code)
-                            .or_else(|| event.get("code").and_then(Value::as_str).map(str::to_string));
+                            .or_else(|| event.get("code").and_then(Value::as_str).map(str::to_string))
+                            .or_else(|| event
+                                .get("response")
+                                .and_then(|response| response.get("incomplete_details"))
+                                .and_then(|details| details.get("reason"))
+                                .and_then(Value::as_str)
+                                .map(str::to_string));
                         match code.as_deref() {
                             // `return undefined` - the caller keeps its history.
                             Some("context_length_exceeded") => return Ok(Value::Null),
@@ -689,6 +693,13 @@ pub(crate) async fn try_compact_openai_codex_responses_typed(
                                     None,
                                 ))
                             }
+                            Some("content_filter") => {
+                                return Err(CompactionRequestError::new(
+                                    "Server compaction was blocked by provider safety filters (content_filter)",
+                                    0,
+                                    None,
+                                ))
+                            }
                             _ => {
                                 return Err(CompactionRequestError::new(
                                     "Server compaction stream failed before completion",
@@ -700,17 +711,22 @@ pub(crate) async fn try_compact_openai_codex_responses_typed(
                     }
                 }
                 let Some(completed) = completed else {
-                    return Err(CompactionRequestError::new(
-                        "Server compaction stream closed before completion",
-                        502,
-                        None,
-                    ));
+                    return if terminal_seen {
+                        Err(CompactionRequestError::new(
+                            "Server compaction terminal event was missing its response object",
+                            0,
+                            None,
+                        ))
+                    } else {
+                        Err(CompactionRequestError::new(
+                            "Server compaction stream closed before completion",
+                            502,
+                            None,
+                        ))
+                    };
                 };
-                let status = completed.get("status");
-                let status_is_incomplete = status
-                    .map(|status| status.is_null() || status.as_str() != Some("completed"))
-                    .unwrap_or(false);
-                if status_is_incomplete || checkpoints.len() != 1 {
+                let status = completed.get("status").and_then(Value::as_str);
+                if status != Some("completed") || checkpoints.len() != 1 {
                     return Err(CompactionRequestError::new(
                         "Server compaction requires a completed response with exactly one encrypted checkpoint",
                         0,
@@ -766,6 +782,22 @@ pub async fn try_compact_openai_codex_responses(
 // ---------------------------------------------------------------------------
 // streamOpenAICodexResponses
 // ---------------------------------------------------------------------------
+
+/// Convert a shared terminal error (including `content_filter`) back into the
+/// provider's API-error path before any successful Done or cached continuation.
+fn codex_terminal_stop_error(output: &AssistantMessage) -> Option<CodexThrown> {
+    if output.stop_reason != "error" {
+        return None;
+    }
+    let failure = stream_failure_from_stop_reason(output.stop_reason_raw.as_deref(), None);
+    Some(CodexThrown::api_error(
+        failure.message,
+        failure.info.provider_error_type,
+        failure.info.status,
+        failure.info.retry_after_ms,
+        None,
+    ))
+}
 
 /// `streamOpenAICodexResponses: StreamFunction<"openai-codex-responses", OpenAICodexResponsesOptions>`.
 pub fn stream_openai_codex_responses(
@@ -916,6 +948,9 @@ async fn run_openai_codex_responses(
                     {
                         return Err(CodexThrown::error("Request was aborted"));
                     }
+                    if let Some(error) = codex_terminal_stop_error(output) {
+                        return Err(error);
+                    }
                     stream.push(AssistantMessageEvent::Done {
                         reason: output.stop_reason.clone(),
                         message: output.clone(),
@@ -1054,6 +1089,9 @@ async fn run_openai_codex_responses(
         return Err(CodexThrown::error("Request was aborted"));
     }
 
+    if let Some(error) = codex_terminal_stop_error(output) {
+        return Err(error);
+    }
     stream.push(AssistantMessageEvent::Done {
         reason: output.stop_reason.clone(),
         message: output.clone(),
@@ -1316,16 +1354,20 @@ where
                         }
                         normalized
                     });
+                    let terminal_kind = if type_ == "response.done" {
+                        crate::providers::responses_transport::response_done_terminal_kind(
+                            normalized_response.as_ref()
+                                .and_then(|response| response.get("status"))
+                                .and_then(Value::as_str),
+                        )
+                    } else if type_ == "response.incomplete" {
+                        "response.incomplete"
+                    } else {
+                        "response.completed"
+                    };
                     let mut output = event;
                     if let Some(object) = output.as_object_mut() {
-                        object.insert(
-                            "type".to_string(),
-                            Value::String(if type_ == "response.incomplete" {
-                                "response.incomplete".to_string()
-                            } else {
-                                "response.completed".to_string()
-                            }),
-                        );
+                        object.insert("type".to_string(), Value::String(terminal_kind.to_string()));
                         object.insert("response".to_string(), normalized_response.unwrap_or(Value::Null));
                     }
                     return Some((output, (events, error_slot)));
@@ -2811,6 +2853,14 @@ async fn process_web_socket_stream(
         .take();
 
     match (result, codex_failure) {
+        (Ok(()), None) if output.stop_reason == "error" => {
+            if let Some(entry) = entry.as_ref() {
+                entry.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).continuation = None;
+            }
+            keep_connection = false;
+            acquired.release(options.stream.session_id.as_deref(), keep_connection);
+            return Err(codex_terminal_stop_error(output).expect("error stop reason guarded above"));
+        }
         (Ok(()), None) => {
             if options
                 .stream
@@ -2886,6 +2936,86 @@ async fn process_web_socket_stream(
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn native_compaction_event_response(
+        events: Vec<Value>,
+    ) -> Result<Option<ProviderCompactionResult>, CompactionRequestError> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 4096];
+            assert!(socket.read(&mut request).await.unwrap() > 0);
+            let body = events.into_iter()
+                .map(|event| format!("data: {event}\r\n\r\n"))
+                .collect::<String>();
+            socket.write_all(format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len(),
+            ).as_bytes()).await.unwrap();
+        });
+        let mut model = model();
+        model.base_url = format!("http://{address}");
+        let mut options = CompactionOptions::default();
+        options.simple.stream.api_key = Some(token("native-compaction-account"));
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5),
+            compact_openai_codex_responses(&model, &Context::default(), Some(&options)))
+            .await.expect("Codex native fixture must settle");
+        server.await.unwrap();
+        result
+    }
+
+    fn native_checkpoint_event() -> Value {
+        json!({"type":"response.output_item.done","item":{
+            "type":"compaction_summary","id":"checkpoint","encrypted_content":"opaque-fixture"
+        }})
+    }
+
+    #[tokio::test]
+    async fn native_compaction_decode_errors_stay_errors_and_unsupported_stays_none() {
+        let unsupported = Model::new(
+            "gpt-4o", "GPT-4o", "openai-responses", "openai", "https://example.invalid",
+        );
+        assert!(compact_openai_codex_responses(&unsupported, &Context::default(), None)
+            .await.unwrap().is_none());
+
+        let checkpoint = native_checkpoint_event();
+        let result = native_compaction_event_response(vec![
+            checkpoint.clone(),
+            json!({"type":"response.done","response":{"id":"complete","status":"completed",
+                "usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}),
+        ]).await.unwrap().expect("valid completed checkpoint must remain accepted");
+        assert_eq!(result.checkpoint.items.len(), 1);
+
+        let error = native_compaction_event_response(vec![
+            checkpoint.clone(),
+            json!({"type":"response.done","response":{"id":"missing-status",
+                "usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}),
+        ]).await.unwrap_err();
+        assert_eq!(error.status, 0);
+        assert_eq!(error.message,
+            "Server compaction requires a completed response with exactly one encrypted checkpoint");
+
+        let error = native_compaction_event_response(vec![
+            checkpoint.clone(), json!({"type":"response.done"}),
+        ]).await.unwrap_err();
+        assert_eq!(error.status, 0, "a malformed terminal is not a retryable transport status");
+        assert_eq!(error.message, "Server compaction terminal event was missing its response object");
+
+        let error = native_compaction_event_response(Vec::new()).await.unwrap_err();
+        assert_eq!(error.status, 502, "a genuine early connection close remains a transport failure");
+
+        let error = native_compaction_event_response(vec![
+            checkpoint,
+            json!({"type":"response.incomplete","response":{
+                "status":"incomplete","incomplete_details":{"reason":"content_filter"},
+                "error":{"code":"content_filter"},
+            }}),
+        ]).await.unwrap_err();
+        assert_eq!(error.status, 0);
+        assert!(error.message.contains("safety filters") && error.message.contains("content_filter"),
+            "content_filter details must survive: {}", error.message);
+    }
 
     #[tokio::test]
     async fn codex_sse_frames_arrive_before_close_for_every_unicode_split() {
@@ -3007,6 +3137,79 @@ mod tests {
             vec![Message::user(UserMessage::new(UserContent::Text("Say hello".to_string()), 1))],
             None,
         )
+    }
+
+    #[tokio::test]
+    async fn normalized_incomplete_filter_errors_at_outer_stream_while_length_completes() {
+        for reason in ["content_filter", "max_output_tokens"] {
+            let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0u8; 8192];
+                socket.read(&mut request).await.unwrap();
+                let item = json!({"type":"response.output_item.done","item":{
+                    "type":"function_call","id":"fn_filter","call_id":"call_filter",
+                    "name":"read","arguments":"{\"path\":\"/tmp/filter\"}"
+                }});
+                let terminal = json!({"type":"response.done","response":{
+                    "id":"terminal-filter","status":"incomplete",
+                    "incomplete_details":{"reason":reason},
+                    "usage":{"input_tokens":2,"output_tokens":5,"total_tokens":7}
+                }});
+                let added = json!({"type":"response.output_item.added","item":{
+                    "type":"function_call","id":"fn_filter","call_id":"call_filter","name":"read","arguments":""
+                }});
+                let body = format!("data: {added}\n\ndata: {item}\n\ndata: {terminal}\n\ndata: [DONE]\n\n");
+                socket.write_all(format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(), body,
+                ).as_bytes()).await.unwrap();
+            });
+            let mut model = model();
+            model.base_url = format!("http://{address}");
+            let options = OpenAICodexResponsesOptions {
+                stream: StreamOptions {
+                    api_key: Some(token("filter-test")), transport: Some("sse".into()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let stream = stream_openai_codex_responses(&model, &context(), Some(options));
+            let (done_reasons, terminal_error) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                let mut done_reasons = Vec::new();
+                let mut terminal_error = None;
+                let stream = stream;
+                while let Some(event) = stream.next().await {
+                    match event {
+                        AssistantMessageEvent::Done { reason, .. } => done_reasons.push(reason),
+                        AssistantMessageEvent::Error { error, .. } => terminal_error = Some(error),
+                        _ => {}
+                    }
+                }
+                (done_reasons, terminal_error)
+            }).await.expect("normalized terminal must settle the outer provider stream");
+
+            if reason == "content_filter" {
+                assert!(done_reasons.is_empty(), "filter error must never emit successful Done");
+                let error = terminal_error.expect("filter must reach the outer Error path");
+                assert_eq!(error.stop_reason, "error");
+                assert_eq!(error.stop_reason_raw.as_deref(), Some("content_filter"));
+                assert!(error.error_message.as_deref().unwrap().contains("content_filter"));
+                assert_eq!(error.usage.output, 5.0);
+                assert!(error.content.iter().any(|block| matches!(block,
+                    ContentBlock::ToolCall(call) if call.arguments.get("path").and_then(Value::as_str) == Some("/tmp/filter"))));
+                let details = error.diagnostics.as_ref().unwrap().iter()
+                    .find(|diagnostic| diagnostic.type_ == "provider_stream_failure")
+                    .and_then(|diagnostic| diagnostic.details.as_ref()).unwrap();
+                assert_eq!(details.get("kind").and_then(Value::as_str), Some("safety"));
+                assert_eq!(details.get("providerErrorType").and_then(Value::as_str), Some("content_filter"));
+            } else {
+                assert!(terminal_error.is_none());
+                assert_eq!(done_reasons, vec!["length"], "max_output_tokens remains a valid length Done");
+            }
+            server.await.unwrap();
+        }
     }
 
     #[test]
@@ -3597,7 +3800,7 @@ mod tests {
     }
 
     struct ScriptedBacklogSocket {
-        inner: FakeSocket,
+        inner: Arc<FakeSocket>,
         scripts: Arc<Mutex<VecDeque<Vec<Value>>>>,
         requests: Arc<Mutex<Vec<Value>>>,
     }
@@ -3680,7 +3883,7 @@ mod tests {
             let requests = Arc::new(Mutex::new(Vec::new()));
             set_web_socket_constructor(Some(Arc::new({
                 let scripts = scripts.clone(); let requests = requests.clone();
-                move |_, _| Arc::new(ScriptedBacklogSocket { inner: FakeSocket::default(), scripts: scripts.clone(), requests: requests.clone() })
+                move |_, _| Arc::new(ScriptedBacklogSocket { inner: fake_socket(), scripts: scripts.clone(), requests: requests.clone() })
             })));
             let hooked = Arc::new(Mutex::new(Vec::new()));
             let options = OpenAICodexResponsesOptions { stream: StreamOptions {
@@ -3733,7 +3936,7 @@ mod tests {
             let scripts = Arc::new(Mutex::new(VecDeque::from(vec![backlog_response("r1"), vec![json!({"type":"response.created","response":{"id":"discard-me"}}), json!({"type":"response.in_progress"}), stale.clone()], backlog_response("r2"), backlog_response("r3")])));
             let requests = Arc::new(Mutex::new(Vec::new()));
             set_web_socket_constructor(Some(Arc::new({ let scripts=scripts.clone(); let requests=requests.clone(); move |_, _| {
-                Arc::new(ScriptedBacklogSocket { inner: FakeSocket::default(), scripts:scripts.clone(), requests:requests.clone() })
+                Arc::new(ScriptedBacklogSocket { inner: fake_socket(), scripts:scripts.clone(), requests:requests.clone() })
             }})));
             let mut options = OpenAICodexResponsesOptions { stream: StreamOptions {
                 api_key: Some(token("acc_test")), session_id: Some("backlog-chain-reset".into()), transport: Some("websocket-cached".into()), timeout_ms: Some(1000.0), ..Default::default()
@@ -3769,6 +3972,71 @@ mod tests {
             }
         });
         set_web_socket_constructor(previous_constructor);
+    }
+
+    #[tokio::test]
+    async fn websocket_content_filter_errors_before_done_or_connection_reuse() {
+        let _guard = WEB_SOCKET_TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let previous_constructor = get_web_socket_constructor();
+        let scripts = Arc::new(Mutex::new(VecDeque::from(vec![vec![
+            json!({"type":"response.output_item.added","item":{
+                "type":"function_call","id":"fn_ws_filter","call_id":"call_ws_filter","name":"read","arguments":""
+            }}),
+            json!({"type":"response.output_item.done","item":{
+                "type":"function_call","id":"fn_ws_filter","call_id":"call_ws_filter",
+                "name":"read","arguments":"{\"path\":\"/tmp/ws-filter\"}"
+            }}),
+            json!({"type":"response.done","response":{
+                "id":"ws-content-filter","status":"incomplete",
+                "incomplete_details":{"reason":"content_filter"},
+                "usage":{"input_tokens":2,"output_tokens":5,"total_tokens":7}
+            }}),
+        ]])));
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let sockets: Arc<Mutex<Vec<Arc<FakeSocket>>>> = Arc::new(Mutex::new(Vec::new()));
+        set_web_socket_constructor(Some(Arc::new({
+            let scripts = scripts.clone();
+            let requests = requests.clone();
+            let sockets = sockets.clone();
+            move |_, _| {
+                let inner = fake_socket();
+                sockets.lock().unwrap().push(inner.clone());
+                Arc::new(ScriptedBacklogSocket {
+                    inner, scripts: scripts.clone(), requests: requests.clone(),
+                })
+            }
+        })));
+        let options = OpenAICodexResponsesOptions {
+            stream: StreamOptions {
+                api_key: Some(token("ws-filter-test")), transport: Some("websocket".into()),
+                session_id: Some("ws-content-filter-no-reuse".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let stream = stream_openai_codex_responses(&model(), &context(), Some(options));
+        let (done_reasons, terminal_error) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let mut done_reasons = Vec::new();
+            let mut terminal_error = None;
+            while let Some(event) = stream.next().await {
+                match event {
+                    AssistantMessageEvent::Done { reason, .. } => done_reasons.push(reason),
+                    AssistantMessageEvent::Error { error, .. } => terminal_error = Some(error),
+                    _ => {}
+                }
+            }
+            (done_reasons, terminal_error)
+        }).await.expect("WebSocket filter must settle without a successful Done");
+        set_web_socket_constructor(previous_constructor);
+
+        assert!(done_reasons.is_empty());
+        let error = terminal_error.expect("content_filter must reach outer Error");
+        assert_eq!(error.stop_reason_raw.as_deref(), Some("content_filter"));
+        assert_eq!(error.usage.output, 5.0);
+        assert_eq!(requests.lock().unwrap().len(), 1, "a provider error must not replay or reuse into another request");
+        let sockets = sockets.lock().unwrap();
+        assert_eq!(sockets.len(), 1);
+        assert_eq!(sockets[0].closed.lock().unwrap().len(), 1, "failed response socket must not return to the reuse pool");
     }
 
     async fn next_socket_event(
@@ -3976,6 +4244,37 @@ mod tests {
             ).await.unwrap();
             assert_eq!(output.stop_reason, "length", "{transport}");
             assert_eq!(output.stop_reason_raw.as_deref(), Some("max_output_tokens"), "{transport}");
+        }
+    }
+
+    #[tokio::test]
+    async fn normalized_done_failed_and_cancelled_reach_shared_errors_with_usage() {
+        for transport in ["codex-sse", "codex-websocket"] {
+            for status in ["failed", "cancelled"] {
+                let slot: Arc<Mutex<Option<CodexThrown>>> = Arc::new(Mutex::new(None));
+                let mapped: Vec<Value> = map_codex_events(
+                    futures::stream::iter(vec![Ok(json!({
+                        "type":"response.done",
+                        "response":{
+                            "id":"done-failure", "status":status,
+                            "error":{"code":"server_error","message":"Rejected"},
+                            "usage":{"input_tokens":2,"output_tokens":5,"total_tokens":7}
+                        }
+                    }))]), slot,
+                ).collect().await;
+                assert_eq!(mapped[0]["type"], "response.failed", "{transport} {status}");
+                assert_eq!(mapped[0]["response"]["status"], status);
+                let model = model();
+                let mut output = AssistantMessage::new(model.api.clone(), model.provider.clone(), model.id.clone(), 0);
+                let stream = AssistantMessageEventStream::new();
+                let error = process_responses_stream(
+                    Box::pin(futures::stream::iter(mapped)), &mut output, &stream, &model, None,
+                ).await.unwrap_err();
+                assert_eq!(error.message(), "server_error: Rejected", "{transport} {status}");
+                assert_eq!(output.stop_reason, "error");
+                assert_eq!(output.stop_reason_raw.as_deref(), Some("server_error"));
+                assert_eq!(output.usage.output, 5.0);
+            }
         }
     }
 

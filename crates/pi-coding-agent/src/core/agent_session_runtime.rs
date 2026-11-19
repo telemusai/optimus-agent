@@ -538,17 +538,15 @@ impl AgentSessionRuntime {
 
     /// `teardownCurrent(reason, targetSessionFile?)`.
     ///
-    /// The TypeScript legs that cannot reject in Rust (`emitSessionShutdownEvent`,
-    /// `beforeSessionInvalidate`, `disposeAsync`) run un-caught, exactly as they
-    /// do when they succeed; only `disposeHostedSubagentRuntimes()` can fail and
-    /// it propagates to `teardownForReplacement`.
+    /// Child disposal can fail after an earlier child was irreversibly disposed.
+    /// Finish old-session teardown in that case so the caller can commit the new
+    /// candidate instead of retaining a partially destroyed old session.
     async fn teardown_current(
         self: &Arc<Self>,
         reason: &str,
         target_session_file: Option<String>,
     ) -> Result<(), String> {
-        // Late fallible child cleanup precedes every irreversible old-session effect.
-        self.dispose_hosted_subagent_runtimes().await?;
+        let child_dispose_error = self.dispose_hosted_subagent_runtimes().await.err();
 
         let runner = self.session_extension_runner();
         if let Some(runner) = runner {
@@ -575,7 +573,10 @@ impl AgentSessionRuntime {
         }
         // Await the kernel's final snapshot flush before invalidating the session.
         self.session().dispose_async(None).await;
-        Ok(())
+        match child_dispose_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
     /// `bindRuntimeHost()`.
@@ -676,13 +677,18 @@ impl AgentSessionRuntime {
     }
 
     /// `buildAndApplyReplacement(build, lease)`.
+    ///
+    /// An outer `Err` means the candidate build failed before any old-session
+    /// effects. `Ok(Some(error))` means child cleanup failed after irreversible
+    /// effects began: the candidate is committed, and the caller must finish the
+    /// replacement before reporting that deferred cleanup error.
     async fn build_and_apply_replacement<F, Fut>(
         self: &Arc<Self>,
         build: F,
         lease: Option<Arc<Mutex<SessionLease>>>,
         reason: &str,
         target_session_file: Option<String>,
-    ) -> Result<(), String>
+    ) -> Result<Option<String>, String>
     where
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = Result<CreateAgentSessionRuntimeResult, String>>,
@@ -694,29 +700,25 @@ impl AgentSessionRuntime {
                 return Err(error);
             }
         };
-        // Building a candidate may fail after allocating services and extensions.
         // Keep the working session installed until the candidate is complete.
-        if let Err(error) = self.teardown_for_replacement(reason, target_session_file, lease.clone()).await {
-            result.result.session.dispose_async(None).await;
-            return Err(error);
-        }
+        // Once child disposal begins, never roll back to its potentially partial
+        // old session: finish teardown, apply the candidate, and commit its lease.
+        let deferred_cleanup_error = self
+            .teardown_for_replacement(reason, target_session_file)
+            .await
+            .err();
         self.apply(result);
         self.commit_replacement_lease(lease);
-        Ok(())
+        Ok(deferred_cleanup_error)
     }
 
-    /// `teardownForReplacement(reason, targetSessionFile, lease)`.
+    /// `teardownForReplacement(reason, targetSessionFile)`.
     async fn teardown_for_replacement(
         self: &Arc<Self>,
         reason: &str,
         target_session_file: Option<String>,
-        lease: Option<Arc<Mutex<SessionLease>>>,
     ) -> Result<(), String> {
-        if let Err(error) = self.teardown_current(reason, target_session_file).await {
-            self.release_uncommitted_lease(lease);
-            return Err(error);
-        }
-        Ok(())
+        self.teardown_current(reason, target_session_file).await
     }
 
     /// `disposeSubagentRuntimes()`.
@@ -1069,7 +1071,7 @@ impl AgentSessionRuntime {
         let session_config = self.session_config.clone();
         let cwd = session_manager.lock().expect("session manager poisoned").get_cwd();
         let previous_for_event = previous_session_file.clone();
-        let built = self
+        let deferred_cleanup_error = self
             .build_and_apply_replacement(
                 {
                     let this = Arc::clone(self);
@@ -1106,12 +1108,12 @@ impl AgentSessionRuntime {
                 "resume",
                 session_manager_file,
             )
-            .await;
-        if let Err(error) = built {
-            return Err(error);
-        }
+            .await?;
         self.finish_session_replacement(options.and_then(|options| options.with_session))
             .await?;
+        if let Some(error) = deferred_cleanup_error {
+            return Err(error);
+        }
         Ok(SessionBeforeEventResult { cancelled: false })
     }
 
@@ -1159,7 +1161,7 @@ impl AgentSessionRuntime {
         let agent_dir = self.services().agent_dir.clone();
         let session_config = self.session_config.clone();
         let cwd = self.cwd();
-        let built = self
+        let deferred_cleanup_error = self
             .build_and_apply_replacement(
                 {
                     let this = Arc::clone(self);
@@ -1196,10 +1198,7 @@ impl AgentSessionRuntime {
                 "new",
                 new_session_file,
             )
-            .await;
-        if let Err(error) = built {
-            return Err(error);
-        }
+            .await?;
         if let Some(setup) = options.as_ref().and_then(|options| options.setup.clone()) {
             let session = self.session();
             setup(Arc::clone(&session.session_manager)).await;
@@ -1215,6 +1214,9 @@ impl AgentSessionRuntime {
         }
         self.finish_session_replacement(options.and_then(|options| options.with_session))
             .await?;
+        if let Some(error) = deferred_cleanup_error {
+            return Err(error);
+        }
         Ok(SessionBeforeEventResult { cancelled: false })
     }
 
@@ -1433,7 +1435,7 @@ impl AgentSessionRuntime {
         let cwd = session_manager.lock().expect("session manager poisoned").get_cwd();
         let reason = reason.to_string();
         let teardown_reason = reason.clone();
-        self.build_and_apply_replacement(
+        let deferred_cleanup_error = self.build_and_apply_replacement(
             {
                 let this = Arc::clone(self);
                 move || {
@@ -1470,7 +1472,11 @@ impl AgentSessionRuntime {
             file,
         )
         .await?;
-        self.finish_session_replacement(with_session).await
+        self.finish_session_replacement(with_session).await?;
+        match deferred_cleanup_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
     /// `importFromJsonl(inputPath, cwdOverride?)`.
@@ -1543,7 +1549,7 @@ impl AgentSessionRuntime {
         let agent_dir = self.services().agent_dir.clone();
         let session_config = self.session_config.clone();
         let cwd = session_manager.lock().expect("session manager poisoned").get_cwd();
-        self.build_and_apply_replacement(
+        let deferred_cleanup_error = self.build_and_apply_replacement(
             {
                 let this = Arc::clone(self);
                 move || {
@@ -1582,6 +1588,9 @@ impl AgentSessionRuntime {
         .await?;
         // `finishSessionReplacement()` with no `withSession`.
         self.finish_session_replacement(None).await?;
+        if let Some(error) = deferred_cleanup_error {
+            return Err(error);
+        }
         Ok(SessionBeforeEventResult { cancelled: false })
     }
 

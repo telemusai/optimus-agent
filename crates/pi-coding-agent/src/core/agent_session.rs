@@ -27027,16 +27027,30 @@ mod post_compaction_continuation_tests {
                 invalidation_flag.store(true, std::sync::atomic::Ordering::SeqCst);
             })));
             let old_session = runtime.session();
+            let old_disposals = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let old_dispose_count = Arc::clone(&old_disposals);
+            old_session.register_dispose_callback(Arc::new(move || {
+                old_dispose_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Box::pin(async {})
+            }));
             fail_build.store(false, std::sync::atomic::Ordering::SeqCst);
             runtime.set_subagent_runtime_host(Some(Arc::new(FailingDisposeHost)));
             let error = runtime.new_session(None).await.unwrap_err();
             assert_eq!(error, "synthetic hosted-child disposal failure");
-            assert!(Arc::ptr_eq(&runtime.session(), &old_session));
-            assert!(!invalidated.load(std::sync::atomic::Ordering::SeqCst));
-            let prompt_error = old_session.prompt("still admitted after child failure", None).await.unwrap_err();
-            assert!(
-                prompt_error.starts_with("Session input dispatch settled without durable delivery (action "),
-                "old session still accepts and settles prompt dispatch: {prompt_error}"
+            let candidate = runtime.session();
+            assert!(!Arc::ptr_eq(&candidate, &old_session));
+            assert!(invalidated.load(std::sync::atomic::Ordering::SeqCst));
+            assert_eq!(old_disposals.load(std::sync::atomic::Ordering::SeqCst), 1);
+            let candidate_disposals = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let candidate_dispose_count = Arc::clone(&candidate_disposals);
+            candidate.register_dispose_callback(Arc::new(move || {
+                candidate_dispose_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Box::pin(async {})
+            }));
+            assert_eq!(
+                candidate_disposals.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "a deferred old-child cleanup error must not dispose the committed candidate"
             );
             runtime.set_subagent_runtime_host(None);
             runtime.set_before_session_invalidate(None);
@@ -27067,6 +27081,11 @@ mod post_compaction_continuation_tests {
             fail_build.store(false, std::sync::atomic::Ordering::SeqCst);
             runtime.new_session(None).await.unwrap();
             assert_eq!(*calls.lock().unwrap(), vec!["a", "b"]);
+            assert_eq!(
+                candidate_disposals.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "the accepted candidate follows the normal one-start/one-shutdown lifecycle"
+            );
 
             calls.lock().unwrap().clear();
             let unsubscribe_d: Arc<Mutex<Option<Arc<dyn Fn() + Send + Sync>>>> = Arc::new(Mutex::new(None));
@@ -27104,7 +27123,141 @@ mod post_compaction_continuation_tests {
             runtime.new_session(None).await.unwrap();
             assert_eq!(*calls.lock().unwrap(), vec!["b", "c", "e"]);
 
+            // The second local child fails after the first child may already be
+            // disposed. The old session cannot be rolled back at that point.
+            struct FailSecondChildDisposeHost {
+                attempts: Arc<std::sync::atomic::AtomicUsize>,
+            }
+            impl crate::core::rlm_runtime::SubagentRuntimeHost for FailSecondChildDisposeHost {
+                fn create_rlm_subagent_runtime(
+                    &self,
+                    _options: crate::core::rlm_runtime::CreateRlmSubagentRuntimeOptions,
+                ) -> BoxFuture<Result<crate::core::rlm_runtime::RlmSubagentRuntime, String>> {
+                    Box::pin(async { Err("unexpected child creation".to_string()) })
+                }
+                fn delete_rlm_subagent_runtime(
+                    &self,
+                    _child_id: &str,
+                    _session: Option<&Arc<AgentSession>>,
+                ) -> BoxFuture<Result<(), String>> {
+                    Box::pin(async { Ok(()) })
+                }
+                fn dispose_rlm_subagent_runtimes(&self) -> BoxFuture<Result<(), String>> {
+                    let attempt = self.attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                    Box::pin(async move {
+                        if attempt == 2 {
+                            Err("synthetic second-child disposal failure".to_string())
+                        } else {
+                            Ok(())
+                        }
+                    })
+                }
+            }
+            let child_dispose_attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let parent = runtime.session();
+            for child_id in ["late-child-a", "late-child-b"] {
+                crate::core::rlm_runtime::SubagentRuntimeHost::create_rlm_subagent_runtime(
+                    runtime.as_ref(),
+                    crate::core::rlm_runtime::CreateRlmSubagentRuntimeOptions {
+                        parent_session: Arc::clone(&parent),
+                        id: child_id.to_string(),
+                        prompt: "late disposal fixture".to_string(),
+                        session_name: child_id.to_string(),
+                        session_dir: child_id.to_string(),
+                        model: parent.model().expect("fixture model"),
+                        thinking_level: parent.thinking_level(),
+                        service_tier: parent.service_tier(),
+                        scoped_models: Vec::new(),
+                        active_tool_names: Vec::new(),
+                        allowed_tool_names: None,
+                        custom_tools: Vec::new(),
+                        include_goals: false,
+                        include_compact_skill: false,
+                        rlm_depth: 1.0,
+                        rlm_max_depth: 2.0,
+                        rlm_parent_node_id: child_id.to_string(),
+                        spawned_by_request_id: None,
+                        spawn_code: None,
+                        on_session_published: None,
+                    },
+                )
+                .await
+                .expect("public local child creation reaches runtime tracking");
+            }
+            let children = runtime.list_subagent_runtimes();
+            assert_eq!(children.len(), 2, "both children are tracked before replacement");
+            let child_disposals: Vec<Arc<std::sync::atomic::AtomicUsize>> = children
+                .iter()
+                .map(|child| {
+                    child.set_subagent_runtime_host(Some(Arc::new(FailSecondChildDisposeHost {
+                        attempts: Arc::clone(&child_dispose_attempts),
+                    })));
+                    let disposals = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                    let dispose_count = Arc::clone(&disposals);
+                    child.session().register_dispose_callback(Arc::new(move || {
+                        dispose_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        Box::pin(async {})
+                    }));
+                    disposals
+                })
+                .collect();
+
+            let old_session = runtime.session();
+            let old_disposals = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let old_dispose_count = Arc::clone(&old_disposals);
+            old_session.register_dispose_callback(Arc::new(move || {
+                old_dispose_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Box::pin(async {})
+            }));
+            let rebound_sessions: Arc<Mutex<Vec<Arc<AgentSession>>>> = Arc::new(Mutex::new(Vec::new()));
+            let weak_current = Arc::new(Mutex::new(Arc::downgrade(&old_session)));
+            let rebound_for_callback = Arc::clone(&rebound_sessions);
+            let weak_for_callback = Arc::clone(&weak_current);
+            runtime.set_rebind_session(Some(Arc::new(move |session| {
+                rebound_for_callback.lock().unwrap().push(Arc::clone(&session));
+                *weak_for_callback.lock().unwrap() = Arc::downgrade(&session);
+                Box::pin(async {})
+            })));
+            let with_session_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let with_session_count = Arc::clone(&with_session_calls);
+            let error = runtime.new_session(Some(crate::core::agent_session_runtime::NewSessionOptionsInput {
+                with_session: Some(Arc::new(move |_| {
+                    with_session_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Box::pin(async {})
+                })),
+                ..Default::default()
+            })).await.unwrap_err();
+            assert_eq!(error, "synthetic second-child disposal failure");
+            assert_eq!(with_session_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert_eq!(child_dispose_attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
+            assert!(runtime.list_subagent_runtimes().is_empty(), "disposed runtimes are never reinserted");
+            assert_eq!(old_disposals.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert!(child_disposals.iter().all(|count| {
+                count.load(std::sync::atomic::Ordering::SeqCst) == 1
+            }));
+
+            let candidate = runtime.session();
+            assert!(!Arc::ptr_eq(&candidate, &old_session));
+            assert_eq!(rebound_sessions.lock().unwrap().len(), 1);
+            assert!(Arc::ptr_eq(&rebound_sessions.lock().unwrap()[0], &candidate));
+            assert!(
+                Arc::ptr_eq(&weak_current.lock().unwrap().upgrade().expect("rebound session stays live"), &candidate),
+                "the host weak-current binding advances even though cleanup reports an error"
+            );
+            let candidate_disposals = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let candidate_dispose_count = Arc::clone(&candidate_disposals);
+            candidate.register_dispose_callback(Arc::new(move || {
+                candidate_dispose_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Box::pin(async {})
+            }));
+            assert_eq!(candidate_disposals.load(std::sync::atomic::Ordering::SeqCst), 0);
+
             runtime.dispose(Some(Default::default())).await.unwrap();
+            assert_eq!(
+                candidate_disposals.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "the committed candidate is disposed only by its later owner shutdown"
+            );
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

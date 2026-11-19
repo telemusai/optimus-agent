@@ -198,7 +198,7 @@ fn compact_openai_responses_guarded() -> CompactFunction {
 		let model = model.clone();
 		let context = context.clone();
 		let options = options.cloned();
-		Box::pin(async move { compact_openai_responses(&model, &context, options.as_ref()).await })
+		Box::pin(async move { try_compact_openai_responses_typed(&model, &context, options.as_ref()).await })
 	})
 }
 
@@ -222,7 +222,7 @@ fn compact_openai_codex_responses_guarded() -> CompactFunction {
 		let model = model.clone();
 		let context = context.clone();
 		let options = options.cloned();
-		Box::pin(async move { compact_openai_codex_responses(&model, &context, options.as_ref()).await })
+		Box::pin(async move { try_compact_openai_codex_responses_typed(&model, &context, options.as_ref()).await })
 	})
 }
 

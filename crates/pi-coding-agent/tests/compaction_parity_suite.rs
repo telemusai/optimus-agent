@@ -24,7 +24,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use pi_agent_core::types::{AgentMessage, CustomAgentMessage};
 use pi_ai::api_registry::{register_api_provider_simple, ApiProviderSimple, SimpleStreamFunction};
-use pi_ai::compaction::{CompactionOptions, ProviderCompactionCheckpoint, ProviderCompactionResult};
+use pi_ai::compaction::{CompactionOptions, CompactionRequestError, ProviderCompactionCheckpoint, ProviderCompactionResult};
 use pi_ai::types::{
     AssistantMessage, AssistantMessageEvent, BoxFuture, CompactFunction, ContentBlock, Context,
     ImageOrTextContent, InputModality, Message, Model, ModelCost, NativeCompactionCapability,
@@ -726,7 +726,7 @@ fn register_fixture_provider(spec: &ProviderSpec) {
             match mode {
                 CompactMode::Checkpoint => {
                 step("provider compact: checkpoint");
-                Some(ProviderCompactionResult {
+                Ok(Some(ProviderCompactionResult {
                     checkpoint: spec.checkpoint(&model),
                     usage: Some(Usage {
                         input: 10.0,
@@ -734,30 +734,28 @@ fn register_fixture_provider(spec: &ProviderSpec) {
                         total_tokens: 15.0,
                         ..Usage::zero()
                     }),
-                })
+                }))
                 }
                 CompactMode::Unsupported => {
                 step("provider compact: unsupported");
-                None
+                Ok(None)
             }
                 CompactMode::Fail(message) => {
-                    // A provider failure must reach the retry layer as an error; the
-                    // production wrapper maps a `None` result to "unsupported", so a
-                    // failure is expressed by panicking through the caller contract.
-                    let _ = (options, message);
-                    None
+                    step("provider compact: failed");
+                    let _ = options;
+                    Err(CompactionRequestError::new(message, 0, None))
                 }
                 CompactMode::IncompatibleCheckpoint => {
                     step("provider compact: incompatible");
                     let mut checkpoint = spec.checkpoint(&model);
                     checkpoint.endpoint = Some("https://other-route.invalid/v1/responses/compact".to_string());
-                    Some(ProviderCompactionResult {
+                    Ok(Some(ProviderCompactionResult {
                         checkpoint,
                         usage: None,
-                    })
+                    }))
                 }
             }
-        }) as BoxFuture<Option<ProviderCompactionResult>>
+        }) as BoxFuture<Result<Option<ProviderCompactionResult>, CompactionRequestError>>
     });
     let supports = Arc::new(|_model: &Model| true);
     register_api_provider_simple(
@@ -1187,7 +1185,7 @@ impl Fixture {
             .await
             .unwrap_or_else(|_| Err("WATCHDOG: compact_with_options never returned".to_string()));
         step("compact: end");
-        result
+        result.map(|_| ())
     }
 
     async fn compact_ok(&self, instructions: Option<&str>) {
