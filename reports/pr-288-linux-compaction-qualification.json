@@ -1,0 +1,290 @@
+{
+  "pr": 288,
+  "date": "2026-11-20",
+  "decision": "hold",
+  "criterion": {
+    "max_geometric_mean_candidate_over_baseline": 0.97,
+    "upper_paired_ci95_must_be_below": 1.0
+  },
+  "primary_metric": {
+    "case": "parallel-assembly",
+    "kernel": "serialize_conversation"
+  },
+  "results": {
+    "passed": false,
+    "ratio": 1.0055403138239472,
+    "confidence_interval": [
+      0.9765213676607746,
+      1.0371216512495116
+    ],
+    "pairs": 30,
+    "baseline_median_ms": 2.7271375,
+    "candidate_median_ms": 2.722911
+  },
+  "preregistered_fixture": {
+    "name": "parallel-assembly",
+    "sha256": {
+      "manifest": "7ccc9b3a4503883a09159c657957f5b28b094add4514e95995217e66e2592f54",
+      "transcript": "2c53498096be4e69bb730b43b7a0aaab278dae7ba7b36ec380c8e39280f519cd"
+    }
+  },
+  "method": {
+    "pairs": 30,
+    "warmup": 10,
+    "inner_iterations_for_warm_kernel": 30,
+    "bootstrap_samples": 10000,
+    "seed": 20261120,
+    "lane": {
+      "kind": "parallel-production",
+      "process_state": "warm",
+      "cpu_ids": [
+        0,
+        2,
+        4,
+        6,
+        8,
+        10
+      ],
+      "mask": "0x555",
+      "topology": {
+        "source": "Linux sysfs",
+        "smt_siblings": [
+          "0,8",
+          "1,9",
+          "2,10",
+          "3,11",
+          "4,12",
+          "5,13",
+          "6,14",
+          "7,15"
+        ]
+      }
+    },
+    "limitations": [
+      "Shared workstation. Linux CPU frequency in kHz, queue is procs_running, and power policy is the per-CPU scaling governor. Six selected logical CPUs span four physical cores.",
+      "No page-cache-cold claim is made",
+      "Thermal, host scheduling, SMT/cache contention and unavailable counters remain limitations"
+    ]
+  },
+  "arms": {
+    "baseline": {
+      "head": "fb20fc8e0096691f6877fb22960cb9974d986809",
+      "exe_sha256": "e05ccceb89d873a33b823c3a22b3ff972b73dc28a8ecc540c14e077a7d24e55a",
+      "source_sha256": {
+        "Cargo.lock": "b5a5550043fbe6602d497be475bd69f4e81268f0174028179b651a3a59dc71f4",
+        "crates/pi-coding-agent/examples/compaction_replay.rs": "ff2640cf132ed6679b125715adc85a29bd6c79b3172d7538d75957a1ed79fd13",
+        "crates/pi-coding-agent/src/core/compaction/utils.rs": "5e41f6a23990aa161d904e12a8f13b43caba611d3e79ba4fb825c6b7fd749e0c",
+        "crates/pi-coding-agent/src/core/agent_session.rs": "6ab097169090f7ecaff896430be353d2a3de40f01d139841ebb4b1d5ab92c8d0",
+        "crates/pi-coding-agent/examples/compaction_replay/local_parity.rs": "4d9eb13a6f5ade8bd9368510ca0919e1f4f8d8760926c1dcb969c09902dad046",
+        "crates/pi-coding-agent/build_provenance.rs": "dec9bdcfda355f656ce01b8f8a1f062bbfd2ab3e0f3dd7b59b3cb8ffe79e2562",
+        "scripts/compaction_paired_protocol.py": "784b384f3a17e1fd4e3de494a8b436ee37d3470ec1a3ce8c5be78ce4e415facb",
+        "scripts/compaction_paired_stats.py": "6c44fb3bfd7dc438d55571c4ec0f7ae68f99eae96f6318a79867abbc54400504"
+      }
+    },
+    "candidate": {
+      "head": "04d2a75af5c50f8fe74baf42a38568c104e1d315",
+      "exe_sha256": "d78f44b9c387709f779b0f0a1b548329dc1309984398f50b4d560e7a0abc4359",
+      "source_sha256": {
+        "Cargo.lock": "b5a5550043fbe6602d497be475bd69f4e81268f0174028179b651a3a59dc71f4",
+        "crates/pi-coding-agent/examples/compaction_replay.rs": "ff2640cf132ed6679b125715adc85a29bd6c79b3172d7538d75957a1ed79fd13",
+        "crates/pi-coding-agent/src/core/compaction/utils.rs": "24aa008aa50626fdf1712f02e7c053e2c73e163a191e92f5c8907a2826316c4e",
+        "crates/pi-coding-agent/src/core/agent_session.rs": "6ab097169090f7ecaff896430be353d2a3de40f01d139841ebb4b1d5ab92c8d0",
+        "crates/pi-coding-agent/examples/compaction_replay/local_parity.rs": "4d9eb13a6f5ade8bd9368510ca0919e1f4f8d8760926c1dcb969c09902dad046",
+        "crates/pi-coding-agent/build_provenance.rs": "dec9bdcfda355f656ce01b8f8a1f062bbfd2ab3e0f3dd7b59b3cb8ffe79e2562",
+        "scripts/compaction_paired_protocol.py": "784b384f3a17e1fd4e3de494a8b436ee37d3470ec1a3ce8c5be78ce4e415facb",
+        "scripts/compaction_paired_stats.py": "6c44fb3bfd7dc438d55571c4ec0f7ae68f99eae96f6318a79867abbc54400504"
+      }
+    }
+  },
+  "parity_receipts_sha256": {
+    "baseline": "31ba3b8dbf30ed401425519a1a78b7c51a2b2cd2627e2a17c4e577b909cd53d8",
+    "candidate": "1466671065fe9e0f465776334bac5537aa750bce884295b5013341128064e7e3"
+  },
+  "raw_run_manifest_sha256": "c3fe1ab7b2f3d1458b75b243fd2c0c40078b01e10dfab5ad3fc36badeccf0a2a",
+  "paired_primary_observations_ms": [
+    {
+      "baseline": 3.061353,
+      "candidate": 3.4264740000000002,
+      "log_ratio": 0.11267476899275904,
+      "pair_id": 0
+    },
+    {
+      "baseline": 2.899394,
+      "candidate": 2.8439419999999997,
+      "log_ratio": -0.01931063171734649,
+      "pair_id": 1
+    },
+    {
+      "baseline": 3.298947,
+      "candidate": 3.2119969999999998,
+      "log_ratio": -0.026710464556437448,
+      "pair_id": 2
+    },
+    {
+      "baseline": 3.029087,
+      "candidate": 2.8440119999999998,
+      "log_ratio": -0.06304552264185681,
+      "pair_id": 3
+    },
+    {
+      "baseline": 3.2088550000000002,
+      "candidate": 2.974263,
+      "log_ratio": -0.07591789847607042,
+      "pair_id": 4
+    },
+    {
+      "baseline": 2.833745,
+      "candidate": 2.7312209999999997,
+      "log_ratio": -0.03685039643521704,
+      "pair_id": 5
+    },
+    {
+      "baseline": 3.079233,
+      "candidate": 2.949121,
+      "log_ratio": -0.043173380150026155,
+      "pair_id": 6
+    },
+    {
+      "baseline": 3.14125,
+      "candidate": 2.719697,
+      "log_ratio": -0.1441003328316956,
+      "pair_id": 7
+    },
+    {
+      "baseline": 2.587421,
+      "candidate": 2.775779,
+      "log_ratio": 0.07026980180000097,
+      "pair_id": 8
+    },
+    {
+      "baseline": 2.587631,
+      "candidate": 2.5485909999999996,
+      "log_ratio": -0.015202127889995285,
+      "pair_id": 9
+    },
+    {
+      "baseline": 2.5429340000000002,
+      "candidate": 2.521005,
+      "log_ratio": -0.008660900961309231,
+      "pair_id": 10
+    },
+    {
+      "baseline": 2.551035,
+      "candidate": 2.779551,
+      "log_ratio": 0.08579024469159098,
+      "pair_id": 11
+    },
+    {
+      "baseline": 2.694766,
+      "candidate": 3.111639,
+      "log_ratio": 0.14383822388364995,
+      "pair_id": 12
+    },
+    {
+      "baseline": 2.619828,
+      "candidate": 2.709223,
+      "log_ratio": 0.033553211150535056,
+      "pair_id": 13
+    },
+    {
+      "baseline": 2.502707,
+      "candidate": 2.656215,
+      "log_ratio": 0.05952923106412115,
+      "pair_id": 14
+    },
+    {
+      "baseline": 2.6349839999999998,
+      "candidate": 2.6997940000000002,
+      "log_ratio": 0.024298363934648307,
+      "pair_id": 15
+    },
+    {
+      "baseline": 2.5337150000000004,
+      "candidate": 2.622971,
+      "log_ratio": 0.03462103960976714,
+      "pair_id": 16
+    },
+    {
+      "baseline": 2.7433050000000003,
+      "candidate": 2.663129,
+      "log_ratio": -0.02966165063374191,
+      "pair_id": 17
+    },
+    {
+      "baseline": 2.731432,
+      "candidate": 2.591613,
+      "log_ratio": -0.05254555200999086,
+      "pair_id": 18
+    },
+    {
+      "baseline": 3.2926650000000004,
+      "candidate": 2.824878,
+      "log_ratio": -0.15323208944969519,
+      "pair_id": 19
+    },
+    {
+      "baseline": 3.3793360000000003,
+      "candidate": 2.939345,
+      "log_ratio": -0.13949247307825263,
+      "pair_id": 20
+    },
+    {
+      "baseline": 2.8255060000000003,
+      "candidate": 2.7261249999999997,
+      "log_ratio": -0.03580627664821486,
+      "pair_id": 21
+    },
+    {
+      "baseline": 2.6730460000000003,
+      "candidate": 2.71048,
+      "log_ratio": 0.013907094841591285,
+      "pair_id": 22
+    },
+    {
+      "baseline": 2.615638,
+      "candidate": 2.674024,
+      "log_ratio": 0.022076409142575644,
+      "pair_id": 23
+    },
+    {
+      "baseline": 2.752594,
+      "candidate": 3.345813,
+      "log_ratio": 0.1951659735722441,
+      "pair_id": 24
+    },
+    {
+      "baseline": 2.722843,
+      "candidate": 3.281351,
+      "log_ratio": 0.18657867280302012,
+      "pair_id": 25
+    },
+    {
+      "baseline": 2.640083,
+      "candidate": 2.629677,
+      "log_ratio": -0.003949331098715145,
+      "pair_id": 26
+    },
+    {
+      "baseline": 2.748824,
+      "candidate": 2.611308,
+      "log_ratio": -0.05132193862588252,
+      "pair_id": 27
+    },
+    {
+      "baseline": 2.5564139999999997,
+      "candidate": 2.707618,
+      "log_ratio": 0.05746378635387208,
+      "pair_id": 28
+    },
+    {
+      "baseline": 2.621854,
+      "candidate": 2.6881320000000004,
+      "log_ratio": 0.024964827491847735,
+      "pair_id": 29
+    }
+  ],
+  "verification": {
+    "full_output_sections_compared": 14,
+    "fresh_process_restore_smoke": true
+  }
+}
