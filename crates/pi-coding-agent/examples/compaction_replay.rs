@@ -34,6 +34,7 @@
 //! Everything here is measurement tooling: no production file depends on it and
 //! it must keep working unchanged BEFORE and AFTER optimization work.
 
+#[cfg(not(feature = "compaction-r4-uninstrumented-wall"))]
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
@@ -65,16 +66,21 @@ use pi_coding_agent::core::agent_session_services::{
     CreateAgentSessionServicesOptions,
 };
 use pi_coding_agent::core::auth_storage::{AuthStorage, AuthStorageData, AuthStorageOptions};
+#[cfg(not(feature = "compaction-r4-uninstrumented-wall"))]
 use pi_ai::models::get_model_input_limit;
+#[cfg(not(feature = "compaction-r4-uninstrumented-wall"))]
 use pi_coding_agent::core::compaction::compaction::{
-    build_summarization_prompt, default_compaction_settings, estimate_context_tokens,
-    estimate_tokens, find_cut_point, prepare_compaction, should_compact_for_model,
-    CompactionSessionEntry, COMPACTION_PROMPT_LEGACY, SUMMARY_UPDATE_POLICY_OFF,
+    build_summarization_prompt, find_cut_point, COMPACTION_PROMPT_LEGACY,
+};
+use pi_coding_agent::core::compaction::compaction::{
+    default_compaction_settings, estimate_context_tokens, estimate_tokens, prepare_compaction,
+    should_compact_for_model, CompactionSessionEntry, SUMMARY_UPDATE_POLICY_OFF,
     MAX_COMPACTION_CONTEXT_TOKENS,
 };
 use pi_coding_agent::core::compaction::utils::{
     serialize_conversation, SUMMARIZATION_SYSTEM_PROMPT,
 };
+#[cfg(not(feature = "compaction-r4-uninstrumented-wall"))]
 use pi_coding_agent::core::jev_compaction::prepare_context;
 use pi_coding_agent::core::messages::convert_to_llm;
 use pi_coding_agent::core::model_registry::ModelRegistry;
@@ -82,6 +88,7 @@ use pi_coding_agent::core::model_tool_output_policy::ModelToolOutputPolicyOption
 use pi_coding_agent::core::resource_loader::DefaultResourceLoaderOptions;
 use pi_coding_agent::core::session_manager::{CustomMessageEntryContent, SessionManager};
 use pi_coding_agent::core::settings_manager::SettingsManager;
+#[cfg(not(feature = "compaction-r4-uninstrumented-wall"))]
 use pi_jev::compaction::CompactionConfig;
 use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
@@ -89,20 +96,28 @@ use rand::{Rng, SeedableRng};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 
+#[cfg(not(feature = "compaction-r4-uninstrumented-wall"))]
 #[path = "compaction_replay/local_parity.rs"]
 mod local_parity;
+#[cfg(not(feature = "compaction-r4-uninstrumented-wall"))]
 #[path = "compaction_replay/candidate_review.rs"]
 mod candidate_review;
+#[path = "compaction_replay/r4_lanes.rs"]
+mod r4_lanes;
 
 // ---------------------------------------------------------------------------
 // Counting global allocator (std-only)
 // ---------------------------------------------------------------------------
 
+#[cfg(not(feature = "compaction-r4-uninstrumented-wall"))]
 static ALLOC_COUNT: AtomicU64 = AtomicU64::new(0);
+#[cfg(not(feature = "compaction-r4-uninstrumented-wall"))]
 static ALLOC_BYTES: AtomicU64 = AtomicU64::new(0);
 
+#[cfg(not(feature = "compaction-r4-uninstrumented-wall"))]
 struct CountingAllocator;
 
+#[cfg(not(feature = "compaction-r4-uninstrumented-wall"))]
 unsafe impl GlobalAlloc for CountingAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         ALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -124,9 +139,11 @@ unsafe impl GlobalAlloc for CountingAllocator {
     }
 }
 
+#[cfg(not(feature = "compaction-r4-uninstrumented-wall"))]
 #[global_allocator]
 static GLOBAL_ALLOCATOR: CountingAllocator = CountingAllocator;
 
+#[cfg(not(feature = "compaction-r4-uninstrumented-wall"))]
 fn alloc_snapshot() -> (u64, u64) {
     (
         ALLOC_COUNT.load(Ordering::Relaxed),
@@ -381,6 +398,7 @@ fn elapsed_ms(start: Instant) -> f64 {
     start.elapsed().as_secs_f64() * 1000.0
 }
 
+#[cfg(not(feature = "compaction-r4-uninstrumented-wall"))]
 fn timing_stats(mut samples: Vec<f64>) -> Value {
     if samples.is_empty() {
         return json!({});
@@ -3729,6 +3747,7 @@ async fn run_replay(cli: &Cli) -> Result<i32, String> {
 // bench-local subcommand
 // ---------------------------------------------------------------------------
 
+#[cfg(not(feature = "compaction-r4-uninstrumented-wall"))]
 fn bench_kernel(
     name: &str,
     detail: Value,
@@ -3771,6 +3790,7 @@ fn bench_kernel(
     })
 }
 
+#[cfg(not(feature = "compaction-r4-uninstrumented-wall"))]
 fn bench_kernel_fallible(
     name: &str,
     detail: Value,
@@ -3811,6 +3831,7 @@ fn bench_kernel_fallible(
     }))
 }
 
+#[cfg(not(feature = "compaction-r4-uninstrumented-wall"))]
 fn jev_expected_skip_value(
     message_count: usize,
     skip: pi_jev::compaction::CompactionSkip,
@@ -3826,6 +3847,7 @@ fn jev_expected_skip_value(
     })
 }
 
+#[cfg(not(feature = "compaction-r4-uninstrumented-wall"))]
 fn run_bench_local(cli: &Cli) -> Result<i32, String> {
     let fixture_path = PathBuf::from(cli.required("fixture")?);
     let out = PathBuf::from(cli.required("out")?);
@@ -4796,10 +4818,24 @@ fn main() {
                 .expect("tokio runtime");
             runtime.block_on(run_replay(&cli))
         }
+        #[cfg(not(feature = "compaction-r4-uninstrumented-wall"))]
         "bench-local" => run_bench_local(&cli),
+        #[cfg(feature = "compaction-r4-uninstrumented-wall")]
+        "bench-local" => Err("bench-local is unavailable in the uninstrumented wall build".to_string()),
+        "r4-lane" => {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("tokio runtime");
+            runtime.block_on(r4_lanes::run(&cli))
+        }
+        #[cfg(not(feature = "compaction-r4-uninstrumented-wall"))]
         "verify-local" => local_parity::run_verify_local(&cli),
+        #[cfg(not(feature = "compaction-r4-uninstrumented-wall"))]
         "capture-local" => candidate_review::run_capture(&cli),
+        #[cfg(not(feature = "compaction-r4-uninstrumented-wall"))]
         "self-test-r2-review" => candidate_review::run_candidate_controls(&cli),
+        #[cfg(not(feature = "compaction-r4-uninstrumented-wall"))]
         "self-test-r2" => local_parity::run_r2_self_test(&cli),
         "verify-reopen" => run_verify_reopen(&cli),
         "self-test-r1" => {
