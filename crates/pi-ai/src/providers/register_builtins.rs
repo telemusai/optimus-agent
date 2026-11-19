@@ -8,7 +8,7 @@ use std::sync::{Arc, OnceLock, RwLock};
 
 use crate::api_registry::{
 	clear_api_providers, get_api_providers, register_api_provider_simple,
-	register_api_provider_simple_with_fallible_compaction, ApiProviderSimple, 
+	register_api_provider_simple_with_fallible_compaction, ApiProviderSimple,
 };
 use crate::compaction::CompactionOptions;
 use crate::types::CompactFunction;
