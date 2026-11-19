@@ -13,6 +13,7 @@ use super::textmas::{
 };
 
 pub const MAX_MAP_CALLS: usize = 64;
+const MIN_MAPPER_OUTPUT_TOKENS: f64 = 256.0;
 
 #[derive(Clone, Debug)]
 enum PreparationItem {
@@ -485,9 +486,16 @@ fn map_fits(base: &Context, model: &Model, items: &[PreparationItem]) -> bool {
     if map_source_bytes_lower_bound(base, items) > MAX_CONTEXT_BYTES {
         return false;
     }
-    map_context(base, items)
-        .ok()
-        .is_some_and(|context| output_budget(model, &context).is_ok())
+    // A one-token allowance is technically positive but cannot fund a useful summary.
+    // Respect smaller provider output ceilings instead of rejecting them categorically.
+    let reserve = if model.max_tokens.is_finite() && model.max_tokens > 0.0 {
+        MIN_MAPPER_OUTPUT_TOKENS.min(model.max_tokens)
+    } else {
+        MIN_MAPPER_OUTPUT_TOKENS
+    };
+    map_context(base, items).ok().is_some_and(|context| {
+        output_budget(model, &context).is_ok_and(|budget| budget >= reserve)
+    })
 }
 
 fn split_text_item(
@@ -641,7 +649,7 @@ pub fn preparation_image_limit_with_mode(
 mod tests {
     use super::*;
     use crate::core::occ::textmas::{
-        usage_record, TextMasCallStatus, TextMasUsageLedger, TextMasUsageRecord,
+        public_draft, usage_record, TextMasCallStatus, TextMasUsageLedger, TextMasUsageRecord,
     };
 
     fn model() -> Model {
@@ -668,6 +676,13 @@ mod tests {
         let text = |text: String| PreparationItem::text("message 1 user text".into(), text);
         let cases = vec![
             ("small fitting text", base(), vec![text("small request".into())]),
+            (
+                "raw bytes exactly at the bound still use exact checks",
+                base(),
+                vec![text("x".repeat(
+                    MAX_CONTEXT_BYTES - "base instructions".len(),
+                ))],
+            ),
             (
                 "raw bytes below but JSON overhead exceeds the bound",
                 base(),
@@ -727,6 +742,12 @@ mod tests {
             }
             if name == "small fitting text" {
                 assert!(actual, "the control case must fit exactly");
+            }
+            if name == "raw bytes exactly at the bound still use exact checks" {
+                assert_eq!(
+                    map_source_bytes_lower_bound(&base, &items),
+                    MAX_CONTEXT_BYTES
+                );
             }
         }
     }
@@ -979,6 +1000,218 @@ mod tests {
         .unwrap();
         assert_ne!(sequential_limit, hierarchical_limit);
         assert!(hierarchical_limit < image.data.len());
+    }
+
+    #[test]
+    fn empty_single_small_cap_and_public_draft_boundaries_stay_explicit() {
+        let empty = TextMasPreparationPlan::new(
+            &Context::new(None, Vec::new(), None),
+            TextMasMode::Hierarchical,
+            &model(),
+        )
+        .unwrap_err();
+        assert!(empty.contains("no public context content"));
+
+        let one_source = "one mapper preserves this complete source".to_string();
+        let one = TextMasPreparationPlan::new(
+            &Context::new(None, vec![user(one_source.clone())], None),
+            TextMasMode::Hierarchical,
+            &model(),
+        )
+        .unwrap();
+        assert_eq!(one.map_contexts.len(), 1);
+        assert!(serde_json::to_vec(&one.map_contexts[0]).unwrap().len() <= MAX_CONTEXT_BYTES);
+        assert_eq!(output_budget(&model(), &one.map_contexts[0]).unwrap(), 2048.0);
+        let Message::User(message) = &one.map_contexts[0].messages[0] else {
+            panic!("synthetic source must be user data")
+        };
+        let UserContent::Text(text) = &message.content else {
+            panic!("text source")
+        };
+        assert_eq!(text.split_once("]\n").unwrap().1, one_source);
+
+        let mut small_cap = model();
+        small_cap.max_tokens = 64.0;
+        let capped = TextMasPreparationPlan::new(
+            &Context::new(None, vec![user(one_source)], None),
+            TextMasMode::Hierarchical,
+            &small_cap,
+        )
+        .unwrap();
+        assert_eq!(capped.map_contexts.len(), 1);
+        assert_eq!(output_budget(&small_cap, &capped.map_contexts[0]).unwrap(), 64.0);
+
+        let mut accepted = pi_ai::types::AssistantMessage::default();
+        accepted.content = vec![pi_ai::types::ContentBlock::Text(
+            pi_ai::types::TextContent::new("\\".repeat(MAX_DRAFT_BYTES)),
+        )];
+        assert_eq!(public_draft(&accepted).unwrap().len(), MAX_DRAFT_BYTES);
+        accepted.content = vec![pi_ai::types::ContentBlock::Text(
+            pi_ai::types::TextContent::new("\\".repeat(MAX_DRAFT_BYTES + 1)),
+        )];
+        assert!(public_draft(&accepted).unwrap_err().contains("draft bound"));
+    }
+
+    #[test]
+    fn mapper_packing_reserves_usable_output_without_losing_source() {
+        let mut small = model();
+        small.context_window = 32_768.0;
+        small.max_tokens = 2_048.0;
+        let base = Context::new(None, Vec::new(), None);
+        let legacy_fits = |len: usize| {
+            let item = PreparationItem::text(
+                "message 1 user text".into(),
+                "x".repeat(len),
+            );
+            map_context(&base, std::slice::from_ref(&item))
+                .ok()
+                .is_some_and(|context| output_budget(&small, &context).is_ok())
+        };
+        let mut low = 1usize;
+        let mut high = MAX_CONTEXT_BYTES;
+        let mut best = 0usize;
+        while low <= high {
+            let mid = low + (high - low) / 2;
+            if legacy_fits(mid) {
+                best = mid;
+                low = mid + 1;
+            } else {
+                high = mid - 1;
+            }
+        }
+        assert!(best > 0 && best < MAX_CONTEXT_BYTES);
+        assert!(!legacy_fits(best + 1));
+        let source = "x".repeat(best);
+        let legacy_item = PreparationItem::text(
+            "message 1 user text".into(),
+            source.clone(),
+        );
+        let legacy_context = map_context(&base, &[legacy_item]).unwrap();
+        let legacy_budget = output_budget(&small, &legacy_context).unwrap();
+        assert_eq!(legacy_budget, 1.0, "the legacy predicate really accepts this exact boundary");
+
+        let original = Context::new(None, vec![user(source.clone())], None);
+        let started = std::time::Instant::now();
+        let plan = TextMasPreparationPlan::new(&original, TextMasMode::Sequential, &small)
+            .expect("the source remains plannable with a useful output reserve");
+        let planning_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let budgets = plan
+            .map_contexts
+            .iter()
+            .map(|context| output_budget(&small, context).unwrap())
+            .collect::<Vec<_>>();
+        let recovered = plan
+            .map_contexts
+            .iter()
+            .map(|context| {
+                assert!(serde_json::to_vec(context).unwrap().len() <= MAX_CONTEXT_BYTES);
+                let Message::User(message) = &context.messages[0] else {
+                    panic!("synthetic source must be user data")
+                };
+                let UserContent::Text(text) = &message.content else {
+                    panic!("text source")
+                };
+                text.split_once("]\n").unwrap().1.to_string()
+            })
+            .collect::<String>();
+        assert_eq!(recovered, source, "splitting must remain lossless");
+        eprintln!(
+            "MAPPER_RESERVE legacy_calls=1 legacy_budget={legacy_budget} calls={} budgets={budgets:?} planning_ms={planning_ms:.3} source_bytes={} recovered_equal=true",
+            plan.map_contexts.len(),
+            source.len(),
+        );
+        assert_eq!(
+            plan.map_contexts.len(),
+            2,
+            "one source that the old planner sent with a one-token allowance must be split"
+        );
+        for budget in budgets {
+            assert!(budget >= 256.0, "every mapper needs a usable output allowance");
+        }
+    }
+
+    #[test]
+    fn mapper_reserve_preserves_the_64_map_boundary_and_source_order() {
+        let mut constrained = model();
+        constrained.context_window = 32_768.0;
+        constrained.max_tokens = 256.0;
+        let base = Context::new(None, Vec::new(), None);
+        let item = |index: usize, text: String| {
+            PreparationItem::text(format!("message {} user text", index + 1), text)
+        };
+        let fits_len = |len: usize| {
+            map_fits(
+                &base,
+                &constrained,
+                std::slice::from_ref(&item(0, "x".repeat(len))),
+            )
+        };
+        let mut low = 1usize;
+        let mut high = MAX_CONTEXT_BYTES;
+        let mut best = 0usize;
+        while low <= high {
+            let mid = low + (high - low) / 2;
+            if fits_len(mid) {
+                best = mid;
+                low = mid + 1;
+            } else {
+                high = mid - 1;
+            }
+        }
+        assert!(best > 128 && best < MAX_CONTEXT_BYTES);
+
+        // Leave room for varying source labels and a stable per-message ordinal.
+        let source_text = |index: usize| format!("{index:02}:{}", "x".repeat(best - 131));
+        assert!(map_fits(
+            &base,
+            &constrained,
+            std::slice::from_ref(&item(63, source_text(63))),
+        ));
+        assert!(!map_fits(
+            &base,
+            &constrained,
+            &[item(63, source_text(63)), item(64, source_text(64))],
+        ));
+        let original = |count: usize| {
+            Context::new(
+                None,
+                (0..count)
+                    .map(|index| user(source_text(index)))
+                    .collect(),
+                None,
+            )
+        };
+
+        let accepted = TextMasPreparationPlan::new(
+            &original(MAX_MAP_CALLS),
+            TextMasMode::Sequential,
+            &constrained,
+        )
+        .expect("exactly 64 independent maps remain admissible");
+        assert_eq!(accepted.map_contexts.len(), MAX_MAP_CALLS);
+        for (index, context) in accepted.map_contexts.iter().enumerate() {
+            assert_eq!(context.messages.len(), 1);
+            assert!(serde_json::to_vec(context).unwrap().len() <= MAX_CONTEXT_BYTES);
+            assert_eq!(output_budget(&constrained, context).unwrap(), 256.0);
+            let Message::User(message) = &context.messages[0] else {
+                panic!("synthetic source must be user data")
+            };
+            let UserContent::Text(text) = &message.content else {
+                panic!("text source")
+            };
+            assert_eq!(text.split_once("]\n").unwrap().1, source_text(index));
+        }
+
+        let error = TextMasPreparationPlan::new(
+            &original(MAX_MAP_CALLS + 1),
+            TextMasMode::Sequential,
+            &constrained,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            "OCC3.1 needs 65 context map calls; the limit is 64"
+        );
     }
 
     #[test]
