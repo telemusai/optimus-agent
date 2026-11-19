@@ -13,6 +13,7 @@ import threading
 import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from pathlib import Path
 from types import FunctionType, SimpleNamespace
 from unittest import mock
@@ -936,7 +937,11 @@ class BashTest(unittest.IsolatedAsyncioTestCase):
                     "PRIME_AGENT_BASH_SHELL": _SHELL_STANDIN,
                 },
             ):
-                with mock.patch.object(bash_module, "_IS_POSIX", False):
+                # Simulate the Windows job lifecycle while appending through the host filesystem.
+                journal_io = mock.patch.object(bash_module, "_open_journal_append",
+                    side_effect=lambda path: os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600),
+                ) if os.name == "posix" else nullcontext()
+                with journal_io, mock.patch.object(bash_module, "_IS_POSIX", False):
                     # The Popen stand-in does not suspend the child, so a real
                     # start-id lookup would race its exit; the record shape is
                     # what this test pins, not the start-id acquisition.

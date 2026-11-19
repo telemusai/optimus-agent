@@ -3466,13 +3466,18 @@ async fn execute_verify_reopen(
 ) -> Result<Value, String> {
     let exe = std::env::current_exe().map_err(|error| error.to_string())?;
     let mut command = tokio::process::Command::new(exe);
+    #[cfg(test)]
+    command.arg("--exact").arg("tests::verify_reopen_child")
+        .env("OPTIMUS_TEST_REOPEN_EXPECTATION", expectation_path)
+        .env("OPTIMUS_TEST_REOPEN_REPORT", report_path);
+    #[cfg(not(test))]
     command
         .arg("verify-reopen")
         .arg("--expectation")
         .arg(expectation_path)
         .arg("--out")
-        .arg(report_path)
-        .kill_on_drop(true);
+        .arg(report_path);
+    command.kill_on_drop(true);
     let output = tokio::time::timeout(Duration::from_secs(timeout_secs), command.output())
         .await
         .map_err(|_| format!("fresh-process reopen timed out after {timeout_secs}s"))?
@@ -5006,6 +5011,16 @@ fn main() {
 mod tests {
     use super::*;
 
+    #[test]
+    fn verify_reopen_child() {
+        let Ok(expectation) = std::env::var("OPTIMUS_TEST_REOPEN_EXPECTATION") else { return };
+        let out = std::env::var("OPTIMUS_TEST_REOPEN_REPORT").expect("fresh-process report path");
+        let cli = Cli { subcommand: "verify-reopen".into(), options: HashMap::from([
+            ("expectation".into(), expectation), ("out".into(), out),
+        ]) };
+        run_verify_reopen(&cli).expect("fresh-process reopen verification");
+    }
+
     fn load_observability_fixture(name: &str) -> LoadedFixture {
         let case_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("examples/fixtures/compaction-observability")
@@ -5017,6 +5032,8 @@ mod tests {
         let options = ReplayOptions {
             provider_delay_ms: 1,
             summary_failure: None,
+            expected_outcome: ReplayOutcomeExpectation::SuccessfulCompaction,
+            expected_summary_calls: 1,
             context_window: 1_000_000.0,
             keep_recent: Some(64.0),
             work: work.to_path_buf(),
