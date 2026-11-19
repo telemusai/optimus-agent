@@ -1203,14 +1203,26 @@ async fn hierarchical_configured_two_is_bounded_ordered_and_work_conserving() {
     let running = tokio::spawn({ let session = session.clone(); async move { session.prompt("CURRENT_REQUEST", None).await } });
     let _cleanup = AbortOnDrop(running.abort_handle());
     probe.wait_for_roles(2).await;
-    assert_eq!(probe.entered.lock().unwrap().as_slice(), ["planner", "critic"]);
+    {
+        let entered = probe.entered.lock().unwrap();
+        assert_eq!(entered.len(), 2);
+        assert_eq!(entered.iter().filter(|entry| entry.as_str() == "planner").count(), 1);
+        assert_eq!(entered.iter().filter(|entry| entry.as_str() == "critic").count(), 1);
+    }
     assert_eq!(probe.peak.load(std::sync::atomic::Ordering::SeqCst), 2);
     // Complete the critic while the planner is blocked. The third role must take
     // the freed capacity-two slot without waiting for a two-item chunk to finish.
     gates[1].add_permits(1);
     probe.wait_for_exit("critic").await;
     probe.wait_for_roles(3).await;
-    assert_eq!(probe.entered.lock().unwrap().as_slice(), ["planner", "critic", "refiner"]);
+    {
+        let entered = probe.entered.lock().unwrap();
+        assert_eq!(entered.len(), 3);
+        let first_two = entered.get(..2).expect("two initial entries");
+        assert_eq!(first_two.iter().filter(|entry| entry.as_str() == "planner").count(), 1);
+        assert_eq!(first_two.iter().filter(|entry| entry.as_str() == "critic").count(), 1);
+        assert_eq!(entered.get(2).map(String::as_str), Some("refiner"));
+    }
     assert_eq!(probe.parent_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
     assert_eq!(probe.peak.load(std::sync::atomic::Ordering::SeqCst), 2);
     gates[0].add_permits(1);

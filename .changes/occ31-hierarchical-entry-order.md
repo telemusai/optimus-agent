@@ -1,0 +1,1 @@
+- Fixed: Allowed either provider admission order for the two concurrent hierarchical TextMAS roles while preserving exact role counts and refiner admission checks.
