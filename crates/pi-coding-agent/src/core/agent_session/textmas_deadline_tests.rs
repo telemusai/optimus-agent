@@ -314,6 +314,7 @@ fn role_run(session: &AgentSession, action_id: &str) -> (TextMasRun, Context) {
         signal: CancellationToken::new(),
         phase: Phase::Armed,
         mapper_retry_used: Default::default(),
+        activity: Default::default(),
     };
     (run, context)
 }

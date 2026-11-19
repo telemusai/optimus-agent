@@ -1,0 +1,1 @@
+- Added optional, content-free OCC3.1 TextMAS lifecycle snapshots and typed activity events under schema 48. Gated the new event per attached session so older clients receive no unknown live or replayed events, without changing usage accounting, model calls, or visual presentation.

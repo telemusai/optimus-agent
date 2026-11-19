@@ -38,6 +38,7 @@ pub struct AgentSessionSnapshotSource {
     pub occ3_global_opt_in: bool,
     /// True while this session owns an active TextMAS preparation run.
     pub textmas_active: bool,
+    pub textmas_activity: Option<crate::core::occ::textmas_activity::TextMasActivitySnapshot>,
     pub context_usage: serde_json::Value,
     pub persisted_recap: Option<String>,
     pub messages: Vec<pi_agent_core::types::AgentMessage>,
@@ -89,7 +90,8 @@ pub fn create_agent_connection_state(
         active_tool_names: session.active_tool_names.clone(),
         occ3_native_dead: session.occ3_native_dead,
         occ3_modes: occ3_modes(session.session_file.as_deref(), session.model.as_ref(),
-            session.occ3_global_opt_in, &session.active_tool_names, session.occ3_native_dead, session.textmas_active),
+            session.occ3_global_opt_in, &session.active_tool_names, session.occ3_native_dead,
+            session.textmas_active, session.textmas_activity.clone()),
         context_usage: session.context_usage.clone(),
         // Baseline recap; the daemon overlays the live summary when attaching.
         recap: persisted_recap(session),
@@ -104,6 +106,7 @@ fn occ3_modes(
     active_tool_names: &[String],
     native_dead: bool,
     textmas_active: bool,
+    textmas_activity: Option<crate::core::occ::textmas_activity::TextMasActivitySnapshot>,
 ) -> Option<crate::modes::agent_connection::types::Occ3Modes> {
     use crate::core::occ::{session_settings, textmas_settings};
     use crate::core::occ3_connectors::activation::{configured_connector, Occ3ActivationRequest};
@@ -123,6 +126,7 @@ fn occ3_modes(
     Some(crate::modes::agent_connection::types::Occ3Modes {
         textmas_mode: textmas.mode,
         textmas_active,
+        textmas_activity,
         latent_enabled,
         latent_active,
         latent_available,
@@ -489,17 +493,18 @@ mod tests {
         std::fs::write(&file, "{\"rlmDepth\":0}\n").unwrap();
         let file = file.to_str().unwrap();
         let model = pi_ai::types::Model { id:"any-model".into(), provider:"custom-local-or-hosted".into(), ..Default::default() };
-        let initial = occ3_modes(Some(file), Some(&model), false, &[], false, false).unwrap();
+        let initial = occ3_modes(Some(file), Some(&model), false, &[], false, false, None).unwrap();
         assert_eq!(initial.textmas_mode, TextMasMode::Off);
         assert!(!initial.latent_enabled && !initial.latent_active && !initial.latent_available);
         textmas_settings::set_mode(file, TextMasMode::Hierarchical).unwrap();
-        let enabled = occ3_modes(Some(file), Some(&model), false, &[], false, false).unwrap();
+        let enabled = occ3_modes(Some(file), Some(&model), false, &[], false, false, None).unwrap();
         assert_eq!(enabled.textmas_mode, TextMasMode::Hierarchical);
+        assert!(enabled.textmas_activity.is_none(), "there is no invented activity before an actual run");
         assert!(!enabled.latent_enabled && !enabled.latent_active && !enabled.latent_available);
         session_settings::save(file, false).unwrap();
-        assert_eq!(occ3_modes(Some(file), Some(&model), false, &[], false, false).unwrap(), enabled);
+        assert_eq!(occ3_modes(Some(file), Some(&model), false, &[], false, false, None).unwrap(), enabled);
         std::fs::write(textmas_settings::preference_path(file), "bad").unwrap();
-        assert!(occ3_modes(Some(file), Some(&model), false, &[], false, false).is_none());
+        assert!(occ3_modes(Some(file), Some(&model), false, &[], false, false, None).is_none());
     }
 
     #[test]
@@ -519,17 +524,17 @@ mod tests {
             fallback:Vec::new(), method:None, artifact_digest:None,
         }), ..Default::default() };
         let tools = vec!["occ3_handoff".to_string()];
-        let global = occ3_modes(Some(file), Some(&model), true, &tools, false, false).unwrap();
+        let global = occ3_modes(Some(file), Some(&model), true, &tools, false, false, None).unwrap();
         assert!(global.latent_enabled && global.latent_active && global.latent_available);
         session_settings::save(file, false).unwrap();
-        assert!(occ3_modes(Some(file), Some(&model), true, &tools, false, false).unwrap().latent_enabled);
+        assert!(occ3_modes(Some(file), Some(&model), true, &tools, false, false, None).unwrap().latent_enabled);
         session_settings::save_latent(file, false).unwrap();
-        let vetoed = occ3_modes(Some(file), Some(&model), true, &tools, false, false).unwrap();
+        let vetoed = occ3_modes(Some(file), Some(&model), true, &tools, false, false, None).unwrap();
         assert!(!vetoed.latent_enabled && !vetoed.latent_active && vetoed.latent_available);
         session_settings::save_latent(file, true).unwrap();
-        let dead = occ3_modes(Some(file), Some(&model), true, &tools, true, false).unwrap();
+        let dead = occ3_modes(Some(file), Some(&model), true, &tools, true, false, None).unwrap();
         assert!(dead.latent_enabled && !dead.latent_active);
-        let not_enrolled = occ3_modes(Some(file), Some(&model), true, &[], false, false).unwrap();
+        let not_enrolled = occ3_modes(Some(file), Some(&model), true, &[], false, false, None).unwrap();
         assert!(not_enrolled.latent_enabled && !not_enrolled.latent_active);
     }
 

@@ -427,6 +427,7 @@ impl InProcessRuntimeHost for SoakHost {
                     active_tool_names: session.get_active_tool_names(),
                     occ3_global_opt_in: false,
                     textmas_active: false,
+                    textmas_activity: None,
                     occ3_native_dead: false,
                     // `contextUsage: session.getContextUsage()` (snapshot.ts:56).
                     context_usage: serde_json::to_value(session.get_context_usage()).unwrap(),

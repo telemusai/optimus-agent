@@ -4,7 +4,7 @@ use pi_agent_core::types::AgentEvent;
 
 /// Refresh persisted metadata when compaction ends, even if the session is idle.
 pub(super) fn event_requires_snapshot_refresh(event_name: &str) -> bool {
-    matches!(event_name, "agent_end" | "session_action_update" | "compaction_end")
+    matches!(event_name, "agent_end" | "session_action_update" | "compaction_end" | "textmas_activity")
 }
 
 struct RefreshResult {
@@ -307,6 +307,11 @@ mod tests {
     fn existing_terminal_events_require_snapshot_refresh() {
         assert!(event_requires_snapshot_refresh("agent_end"));
         assert!(event_requires_snapshot_refresh("session_action_update"));
+    }
+
+    #[test]
+    fn textmas_activity_refreshes_the_authoritative_snapshot() {
+        assert!(event_requires_snapshot_refresh("textmas_activity"));
     }
 
     #[test]

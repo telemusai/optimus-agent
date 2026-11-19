@@ -781,6 +781,9 @@ pub enum AgentSessionEvent {
     SessionActionUpdate {
         actions: SessionActionSnapshot,
     },
+    TextMasActivity {
+        activity: crate::core::occ::textmas_activity::TextMasActivitySnapshot,
+    },
     CompactionStart {
         reason: CompactionReason,
         custom_instructions: Option<String>,
@@ -900,6 +903,7 @@ impl AgentSessionEvent {
             AgentSessionEvent::Agent(event) => event.type_name(),
             AgentSessionEvent::IpythonSentAgentMessage { .. } => "ipython_sent_agent_message",
             AgentSessionEvent::SessionActionUpdate { .. } => "session_action_update",
+            AgentSessionEvent::TextMasActivity { .. } => "textmas_activity",
             AgentSessionEvent::CompactionStart { .. } => "compaction_start",
             AgentSessionEvent::SessionInfoChanged { .. } => "session_info_changed",
             AgentSessionEvent::MessageStart { .. } => "message_start",
