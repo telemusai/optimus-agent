@@ -5107,6 +5107,63 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn length_cap_streams_expose_reasoning_visible_and_accounting_classes() {
+		let cases = vec![
+			("reasoning_exhaustion", Some("unfinished private reasoning"), None, 8192.0, 8192.0),
+			("overlong_visible", Some("private reasoning"), Some("v".repeat(16_385)), 8192.0, 4096.0),
+			("truncated_visible", Some("unfinished private reasoning"), Some("source brief ends mid-".to_string()), 8192.0, 8000.0),
+			("inconsistent_accounting", Some("counter mismatch"), Some("visible text".to_string()), 123.0, 8192.0),
+		];
+		for (name, reasoning, visible, completion_tokens, reasoning_tokens) in cases {
+			let mut delta = serde_json::Map::new();
+			if let Some(reasoning) = reasoning { delta.insert("reasoning_content".into(), json!(reasoning)); }
+			if let Some(visible) = visible { delta.insert("content".into(), json!(visible)); }
+			let chunk = json!({"choices":[{"delta":delta,"finish_reason":null}]});
+			let terminal = json!({
+				"choices":[{"delta":{},"finish_reason":"length"}],
+				"usage":{"prompt_tokens":169,"prompt_tokens_details":{"cached_tokens":100},"completion_tokens":completion_tokens,"completion_tokens_details":{"reasoning_tokens":reasoning_tokens}}
+			});
+			let body = format!("data: {chunk}\r\n\r\ndata: {terminal}\r\n\r\ndata: [DONE]\r\n\r\n");
+			let (address, server) = serve_http("200 OK", body).await;
+			let mut model = base_model();
+			model.base_url = format!("http://{address}");
+			let mut options = keyed_options();
+			let observations = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+			let capture = observations.clone();
+			options.stream.on_usage_observation = Some(std::sync::Arc::new(move |usage, _| {
+				capture.lock().unwrap().push(usage);
+				Box::pin(async {})
+			}));
+			let stream = stream_openai_completions(&model, &context(vec![user_text("fixture")]), Some(options));
+			let output = tokio::time::timeout(std::time::Duration::from_secs(5), stream.result()).await.unwrap();
+			server.await.unwrap();
+			assert_eq!(output.stop_reason, "length", "{name}");
+			assert!(output.error_message.is_none(), "length is a completed provider stream, not an adapter error: {name}");
+			assert_eq!(output.usage.output, completion_tokens, "{name}");
+			let public = output.content.iter().filter_map(|block| match block {
+				ContentBlock::Text(text) => Some(text.text.as_str()), _ => None,
+			}).collect::<String>();
+			let private = output.content.iter().filter_map(|block| match block {
+				ContentBlock::Thinking(thinking) => Some(thinking.thinking.as_str()), _ => None,
+			}).collect::<String>();
+			let observations = observations.lock().unwrap();
+			assert_eq!(observations.len(), 1, "{name}");
+			assert_eq!(observations[0].output_tokens, Some(Some(completion_tokens)), "{name}");
+			assert_eq!(observations[0].reasoning_tokens, Some(Some(reasoning_tokens)), "{name}");
+			match name {
+				"reasoning_exhaustion" => { assert!(public.is_empty()); assert!(!private.is_empty()); },
+				"overlong_visible" => assert_eq!(public.len(), 16_385),
+				"truncated_visible" => assert_eq!(public, "source brief ends mid-"),
+				"inconsistent_accounting" => {
+					assert_eq!(output.usage.output, 123.0);
+					assert_eq!(observations[0].reasoning_tokens, Some(Some(8192.0)));
+				},
+				_ => unreachable!(),
+			}
+		}
+	}
+
+	#[tokio::test]
 	async fn completions_observers_preserve_unknown_and_zero_counts_and_contain_panics() {
 		let stream = AssistantMessageEventStream::new_owned();
 		let usages = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -6941,6 +6998,22 @@ mod t15_controls_tests {
 		let tool = &with_tools["tools"][0];
 		assert_eq!(tool["function"]["name"], json!("read"));
 		assert!(tool.get("strict").is_none(), "supportsStrictMode false must omit strict");
+	}
+
+	#[test]
+	fn t15_textmas_kimi_k31_routes_max_reasoning_with_exact_total_output_cap() {
+		let model = route_model(
+			"kimi-k3.1-pro",
+			262_144.0,
+			&[("off", None), ("minimal", None), ("low", None), ("medium", None), ("high", None), ("xhigh", None), ("max", Some("max"))],
+		);
+		assert_eq!(clamp_thinking_level(&model, "max"), "max");
+		let mut options = effort_options(Some("max"));
+		options.stream.max_tokens = Some(8192.0);
+		let params = build(&model, &context_with(vec![user_text("tool-free mapper")]), Some(&options));
+		assert_eq!(params["max_tokens"], json!(8192));
+		assert!(params.get("max_completion_tokens").is_none());
+		assert_eq!(params["reasoning_effort"], json!("max"));
 	}
 
 	/// E-02/E-04 integration: one SSE body exercising text, reasoning, tool-call

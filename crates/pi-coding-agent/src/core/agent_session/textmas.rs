@@ -36,6 +36,7 @@ struct TextMasRun {
     model: Model,
     signal: CancellationToken,
     phase: Phase,
+    mapper_retry_used: Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[derive(Clone)]
@@ -105,6 +106,18 @@ impl Drop for CallGuard {
     }
 }
 
+fn textmas_role_public_error(
+    role: TextMasRole,
+    error: (TextMasCallStatus, String, bool),
+) -> String {
+    let suffix = if role == TextMasRole::Mapper {
+        "No final execution or automatic preparation replay beyond one exact-cap retry."
+    } else {
+        "No final execution or automatic preparation retry."
+    };
+    format!("OCC3.1 {}: {}. {suffix}", role.as_str(), error.1)
+}
+
 impl AgentSession {
     /// Genuine root user delivery is the only activation authority, not request_index or preference alone.
     pub(super) fn arm_textmas(self: &Arc<Self>, turns: &[QueuedSessionAction]) -> Result<(), String> {
@@ -134,7 +147,7 @@ impl AgentSession {
         self.install_textmas_context_hook()?;
         let mut state = self.textmas.lock().unwrap();
         if state.run.is_some() { return Err("OCC3.1 already owns an active turn".into()); }
-        state.run = Some(TextMasRun { action_id: action.id.clone(), input_ids: turns.iter().map(|action| action.id.clone()).collect(), last_user, mode, model: self.agent.model(), signal: CancellationToken::new(), phase: Phase::Armed });
+        state.run = Some(TextMasRun { action_id: action.id.clone(), input_ids: turns.iter().map(|action| action.id.clone()).collect(), last_user, mode, model: self.agent.model(), signal: CancellationToken::new(), phase: Phase::Armed, mapper_retry_used: Default::default() });
         Ok(())
     }
 
@@ -438,10 +451,10 @@ impl AgentSession {
                 .map(|(index, context)| async move {
                     let call_index = u32::try_from(index)
                         .map_err(|_| "OCC3.1 mapper call index overflow".to_string())?;
-                    self.run_textmas_role(
+                    self.run_textmas_mapper(
                         run,
-                        TextMasRole::Mapper,
-                        Some(call_index),
+                        call_index,
+                        map_count,
                         context,
                         parent_signal,
                     )
@@ -493,8 +506,9 @@ impl AgentSession {
         } else {
             ""
         };
+        let mapper_retries = usize::from(run.mapper_retry_used.load(std::sync::atomic::Ordering::Acquire));
         let note = format!(
-            "Used {map_count} shared context-map and {reduce_count} context-reduction calls because an actual role request exceeded its bound; {system_source}resized {resized_images} preparation-only image(s); latest user message {latest}. Summaries are lossy advisory context, and the complete parent history remains authoritative."
+            "Used {map_count} initial shared context-map calls plus {mapper_retries} bounded exact-cap mapper retry and {reduce_count} context-reduction calls because an actual role request exceeded its bound; {system_source}resized {resized_images} preparation-only image(s); latest user message {latest}. Summaries are lossy advisory context, and the complete parent history remains authoritative."
         );
         Ok(TextMasReduction { original, note })
     }
@@ -529,6 +543,100 @@ impl AgentSession {
     ) -> Result<String, String> {
         ensure_textmas_current(self, run, parent_signal)?;
         let output_budget = contract::output_budget(&run.model, &context)?;
+        let reasoning = self.agent.thinking_level().as_str().to_string();
+        let deadline = tokio::time::Instant::now() + stage_timeout;
+        self.run_textmas_role_once(
+            run,
+            role,
+            call_index,
+            context,
+            output_budget,
+            reasoning,
+            deadline,
+            parent_signal,
+        )
+        .await
+        .map_err(|error| textmas_role_public_error(role, error))
+    }
+
+    async fn run_textmas_mapper(
+        self: &Arc<Self>,
+        run: &TextMasRun,
+        call_index: u32,
+        map_count: usize,
+        context: Context,
+        parent_signal: Option<&CancellationToken>,
+    ) -> Result<String, String> {
+        let output_budget = contract::output_budget(&run.model, &context)?;
+        let reasoning = self.agent.thinking_level().as_str().to_string();
+        // This instant is shared by the first attempt and its one possible retry.
+        // Provider-local timeouts do not extend the original logical mapper deadline.
+        let deadline = tokio::time::Instant::now()
+            + std::time::Duration::from_secs(contract::STAGE_TIMEOUT_SECONDS);
+        let first = self
+            .run_textmas_role_once(
+                run,
+                TextMasRole::Mapper,
+                Some(call_index),
+                context.clone(),
+                output_budget,
+                reasoning.clone(),
+                deadline,
+                parent_signal,
+            )
+            .await;
+        let error = match first {
+            Ok(draft) => return Ok(draft),
+            Err(error) => error,
+        };
+        if !error.2 {
+            return Err(textmas_role_public_error(TextMasRole::Mapper, error));
+        }
+        // One mapper may retry for the entire root action, even when peers wake
+        // together. Later length failures retain their original fail-closed error.
+        if run
+            .mapper_retry_used
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return Err(textmas_role_public_error(TextMasRole::Mapper, error));
+        }
+        let retry_index = u32::try_from(map_count)
+            .map_err(|_| "OCC3.1 mapper retry call index overflow".to_string())?;
+        ensure_textmas_current(self, run, parent_signal)?;
+        self.run_textmas_role_once(
+            run,
+            TextMasRole::Mapper,
+            Some(retry_index),
+            context,
+            output_budget,
+            reasoning.clone(),
+            deadline,
+            parent_signal,
+        )
+        .await
+        .map_err(|error| textmas_role_public_error(TextMasRole::Mapper, error))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn run_textmas_role_once(
+        self: &Arc<Self>,
+        run: &TextMasRun,
+        role: TextMasRole,
+        call_index: Option<u32>,
+        context: Context,
+        output_budget: f64,
+        reasoning: String,
+        deadline: tokio::time::Instant,
+        parent_signal: Option<&CancellationToken>,
+    ) -> Result<String, (TextMasCallStatus, String, bool)> {
+        ensure_textmas_current(self, run, parent_signal)
+            .map_err(|error| (TextMasCallStatus::Cancelled, error, false))?;
         let started = TextMasUsageRecord::new_indexed(
             &run.action_id,
             role,
@@ -536,12 +644,13 @@ impl AgentSession {
             TextMasCallStatus::Started,
             None,
         );
-        self.persist_textmas_usage(&started)?;
+        self.persist_textmas_usage(&started)
+            .map_err(|error| (TextMasCallStatus::Failed, error, false))?;
         let receipt = StreamTaskReceipt::new_unsupported();
         if let Some(scope) = self.agent.execution_scope() {
             scope
                 .register_stream(receipt.clone())
-                .map_err(|_| "OCC3.1 execution scope was stopped")?;
+                .map_err(|_| (TextMasCallStatus::Failed, "OCC3.1 execution scope was stopped".into(), false))?;
         }
         let mut guard = CallGuard {
             session: Arc::downgrade(self),
@@ -556,7 +665,7 @@ impl AgentSession {
         let options = self
             .agent
             .side_question_options()
-            .ok_or("OCC3.1 provider interface is unavailable")?;
+            .ok_or((TextMasCallStatus::Failed, "OCC3.1 provider interface is unavailable".into(), false))?;
         let mut request = SimpleStreamOptions::default();
         request.stream.signal = Some(guard.signal.clone());
         request.stream.timeout_ms = Some(contract::STAGE_TIMEOUT_SECONDS as f64 * 1000.0);
@@ -572,7 +681,7 @@ impl AgentSession {
             run.action_id,
             role.as_str()
         ));
-        request.reasoning = Some(self.agent.thinking_level().as_str().into());
+        request.reasoning = Some(reasoning);
         request.thinking_budgets = options.thinking_budgets;
         // Use the real selected provider closure: registry auth, headers, and custom APIs all remain intact.
         // No on_payload extension, latent lease, source capture, or tools are installed on advisory requests.
@@ -580,10 +689,11 @@ impl AgentSession {
             crate::core::semantic_edges::unwrap_semantic_edge_stream_fn(&self.agent.stream_fn());
         let request_receipt = receipt.clone();
         let model = run.model.clone();
-        let result = run_textmas_provider_request(
+        let result = run_textmas_provider_request_at(
             &run.signal,
             parent_signal,
-            stage_timeout,
+            deadline,
+            Some(output_budget),
             &mut guard.usage,
             async move {
                 if let Some(get_key) = options.get_api_key { request.stream.api_key = get_key(model.provider.clone()).await; }
@@ -595,7 +705,7 @@ impl AgentSession {
         .await;
         let status = match &result {
             Ok(_) => TextMasCallStatus::Completed,
-            Err((status, _)) => *status,
+            Err((status, _, _)) => *status,
         };
         let terminal = TextMasUsageRecord::new_indexed(
             &run.action_id,
@@ -604,15 +714,12 @@ impl AgentSession {
             status,
             guard.usage.clone(),
         );
-        // No second write on a failed terminal persist: the reservation remains unknown and replay stays blocked.
+        // No retry after a terminal-persistence failure: the reservation remains
+        // unknown and replay stays blocked rather than hiding another request.
         guard.settled = true;
-        self.persist_textmas_usage(&terminal)?;
-        result.map_err(|(_, error)| {
-            format!(
-                "OCC3.1 {}: {error}. No final execution or automatic preparation retry.",
-                role.as_str()
-            )
-        })
+        self.persist_textmas_usage(&terminal)
+            .map_err(|error| (TextMasCallStatus::Failed, error, false))?;
+        Ok(result?)
     }
 
     fn persist_textmas_usage(&self, record: &TextMasUsageRecord) -> Result<(), String> {
@@ -625,8 +732,14 @@ impl AgentSession {
     }
 }
 
+#[cfg(test)]
 type TextMasProviderResult = Result<String, (TextMasCallStatus, String)>;
+type TextMasProviderAttemptResult = Result<String, (TextMasCallStatus, String, bool)>;
 
+// Retain the PR291 unit-test seam while implementing each physical call with an
+// absolute deadline. Mapper retry attempts share that instant instead of getting
+// another provider-local 120-second window.
+#[cfg(test)]
 async fn run_textmas_provider_request<S, R, F>(
     run_signal: &CancellationToken,
     parent_signal: Option<&CancellationToken>,
@@ -640,56 +753,89 @@ where
     F: std::future::Future<Output = (S, R)>,
 {
     let deadline = tokio::time::Instant::now() + stage_timeout;
+    run_textmas_provider_request_at(
+        run_signal,
+        parent_signal,
+        deadline,
+        None,
+        usage,
+        open_stream,
+    )
+    .await
+    .map_err(|(status, error, _)| (status, error))
+}
+
+async fn run_textmas_provider_request_at<S, R, F>(
+    run_signal: &CancellationToken,
+    parent_signal: Option<&CancellationToken>,
+    deadline: tokio::time::Instant,
+    output_budget: Option<f64>,
+    usage: &mut Option<Usage>,
+    open_stream: F,
+) -> TextMasProviderAttemptResult
+where
+    S: futures::Stream<Item = AssistantMessageEvent> + Unpin,
+    R: Fn() -> Option<AssistantMessage>,
+    F: std::future::Future<Output = (S, R)>,
+{
     if tokio::time::Instant::now() >= deadline {
-        return Err((TextMasCallStatus::TimedOut, "preparation timed out".into()));
+        return Err((TextMasCallStatus::TimedOut, "preparation timed out".into(), false));
     }
     let (mut stream, result_if_ready) = tokio::select! {
         biased;
-        _ = run_signal.cancelled() => return Err((TextMasCallStatus::Cancelled, "preparation was cancelled".to_string())),
-        _ = cancelled(parent_signal) => return Err((TextMasCallStatus::Cancelled, "preparation was cancelled".to_string())),
+        _ = run_signal.cancelled() => return Err((TextMasCallStatus::Cancelled, "preparation was cancelled".to_string(), false)),
+        _ = cancelled(parent_signal) => return Err((TextMasCallStatus::Cancelled, "preparation was cancelled".to_string(), false)),
         result = tokio::time::timeout_at(deadline, open_stream) => {
-            result.map_err(|_| (TextMasCallStatus::TimedOut, "preparation timed out".to_string()))?
+            result.map_err(|_| (TextMasCallStatus::TimedOut, "preparation timed out".to_string(), false))?
         },
     };
     loop {
         // Check before every select: a continuously ready stream must not starve either signal.
         if run_signal.is_cancelled() || parent_signal.is_some_and(CancellationToken::is_cancelled) {
-            return Err((TextMasCallStatus::Cancelled, "preparation was cancelled".to_string()));
+            return Err((TextMasCallStatus::Cancelled, "preparation was cancelled".to_string(), false));
         }
         if tokio::time::Instant::now() >= deadline {
-            return Err((TextMasCallStatus::TimedOut, "preparation timed out".into()));
+            return Err((TextMasCallStatus::TimedOut, "preparation timed out".into(), false));
         }
         let next = tokio::select! {
             biased;
-            _ = run_signal.cancelled() => return Err((TextMasCallStatus::Cancelled, "preparation was cancelled".to_string())),
-            _ = cancelled(parent_signal) => return Err((TextMasCallStatus::Cancelled, "preparation was cancelled".to_string())),
+            _ = run_signal.cancelled() => return Err((TextMasCallStatus::Cancelled, "preparation was cancelled".to_string(), false)),
+            _ = cancelled(parent_signal) => return Err((TextMasCallStatus::Cancelled, "preparation was cancelled".to_string(), false)),
             result = tokio::time::timeout_at(deadline, stream.next()) => match result {
                 Ok(next) => next,
-                Err(_) => return Err((TextMasCallStatus::TimedOut, "preparation timed out".into())),
+                Err(_) => return Err((TextMasCallStatus::TimedOut, "preparation timed out".into(), false)),
             },
         };
         let Some(event) = next else { break };
         if let Some(partial) = event.partial() {
             *usage = Some(partial.usage.clone());
             if serde_json::to_vec(partial).map_or(true, |bytes| bytes.len() > contract::MAX_STAGE_RESPONSE_BYTES) {
-                return Err((TextMasCallStatus::Failed, "preparation response exceeded its bound".into()));
+                return Err((TextMasCallStatus::Failed, "preparation response exceeded its bound".into(), false));
             }
             if partial.content.iter().any(|block| matches!(block, pi_ai::types::ContentBlock::ToolCall(_))) {
-                return Err((TextMasCallStatus::Failed, "preparation returned a tool call; no tool was executed".into()));
+                return Err((TextMasCallStatus::Failed, "preparation returned a tool call; no tool was executed".into(), false));
             }
         }
         let terminal = match event { AssistantMessageEvent::Done { message, .. } => Some(message), AssistantMessageEvent::Error { error, .. } => Some(error), _ => None };
         if let Some(message) = terminal {
             *usage = Some(message.usage.clone());
-            return contract::public_draft(&message).map_err(|error| (TextMasCallStatus::Failed, error));
+            return contract::public_draft_detailed(&message).map_err(|error| {
+                let exact_cap_length = error.terminal_length
+                    && output_budget.is_some_and(|cap| message.usage.output == cap);
+                (TextMasCallStatus::Failed, error.message, exact_cap_length)
+            });
         }
     }
     // Some injected/native adapters end directly with a terminal result.
     if let Some(message) = result_if_ready() {
         *usage = Some(message.usage.clone());
-        contract::public_draft(&message).map_err(|error| (TextMasCallStatus::Failed, error))
+        contract::public_draft_detailed(&message).map_err(|error| {
+            let exact_cap_length = error.terminal_length
+                && output_budget.is_some_and(|cap| message.usage.output == cap);
+            (TextMasCallStatus::Failed, error.message, exact_cap_length)
+        })
     } else {
-        Err((TextMasCallStatus::Failed, "provider ended without a result".into()))
+        Err((TextMasCallStatus::Failed, "provider ended without a result".into(), false))
     }
 }
 

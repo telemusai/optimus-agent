@@ -1,7 +1,7 @@
 //! OCC3.1 native execution through a registered offline, non-latent custom provider.
 use pi_ai::providers::faux::*;
 use pi_ai::types::{AssistantMessage, ContentBlock, Context, Message, Model, ToolCall};
-use pi_coding_agent::core::occ::{textmas::{MAX_CONTEXT_BYTES, TextMasCallStatus, TextMasMode, TextMasRole, TextMasUsageLedger, TextMasUsageRecord, usage_record}, textmas_settings};
+use pi_coding_agent::core::occ::{textmas::{MAX_CONTEXT_BYTES, MAX_OUTPUT_TOKENS, TextMasCallStatus, TextMasMode, TextMasRole, TextMasUsageLedger, TextMasUsageRecord, usage_record}, textmas_settings};
 use pi_coding_agent::core::extensions::types::{ExtensionEvent, ExtensionFactory, InputSource};
 use pi_coding_agent::core::agent_session::{AgentSession, PromptOptions};
 use pi_coding_agent::core::agent_session_services::*;
@@ -51,10 +51,15 @@ struct Fixture {
     old_profile: Option<std::ffi::OsString>,
     provider: FauxProviderRegistration,
     captured: Arc<Mutex<Vec<Context>>>,
+    output_limit: f64,
 }
 
 impl Fixture {
     fn new() -> Self {
+        Self::with_limits(2048.0, 128000.0)
+    }
+
+    fn with_limits(output_limit: f64, context_window: f64) -> Self {
         let root = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(root.path().join("workspace")).unwrap();
         std::fs::create_dir_all(root.path().join("profile")).unwrap();
@@ -68,7 +73,7 @@ impl Fixture {
         let provider = register_faux_provider(Some(RegisterFauxProviderOptions {
             provider: Some("textmas-custom-nonlatent".into()),
             api: Some("offline-textmas-api".into()),
-            models: Some(vec![FauxModelDefinition { id: "ordinary-model".into(), reasoning: Some(false), max_tokens: Some(2048.0), context_window: Some(128000.0), ..Default::default() }]),
+            models: Some(vec![FauxModelDefinition { id: "ordinary-model".into(), reasoning: Some(false), max_tokens: Some(output_limit), context_window: Some(context_window), ..Default::default() }]),
             tokens_per_second: Some(0.0),
             ..Default::default()
         }));
@@ -77,6 +82,7 @@ impl Fixture {
             old_profile,
             provider,
             captured: Default::default(),
+            output_limit,
         }
     }
 
@@ -165,7 +171,16 @@ impl Fixture {
     }
 
     fn reply(&self, message: AssistantMessage, file: Option<String>, gate: Option<Arc<tokio::sync::Semaphore>>) {
+        self.reply_with_delay(message, file, gate, None);
+    }
+
+    fn reply_delayed(&self, message: AssistantMessage, file: Option<String>, delay: Duration) {
+        self.reply_with_delay(message, file, None, Some(delay));
+    }
+
+    fn reply_with_delay(&self, message: AssistantMessage, file: Option<String>, gate: Option<Arc<tokio::sync::Semaphore>>, delay: Option<Duration>) {
         let captured = self.captured.clone();
+        let output_limit = self.output_limit;
         self.provider.append_responses(vec![FauxResponseStep::Factory(Arc::new(move |context, options, _, model| {
             assert_eq!(model.provider, "textmas-custom-nonlatent");
             assert_eq!(model.api, "offline-textmas-api");
@@ -175,7 +190,7 @@ impl Fixture {
             if context.tools.is_none() {
                 assert!(options.inference_state.is_none());
                 assert!(options.source_capture.is_none());
-                assert!(options.max_tokens.unwrap() <= 2048.0);
+                assert!(options.max_tokens.unwrap() <= output_limit);
                 assert_eq!(options.timeout_ms, Some(120000.0));
             }
             if let Some(file) = &file {
@@ -189,6 +204,9 @@ impl Fixture {
             let signal = options.signal.clone();
             let message = message.clone();
             Box::pin(async move {
+                if let Some(delay) = delay {
+                    tokio::time::sleep(delay).await;
+                }
                 if let Some(gate) = gate {
                     tokio::select! {
                         permit = gate.acquire() => { permit.unwrap().forget(); },
@@ -220,6 +238,7 @@ impl Fixture {
 
     fn dynamic_preparation_replies_impl(&self, count: usize, parent_failures: usize, dense: bool) {
         let captured = self.captured.clone();
+        let output_limit = self.output_limit;
         let parent_attempt = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let steps = (0..count).map(|_| {
             let captured = captured.clone();
@@ -244,7 +263,7 @@ impl Fixture {
                 } else {
                     assert!(options.inference_state.is_none());
                     assert!(options.source_capture.is_none());
-                    assert!(options.max_tokens.unwrap() <= 2048.0);
+                    assert!(options.max_tokens.unwrap() <= output_limit);
                     assert_eq!(options.timeout_ms, Some(120000.0));
                     let text = if prompt.contains("advisory role: mapper") {
                         if dense { "\\".repeat(pi_coding_agent::core::occ::textmas::MAX_DRAFT_BYTES) } else { "MAPPER_BRIEF".to_string() }
@@ -926,6 +945,579 @@ async fn off_internal_extension_and_child_turns_never_fan_out() {
     assert_eq!(f.captured.lock().unwrap().len(), 4);
     assert!(child.get_session_stats().textmas_usage.is_none());
     child.dispose_async(Some(false)).await;
+}
+
+#[tokio::test]
+async fn mapper_stream_length_at_exact_cap_fails_closed_after_bounded_retry_with_full_accounting() {
+    let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let f = Fixture::with_limits(MAX_OUTPUT_TOKENS, 1_048_576.0);
+    let session = f.session(0, true).await;
+    turn(&session, "/mode direct", None).await.unwrap();
+    let file = session.session_file().unwrap();
+    textmas_settings::set_mode(&file, TextMasMode::Hierarchical).unwrap();
+    let source = format!("CURRENT_REQUEST:BEGIN:{}:END", "s".repeat(MAX_CONTEXT_BYTES * 2));
+
+    for _ in 0..3 {
+        f.reply(text_reply("MAPPER_BRIEF"), Some(file.clone()), None);
+    }
+    // Faux usage is ceil(UTF-16 units / 4), including private reasoning. Keep
+    // this attempt public-only so 32,768 ASCII bytes account for exactly 8,192.
+    let partial = "x".repeat(MAX_OUTPUT_TOKENS as usize * 4);
+    let capped = faux_assistant_message(
+        FauxAssistantContent::Text(partial.clone()),
+        Some(FauxAssistantMessageOptions { stop_reason: Some("length".into()), ..Default::default() }),
+    );
+    f.reply(capped.clone(), Some(file.clone()), None);
+    f.reply(capped, Some(file), None);
+
+    let error = turn(&session, &source, None).await.unwrap_err();
+    assert!(error.contains("OCC3.1 mapper"), "{error}");
+    assert!(error.contains("stop: length"), "{error}");
+    assert!(!error.contains("xxxx"));
+    let contexts = f.captured.lock().unwrap().clone();
+    assert_eq!(contexts.len(), 5, "four initial mappers and one retry; no reducer, P/C/R, parent, or further retry");
+    assert!(contexts.iter().all(|context| {
+        context.tools.is_none()
+            && context.system_prompt.as_deref().unwrap_or_default().contains("advisory role: mapper")
+    }));
+
+    let usage = ledger(&session);
+    let records = usage.records().collect::<Vec<_>>();
+    assert_eq!(records.len(), 5, "{records:#?}");
+    assert_eq!(records.iter().filter(|record| record.status == TextMasCallStatus::Completed).count(), 3);
+    assert_eq!(records.iter().filter(|record| record.status == TextMasCallStatus::Failed).count(), 2);
+    assert!(records.iter().all(|record| record.role == TextMasRole::Mapper));
+    let capped = records.iter().filter(|record| record.status == TextMasCallStatus::Failed).collect::<Vec<_>>();
+    assert_eq!(capped.len(), 2);
+    assert!(capped.iter().all(|record| record.usage.as_ref().unwrap().output == MAX_OUTPUT_TOKENS));
+    assert_eq!(records.iter().map(|record| record.call_index.unwrap()).collect::<Vec<_>>(), vec![0, 1, 2, 3, 4]);
+    assert!(records.iter().take(3).all(|record| {
+        record.status == TextMasCallStatus::Completed
+            && record.usage.as_ref().unwrap().output == 3.0
+    }));
+    assert_capped_mapper_retry_pair(records[3], records[4], TextMasCallStatus::Failed, MAX_OUTPUT_TOKENS);
+    assert_faux_attempt_totals(&usage);
+    assert_eq!(serde_json::to_vec(&contexts[3]).unwrap(), serde_json::to_vec(&contexts[4]).unwrap());
+    let summary = usage.summary().unwrap();
+    assert_eq!(summary.calls, 5);
+    assert_eq!(summary.known_subtotal.output, 16_393.0);
+    assert_eq!(summary.known_subtotal.cost.total, 0.0);
+    assert_eq!(summary.unknown_usage_calls, 0);
+    assert_eq!(summary.unknown_cost_calls, 5);
+    assert_ledger_conserves_records(&usage);
+
+    let history = serde_json::to_string(&session.messages()).unwrap();
+    assert!(history.contains(&source), "the original parent history remains byte-for-byte available");
+    assert!(!history.contains(&partial));
+    session.dispose_async(Some(false)).await;
+}
+
+
+
+
+fn exact_cap_message() -> AssistantMessage {
+    faux_assistant_message(
+        FauxAssistantContent::Text("x".repeat(MAX_OUTPUT_TOKENS as usize * 4)),
+        Some(FauxAssistantMessageOptions { stop_reason: Some("length".into()), ..Default::default() }),
+    )
+}
+
+fn queue_last_cap_sequence(f: &Fixture, file: &str, second: AssistantMessage, recovered: bool) {
+    for _ in 0..3 {
+        f.reply(text_reply("MAPPER_BRIEF"), Some(file.into()), None);
+    }
+    f.reply_delayed(exact_cap_message(), Some(file.into()), Duration::from_millis(20));
+    f.reply_delayed(second, Some(file.into()), Duration::from_millis(20));
+    if recovered {
+        f.reply(text_reply("REDUCED_BRIEF"), Some(file.into()), None);
+        f.drafts(file);
+        f.reply(
+            faux_assistant_message(
+                "".into(),
+                Some(FauxAssistantMessageOptions {
+                    stop_reason: Some("error".into()),
+                    error_message: Some("synthetic parent retry".into()),
+                    ..Default::default()
+                }),
+            ),
+            None,
+            None,
+        );
+        f.reply(text_reply("FINAL_PARENT"), None, None);
+    }
+}
+
+fn retry_test_source() -> String {
+    format!("CURRENT_REQUEST:BEGIN:{}:END", "s".repeat(MAX_CONTEXT_BYTES * 2))
+}
+
+fn assert_ledger_conserves_records(usage: &TextMasUsageLedger) {
+    let records = usage.records().collect::<Vec<_>>();
+    let summary = usage.summary().unwrap();
+    let known = records.iter().filter(|record| record.usage_known).collect::<Vec<_>>();
+    let expected_output = known.iter().map(|record| record.usage.as_ref().unwrap().output).sum::<f64>();
+    let expected_total = known.iter().map(|record| record.usage.as_ref().unwrap().total_tokens).sum::<f64>();
+    let expected_cost = known.iter().map(|record| record.usage.as_ref().unwrap().cost.total).sum::<f64>();
+    assert_eq!(summary.known_subtotal.output, expected_output);
+    assert_eq!(summary.known_tokens, expected_total);
+    assert_eq!(summary.known_subtotal.total_tokens, expected_total);
+    assert_eq!(summary.known_subtotal.cost.total, expected_cost);
+}
+
+// Prompt-size totals are fixture measurements, not the retry contract. Check
+// per-attempt accounting without freezing one sampled mapper schedule.
+fn assert_faux_attempt_totals(usage: &TextMasUsageLedger) {
+    for record in usage.records() {
+        assert!(record.usage_known, "synthetic attempt must retain usage: {record:#?}");
+        let u = record.usage.as_ref().unwrap();
+        assert_eq!(u.total_tokens, u.input + u.output + u.cache_read + u.cache_write,
+            "faux total preserves its attempt components: {record:#?}");
+    }
+}
+
+fn assert_capped_mapper_retry_pair(
+    first: &TextMasUsageRecord,
+    retry: &TextMasUsageRecord,
+    retry_status: TextMasCallStatus,
+    retry_output: f64,
+) {
+    assert_eq!(first.call_index, Some(3));
+    assert_eq!(retry.call_index, Some(4));
+    assert_eq!(first.status, TextMasCallStatus::Failed);
+    assert_eq!(retry.status, retry_status);
+    let first = first.usage.as_ref().unwrap();
+    let retry = retry.usage.as_ref().unwrap();
+    assert_eq!(first.output, MAX_OUTPUT_TOKENS);
+    assert_eq!(retry.output, retry_output);
+    // The callers already prove byte-identical contexts. Prompt-side usage
+    // must also stay unchanged across the fresh retry invocation.
+    assert_eq!(first.input, retry.input);
+    assert_eq!(first.cache_read, retry.cache_read);
+    assert_eq!(first.cache_write, retry.cache_write);
+    assert_eq!(first.cost.total, retry.cost.total);
+    assert_eq!(first.total_tokens - first.output, retry.total_tokens - retry.output);
+}
+
+async fn wait_for_captured(f: &Fixture, count: usize) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while f.captured.lock().unwrap().len() < count {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn mapper_exact_cap_retry_recovers_in_order_and_parent_retry_does_not_respend() {
+    let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let f = Fixture::with_limits(MAX_OUTPUT_TOKENS, 1_048_576.0);
+    let session = f.session(0, true).await;
+    turn(&session, "/mode direct", None).await.unwrap();
+    let file = session.session_file().unwrap();
+    textmas_settings::set_mode(&file, TextMasMode::Hierarchical).unwrap();
+    queue_last_cap_sequence(&f, &file, text_reply("RETRY_SUCCESS_MAP"), true);
+    let source = retry_test_source();
+    let started = std::time::Instant::now();
+    turn(&session, &source, None).await.unwrap();
+    let wall = started.elapsed();
+    assert!(wall >= Duration::from_millis(40));
+
+    let contexts = f.captured.lock().unwrap().clone();
+    assert_eq!(contexts.len(), 11, "5 maps, reducer, P/C/R, and 2 parent attempts");
+    let mapper_contexts = contexts.iter().filter(|context| {
+        context.system_prompt.as_deref().unwrap_or_default().contains("advisory role: mapper")
+    }).collect::<Vec<_>>();
+    assert_eq!(mapper_contexts.len(), 5);
+    assert_eq!(serde_json::to_vec(mapper_contexts[3]).unwrap(), serde_json::to_vec(mapper_contexts[4]).unwrap(), "retry context is byte-identical");
+    let reducer = serde_json::to_string(contexts.iter().find(|context| {
+        context.system_prompt.as_deref().unwrap_or_default().contains("advisory role: reducer")
+    }).unwrap()).unwrap();
+    let first = reducer.find("MAPPER_BRIEF").unwrap();
+    let second = reducer[first + 1..].find("MAPPER_BRIEF").unwrap() + first + 1;
+    let third = reducer[second + 1..].find("MAPPER_BRIEF").unwrap() + second + 1;
+    let retried = reducer.find("RETRY_SUCCESS_MAP").unwrap();
+    assert!(first < second && second < third && third < retried, "retry occupies its logical last-map position");
+    assert_eq!(contexts.iter().filter(|context| context.tools.is_some()).count(), 2, "ordinary parent retry only");
+    let final_parent = serde_json::to_string(contexts.last().unwrap()).unwrap();
+    assert!(final_parent.contains("plus 1 bounded exact-cap mapper retry"), "additional spend is explicit");
+
+    let usage = ledger(&session);
+    let records = usage.records().collect::<Vec<_>>();
+    assert_eq!(records.len(), 9, "5 mapper, 1 reducer and 3 P/C/R records");
+    let mapper_records = records.iter().copied().filter(|record| record.role == TextMasRole::Mapper).collect::<Vec<_>>();
+    assert_eq!(mapper_records.len(), 5);
+    assert_eq!(mapper_records.iter().filter(|record| record.status == TextMasCallStatus::Failed).count(), 1);
+    assert_eq!(mapper_records.iter().filter(|record| record.status == TextMasCallStatus::Completed).count(), 4);
+    assert_eq!(mapper_records.iter().map(|record| record.call_index.unwrap()).collect::<Vec<_>>(), vec![0, 1, 2, 3, 4]);
+    assert_eq!(mapper_records.iter().find(|record| record.call_index == Some(4)).unwrap().status, TextMasCallStatus::Completed);
+    assert!(mapper_records.iter().take(3).all(|record| {
+        record.status == TextMasCallStatus::Completed
+            && record.usage.as_ref().unwrap().output == 3.0
+    }));
+    assert_capped_mapper_retry_pair(mapper_records[3], mapper_records[4], TextMasCallStatus::Completed, 5.0);
+    for role in [TextMasRole::Reducer, TextMasRole::Planner, TextMasRole::Critic, TextMasRole::Refiner] {
+        assert_eq!(records.iter().filter(|record| record.role == role).count(), 1);
+    }
+    let summary = usage.summary().unwrap();
+    assert_eq!(summary.known_subtotal.output, 8237.0);
+    assert_eq!(summary.unknown_usage_calls, 0);
+    assert_eq!(summary.unknown_cost_calls, 9);
+    assert_eq!(summary.known_subtotal.cost.total, 0.0);
+    assert_faux_attempt_totals(&usage);
+    assert_ledger_conserves_records(&usage);
+    let mapper_total = mapper_records.iter().map(|record| record.usage.as_ref().unwrap().total_tokens).sum::<f64>();
+    println!("AFTER_RECOVERED_SEQUENCE wall_micros={} mapper_calls={} output={} mapper_total_tokens={} auxiliary_total_tokens={}", wall.as_micros(), mapper_records.len(), summary.known_subtotal.output, mapper_total, summary.known_tokens);
+    let history = serde_json::to_string(&session.messages()).unwrap();
+    assert!(history.contains(&source));
+    assert!(!history.contains(&"x".repeat(MAX_OUTPUT_TOKENS as usize * 4)));
+    assert!(!history.contains("synthetic parent retry"));
+    session.dispose_async(Some(false)).await;
+}
+
+#[tokio::test]
+async fn mapper_exact_cap_retry_exhausts_after_two_failed_invocations() {
+    let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let f = Fixture::with_limits(MAX_OUTPUT_TOKENS, 1_048_576.0);
+    let session = f.session(0, true).await;
+    turn(&session, "/mode direct", None).await.unwrap();
+    let file = session.session_file().unwrap();
+    textmas_settings::set_mode(&file, TextMasMode::Hierarchical).unwrap();
+    queue_last_cap_sequence(&f, &file, exact_cap_message(), false);
+    let source = retry_test_source();
+    let started = std::time::Instant::now();
+    let error = turn(&session, &source, None).await.unwrap_err();
+    let wall = started.elapsed();
+    assert!(wall >= Duration::from_millis(40));
+    assert!(error.contains("stop: length"));
+    assert!(!error.contains("xxxx"));
+    let contexts = f.captured.lock().unwrap().clone();
+    assert_eq!(contexts.len(), 5, "exactly four initial calls and one retry, with no downstream call");
+    assert_eq!(serde_json::to_vec(&contexts[3]).unwrap(), serde_json::to_vec(&contexts[4]).unwrap());
+    let usage = ledger(&session);
+    let records = usage.records().collect::<Vec<_>>();
+    assert_eq!(records.len(), 5);
+    assert!(records.iter().all(|record| record.role == TextMasRole::Mapper));
+    assert_eq!(records.iter().filter(|record| record.status == TextMasCallStatus::Completed).count(), 3);
+    let failed = records.iter().filter(|record| record.status == TextMasCallStatus::Failed).collect::<Vec<_>>();
+    assert_eq!(failed.len(), 2);
+    assert!(failed.iter().all(|record| record.usage.as_ref().unwrap().output == MAX_OUTPUT_TOKENS));
+    assert_eq!(records.iter().map(|record| record.call_index.unwrap()).collect::<Vec<_>>(), vec![0, 1, 2, 3, 4]);
+    let summary = usage.summary().unwrap();
+    assert_eq!(summary.known_subtotal.output, 16_393.0);
+    assert!(records.iter().take(3).all(|record| {
+        record.status == TextMasCallStatus::Completed
+            && record.usage.as_ref().unwrap().output == 3.0
+    }));
+    assert_capped_mapper_retry_pair(records[3], records[4], TextMasCallStatus::Failed, MAX_OUTPUT_TOKENS);
+    assert_faux_attempt_totals(&usage);
+    assert_eq!(summary.known_subtotal.cost.total, 0.0);
+    assert_eq!(summary.unknown_usage_calls, 0);
+    assert_eq!(summary.unknown_cost_calls, 5);
+    assert_ledger_conserves_records(&usage);
+    println!("AFTER_EXHAUSTED_SEQUENCE wall_micros={} mapper_calls={} output={} total_tokens={}", wall.as_micros(), records.len(), summary.known_subtotal.output, summary.known_tokens);
+    let history = serde_json::to_string(&session.messages()).unwrap();
+    assert!(history.contains(&source));
+    assert!(!history.contains(&"x".repeat(MAX_OUTPUT_TOKENS as usize * 4)));
+    session.dispose_async(Some(false)).await;
+}
+
+#[tokio::test]
+async fn mapper_retry_requires_the_exact_cap_length_terminal() {
+    let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    for case in ["below-cap-length", "provider-error", "length-with-provider-error-at-cap", "oversized-stop"] {
+        let f = Fixture::with_limits(MAX_OUTPUT_TOKENS, 1_048_576.0);
+        let session = f.session(0, true).await;
+        turn(&session, "/mode direct", None).await.unwrap();
+        let file = session.session_file().unwrap();
+        textmas_settings::set_mode(&file, TextMasMode::Hierarchical).unwrap();
+        for _ in 0..3 {
+            f.reply(text_reply("MAPPER_BRIEF"), Some(file.clone()), None);
+        }
+        let last = match case {
+            "below-cap-length" => faux_assistant_message("partial".into(), Some(FauxAssistantMessageOptions { stop_reason: Some("length".into()), ..Default::default() })),
+            "provider-error" => faux_assistant_message("partial".into(), Some(FauxAssistantMessageOptions { stop_reason: Some("error".into()), error_message: Some("UNTRUSTED_PROVIDER_ERROR".into()), ..Default::default() })),
+            "length-with-provider-error-at-cap" => faux_assistant_message(FauxAssistantContent::Text("x".repeat(MAX_OUTPUT_TOKENS as usize * 4)), Some(FauxAssistantMessageOptions { stop_reason: Some("length".into()), error_message: Some("UNTRUSTED_PROVIDER_ERROR".into()), ..Default::default() })),
+            _ => text_reply(&"O".repeat(pi_coding_agent::core::occ::textmas::MAX_DRAFT_BYTES + 1)),
+        };
+        f.reply(last, Some(file), None);
+        let source = retry_test_source();
+        let error = turn(&session, &source, None).await.unwrap_err();
+        if case == "below-cap-length" { assert!(error.contains("stop: length")); }
+        if matches!(case, "provider-error" | "length-with-provider-error-at-cap") {
+            assert!(error.contains("provider error"));
+            assert!(!error.contains("UNTRUSTED_PROVIDER_ERROR"));
+        }
+        if case == "oversized-stop" { assert!(error.contains("draft bound")); }
+        assert_eq!(f.captured.lock().unwrap().len(), 4, "no retry for {case}");
+        let usage = ledger(&session);
+        assert!(usage.records().all(|record| record.role == TextMasRole::Mapper && record.call_index != Some(4)));
+        assert_eq!(usage.summary().unwrap().calls, 4);
+        let history = serde_json::to_string(&session.messages()).unwrap();
+        assert!(history.contains(&source));
+        session.dispose_async(Some(false)).await;
+    }
+}
+
+#[tokio::test]
+async fn successful_mapper_batch_does_not_retry_or_duplicate_downstream_calls() {
+    let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let f = Fixture::with_limits(MAX_OUTPUT_TOKENS, 1_048_576.0);
+    let session = f.session(0, true).await;
+    turn(&session, "/mode direct", None).await.unwrap();
+    let file = session.session_file().unwrap();
+    textmas_settings::set_mode(&file, TextMasMode::Hierarchical).unwrap();
+    for _ in 0..4 {
+        f.reply(text_reply("MAPPER_BRIEF"), Some(file.clone()), None);
+    }
+    f.reply(text_reply("REDUCED_BRIEF"), Some(file.clone()), None);
+    f.drafts(&file);
+    f.reply(text_reply("FINAL_PARENT"), None, None);
+    let source = retry_test_source();
+    turn(&session, &source, None).await.unwrap();
+    assert_eq!(f.captured.lock().unwrap().len(), 9);
+    let usage = ledger(&session);
+    let records = usage.records().collect::<Vec<_>>();
+    assert_eq!(records.len(), 8);
+    assert!(records.iter().all(|record| record.status == TextMasCallStatus::Completed));
+    assert_eq!(records.iter().filter(|record| record.role == TextMasRole::Mapper).count(), 4);
+    assert!(records.iter().all(|record| record.call_index != Some(4) || record.role != TextMasRole::Mapper));
+    assert_eq!(usage.summary().unwrap().known_subtotal.output, 43.0);
+    assert_ledger_conserves_records(&usage);
+    let contexts = f.captured.lock().unwrap();
+    assert!(serde_json::to_string(contexts.last().unwrap()).unwrap().contains("plus 0 bounded exact-cap mapper retry"));
+    assert!(serde_json::to_string(&session.messages()).unwrap().contains(&source));
+    session.dispose_async(Some(false)).await;
+}
+
+#[tokio::test]
+async fn simultaneous_mapper_caps_share_one_action_retry_and_keep_logical_identity() {
+    let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let f = Fixture::with_limits(MAX_OUTPUT_TOKENS, 1_048_576.0);
+    let session = f.session(0, true).await;
+    turn(&session, "/mode direct", None).await.unwrap();
+    let file = session.session_file().unwrap();
+    textmas_settings::set_mode(&file, TextMasMode::Hierarchical).unwrap();
+    f.reply(text_reply("MAPPER_BRIEF"), Some(file.clone()), None);
+    f.reply(text_reply("MAPPER_BRIEF"), Some(file.clone()), None);
+    let later_failure = Arc::new(tokio::sync::Semaphore::new(0));
+    f.reply(exact_cap_message(), Some(file.clone()), Some(later_failure.clone()));
+    f.reply(exact_cap_message(), Some(file.clone()), None);
+    f.reply(text_reply("MAPPER_BRIEF"), Some(file), None);
+    let source = retry_test_source();
+    let running = tokio::spawn({
+        let session = session.clone();
+        let source = source.clone();
+        async move { session.prompt(&source, None).await }
+    });
+    let _cleanup = AbortOnDrop(running.abort_handle());
+    // Mapper 2 is held at its cap. Mapper 3 therefore claims the sole retry
+    // deterministically and completes before mapper 2 is released.
+    wait_for_captured(&f, 5).await;
+    later_failure.add_permits(1);
+    let error = tokio::time::timeout(Duration::from_secs(10), running).await.unwrap().unwrap().unwrap_err();
+    assert!(error.contains("stop: length"));
+    idle(&session).await;
+    let contexts = f.captured.lock().unwrap().clone();
+    assert_eq!(contexts.len(), 5, "one action-wide retry and no downstream calls");
+    assert_eq!(serde_json::to_vec(&contexts[3]).unwrap(), serde_json::to_vec(&contexts[4]).unwrap());
+    let usage = ledger(&session);
+    let records = usage.records().collect::<Vec<_>>();
+    assert_eq!(records.len(), 5);
+    assert!(records.iter().all(|record| record.role == TextMasRole::Mapper));
+    assert_eq!(records.iter().find(|record| record.call_index == Some(4)).unwrap().status, TextMasCallStatus::Completed);
+    assert_eq!(records.iter().filter(|record| matches!(record.call_index, Some(2) | Some(3)) && record.status == TextMasCallStatus::Failed).count(), 2);
+    assert_eq!(usage.summary().unwrap().known_subtotal.output, 16_393.0);
+    assert_ledger_conserves_records(&usage);
+    assert!(serde_json::to_string(&session.messages()).unwrap().contains(&source));
+    session.dispose_async(Some(false)).await;
+}
+
+
+
+#[tokio::test]
+async fn unordered_mapper_fail_fast_admits_one_exact_cap_retry_and_cancels_held_siblings() {
+    let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let f = Fixture::with_limits(MAX_OUTPUT_TOKENS, 1_048_576.0);
+    let session = f.session(0, true).await;
+    turn(&session, "/mode direct", None).await.unwrap();
+    let file = session.session_file().unwrap();
+    textmas_settings::set_mode(&file, TextMasMode::Hierarchical).unwrap();
+    let earlier = Arc::new(tokio::sync::Semaphore::new(0));
+    let sibling = Arc::new(tokio::sync::Semaphore::new(0));
+    f.reply(text_reply("HELD_EARLIER_MAPPER"), Some(file.clone()), Some(earlier.clone()));
+    f.reply(exact_cap_message(), Some(file.clone()), None);
+    f.reply(text_reply("HELD_LATER_MAPPER"), Some(file.clone()), Some(sibling.clone()));
+    f.reply(provider_error("synthetic retry terminal failure"), Some(file), None);
+    let source = retry_test_source();
+    let running = tokio::spawn({
+        let session = session.clone();
+        let source = source.clone();
+        async move { session.prompt(&source, None).await }
+    });
+    let _cleanup = AbortOnDrop(running.abort_handle());
+    wait_for_captured(&f, 4).await;
+    let error = tokio::time::timeout(Duration::from_secs(10), running)
+        .await
+        .expect("the retry failure must not wait for mapper zero")
+        .unwrap()
+        .unwrap_err();
+    assert!(error.contains("OCC3.1 mapper") && error.contains("provider error"), "{error}");
+    idle(&session).await;
+    let contexts = f.captured.lock().unwrap().clone();
+    assert_eq!(contexts.len(), 4, "three admitted initial mappers plus exactly one retry");
+    assert_eq!(serde_json::to_vec(&contexts[1]).unwrap(), serde_json::to_vec(&contexts[3]).unwrap());
+    assert!(contexts.iter().all(|context| context.tools.is_none()));
+
+    let usage = ledger(&session);
+    let records = usage.records().collect::<Vec<_>>();
+    assert_eq!(records.len(), 4);
+    assert!(records.iter().all(|record| record.role == TextMasRole::Mapper));
+    for (index, status) in [
+        (0, TextMasCallStatus::Cancelled),
+        (1, TextMasCallStatus::Failed),
+        (2, TextMasCallStatus::Cancelled),
+        (4, TextMasCallStatus::Failed),
+    ] {
+        let matching = records.iter().filter(|record| record.call_index == Some(index)).collect::<Vec<_>>();
+        assert_eq!(matching.len(), 1, "fresh unique audit identity for mapper {index}");
+        assert_eq!(matching[0].status, status, "mapper {index}");
+    }
+    assert!(!records.iter().any(|record| record.call_index == Some(3)), "the unadmitted sibling has no fabricated usage");
+    assert_eq!(usage.summary().unwrap().calls, 4);
+    assert_eq!(usage.summary().unwrap().unknown_usage_calls, 2);
+    assert_ledger_conserves_records(&usage);
+    assert!(serde_json::to_string(&session.messages()).unwrap().contains(&source));
+    earlier.add_permits(1);
+    sibling.add_permits(1);
+    session.dispose_async(Some(false)).await;
+}
+
+#[tokio::test]
+async fn unordered_capped_cas_loser_cancels_the_pending_retry_winner() {
+    let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let f = Fixture::with_limits(MAX_OUTPUT_TOKENS, 1_048_576.0);
+    let session = f.session(0, true).await;
+    turn(&session, "/mode direct", None).await.unwrap();
+    let file = session.session_file().unwrap();
+    textmas_settings::set_mode(&file, TextMasMode::Hierarchical).unwrap();
+    f.reply(text_reply("HELD_EARLIER_MAPPER"), Some(file.clone()), Some(Arc::new(tokio::sync::Semaphore::new(0))));
+    f.reply(exact_cap_message(), Some(file.clone()), None);
+    let loser = Arc::new(tokio::sync::Semaphore::new(0));
+    f.reply(exact_cap_message(), Some(file.clone()), Some(loser.clone()));
+    f.reply(text_reply("RETRY_MUST_NOT_RECOVER"), Some(file), Some(Arc::new(tokio::sync::Semaphore::new(0))));
+    let running = tokio::spawn({ let session = session.clone(); async move {
+        session.prompt(&retry_test_source(), None).await
+    }});
+    let _cleanup = AbortOnDrop(running.abort_handle());
+    // Mapper 1 claims the sole retry while mapper 2 remains gated. Releasing
+    // mapper 2 makes its CAS loss primary without waiting for winner recovery.
+    wait_for_captured(&f, 4).await;
+    loser.add_permits(1);
+    let error = tokio::time::timeout(Duration::from_secs(10), running)
+        .await
+        .expect("the losing mapper does not wait for the pending retry")
+        .unwrap()
+        .unwrap_err();
+    assert!(error.contains("stop: length"), "{error}");
+    idle(&session).await;
+    assert_eq!(f.captured.lock().unwrap().len(), 4, "no reducer, P/C/R, parent, or generic retry");
+    let usage = ledger(&session);
+    let records = usage.records().collect::<Vec<_>>();
+    assert_eq!(records.len(), 4);
+    for (index, status) in [
+        (0, TextMasCallStatus::Cancelled),
+        (1, TextMasCallStatus::Failed),
+        (2, TextMasCallStatus::Failed),
+        (4, TextMasCallStatus::Cancelled),
+    ] {
+        let matching = records.iter().filter(|record| record.call_index == Some(index)).collect::<Vec<_>>();
+        assert_eq!(matching.len(), 1, "distinct original/retry audit identity {index}");
+        assert_eq!(matching[0].status, status, "mapper {index}");
+    }
+    assert_eq!(usage.summary().unwrap().unknown_usage_calls, 2);
+    assert_ledger_conserves_records(&usage);
+    assert!(!serde_json::to_string(&session.messages()).unwrap().contains("RETRY_MUST_NOT_RECOVER"));
+    session.dispose_async(Some(false)).await;
+}
+
+#[tokio::test]
+async fn mapper_retry_cancellation_and_model_change_stop_the_second_attempt() {
+    for model_change in [false, true] {
+        let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+        let f = Fixture::with_limits(MAX_OUTPUT_TOKENS, 1_048_576.0);
+        let session = f.session(0, true).await;
+        turn(&session, "/mode direct", None).await.unwrap();
+        let file = session.session_file().unwrap();
+        textmas_settings::set_mode(&file, TextMasMode::Hierarchical).unwrap();
+        for _ in 0..3 {
+            f.reply(text_reply("MAPPER_BRIEF"), Some(file.clone()), None);
+        }
+        f.reply(exact_cap_message(), Some(file.clone()), None);
+        f.reply(text_reply("RETRY_SUCCESS_MAP"), Some(file), Some(Arc::new(tokio::sync::Semaphore::new(0))));
+        let source = retry_test_source();
+        let running = tokio::spawn({
+            let session = session.clone();
+            let source = source.clone();
+            async move { session.prompt(&source, None).await }
+        });
+        let _cleanup = AbortOnDrop(running.abort_handle());
+        wait_for_captured(&f, 5).await;
+        if model_change {
+            let mut other = session.model().unwrap();
+            other.id = "another-ordinary-model".into();
+            session.set_model(other, Default::default()).await.unwrap();
+            let error = tokio::time::timeout(Duration::from_secs(10), running).await.unwrap().unwrap();
+            assert!(error.is_err());
+        } else {
+            session.abort().await.unwrap();
+            let result = tokio::time::timeout(Duration::from_secs(10), running).await.unwrap().unwrap();
+            assert!(result.is_err());
+        }
+        idle(&session).await;
+        assert_eq!(f.captured.lock().unwrap().len(), 5, "no further attempt after invalidation");
+        let contexts = f.captured.lock().unwrap().clone();
+        assert_eq!(serde_json::to_vec(&contexts[3]).unwrap(), serde_json::to_vec(&contexts[4]).unwrap());
+        let usage = ledger(&session);
+        let retry = usage.records().find(|record| record.role == TextMasRole::Mapper && record.call_index == Some(4)).unwrap();
+        assert_eq!(retry.status, TextMasCallStatus::Cancelled, "model_change={model_change}");
+        assert_eq!(usage.summary().unwrap().calls, 5);
+        assert!(serde_json::to_string(&session.messages()).unwrap().contains(&source));
+        session.dispose_async(Some(false)).await;
+    }
+}
+
+#[tokio::test]
+#[ignore = "measures the real 120-second deadline shared by first attempt and retry"]
+async fn mapper_retry_shares_the_original_120_second_deadline() {
+    let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let f = Fixture::with_limits(MAX_OUTPUT_TOKENS, 1_048_576.0);
+    let session = f.session(0, true).await;
+    turn(&session, "/mode direct", None).await.unwrap();
+    let file = session.session_file().unwrap();
+    textmas_settings::set_mode(&file, TextMasMode::Hierarchical).unwrap();
+    for _ in 0..3 {
+        f.reply(text_reply("MAPPER_BRIEF"), Some(file.clone()), None);
+    }
+    f.reply_delayed(exact_cap_message(), Some(file.clone()), Duration::from_secs(30));
+    f.reply(text_reply("RETRY_SUCCESS_MAP"), Some(file), Some(Arc::new(tokio::sync::Semaphore::new(0))));
+    let source = retry_test_source();
+    let started = std::time::Instant::now();
+    let result = tokio::time::timeout(Duration::from_secs(160), session.prompt(&source, None)).await.expect("deadline fixture settled");
+    let wall = started.elapsed();
+    let error = result.unwrap_err();
+    idle(&session).await;
+    assert!(error.contains("timed out"), "{error}");
+    assert!(wall >= Duration::from_secs(120), "the original deadline elapsed: {wall:?}");
+    assert!(wall < Duration::from_secs(145), "retry must not receive a fresh 120 seconds: {wall:?}");
+    assert_eq!(f.captured.lock().unwrap().len(), 5);
+    let usage = ledger(&session);
+    let retry = usage.records().find(|record| record.role == TextMasRole::Mapper && record.call_index == Some(4)).unwrap();
+    assert_eq!(retry.status, TextMasCallStatus::TimedOut);
+    assert_eq!(usage.summary().unwrap().calls, 5);
+    println!("AFTER_SHARED_DEADLINE wall_micros={} first_cap_delay_seconds=30 retry_fresh_budget=false", wall.as_micros());
+    assert!(serde_json::to_string(&session.messages()).unwrap().contains(&source));
+    session.dispose_async(Some(false)).await;
 }
 
 #[tokio::test]
