@@ -63,21 +63,11 @@ pub fn compact_simple(
     context: &Context,
     options: Option<&CompactionOptions>,
 ) -> BoxFuture<Result<Option<ProviderCompactionResult>, CompactionRequestError>> {
-    if !supports_compaction(model) {
-        return Box::pin(async { Ok(None) });
-    }
-    let compact = resolve_api_provider(&model.api)
-        .compact
-        .expect("checked by supports_compaction");
-    let model = model.clone();
-    let context = context.clone();
-    let options = options.cloned();
-    Box::pin(async move { compact(&model, &context, options.as_ref()).await })
+    try_compact_simple(model, context, options)
 }
 
 /// Fallible native compaction preserves request failures separately from `None`, which means
-/// that compaction is unsupported. Custom providers retain their existing [`compact_simple`]
-/// contract; built-in providers opt into typed failures through an internal registration slot.
+/// that compaction is unsupported. The snapshot keeps model support and dispatch on the same registration.
 pub fn try_compact_simple(
     model: &Model,
     context: &Context,
