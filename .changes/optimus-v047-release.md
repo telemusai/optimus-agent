@@ -1,0 +1,1 @@
+- Changed the native application, bundled resources, and Python runtime version to 0.1.47.
