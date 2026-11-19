@@ -1,0 +1,1 @@
+- Propagated terminal stdout write and flush failures through the existing interactive terminal error boundary with one content-free error transition. Preserved successful ConPTY chunking/output order; blocked writes and the intermittent terminal freeze remain unproven.
