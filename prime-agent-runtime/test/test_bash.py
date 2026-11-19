@@ -1402,6 +1402,199 @@ class BashTest(unittest.IsolatedAsyncioTestCase):
         finally:
             handle._job = None
 
+    def test_escaped_probe_uses_snapshot_during_concurrent_discovery(self):
+        handle = object.__new__(bash_module.BashHandle)
+        handle._escaped = {200: "proc:first", 201: "proc:second"}
+        handle._escaped_lock = threading.Lock()
+        handle._pid = 100
+        probe_entered, release_probe = threading.Event(), threading.Event()
+        result: list[bool] = []
+        errors: list[BaseException] = []
+
+        def probe(pid):
+            if pid == 200:
+                probe_entered.set()
+                self.assertTrue(release_probe.wait(5))
+            return False, None
+
+        def group_alive():
+            try:
+                result.append(handle._group_alive())
+            except BaseException as exc:
+                errors.append(exc)
+
+        with mock.patch.object(bash_module, "_IS_POSIX", True), \
+                mock.patch.object(bash_module, "_probe_escaped_identity", side_effect=probe), \
+                mock.patch.object(bash_module, "_process_start_id", return_value="proc:new"), \
+                mock.patch.object(bash_module.os, "killpg", side_effect=ProcessLookupError, create=True):
+            probe_thread = threading.Thread(target=group_alive)
+            probe_thread.start()
+            self.assertTrue(probe_entered.wait(5))
+            handle._remember_escaped([202])
+            release_probe.set()
+            probe_thread.join(5)
+        self.assertFalse(probe_thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(result, [False])
+        self.assertEqual(handle._escaped[202], "proc:new")
+
+    async def test_failed_watch_reap_retries_through_kill_and_wakes_once(self):
+        handle = bash("echo hi")
+        first_attempt = threading.Event()
+        attempts = 0
+
+        def transient_reap():
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                first_attempt.set()
+                return False
+            return True
+
+        completion = mock.Mock()
+        with mock.patch.object(handle, "_reap_group", side_effect=transient_reap), \
+                mock.patch.object(bash_module, "_record_journal", return_value=True) as journal:
+            with handle._callback_lock:
+                handle._reap_callbacks.append(completion)
+            waiter = asyncio.ensure_future(handle._wait_reaped())
+            result = await asyncio.wait_for(handle, timeout=5)
+            self.assertTrue(await asyncio.to_thread(first_attempt.wait, 5))
+            await asyncio.sleep(0.05)
+            self.assertEqual(result.exit_code, 0)
+            self.assertTrue(handle.running)
+            self.assertFalse(waiter.done())
+            completion.assert_not_called()
+            journal.assert_not_called()
+            with bash_module._live_lock:
+                self.assertIn(handle, bash_module._live_handles)
+
+            with mock.patch.object(bash_module, "_IS_POSIX", True), \
+                    mock.patch.object(handle, "_signal_own_tree", return_value=True):
+                handle.kill(_SIGKILL)
+            await asyncio.wait_for(waiter, timeout=5)
+            self.assertTrue(handle._reaped)
+            completion.assert_called_once_with()
+            journal.assert_called_once_with(handle._pid, active=False)
+            self.assertEqual(attempts, 2)
+            with bash_module._live_lock:
+                self.assertNotIn(handle, bash_module._live_handles)
+
+    async def test_failed_watch_reap_retries_through_shutdown_cleanup(self):
+        handle = bash("echo hi")
+        first_attempt = threading.Event()
+        attempts = 0
+
+        def transient_reap():
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                first_attempt.set()
+                return False
+            return True
+
+        completion = mock.Mock()
+        with mock.patch.object(handle, "_reap_group", side_effect=transient_reap), \
+                mock.patch.object(bash_module, "_record_journal", return_value=True) as journal:
+            with handle._callback_lock:
+                handle._reap_callbacks.append(completion)
+            waiter = asyncio.ensure_future(handle._wait_reaped())
+            await asyncio.wait_for(handle, timeout=5)
+            self.assertTrue(await asyncio.to_thread(first_attempt.wait, 5))
+            await asyncio.sleep(0.05)
+            self.assertFalse(handle._reaped)
+            with mock.patch.object(bash_module, "_IS_POSIX", True), \
+                    mock.patch.object(bash_module, "_descendant_pids", return_value=[]), \
+                    mock.patch.object(bash_module.signal, "SIGKILL", _SIGKILL, create=True), \
+                    mock.patch.object(bash_module, "_signal_tree", return_value=True):
+                bash_module._kill_live_handles()
+            await asyncio.wait_for(waiter, timeout=5)
+            self.assertTrue(handle._reaped)
+            self.assertEqual(attempts, 2)
+            completion.assert_called_once_with()
+            journal.assert_called_once_with(handle._pid, active=False)
+
+    def test_reused_escaped_pid_is_not_signaled_or_treated_as_live(self):
+        handle = object.__new__(bash_module.BashHandle)
+        handle._escaped = {}
+        handle._escaped_lock = threading.Lock()
+        handle._pid = 100
+        with mock.patch.object(bash_module, "_IS_POSIX", True), mock.patch.object(
+            bash_module, "_process_start_id", side_effect=["proc:before", "proc:after", "proc:after"]
+        ), mock.patch.object(bash_module, "_signal_group", return_value=True), \
+                mock.patch.object(bash_module, "_signal_pid") as signal_pid, \
+                mock.patch.object(bash_module.os, "kill") as kill, \
+                mock.patch.object(bash_module.os, "killpg", side_effect=ProcessLookupError, create=True):
+            handle._remember_escaped([200])
+            self.assertEqual(handle._escaped, {200: "proc:before"})
+            self.assertTrue(bash_module._signal_tree(100, _SIGKILL, handle._escaped))
+            self.assertFalse(handle._group_alive())
+        signal_pid.assert_not_called()
+        kill.assert_not_called()
+
+    def test_unchanged_escaped_identity_is_revalidated_then_signaled(self):
+        handle = object.__new__(bash_module.BashHandle)
+        handle._escaped = {}
+        handle._escaped_lock = threading.Lock()
+        with mock.patch.object(bash_module, "_IS_POSIX", True), mock.patch.object(
+            bash_module, "_process_start_id", side_effect=["proc:same", "proc:same"]
+        ), mock.patch.object(bash_module, "_signal_group", return_value=True), \
+                mock.patch.object(bash_module, "_signal_pid", return_value=True) as signal_pid:
+            handle._remember_escaped([200])
+            self.assertTrue(bash_module._signal_tree(100, _SIGKILL, handle._escaped))
+        signal_pid.assert_called_once_with(200, _SIGKILL)
+
+    async def test_unknown_escaped_identity_rechecks_until_positive_absence_retires_journal(self):
+        handle = object.__new__(bash_module.BashHandle)
+        handle._escaped = {200: None}
+        handle._escaped_lock = threading.Lock()
+        handle._pid = 100
+        # The first lookup cannot establish either identity or absence. Later
+        # ProcessLookupError probes positively prove absence, allowing both the
+        # bounded liveness await and inactive journal update to finish.
+        with mock.patch.object(bash_module, "_IS_POSIX", True), \
+                mock.patch.object(bash_module, "_process_start_id", return_value=None), \
+                mock.patch.object(
+                    bash_module.os, "kill",
+                    side_effect=[None, ProcessLookupError, ProcessLookupError],
+                ) as kill, \
+                mock.patch.object(bash_module.os, "killpg", side_effect=ProcessLookupError, create=True), \
+                mock.patch.object(bash_module, "_signal_group", return_value=True), \
+                mock.patch.object(bash_module.signal, "SIGKILL", _SIGKILL, create=True), \
+                mock.patch.object(bash_module, "_signal_pid") as signal_pid, \
+                mock.patch.object(bash_module, "_descendant_pids", return_value=[]), \
+                mock.patch.object(bash_module, "_live_handles", {handle}), \
+                mock.patch.object(bash_module, "_record_journal", return_value=True) as record_journal:
+            self.assertTrue(handle._group_alive())
+            self.assertTrue(await asyncio.wait_for(handle._await_group_death(0.2), timeout=1))
+            bash_module._kill_live_handles()
+        self.assertEqual(kill.call_args_list, [mock.call(200, 0)] * 3)
+        signal_pid.assert_not_called()
+        record_journal.assert_called_once_with(100, active=False)
+
+    def test_transient_known_identity_failure_stays_live_unsignaled_and_undelivered(self):
+        handle = object.__new__(bash_module.BashHandle)
+        handle._escaped = {200: "proc:stable"}
+        handle._escaped_lock = threading.Lock()
+        handle._pid = 100
+        with mock.patch.object(bash_module, "_IS_POSIX", True), mock.patch.object(
+            bash_module, "_probe_escaped_identity",
+            side_effect=[
+                (None, None),  # signal: transient lookup failure
+                (None, None),  # liveness: still conservatively live
+                (True, "proc:reused"),  # positive change: old child is gone
+                (True, "proc:stable"),  # unchanged match: delivery permitted
+            ],
+        ), mock.patch.object(bash_module, "_signal_group", return_value=True) as signal_group, \
+                mock.patch.object(bash_module, "_signal_pid", return_value=True) as signal_pid:
+            self.assertFalse(bash_module._signal_tree(100, _SIGKILL, handle._escaped))
+            self.assertTrue(handle._group_alive())
+            signal_pid.assert_not_called()
+            self.assertTrue(bash_module._signal_tree(100, _SIGKILL, handle._escaped))
+            signal_pid.assert_not_called()
+            self.assertTrue(bash_module._signal_tree(100, _SIGKILL, handle._escaped))
+        signal_pid.assert_called_once_with(200, _SIGKILL)
+        self.assertEqual(signal_group.call_count, 3)
+
     def test_darwin_start_id_uses_absolute_ps(self):
         completed = mock.Mock(stdout="Mon Jan  1 00:00:00 2026\n")
         # Simulate darwin completely: os.name must leave the Windows branch too.

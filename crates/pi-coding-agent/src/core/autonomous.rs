@@ -11,7 +11,9 @@ use tokio::io::AsyncReadExt;
 use tokio_util::sync::CancellationToken;
 
 use crate::utils::child_process::{spawn_hidden, wait_for_child_process, SpawnOptions};
-use crate::utils::shell::{kill_process_tree, track_detached_child_pid, untrack_detached_child_pid};
+use crate::utils::shell::{
+    kill_owned_child_process_tree, track_detached_child, untrack_detached_child, OwnedChildProcess,
+};
 
 /// `interface AgentAutonomousConfig`.
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -817,70 +819,83 @@ async fn run_child_process(
             }
         }
     };
-    let pid = handle.child.id().map(|id| id as i32);
-    if let Some(pid) = pid {
-        track_detached_child_pid(pid);
+    let process = handle.child.owned_process().cloned();
+    if let Some(process) = process.as_ref() {
+        track_detached_child(process);
     }
     let mut child = handle.child;
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
     let max_output_chars = options.max_output_chars.unwrap_or(MAX_CHILD_PROCESS_OUTPUT_CHARS);
     let truncated = Arc::new(AtomicBool::new(false));
+    let stdout_output = Arc::new(std::sync::Mutex::new(String::new()));
+    let stderr_output = Arc::new(std::sync::Mutex::new(String::new()));
 
     let stdout_task = stdout.map(|stream| {
         let truncated = truncated.clone();
-        tokio::spawn(async move { read_stream(stream, max_output_chars, truncated).await })
+        let output = stdout_output.clone();
+        tokio::spawn(async move { read_stream(stream, max_output_chars, truncated, output).await })
     });
     let stderr_task = stderr.map(|stream| {
         let truncated = truncated.clone();
-        tokio::spawn(async move { read_stream(stream, max_output_chars, truncated).await })
+        let output = stderr_output.clone();
+        tokio::spawn(async move { read_stream(stream, max_output_chars, truncated, output).await })
     });
 
     let timed_out = Arc::new(AtomicBool::new(false));
     let mut signal_task = None;
     if let Some(signal) = options.signal.clone() {
         let timed_out = timed_out.clone();
-        let pid_for_signal = pid;
+        let process_for_signal = process.clone();
         signal_task = Some(tokio::spawn(async move {
             signal.cancelled().await;
             let _ = timed_out;
-            if let Some(pid) = pid_for_signal {
-                kill_process_tree(pid);
-            }
+            process_for_signal
+                .as_ref()
+                .map(kill_autonomous_process_tree)
+                .unwrap_or(true)
         }));
     }
     let timeout_task = match options.timeout_ms {
         Some(timeout_ms) => {
             let timed_out = timed_out.clone();
-            let pid_for_timeout = pid;
+            let process_for_timeout = process.clone();
             Some(tokio::spawn(async move {
                 tokio::time::sleep(Duration::from_millis(timeout_ms.max(0.0) as u64)).await;
                 timed_out.store(true, Ordering::SeqCst);
-                if let Some(pid) = pid_for_timeout {
-                    kill_process_tree(pid);
-                }
+                process_for_timeout
+                    .as_ref()
+                    .map(kill_autonomous_process_tree)
+                    .unwrap_or(true)
             }))
         }
         None => None,
     };
 
     let status_result = wait_for_child_process(child).await;
-    if let Some(task) = timeout_task {
-        task.abort();
-    }
-    if let Some(task) = signal_task {
-        task.abort();
-    }
-    let stdout_text = match stdout_task {
-        Some(task) => task.await.unwrap_or_default(),
-        None => String::new(),
+    let timeout_cleanup_complete = match timeout_task {
+        Some(task) => stop_autonomous_cleanup_task(task).await,
+        None => true,
     };
-    let stderr_text = match stderr_task {
-        Some(task) => task.await.unwrap_or_default(),
-        None => String::new(),
+    let signal_cleanup_complete = match signal_task {
+        Some(task) => stop_autonomous_cleanup_task(task).await,
+        None => true,
     };
-    if let Some(pid) = pid {
-        untrack_detached_child_pid(pid);
+
+    // The outer readers own the pipes taken above. The direct child can exit
+    // while a descendant retains either write end, so join both readers under
+    // one post-exit deadline instead of waiting for EOF without a bound.
+    let output_drain_deadline = tokio::time::Instant::now()
+        + Duration::from_millis(crate::utils::child_process::EXIT_STDIO_GRACE_MS);
+    let reader_tasks = [stdout_task, stderr_task].into_iter().flatten().collect::<Vec<_>>();
+    let reader_cleanup_complete =
+        finish_stream_readers(reader_tasks, output_drain_deadline, process.clone()).await;
+    let cleanup_complete =
+        timeout_cleanup_complete && signal_cleanup_complete && reader_cleanup_complete;
+    let stdout_text = take_stream_output(&stdout_output);
+    let stderr_text = take_stream_output(&stderr_output);
+    if let Some(process) = process.as_ref() {
+        untrack_autonomous_child_with(process, cleanup_complete, untrack_detached_child);
     }
     let (status, signal_name, error) = match status_result {
         Ok(status) => (status, None, None),
@@ -897,6 +912,88 @@ async fn run_child_process(
     }
 }
 
+/// Stop a timeout/signal task after the direct wait settles. A task cancelled
+/// before firing made no cleanup attempt; a completed false result or panic
+/// fails closed and retains the registration for retry.
+async fn stop_autonomous_cleanup_task(task: tokio::task::JoinHandle<bool>) -> bool {
+    task.abort();
+    match task.await {
+        Ok(cleanup_complete) => cleanup_complete,
+        Err(error) if error.is_cancelled() => true,
+        Err(_) => false,
+    }
+}
+
+/// Kill through live-tree cleanup, including group members that outlive the leader.
+fn kill_autonomous_process_tree(process: &OwnedChildProcess) -> bool {
+    kill_owned_child_process_tree(process)
+}
+
+/// The production path supplies the registry untrack operation. Tests inject an
+/// observer so a false cleanup outcome is proven to retain the exact generation
+/// without signalling or registering a real process.
+fn untrack_autonomous_child_with(
+    process: &OwnedChildProcess,
+    cleanup_complete: bool,
+    untrack: impl FnOnce(&OwnedChildProcess),
+) -> bool {
+    if !cleanup_complete {
+        return false;
+    }
+    untrack(process);
+    true
+}
+
+/// Finish every outer reader against the same remaining gate. If a pipe holder
+/// prevents EOF, stop its process group and settle every JoinHandle before
+/// returning the output captured so far.
+async fn finish_stream_readers(
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+    deadline: tokio::time::Instant,
+    process: Option<OwnedChildProcess>,
+) -> bool {
+    finish_stream_readers_with(tasks, deadline, process, kill_autonomous_process_tree).await
+}
+
+async fn finish_stream_readers_with(
+    mut tasks: Vec<tokio::task::JoinHandle<()>>,
+    deadline: tokio::time::Instant,
+    process: Option<OwnedChildProcess>,
+    kill: impl FnOnce(&OwnedChildProcess) -> bool,
+) -> bool {
+    let mut drain_timed_out = false;
+    let mut completed_tasks = 0;
+    for task in &mut tasks {
+        if tokio::time::timeout_at(deadline, task).await.is_err() {
+            drain_timed_out = true;
+            break;
+        }
+        // Await through &mut consumes the JoinHandle's output. Do not poll
+        // completed handles again during final abort/settlement below.
+        completed_tasks += 1;
+    }
+    let cleanup_complete = if drain_timed_out && tasks.iter().any(|task| !task.is_finished()) {
+        process.as_ref().map(kill).unwrap_or(true)
+    } else {
+        true
+    };
+    for (index, task) in tasks.into_iter().enumerate() {
+        if index < completed_tasks {
+            continue;
+        }
+        if !task.is_finished() {
+            task.abort();
+        }
+        let _ = task.await;
+    }
+    cleanup_complete
+}
+
+fn take_stream_output(output: &Arc<std::sync::Mutex<String>>) -> String {
+    let mut output = output.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    std::mem::take(&mut *output)
+}
+
 fn check_signal(signal: &Option<CancellationToken>) -> Option<()> {
     if signal.as_ref().map(|signal| signal.is_cancelled()).unwrap_or(false) {
         return None;
@@ -905,18 +1002,20 @@ fn check_signal(signal: &Option<CancellationToken>) -> Option<()> {
 }
 
 /// Reads a child stream, capping stored characters at `max_output_chars`.
+/// The shared buffer retains partial output if the owner has to abort the read.
 async fn read_stream(
     mut stream: impl tokio::io::AsyncRead + Unpin,
     max_output_chars: usize,
     truncated: Arc<AtomicBool>,
-) -> String {
-    let mut output = String::new();
+    output: Arc<std::sync::Mutex<String>>,
+) {
     let mut buffer = vec![0u8; 8192];
     loop {
         match stream.read(&mut buffer).await {
             Ok(0) => break,
             Ok(read) => {
                 let chunk = String::from_utf8_lossy(&buffer[..read]).to_string();
+                let mut output = output.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                 let remaining = max_output_chars.saturating_sub(output.chars().count());
                 if remaining > 0 {
                     output.extend(chunk.chars().take(remaining));
@@ -928,7 +1027,6 @@ async fn read_stream(
             Err(_) => break,
         }
     }
-    output
 }
 
 /// `formatProcessExit(result)`.
@@ -1222,6 +1320,202 @@ mod tests {
             }),
             "exited 1"
         );
+    }
+
+    #[tokio::test]
+    async fn completed_reader_task_is_not_polled_twice() {
+        let task = tokio::spawn(async {});
+        tokio::task::yield_now().await;
+        assert!(finish_stream_readers_with(
+            vec![task],
+            tokio::time::Instant::now() + Duration::from_secs(1),
+            None,
+            |_| panic!("completed readers need no process cleanup"),
+        )
+        .await);
+    }
+
+    #[test]
+    fn failed_autonomous_cleanup_retains_the_exact_generation_for_retry() {
+        let process = crate::utils::shell::register_owned_child_process(i32::MAX)
+            .expect("synthetic process registration");
+        assert!(!untrack_autonomous_child_with(
+            &process,
+            false,
+            |_| panic!("failed cleanup must retain its generation"),
+        ));
+
+        let mut untracked = Vec::new();
+        assert!(untrack_autonomous_child_with(
+            &process,
+            true,
+            |candidate| untracked.push(candidate.clone()),
+        ));
+        assert_eq!(untracked, vec![process.clone()]);
+        crate::utils::shell::release_owned_child_process(&process);
+    }
+
+    #[tokio::test]
+    async fn timeout_or_signal_cleanup_outcome_is_not_discarded() {
+        let task = tokio::spawn(async { false });
+        while !task.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        assert!(!stop_autonomous_cleanup_task(task).await);
+
+        // A task aborted before it fired did not attempt a failed kill and must
+        // not spuriously retain a successfully settled direct child.
+        let task = tokio::spawn(futures::future::pending::<bool>());
+        assert!(stop_autonomous_cleanup_task(task).await);
+    }
+
+    #[tokio::test]
+    async fn failed_reader_cleanup_is_returned_after_bounded_task_settlement() {
+        let process = crate::utils::shell::register_owned_child_process(i32::MAX)
+            .expect("synthetic process registration");
+        let task = tokio::spawn(futures::future::pending::<()>());
+        let task_handle = task.abort_handle();
+        let mut kill_attempts = Vec::new();
+        let cleanup_complete = tokio::time::timeout(
+            Duration::from_secs(1),
+            finish_stream_readers_with(
+                vec![task],
+                tokio::time::Instant::now(),
+                Some(process.clone()),
+                |candidate| {
+                    kill_attempts.push(candidate.clone());
+                    false
+                },
+            ),
+        )
+        .await
+        .expect("reader abort and join must stay bounded");
+        assert!(!cleanup_complete);
+        assert!(task_handle.is_finished());
+        assert_eq!(kill_attempts, vec![process.clone()]);
+        crate::utils::shell::release_owned_child_process(&process);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn direct_early_eof_returns_without_waiting_for_the_drain_deadline() {
+        let started = std::time::Instant::now();
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            run_child_process(
+                "printf early-direct-eof; exit 0",
+                &[],
+                ChildProcessOptions {
+                    shell: true,
+                    timeout_ms: Some(5_000.0),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .expect("ordinary direct EOF must not wait for an inherited-pipe timeout");
+        assert_eq!(result.status, Some(0));
+        assert_eq!(result.stdout, "early-direct-eof");
+        assert_eq!(result.timed_out, Some(false));
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn inherited_pipe_holder_is_killed_after_the_direct_leader_exits() {
+        let directory = tempfile::tempdir().unwrap();
+        let pid_path = directory.path().join("holder.pid");
+        let command = format!(
+            "sleep 30 & holder=$!; printf '%s' \"$holder\" > '{}'; printf leader-exited; exit 0",
+            pid_path.to_string_lossy()
+        );
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            run_child_process(
+                &command,
+                &[],
+                ChildProcessOptions {
+                    shell: true,
+                    timeout_ms: Some(5_000.0),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .expect("a descendant holding stdout/stderr must not hang the gate");
+        assert_eq!(result.status, Some(0));
+        assert_eq!(result.stdout, "leader-exited");
+        assert_eq!(result.timed_out, Some(false));
+
+        let holder_pid = std::fs::read_to_string(&pid_path).unwrap().parse::<i32>().unwrap();
+        let cleanup_deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while crate::utils::child_process::is_process_alive(holder_pid)
+            && std::time::Instant::now() < cleanup_deadline
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            !crate::utils::child_process::is_process_alive(holder_pid),
+            "the pipe-holding descendant survived group cleanup"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timeout_returns_partial_output_and_settles_the_reader_tasks() {
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            run_child_process(
+                "printf timeout-partial; sleep 30",
+                &[],
+                ChildProcessOptions {
+                    shell: true,
+                    timeout_ms: Some(50.0),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .expect("timeout cleanup and partial-output collection must be bounded");
+        assert_eq!(result.timed_out, Some(true));
+        assert_eq!(result.stdout, "timeout-partial");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn abort_returns_partial_output_and_settles_the_reader_tasks() {
+        let directory = tempfile::tempdir().unwrap();
+        let ready_path = directory.path().join("ready");
+        let command = format!(
+            "printf abort-partial; : > '{}'; sleep 30",
+            ready_path.to_string_lossy()
+        );
+        let signal = CancellationToken::new();
+        let task_signal = signal.clone();
+        let mut task = tokio::spawn(async move {
+            run_child_process(
+                &command,
+                &[],
+                ChildProcessOptions {
+                    shell: true,
+                    signal: Some(task_signal),
+                    ..Default::default()
+                },
+            )
+            .await
+        });
+        let ready_deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while !ready_path.exists() && std::time::Instant::now() < ready_deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(ready_path.exists(), "the child did not reach its partial-output marker");
+        signal.cancel();
+        let result = tokio::time::timeout(Duration::from_secs(2), &mut task)
+            .await
+            .expect("abort cleanup and partial-output collection must be bounded")
+            .unwrap();
+        assert_eq!(result.timed_out, Some(false));
+        assert_eq!(result.stdout, "abort-partial");
     }
 
     #[tokio::test]

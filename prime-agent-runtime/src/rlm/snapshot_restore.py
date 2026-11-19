@@ -11,6 +11,47 @@ RESTORE_SKIP = {"In", "Out", "get_ipython"}
 _ATOMS = (int, float, str, bytes, bool, type(None))
 
 
+def _replace_tuple_references(value: Any, old: tuple[Any, ...], new: tuple[Any, ...]) -> None:
+    """Backpatch direct old-tuple references in an already revived graph."""
+    if isinstance(value, list):
+        for index, item in enumerate(value):
+            if item is old:
+                value[index] = new
+        return
+    if isinstance(value, dict):
+        for key, item in list(value.items()):
+            replacement_key = new if key is old else key
+            if key is old:
+                del value[key]
+            value[replacement_key] = new if item is old else item
+        return
+    if isinstance(value, functools.partial):
+        args = new if value.args is old else tuple(new if arg is old else arg for arg in value.args)
+        value.__setstate__((
+            value.func,
+            args,
+            {key: new if arg is old else arg for key, arg in value.keywords.items()},
+            {key: new if attr is old else attr for key, attr in value.__dict__.items()},
+        ))
+        return
+    if isinstance(value, types.FunctionType):
+        if value.__defaults__ is old:
+            value.__defaults__ = new
+        elif value.__defaults__:
+            value.__defaults__ = tuple(new if item is old else item for item in value.__defaults__)
+        if value.__kwdefaults__:
+            value.__kwdefaults__ = {
+                key: new if item is old else item for key, item in value.__kwdefaults__.items()
+            }
+        value.__dict__.update({key: new if item is old else item for key, item in value.__dict__.items()})
+        for cell in value.__closure__ or ():
+            try:
+                if cell.cell_contents is old:
+                    cell.cell_contents = new
+            except ValueError:
+                pass
+
+
 def _revive(
     value: Any,
     ns: dict[str, Any],
@@ -37,18 +78,42 @@ def _revive(
             {key: revive(attr) for key, attr in value.__dict__.items()},
         ))
         return rebuilt
-    if isinstance(value, (list, dict)):
+    if isinstance(value, list):
         memo[id(value)] = value
-        for key, item in enumerate(value) if isinstance(value, list) else value.items():
+        for key, item in enumerate(value):
             revived = revive(item)
             if revived is not item:
                 value[key] = revived
         return value
+    if isinstance(value, dict):
+        memo[id(value)] = value
+        # Dict backpatching may replace a rebuilt tuple key during revival.
+        # Iterate over a snapshot so that legal key replacement cannot mutate
+        # the live iterator and drop the entire restored dictionary.
+        for key, item in list(value.items()):
+            revived_key = revive(key)
+            revived_item = revive(item)
+            if revived_key is not key:
+                # Recursive tuple revival can already have backpatched this key.
+                if key in value:
+                    del value[key]
+                value[revived_key] = revived_item
+            elif revived_item is not item:
+                value[key] = revived_item
+        return value
     if type(value) is tuple:
+        # Seed before descent: tuple -> list/dict -> tuple cycles otherwise
+        # recurse forever. The original is only a temporary placeholder; after
+        # rebuilding (usually because a function changed), rebind every direct
+        # reference held by already-revived mutable objects to the new tuple.
+        memo[id(value)] = value
         items = tuple(revive(item) for item in value)
-        if all(new is old for new, old in zip(items, value)):
-            items = value
-        return memo.setdefault(id(value), items)
+        rebuilt = value if all(new is old for new, old in zip(items, value)) else items
+        memo[id(value)] = rebuilt
+        if rebuilt is not value:
+            for dependent in list(memo.values()):
+                _replace_tuple_references(dependent, value, rebuilt)
+        return rebuilt
     if not isinstance(value, types.FunctionType) or value.__module__ != "__main__":
         return value
 

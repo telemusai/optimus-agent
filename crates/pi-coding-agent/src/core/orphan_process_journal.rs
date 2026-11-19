@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::core::session_lease::get_process_start_id;
-use crate::utils::child_process::{spawn_sync_hidden, SpawnOptions};
+use crate::utils::child_process::{spawn_sync_hidden_with_timeout, SpawnOptions};
 
 pub const ORPHAN_PROCESS_JOURNAL_ENV: &str = "PRIME_AGENT_INTERNAL_ORPHAN_PROCESS_JOURNAL";
 
@@ -169,15 +169,25 @@ pub fn reap_kernel_orphan_processes(kernel_pid: i64) {
         if orphan.kernel_pid != Some(kernel_pid) || orphan.pid == kernel_pid {
             continue;
         }
-        if !should_reap_orphan_process(&orphan) {
-            continue;
-        }
-        // Inactive only after a delivered signal; a stale record is neutralized by the startId check.
-        if kill_orphan_process(orphan.pid) {
-            record_orphan_process_state(orphan.pid, false);
-        }
+        reap_orphan_process(&orphan);
     }
 }
+
+/// Run the same identity check, bounded kill, and journal transition for one
+/// orphan. A failed or timed-out kill must retain the active journal record.
+fn reap_orphan_process(orphan: &ActiveOrphanProcess) -> bool {
+    if !should_reap_orphan_process(orphan) {
+        return false;
+    }
+    // Inactive only after a delivered signal; a stale record is neutralized by the startId check.
+    if kill_orphan_process(orphan.pid) {
+        record_orphan_process_state(orphan.pid, false);
+        return true;
+    }
+    false
+}
+
+const ORPHAN_TASKKILL_TIMEOUT_MS: u64 = 3_000;
 
 /// Hardened cross-platform tree kill for journaled orphans: absolute System32
 /// taskkill /T on win32 (a bare name could resolve a planted CWD taskkill.exe),
@@ -185,14 +195,19 @@ pub fn reap_kernel_orphan_processes(kernel_pid: i64) {
 pub fn kill_orphan_process(pid: i64) -> bool {
     if cfg!(windows) {
         // In-kernel bash() kill paths use taskkill /T; the reaper must kill the same tree,
-        // not just the shell pid.
+        // not just the shell pid. Capture under one deadline so teardown cannot
+        // wedge behind a hung taskkill or an inherited output pipe.
         let taskkill = crate::utils::shell::windows_taskkill_program();
-        let mut env = SpawnOptions::default();
-        env.env = Some(vec![("NoDefaultCurrentDirectoryInExePath".to_string(), "1".to_string())]);
-        let result = spawn_sync_hidden(
+        let result = spawn_sync_hidden_with_timeout(
             &taskkill,
             &["/F".to_string(), "/T".to_string(), "/PID".to_string(), pid.to_string()],
-            env,
+            SpawnOptions {
+                env: Some(vec![("NoDefaultCurrentDirectoryInExePath".to_string(), "1".to_string())]),
+                capture_stdout: true,
+                capture_stderr: true,
+                ..Default::default()
+            },
+            ORPHAN_TASKKILL_TIMEOUT_MS,
         );
         return matches!(result, Ok(output) if output.status.success());
     }
@@ -321,6 +336,123 @@ mod tests {
         };
         assert!(!is_orphan_process_identity_current(&orphan));
         assert_eq!(should_reap_orphan_process(&orphan), !cfg!(windows));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn injected_taskkill_hang_is_bounded_false_and_retains_journal() {
+        use std::process::{Command, Stdio};
+        use std::sync::Mutex;
+        use std::time::{Duration, Instant};
+
+        static TEST_LOCK: Mutex<()> = Mutex::new(());
+        static TASKKILL_CALLS: Mutex<Vec<(String, Vec<String>)>> = Mutex::new(Vec::new());
+
+        struct ChildGuard(std::process::Child);
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        struct OverrideGuard;
+        impl Drop for OverrideGuard {
+            fn drop(&mut self) {
+                crate::utils::child_process::set_sync_spawn_override_for_tests(None);
+            }
+        }
+
+        struct EnvGuard(Option<std::ffi::OsString>);
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                if let Some(previous) = self.0.take() {
+                    std::env::set_var(ORPHAN_PROCESS_JOURNAL_ENV, previous);
+                } else {
+                    std::env::remove_var(ORPHAN_PROCESS_JOURNAL_ENV);
+                }
+            }
+        }
+
+        fn inject_hang(
+            command: &str,
+            args: &[String],
+            _options: &SpawnOptions,
+        ) -> Option<std::io::Result<std::process::Child>> {
+            if !command.ends_with("taskkill.exe") {
+                return None;
+            }
+            TASKKILL_CALLS
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push((command.to_string(), args.to_vec()));
+            Some(
+                Command::new("ping")
+                    .args(["-n", "30", "127.0.0.1"])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn(),
+            )
+        }
+
+        let _serial = TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        TASKKILL_CALLS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+
+        let target = Command::new("ping")
+            .args(["-n", "30", "127.0.0.1"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut target = ChildGuard(target);
+        let pid = target.0.id() as i64;
+        let process_start_id = get_process_start_id(pid).expect("live orphan start id");
+        let owner_pid = std::process::id() as i64;
+        let dir = std::env::temp_dir().join(format!("orphan-taskkill-hang-{}-{pid}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("journal.jsonl");
+        let path_text = path.to_string_lossy().to_string();
+
+        let _env = EnvGuard(std::env::var_os(ORPHAN_PROCESS_JOURNAL_ENV));
+        std::env::set_var(ORPHAN_PROCESS_JOURNAL_ENV, &path);
+        record_orphan_process_state(pid, true);
+        let _override = OverrideGuard;
+        crate::utils::child_process::set_sync_spawn_override_for_tests(Some(inject_hang));
+
+        let orphan = ActiveOrphanProcess {
+            pid,
+            kernel_pid: Some(owner_pid),
+            process_start_id: Some(process_start_id),
+        };
+        let started = Instant::now();
+        assert!(!reap_orphan_process(&orphan), "a hung taskkill must not report delivery");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "taskkill recovery exceeded its bound: {:?}",
+            started.elapsed()
+        );
+        assert!(target.0.try_wait().unwrap().is_none(), "the injected taskkill must not kill the orphan");
+
+        let active = read_active_orphan_processes(&path_text, owner_pid).unwrap();
+        assert_eq!(active.len(), 1, "failed recovery must retain active journal evidence");
+        assert_eq!(active[0].pid, pid);
+        let calls = TASKKILL_CALLS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        assert_eq!(calls.len(), 1, "the live recovery path must reach taskkill");
+        assert_eq!(
+            calls[0].1,
+            vec!["/F".to_string(), "/T".to_string(), "/PID".to_string(), pid.to_string()]
+        );
+
+        drop(_override);
+        drop(_env);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
