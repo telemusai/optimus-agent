@@ -657,6 +657,66 @@ impl crate::core::tools::BashOperations for ExtensionBashOperations {
     }
 }
 
+/// Fail-loud OCC-3 twin guard for `resolve_rlm_subagent_model`. The selection
+/// is returned unchanged when no authenticated entry shares the model id with
+/// an enabled OCC-3 configuration; otherwise the error names the resolved
+/// selector and the exact OCC-3 selector(s) to use instead.
+fn occ3_twin_guarded_selection(
+    model: Model,
+    target: &str,
+    authenticated: &[Model],
+) -> Result<RlmSubagentModelSelection, String> {
+    if let Some(error) = occ3_twin_error(&model, target, authenticated) {
+        return Err(error);
+    }
+    Ok(RlmSubagentModelSelection { model })
+}
+
+/// The OCC-3 twin refusal for `model`, or `None` when the spawn may proceed.
+fn occ3_twin_error(model: &Model, target: &str, authenticated: &[Model]) -> Option<String> {
+    let twins = crate::core::rlm_runtime::occ3_configured_twin_selectors(model, authenticated);
+    if twins.is_empty() {
+        return None;
+    }
+    let selectors: Vec<String> = twins.iter().map(|twin| format!("\"{twin}\"")).collect();
+    let selector_hint = if twins.len() == 1 {
+        format!("Pass the exact OCC-3 selector {}", selectors[0])
+    } else {
+        format!("Pass one of the exact OCC-3 selectors {}", selectors.join(", "))
+    };
+    Some(format!(
+        "Requested {target} model \"{}/{}\" has no OCC-3 configuration, but an OCC-3-configured entry with the same model id exists. Children on this entry never receive the native occ3_handoff tool. {selector_hint} instead",
+        model.provider,
+        model.id,
+    ))
+}
+
+/// The unavailable-model refusal. A bare model id shared by multiple
+/// providers additionally lists the exact `provider/id` selectors,
+/// OCC-3-configured entries first, so the reference can be disambiguated.
+fn format_unavailable_rlm_model_message(
+    reference: &str,
+    target: &str,
+    authenticated: &[Model],
+) -> String {
+    let mut message = format!(
+        "Requested {target} model \"{reference}\" is unavailable, unauthenticated, or expired"
+    );
+    if !reference.contains('/') {
+        let selectors =
+            crate::core::rlm_runtime::selectors_for_model_id(reference, authenticated);
+        if selectors.len() > 1 {
+            let quoted: Vec<String> =
+                selectors.iter().map(|selector| format!("\"{selector}\"")).collect();
+            message.push_str(&format!(
+                "; the model id \"{reference}\" is available from multiple providers: {}",
+                quoted.join(", ")
+            ));
+        }
+    }
+    message
+}
+
 impl AgentSession {
     pub async fn bind_extensions(
         self: &Arc<Self>,
@@ -3226,6 +3286,12 @@ impl AgentSession {
     }
 
     /// `_resolveRlmSubagentModel(reference, target)` (agent-session.ts:11418-11446).
+    ///
+    /// Fails loud when the resolution lands on a non-OCC-3 entry while an
+    /// OCC-3-configured entry with the same model id is authenticated: latent
+    /// transfer is same-exact-model only, so a child spawned on the ordinary
+    /// entry silently lacks the native `occ3_handoff` tool and the missing
+    /// tool is the only symptom. No fallback, no auto-rewrite.
     pub(super) async fn resolve_rlm_subagent_model(
         self: &Arc<Self>,
         reference: Option<&str>,
@@ -3233,31 +3299,34 @@ impl AgentSession {
     ) -> Result<RlmSubagentModelSelection, String> {
         let parent_model = self.model().ok_or_else(format_no_model_selected_message)?;
         let Some(reference) = reference else {
-            return Ok(RlmSubagentModelSelection {
-                model: parent_model,
-            });
+            let authenticated = self.authenticated_rlm_models().await;
+            return occ3_twin_guarded_selection(parent_model, target, &authenticated);
         };
         let normalized_reference = reference.to_lowercase();
         let parent_selector =
             format!("{}/{}", parent_model.provider, parent_model.id).to_lowercase();
         if parent_selector == normalized_reference {
-            return Ok(RlmSubagentModelSelection {
-                model: parent_model,
-            });
+            let authenticated = self.authenticated_rlm_models().await;
+            return occ3_twin_guarded_selection(parent_model, target, &authenticated);
         }
-        let model = self
-            .authenticated_rlm_models()
-            .await
-            .into_iter()
+        let authenticated = self.authenticated_rlm_models().await;
+        let model = authenticated
+            .iter()
             .find(|candidate| {
                 format!("{}/{}", candidate.provider, candidate.id).to_lowercase()
                     == normalized_reference
-            });
+            })
+            .cloned();
         let Some(model) = model else {
-            return Err(format!(
-                "Requested {target} model \"{reference}\" is unavailable, unauthenticated, or expired"
+            return Err(format_unavailable_rlm_model_message(
+                reference,
+                target,
+                &authenticated,
             ));
         };
+        if let Some(error) = occ3_twin_error(&model, target, &authenticated) {
+            return Err(error);
+        }
         let request_model = model.clone();
         let registry = self.model_registry.clone();
         let auth = crate::core::sdk::with_model_registry(registry, move |registry| {
@@ -3393,6 +3462,7 @@ impl AgentSession {
 
     /// `_isRetryableError(message)` (agent-session.ts:12000-12019).
     pub(super) fn is_retryable_error(&self, message: &AssistantMessage) -> bool {
+        if self.textmas_failure().is_some() { return false; }
         if message.stop_reason != STOP_REASON_ERROR || message.error_message.is_none() {
             return false;
         }
@@ -3801,12 +3871,23 @@ impl AgentSession {
     /// All observers await the same deferred; only the retry owner clears its slot.
     /// A waiter never consumes pending state or resurrects a settled generation.
     pub(super) async fn wait_for_retry(&self) {
-        let promise = { self.retry_promise.lock().unwrap().clone() };
-        let Some(promise) = promise else {
-            return;
-        };
-        let _ = promise.wait().await;
-        self.agent.wait_for_idle().await;
+        if let Some(settled) = self.retry_settled_future() {
+            settled.await;
+        }
+    }
+
+    /// The `wait_for_retry` wait as an owned future, or `None` when no
+    /// retry is pending. It owns only the cloned retry deferred and the
+    /// agent handle, never the session, so a detached waiter can drop its
+    /// session reference before awaiting and the session can be freed
+    /// while the wait is still in progress.
+    pub(super) fn retry_settled_future(&self) -> Option<BoxFuture<()>> {
+        let promise = self.retry_promise.lock().unwrap().clone()?;
+        let agent = Arc::clone(&self.agent);
+        Some(Box::pin(async move {
+            let _ = promise.wait().await;
+            agent.wait_for_idle().await;
+        }))
     }
 
     /// `get isRetrying()`.
@@ -4460,6 +4541,14 @@ impl AgentSession {
                 total_cost += assistant.usage.cost.total;
             }
         }
+        let mut textmas = crate::core::occ::textmas::TextMasUsageLedger::default();
+        for record in entries.iter().filter_map(crate::core::occ::textmas::usage_record) { textmas.observe(record); }
+        let auxiliary = textmas.total();
+        total_input += auxiliary.input;
+        total_output += auxiliary.output;
+        total_cache_read += auxiliary.cache_read;
+        total_cache_write += auxiliary.cache_write;
+        total_cost += auxiliary.cost.total;
         SessionStats {
             session_file: self.session_file(),
             session_id: self.session_id(),
@@ -4476,6 +4565,7 @@ impl AgentSession {
                 total: total_input + total_output + total_cache_read + total_cache_write,
             },
             cost: total_cost,
+            textmas_usage: textmas.summary(),
             context_usage: self.get_context_usage().map(|usage| {
                 crate::core::session_stats::ContextUsage {
                     tokens: usage.tokens,

@@ -2332,6 +2332,7 @@ struct SessionScanAccumulator {
     assistant_usage_by_id: BTreeMap<String, Usage>,
     attributed_child_usage: Usage,
     summarization_usage: Usage,
+    textmas_usage: crate::core::occ::textmas::TextMasUsageLedger,
 }
 
 struct SessionScanState {
@@ -2404,7 +2405,7 @@ fn drop_session_scan_state(file_path: &str) {
 /// Refresh LRU recency and enforce the retained-usage bound.
 fn store_session_scan_state(file_path: &str, mut state: SessionScanState) {
     drop_session_scan_state(file_path);
-    state.accounted_usage_entries = state.acc.assistant_usage_by_id.len();
+    state.accounted_usage_entries = state.acc.assistant_usage_by_id.len().saturating_add(state.acc.textmas_usage.len());
     let accounted = state.accounted_usage_entries;
     let mut store = session_scan_store()
         .lock()
@@ -2438,6 +2439,7 @@ fn create_session_scan_accumulator() -> SessionScanAccumulator {
         assistant_usage_by_id: BTreeMap::new(),
         attributed_child_usage: empty_usage(),
         summarization_usage: empty_usage(),
+        textmas_usage: Default::default(),
     }
 }
 
@@ -2503,6 +2505,7 @@ async fn scan_session_info(file_path: &str, retry_on_replacement: bool) -> Optio
                 assistant_usage_by_id: state.acc.assistant_usage_by_id.clone(),
                 attributed_child_usage: state.acc.attributed_child_usage.clone(),
                 summarization_usage: state.acc.summarization_usage.clone(),
+                textmas_usage: state.acc.textmas_usage.clone(),
             },
             info: state.info.clone(),
             accounted_usage_entries: state.accounted_usage_entries,
@@ -2594,6 +2597,7 @@ fn clone_scan_state(state: &SessionScanState) -> SessionScanState {
             assistant_usage_by_id: state.acc.assistant_usage_by_id.clone(),
             attributed_child_usage: state.acc.attributed_child_usage.clone(),
             summarization_usage: state.acc.summarization_usage.clone(),
+            textmas_usage: state.acc.textmas_usage.clone(),
         },
         info: state.info.clone(),
         accounted_usage_entries: state.accounted_usage_entries,
@@ -2720,6 +2724,9 @@ fn fold_session_scan_line(acc: &mut SessionScanAccumulator, line_buffer: &[u8]) 
         _ => return,
     };
 
+    if let Some(record) = crate::core::occ::textmas::usage_record(&entry) {
+        acc.textmas_usage.observe(record);
+    }
     if entry_type(&entry) == "session_info" {
         let name = entry
             .get("name")
@@ -2842,6 +2849,7 @@ fn snapshot_session_info(
         add_assistant_usage(&mut usage_total, usage);
     }
     add_assistant_usage(&mut usage_total, &acc.summarization_usage);
+    add_assistant_usage(&mut usage_total, &acc.textmas_usage.total());
     subtract_assistant_usage(&mut usage_total, &acc.attributed_child_usage);
     let cwd = header
         .get("cwd")
@@ -2897,6 +2905,7 @@ fn clone_accumulator(acc: &SessionScanAccumulator) -> SessionScanAccumulator {
         assistant_usage_by_id: acc.assistant_usage_by_id.clone(),
         attributed_child_usage: acc.attributed_child_usage.clone(),
         summarization_usage: acc.summarization_usage.clone(),
+        textmas_usage: acc.textmas_usage.clone(),
     }
 }
 
@@ -3715,6 +3724,31 @@ pub struct SessionManager {
 }
 
 impl SessionManager {
+    /// Snapshot an in-memory manager before a fallible replacement build. The
+    /// candidate owns its mutations and listener list; failure leaves the live
+    /// manager and its observers byte-for-byte untouched.
+    pub fn clone_for_nonpersisted_replacement(&self) -> Self {
+        assert!(!self.persist, "only non-persisted managers can be cloned transactionally");
+        Self {
+            session_id: self.session_id.clone(),
+            session_file: self.session_file.clone(),
+            session_dir: self.session_dir.clone(),
+            cwd: self.cwd.clone(),
+            persist: self.persist,
+            flushed: self.flushed,
+            file_entries: self.file_entries.clone(),
+            by_id: self.by_id.clone(),
+            labels_by_id: self.labels_by_id.clone(),
+            label_timestamps_by_id: self.label_timestamps_by_id.clone(),
+            leaf_id: self.leaf_id.clone(),
+            persist_listeners: Arc::new(Mutex::new(Vec::new())),
+            load_observation: self.load_observation,
+            persist_write_epoch: self.persist_write_epoch,
+            rlm_delivery_synced_epoch: self.rlm_delivery_synced_epoch,
+            write_buffer: None,
+        }
+    }
+
     fn new_internal(
         cwd: String,
         session_dir: String,
@@ -4907,6 +4941,22 @@ impl SessionManager {
 
     pub fn get_entry(&self, id: &str) -> Option<SessionEntry> {
         self.by_id.get(id).cloned()
+    }
+
+    /// True when a custom_message entry of this type carrying this
+    /// `noticeId` (in its details) already exists. Full-history scan with
+    /// no window and no clones: delivery dedup must be exact, not
+    /// probabilistic. Read-only.
+    pub fn has_custom_message_notice(&self, custom_type: &str, notice_id: &str) -> bool {
+        self.by_id.values().any(|entry| {
+            entry_type(entry) == "custom_message"
+                && entry.get("customType").and_then(Value::as_str) == Some(custom_type)
+                && entry
+                    .get("details")
+                    .and_then(|details| details.get("noticeId"))
+                    .and_then(Value::as_str)
+                    == Some(notice_id)
+        })
     }
 
     pub fn get_children(&self, parent_id: &str) -> Vec<SessionEntry> {
