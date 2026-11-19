@@ -3067,6 +3067,25 @@ fn env_stamp(cli: &Cli) -> Value {
     })
 }
 
+fn runtime_stamp() -> Value {
+    let available = std::thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(1);
+    json!({
+        "charcount": {
+            "requested_mode": std::env::var("PRIME_AGENT_COMPACT_RUST_COUNT").unwrap_or_else(|_| "auto".to_string()),
+            "effective_backend": pi_coding_agent::core::compaction::charcount::backend().name(),
+            "dispatch_diagnostic": pi_coding_agent::core::compaction::charcount::diagnostic(),
+        },
+        "parallel": {
+            "requested_mode": std::env::var("PRIME_AGENT_COMPACTION_PARALLEL").unwrap_or_else(|_| "auto".to_string()),
+            "available_parallelism": available,
+            "effective_workers": available.min(6),
+            "fallback_count": pi_coding_agent::core::compaction::parallel::parallel_fallback_count(),
+        }
+    })
+}
+
 
 
 fn reopen_expectation_value<'a>(expected: &'a Value, pointer: &str) -> Result<&'a str, String> {
@@ -3681,6 +3700,7 @@ async fn run_replay(cli: &Cli) -> Result<i32, String> {
         "subcommand": "replay",
         "schema": 1,
         "env": env_stamp(cli),
+        "runtime": runtime_stamp(),
         "config": {
             "provider_delay_ms": options.provider_delay_ms,
             "summary_failure": options.summary_failure,
@@ -3694,7 +3714,7 @@ async fn run_replay(cli: &Cli) -> Result<i32, String> {
         "cases": case_results,
         "failures": failures,
     });
-    write_json(&out, &output)?;
+    write_new_json(&out, &output)?;
     println!("wrote {} ({} cases, {} failures)", out.display(), output["case_count"], failures.len());
     if failures.is_empty() {
         Ok(0)
@@ -4175,6 +4195,7 @@ fn run_bench_local(cli: &Cli) -> Result<i32, String> {
         "subcommand": "bench-local",
         "schema": 1,
         "env": env_stamp(cli),
+        "runtime": runtime_stamp(),
         "config": {
             "iters": iters,
             "warmup": warmup,
@@ -4190,7 +4211,7 @@ fn run_bench_local(cli: &Cli) -> Result<i32, String> {
         "parity_gate": "verify-local; scalar checksums are auxiliary only",
         "cases": results,
     });
-    write_json(&out, &output)?;
+    write_new_json(&out, &output)?;
     println!("wrote {}", out.display());
     Ok(0)
 }
