@@ -1,0 +1,14 @@
+{
+    "schema": 1,
+    "name": "pre-turn-user-last",
+    "class": "ascii",
+    "file": "transcript.json",
+    "bytes": 1582,
+    "chars": 901,
+    "message_count": 21,
+    "tool_call_messages": 0,
+    "tool_results": 0,
+    "keep_recent_tokens_hint": 64.0,
+    "threshold_tokens_at_defaults": 250000.0,
+    "content_class": "ascii"
+}

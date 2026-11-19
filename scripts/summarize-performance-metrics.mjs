@@ -45,6 +45,7 @@ const MEASUREMENTS = new Set([
 	"dispatch_to_first_text_ms",
 	"dispatch_to_network_terminal_ms",
 	"local_drain_ms",
+	"streaming_ms",
 	"transport_websocket",
 	"local_gateway_wait_ms",
 	"upstream_wait_ms",

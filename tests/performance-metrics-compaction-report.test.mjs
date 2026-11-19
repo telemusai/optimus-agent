@@ -18,9 +18,9 @@ test("reports compaction phases and keeps summary attempts separate from ordinar
 			record("compaction_history", "compaction", undefined),
 			record("provider_attempt", "compaction", undefined, { attempt_ordinal: 1 }),
 			record("provider_attempt", "compaction", "started", { attempt_ordinal: 1 }),
-			record("provider_attempt", "compaction", "success", { total_ms: 600, dispatch_to_network_terminal_ms: 590, attempt_ordinal: 1 }),
+			record("provider_attempt", "compaction", "success", { total_ms: 600, dispatch_to_network_terminal_ms: 590, streaming_ms: 570, attempt_ordinal: 1 }),
 			record("compaction_history", "compaction", "success", { total_ms: 610 }),
-			record("provider_attempt", "provider", "success", { total_ms: 30 }),
+			record("provider_attempt", "provider", "success", { total_ms: 30, streaming_ms: 20 }),
 			record("session_input", "session", "success", { queue_ms: 50, input_agent_message: 1 }),
 		];
 		writeFileSync(join(directory, "performance-v1-isolated.jsonl"), rows.map((row) => JSON.stringify(row)).join("\n") + "\n");
@@ -32,6 +32,8 @@ test("reports compaction phases and keeps summary attempts separate from ordinar
 		assert.equal(Object.values(report.measurements.providerAttemptsByIdentity)[0].total_ms.mean, 30);
 		assert.equal(Object.values(report.measurements.compactionAttemptsByIdentity)[0].total_ms.mean, 600);
 		assert.equal(Object.values(report.measurements.compactionAttemptsByIdentity)[0].dispatch_to_network_terminal_ms.mean, 590);
+		assert.equal(Object.values(report.measurements.compactionAttemptsByIdentity)[0].streaming_ms.mean, 570);
+		assert.equal(Object.values(report.measurements.providerAttemptsByIdentity)[0].streaming_ms.mean, 20);
 		assert.equal(report.measurements.byOperation.session_input.input_agent_message.sum, 1);
 	} finally {
 		rmSync(directory, { recursive: true, force: true });

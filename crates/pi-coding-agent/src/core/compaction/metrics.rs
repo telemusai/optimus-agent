@@ -192,6 +192,9 @@ struct RequestState {
     tool: Option<f64>,
     text: Option<f64>,
     terminal: Option<f64>,
+    first_generated: Option<f64>,
+    last_generated: Option<f64>,
+    generated_clock_invalid: bool,
     websocket: Option<f64>,
     usage: Option<PerformanceMetricUsageV1>,
 }
@@ -270,6 +273,16 @@ impl CompactionRequestMetrics {
                         state.websocket = Some(1.0);
                     }
                 } else {
+                    if matches!(stage, "thinking" | "tool" | "text") {
+                        let now = safe_now(recorder.as_ref()).unwrap_or(f64::NAN);
+                        if !now.is_finite()
+                            || state.last_generated.is_some_and(|previous| now < previous)
+                        {
+                            state.generated_clock_invalid = true;
+                        }
+                        state.first_generated.get_or_insert(now);
+                        state.last_generated = Some(now);
+                    }
                     let slot = match stage {
                         "raw_event" => Some(&mut state.first_raw),
                         "thinking" => Some(&mut state.thinking),
@@ -314,6 +327,11 @@ impl CompactionRequestMetrics {
 
     fn capture(&mut self, message: Option<&AssistantMessage>) {
         if let Ok(state) = self.state.lock() {
+            let started_at = self.phase.started_at;
+            self.phase.measurement(
+                Measurement::WaitMs,
+                elapsed_metric_ms(started_at, state.dispatch),
+            );
             for (key, at) in [
                 (Measurement::DispatchToResponseHeadersMs, state.headers),
                 (Measurement::DispatchToFirstRawMs, state.first_raw),
@@ -325,6 +343,14 @@ impl CompactionRequestMetrics {
                 self.phase
                     .measurement(key, elapsed_metric_ms(state.dispatch, at));
             }
+            let streaming_ms = if state.generated_clock_invalid {
+                None
+            } else {
+                elapsed_metric_ms(state.first_generated, state.last_generated)
+                    .filter(|elapsed| *elapsed > 0.0)
+            };
+            self.phase
+                .measurement(Measurement::StreamingMs, streaming_ms);
             self.phase.measurement(
                 Measurement::LocalDrainMs,
                 elapsed_metric_ms(
