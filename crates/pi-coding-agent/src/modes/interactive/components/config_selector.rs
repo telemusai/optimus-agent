@@ -923,7 +923,8 @@ impl Component for ResourceList {
             }
             return;
         }
-        if data == " " || kb.matches(data, "tui.select.confirm") {
+        let space_toggles = data == " " && self.search_input.get_value().is_empty();
+        if space_toggles || kb.matches(data, "tui.select.confirm") {
             let entry = self.filtered_items.get(self.selected_index).cloned();
             if let Some(FlatEntry::Item { mut item }) = entry {
                 let new_enabled = !item.enabled;
@@ -1372,6 +1373,53 @@ mod tests {
         assert_eq!(recorded.len(), 2);
         assert_eq!(recorded[0].0, recorded[1].0);
         assert!(recorded[1].1, "the same item toggles back to enabled");
+    }
+
+    #[test]
+    fn active_search_inserts_spaces_but_enter_still_toggles_package_and_top_level_items() {
+        for package in [true, false] {
+            let mut input = paths();
+            if package {
+                input.extensions.clear();
+                input.skills.clear();
+                input.themes.clear();
+                input.prompts[0].path = "/pkg/prompts/my note.md".into();
+            } else {
+                input.extensions[0].path = "/agent/extensions/my item/index.ts".into();
+                input.skills.clear();
+                input.prompts.clear();
+                input.themes.clear();
+            }
+            let mut settings = serde_json::Map::new();
+            if package {
+                settings.insert("packages".into(), serde_json::json!(["npm:thing"]));
+            }
+            let mut list = ResourceList::new(
+                build_groups(&input),
+                SettingsManager::in_memory(settings),
+                "/work".to_string(),
+                "/agent".to_string(),
+            );
+            let toggled = Rc::new(RefCell::new(0usize));
+            let sink = Rc::clone(&toggled);
+            list.on_toggle = Some(Box::new(move |_item, _enabled| *sink.borrow_mut() += 1));
+            let settings_before = list.settings_manager.get_global_settings();
+
+            for ch in "my".chars() {
+                list.handle_input(&ch.to_string());
+            }
+            list.handle_input(" ");
+
+            assert_eq!(list.search_input.get_value(), "my ");
+            assert_eq!(*toggled.borrow(), 0);
+            assert_eq!(list.settings_manager.get_global_settings(), settings_before);
+
+            list.handle_input("\u{7f}");
+            assert_eq!(list.search_input.get_value(), "my");
+            list.handle_input("\r");
+            assert_eq!(*toggled.borrow(), 1, "Enter remains intentional activation");
+            assert_ne!(list.settings_manager.get_global_settings(), settings_before);
+        }
     }
 
     #[test]

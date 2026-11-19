@@ -768,6 +768,7 @@ impl TreeList {
         label: Option<String>,
         label_timestamp: Option<String>,
     ) {
+        let mut updated = false;
         for flat_node in self.flat_nodes.iter_mut() {
             if flat_node.node.entry.id() == entry_id {
                 flat_node.node.label = label.clone();
@@ -775,8 +776,14 @@ impl TreeList {
                     Some(_) => Some(label_timestamp.unwrap_or_else(|| now_iso8601())),
                     None => None,
                 };
+                updated = true;
                 break;
             }
+        }
+        if updated {
+            // label changes can alter both search matches and labeled-only
+            // membership, so the visible projection is stale until rebuilt.
+            self.apply_filter();
         }
     }
 
@@ -2201,6 +2208,45 @@ mod linear_storage_tests {
             assert_eq!(list.selected_index(), 0);
             assert!(list.render(40.0).iter().any(|line| line.contains("No entries found")));
         }
+    }
+
+    #[test]
+    fn label_save_rebuilds_labeled_projection_selection_and_activation() {
+        crate::modes::interactive::theme::theme::init_theme(Some("prime"), false);
+        let nodes = vec![custom_node("node-0"), custom_node("node-1")];
+        let mut list = TreeList::new(&nodes, None, 10, None, Some("labeled-only"));
+        assert!(list.filtered_nodes.is_empty());
+        let activated = Rc::new(RefCell::new(Vec::<String>::new()));
+        let sink = Rc::clone(&activated);
+        list.on_select = Some(Box::new(move |id| sink.borrow_mut().push(id.to_string())));
+
+        list.update_node_label("node-1", Some("fresh label".into()), None);
+        assert_eq!(list.filtered_nodes.len(), 1);
+        assert_eq!(list.get_selected_node().unwrap().entry.id(), "node-1");
+        assert!(list.render(100.0).join("\n").contains("fresh label"));
+
+        list.update_node_label("node-1", Some("renamed now".into()), None);
+        let rendered = list.render(100.0).join("\n");
+        assert!(rendered.contains("renamed now"));
+        assert!(!rendered.contains("fresh label"));
+
+        list.update_node_label("node-0", Some("fallback".into()), None);
+        assert_eq!(list.filtered_nodes.len(), 2);
+        assert_eq!(list.get_selected_node().unwrap().entry.id(), "node-1");
+        list.update_node_label("node-1", None, None);
+        assert_eq!(list.filtered_nodes.len(), 1);
+        assert_eq!(list.get_selected_node().unwrap().entry.id(), "node-0");
+        list.handle_input("\r");
+        assert_eq!(activated.borrow().as_slice(), ["node-0"]);
+
+        list.update_node_label("node-0", None, None);
+        assert!(list.filtered_nodes.is_empty());
+        list.handle_input("\r");
+        assert_eq!(
+            activated.borrow().as_slice(),
+            ["node-0"],
+            "an empty projection cannot activate a stale row"
+        );
     }
 
     #[test]

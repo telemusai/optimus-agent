@@ -1622,7 +1622,10 @@ fn open_external_editor_for(
         );
         return;
     };
-    let current_text = editor.borrow().editor().get_text().to_string();
+    let current_text =
+        crate::modes::interactive::components::extension_editor::external_editor_draft(
+            editor.borrow().editor(),
+        );
     let tmp_file = std::env::temp_dir().join(format!("pi-editor-{}.pi.md", now_ms()));
     let mut command = match crate::modes::interactive::components::extension_editor::external_editor_command(
         &editor_cmd,
@@ -1643,11 +1646,10 @@ fn open_external_editor_for(
     match command.status() {
         Ok(status) if status.success() => match std::fs::read_to_string(&tmp_file) {
             Ok(content) => {
-                let new_content =
-                    crate::modes::interactive::components::extension_editor::strip_trailing_newline(
-                        &content,
-                    );
-                editor.borrow_mut().editor_mut().set_text(&new_content);
+                crate::modes::interactive::components::extension_editor::apply_external_editor_content(
+                    &mut *editor.borrow_mut().editor_mut(),
+                    &content,
+                );
             }
             Err(error) => mode
                 .borrow_mut()
@@ -3600,7 +3602,9 @@ async fn run_terminal(
             bridge.footer_data.set_cwd(&mode.borrow().get_current_cwd());
             bridge.footer_data.set_available_provider_count(models.iter().map(|m| &m.provider).collect::<std::collections::HashSet<_>>().len());
         }
-        queue_runtime.poll();
+        if queue_runtime.poll() {
+            ui.borrow_mut().request_render();
+        }
         if state_refresh.poll(&mode, &current_session_id) {
             ui.borrow_mut().request_render();
         }
@@ -8262,6 +8266,56 @@ fn apply_event_legacy_for_speed(
             pasted,
             "the paste table is restored, so the marker expands again"
         );
+    }
+
+    #[test]
+    fn native_external_editor_round_trip_expands_large_pastes_before_final_submission() {
+        let tui = Rc::new(RefCell::new(TUI::new(
+            Box::new(pi_tui::terminal::ProcessTerminal::new()),
+            None,
+        )));
+        let editor = Rc::new(RefCell::new(CustomEditor::new(
+            tui,
+            editor_theme(),
+            CustomEditorOptions::default(),
+        )));
+        let pasted = (1..=12)
+            .map(|line| if line == 2 { "[paste #1]".into() } else { format!("line {line}") })
+            .collect::<Vec<String>>()
+            .join("\n");
+        pi_tui::tui::Component::handle_input(
+            &mut *editor.borrow_mut().editor_mut(),
+            &format!("\u{1b}[200~{pasted}\u{1b}[201~"),
+        );
+        assert_eq!(editor.borrow().editor().get_text(), "[paste #1 +12 lines]");
+        assert_eq!(
+            editor.borrow().editor().get_paste_snapshot().pastes.len(),
+            1
+        );
+
+        let draft = crate::modes::interactive::components::extension_editor::external_editor_draft(
+            editor.borrow().editor(),
+        );
+        assert_eq!(draft, pasted);
+        crate::modes::interactive::components::extension_editor::apply_external_editor_content(
+            &mut *editor.borrow_mut().editor_mut(),
+            &format!("{draft}\n"),
+        );
+        assert_eq!(editor.borrow().editor().get_expanded_text(), draft);
+        assert!(editor
+            .borrow()
+            .editor()
+            .get_paste_snapshot()
+            .pastes
+            .is_empty());
+
+        let edited = format!("{draft}\nexternal append\n[paste #1]");
+        crate::modes::interactive::components::extension_editor::apply_external_editor_content(
+            &mut *editor.borrow_mut().editor_mut(),
+            &format!("{edited}\n"),
+        );
+        let final_submission = editor.borrow().editor().get_expanded_text();
+        assert_eq!(final_submission, edited);
     }
 
     fn compaction_notice_end(error: Option<&str>, committed: bool, aborted: bool) -> wire::AgentConnectionSessionEvent {

@@ -199,7 +199,10 @@ impl QueueRuntime {
         });
     }
 
-    pub(super) fn poll(&mut self) {
+    pub(super) fn poll(&mut self) -> bool {
+        let before_editor = self.editor.borrow().editor().get_text();
+        let before_selection = self.mode.borrow().queue_selection.selected().cloned();
+        let before_queue = self.mode.borrow().get_connection_queue();
         let session = self
             .mode
             .borrow()
@@ -323,6 +326,9 @@ impl QueueRuntime {
             }
         }
         self.start_next();
+        before_editor != self.editor.borrow().editor().get_text()
+            || before_selection != self.mode.borrow().queue_selection.selected().cloned()
+            || before_queue != self.mode.borrow().get_connection_queue()
     }
 }
 
@@ -1093,11 +1099,12 @@ mod tests {
 
     /// Waits for a predicate on the polling loop, then polls once more so the
     /// runtime observes the reply.
-    async fn settle(harness: &mut Harness, predicate: impl Fn(&Harness) -> bool) {
+    async fn settle(harness: &mut Harness, predicate: impl Fn(&Harness) -> bool) -> bool {
+        let mut visible_change = false;
         for _ in 0..2_000 {
-            harness.runtime.poll();
+            visible_change |= harness.runtime.poll();
             if predicate(harness) {
-                return;
+                return visible_change;
             }
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
@@ -1221,7 +1228,15 @@ mod tests {
 
         // Now the late reply lands with its stale snapshot.
         release.send(()).unwrap();
-        settle(&mut harness, |h| !h.pending()).await;
+        let visible_change = settle(&mut harness, |h| !h.pending()).await;
+        assert!(
+            visible_change,
+            "the stale successful edit reset must request an immediate frame"
+        );
+        assert!(
+            !harness.runtime.poll(),
+            "a settled no-op poll must not repaint"
+        );
 
         // The newer state must survive: the stale snapshot must not restore
         // ["s2", "s1"] and the selection must drop because "s2" is gone.
@@ -1284,6 +1299,30 @@ mod tests {
             .statuses()
             .iter()
             .any(|line| line.contains("Queue changed; reorder not applied")));
+    }
+
+    #[test]
+    fn poll_signals_a_real_session_reset_once_and_then_stays_quiet() {
+        let mut harness = harness((&["s1"], &[]));
+        browse_to_follow_up(&mut harness, "draft");
+        harness.set_editor_text("s1");
+        harness.mode.borrow_mut().apply_connection_state_snapshot(
+            crate::modes::interactive::interactive_mode_services::AgentConnectionState {
+                session_id: "s2".into(),
+                active_session_id: Some("active-s2".into()),
+                ..Default::default()
+            },
+        );
+
+        assert!(
+            harness.runtime.poll(),
+            "dropping the visible queue selection is a frame change"
+        );
+        assert!(!harness.is_browsing());
+        assert!(
+            !harness.runtime.poll(),
+            "the same settled state must not request another frame"
+        );
     }
 
     /// A session switch must drop the selection, the stash and any queued

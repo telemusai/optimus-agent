@@ -203,7 +203,7 @@ impl ExtensionEditorComponent {
         };
         self.set_external_editor_error(String::new());
 
-        let current_text = self.editor.borrow().get_text();
+        let current_text = external_editor_draft(&self.editor.borrow());
         let tmp_file =
             std::env::temp_dir().join(format!("pi-extension-editor-{}.md", now_millis()));
         let mut command = match external_editor_command(&editor_cmd, &tmp_file) {
@@ -224,8 +224,7 @@ impl ExtensionEditorComponent {
         match command.status() {
             Ok(status) if status.success() => match std::fs::read_to_string(&tmp_file) {
                 Ok(content) => {
-                    let new_content = strip_trailing_newline(&content);
-                    self.editor.borrow_mut().set_text(&new_content);
+                    apply_external_editor_content(&mut self.editor.borrow_mut(), &content);
                 }
                 Err(error) => {
                     error_message = Some(format!("Could not read the editor draft: {error}"));
@@ -256,6 +255,26 @@ impl ExtensionEditorComponent {
         };
         self.external_editor_error.borrow_mut().set_text(text);
     }
+}
+
+/// External editors must receive the submitted content, not the collapsed
+/// paste markers used for terminal layout.
+pub(in crate::modes::interactive) fn external_editor_draft(editor: &Editor) -> String {
+    editor.get_expanded_text()
+}
+
+pub(in crate::modes::interactive) fn apply_external_editor_content(
+    editor: &mut Editor,
+    content: &str,
+) {
+    let new_content = strip_trailing_newline(content);
+    editor.set_text(&new_content);
+    // The returned draft is already expanded. Keeping the old registry could
+    // re-expand literal marker text present in that draft or typed afterward.
+    editor.restore_paste_snapshot(pi_tui::editor_component::EditorPasteSnapshot {
+        pastes: Vec::new(),
+        paste_counter: 0,
+    });
 }
 
 pub(in crate::modes::interactive) fn external_editor_command(
@@ -419,6 +438,64 @@ mod tests {
         assert!(parse_editor_command_for("\"unterminated", true).is_err());
         assert!(parse_editor_command_for("\"unterminated", false).is_err());
         assert!(external_editor_command("   ", Path::new("draft.md")).is_err());
+    }
+
+    #[test]
+    fn external_draft_expands_large_pastes_and_survives_edit_and_submit() {
+        crate::modes::interactive::theme::theme::init_theme(Some("prime"), false);
+        let tui = Rc::new(RefCell::new(TUI::new(
+            Box::new(pi_tui::terminal::ProcessTerminal::new()),
+            None,
+        )));
+        let mut editor = Editor::new(
+            tui,
+            to_tui_editor_theme(get_editor_theme()),
+            EditorOptions::default(),
+        );
+        let pasted = (1..=12)
+            .map(|line| {
+                if line == 2 {
+                    "[paste #1]".into()
+                } else {
+                    format!("line {line}")
+                }
+            })
+            .collect::<Vec<String>>()
+            .join("\n");
+        pi_tui::tui::Component::handle_input(
+            &mut editor,
+            &format!("\u{1b}[200~{pasted}\u{1b}[201~"),
+        );
+        assert_eq!(editor.get_text(), "[paste #1 +12 lines]");
+        assert_eq!(editor.get_paste_snapshot().pastes.len(), 1);
+
+        let draft = external_editor_draft(&editor);
+        assert_eq!(draft, pasted, "the file draft must not contain a marker");
+
+        apply_external_editor_content(&mut editor, &format!("{draft}\n"));
+        assert_eq!(
+            editor.get_expanded_text(),
+            draft,
+            "literal markers must survive an unchanged draft"
+        );
+        assert!(editor.get_paste_snapshot().pastes.is_empty());
+
+        let edited = format!("{draft}\nexternal append\n[paste #1]");
+        apply_external_editor_content(&mut editor, &format!("{edited}\n"));
+        assert_eq!(
+            editor.get_expanded_text(),
+            edited,
+            "new literal markers must not self-expand"
+        );
+        assert_eq!(editor.get_paste_snapshot().paste_counter, 0);
+
+        let submitted = Rc::new(RefCell::new(None::<String>));
+        let submitted_slot = Rc::clone(&submitted);
+        editor.on_submit = Some(Box::new(move |text| {
+            *submitted_slot.borrow_mut() = Some(text.to_string());
+        }));
+        pi_tui::tui::Component::handle_input(&mut editor, "\r");
+        assert_eq!(submitted.borrow().as_deref(), Some(edited.as_str()));
     }
 }
 
