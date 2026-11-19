@@ -290,7 +290,8 @@ async fn scenario_k_partial_tool_call_then_stream_error_never_executes_the_tool(
     .expect("the interrupted run must terminate");
     let produced = tokio::time::timeout(Duration::from_secs(30), stream.result())
         .await
-        .expect("the interrupted run must publish its transcript");
+        .expect("the interrupted run must publish its transcript")
+        .expect("the interrupted run must end with a transcript result, not without one");
 
     // The tool never ran, and no side effect reached the filesystem.
     assert_eq!(calls.load(Ordering::SeqCst), 0, "the incomplete tool call must not execute");
