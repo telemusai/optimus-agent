@@ -103,8 +103,7 @@ pub async fn run_rpc_mode_with_connection(
         shutdown_requested: Mutex::new(false),
         shutting_down: Mutex::new(false),
         input_ended: Mutex::new(false),
-        prompt_response_pending: Mutex::new(false),
-        buffered_connection_outputs: Mutex::new(Vec::new()),
+        connection_output: RpcConnectionOutput::new(output.clone()),
         pending_connection_ui_requests: Mutex::new(HashSet::new()),
         signal_cleanup_handlers: Mutex::new(Vec::new()),
         observations: Mutex::new(HashMap::new()),
@@ -230,6 +229,86 @@ struct ActiveObservation {
     pending_events: Vec<Value>,
 }
 
+#[derive(Default)]
+struct RpcConnectionOutputState {
+    prompt_response_pending: bool,
+    buffered: Vec<Value>,
+}
+
+struct RpcConnectionOutput {
+    output: Arc<dyn Fn(Value) + Send + Sync>,
+    state: Mutex<RpcConnectionOutputState>,
+    // Serialize the pending check, append, and drain. Emit without the state lock.
+    pump_tail: Mutex<()>,
+    #[cfg(test)]
+    after_pending_read: Option<Arc<dyn Fn() + Send + Sync>>,
+}
+
+impl RpcConnectionOutput {
+    fn new(output: Arc<dyn Fn(Value) + Send + Sync>) -> Self {
+        Self {
+            output,
+            state: Mutex::new(RpcConnectionOutputState::default()),
+            pump_tail: Mutex::new(()),
+            #[cfg(test)]
+            after_pending_read: None,
+        }
+    }
+
+    fn begin_prompt(&self) {
+        let _tail = self.pump_tail.lock().expect("connection output pump poisoned");
+        self.state.lock().expect("connection output poisoned").prompt_response_pending = true;
+    }
+
+    fn finish_prompt(&self) {
+        let _tail = self.pump_tail.lock().expect("connection output pump poisoned");
+        let events = {
+            let mut state = self.state.lock().expect("connection output poisoned");
+            state.prompt_response_pending = false;
+            state.buffered.drain(..).collect::<Vec<_>>()
+        };
+        self.emit(events);
+    }
+
+    fn output_event(&self, event: Value) {
+        let _tail = self.pump_tail.lock().expect("connection output pump poisoned");
+        let events = {
+            let mut state = self.state.lock().expect("connection output poisoned");
+            let prompt_response_pending = state.prompt_response_pending;
+            #[cfg(test)]
+            if let Some(hook) = &self.after_pending_read {
+                hook();
+            }
+            state.buffered.push(event);
+            if prompt_response_pending {
+                Vec::new()
+            } else {
+                state.buffered.drain(..).collect()
+            }
+        };
+        self.emit(events);
+    }
+
+    fn flush(&self) {
+        let _tail = self.pump_tail.lock().expect("connection output pump poisoned");
+        let events = {
+            let mut state = self.state.lock().expect("connection output poisoned");
+            if state.prompt_response_pending {
+                Vec::new()
+            } else {
+                state.buffered.drain(..).collect()
+            }
+        };
+        self.emit(events);
+    }
+
+    fn emit(&self, events: Vec<Value>) {
+        for event in events {
+            (self.output)(event);
+        }
+    }
+}
+
 struct RpcModeState {
     /// Weak self-reference for the tasks that need the shared state handle.
     self_ref: Mutex<Weak<RpcModeState>>,
@@ -240,8 +319,7 @@ struct RpcModeState {
     shutdown_requested: Mutex<bool>,
     shutting_down: Mutex<bool>,
     input_ended: Mutex<bool>,
-    prompt_response_pending: Mutex<bool>,
-    buffered_connection_outputs: Mutex<Vec<Value>>,
+    connection_output: RpcConnectionOutput,
     pending_connection_ui_requests: Mutex<HashSet<String>>,
     signal_cleanup_handlers: Mutex<Vec<Arc<dyn Fn() + Send + Sync>>>,
     observations: Mutex<HashMap<String, ActiveObservation>>,
@@ -277,24 +355,7 @@ impl RpcModeState {
     }
 
     fn output_connection_event(&self, event: Value) {
-        if *self.prompt_response_pending.lock().expect("pending poisoned") {
-            self.buffered_connection_outputs
-                .lock()
-                .expect("buffered poisoned")
-                .push(event);
-            return;
-        }
-        (self.output)(event);
-    }
-
-    fn flush_connection_events(&self) {
-        let drained: Vec<Value> = {
-            let mut buffered = self.buffered_connection_outputs.lock().expect("buffered poisoned");
-            buffered.drain(..).collect()
-        };
-        for event in drained {
-            (self.output)(event);
-        }
+        self.connection_output.output_event(event);
     }
 
     async fn handle_connection_event(&self, event: AgentConnectionEvent) {
@@ -567,7 +628,7 @@ impl RpcModeState {
     async fn execute_command(self: &Arc<Self>, command: RpcCommand) {
         let is_prompt = matches!(command, RpcCommand::Prompt { .. });
         if is_prompt {
-            *self.prompt_response_pending.lock().expect("pending poisoned") = true;
+            self.connection_output.begin_prompt();
         }
         let id = command.id().map(str::to_string);
         match self.handle_command(&command).await {
@@ -586,8 +647,7 @@ impl RpcModeState {
             }
         }
         if is_prompt {
-            *self.prompt_response_pending.lock().expect("pending poisoned") = false;
-            self.flush_connection_events();
+            self.connection_output.finish_prompt();
         }
         if *self.shutdown_requested.lock().expect("shutdown poisoned") {
             self.shutdown(0).await;
@@ -605,7 +665,9 @@ impl RpcModeState {
         while self.pending_commands.load(std::sync::atomic::Ordering::SeqCst) > 0 {
             self.commands_settled.notified().await;
         }
-        match self.connection.wait_for_idle().await {
+        let idle_result = self.connection.wait_for_idle().await;
+        self.connection_output.flush();
+        match idle_result {
             Ok(()) => self.shutdown(0).await,
             Err(_) => self.shutdown(1).await,
         }
@@ -1148,4 +1210,85 @@ fn session_event_to_json(event: &AgentConnectionSessionEvent) -> Value {
 /// `output(value)` for an `RpcResponse`.
 fn response_value(response: RpcResponse) -> Value {
     serde_json::to_value(&response).unwrap_or(Value::Null)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use std::sync::{mpsc, Barrier};
+    use std::time::Duration;
+
+    fn recording_output() -> (RpcConnectionOutput, Arc<Mutex<Vec<Value>>>) {
+        let emitted = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&emitted);
+        let output = RpcConnectionOutput::new(Arc::new(move |event| {
+            sink.lock().expect("recorded output poisoned").push(event);
+        }));
+        (output, emitted)
+    }
+
+    #[test]
+    fn late_connection_output_is_flushed_without_another_prompt() {
+        let (mut output, emitted) = recording_output();
+        let pending_read = Arc::new(Barrier::new(2));
+        let append = Arc::new(Barrier::new(2));
+        output.after_pending_read = Some({
+            let pending_read = Arc::clone(&pending_read);
+            let append = Arc::clone(&append);
+            Arc::new(move || {
+                pending_read.wait();
+                append.wait();
+            })
+        });
+        let output = Arc::new(output);
+        output.begin_prompt();
+        let late = json!({"type": "late_event"});
+
+        let event_task = {
+            let output = Arc::clone(&output);
+            let late = late.clone();
+            std::thread::spawn(move || output.output_event(late))
+        };
+        pending_read.wait();
+        let (flushed_tx, flushed_rx) = mpsc::channel();
+        let flush_task = {
+            let output = Arc::clone(&output);
+            std::thread::spawn(move || {
+                output.finish_prompt();
+                flushed_tx.send(()).expect("flush receiver dropped");
+            })
+        };
+        let flushed_before_append = flushed_rx.recv_timeout(Duration::from_millis(50)).is_ok();
+        append.wait();
+        event_task.join().expect("event task panicked");
+        flush_task.join().expect("flush task panicked");
+
+        assert!(!flushed_before_append, "prompt flush passed the pending append");
+        assert_eq!(*emitted.lock().expect("recorded output poisoned"), vec![late]);
+        let state = output.state.lock().expect("connection output poisoned");
+        assert!(state.buffered.is_empty());
+        assert!(!state.prompt_response_pending);
+    }
+
+    #[test]
+    fn eof_flush_drains_buffered_connection_output_in_order() {
+        let (output, emitted) = recording_output();
+        let first = json!({"sequence": 1});
+        let second = json!({"sequence": 2});
+        output.begin_prompt();
+        output.output_event(first.clone());
+        output.output_event(second.clone());
+        assert!(emitted.lock().expect("recorded output poisoned").is_empty());
+
+        // Reproduce the stranded buffer left by the former separate-lock race.
+        output.state.lock().expect("connection output poisoned").prompt_response_pending = false;
+        output.flush();
+
+        assert_eq!(
+            *emitted.lock().expect("recorded output poisoned"),
+            vec![first, second]
+        );
+        assert!(output.state.lock().expect("connection output poisoned").buffered.is_empty());
+    }
 }

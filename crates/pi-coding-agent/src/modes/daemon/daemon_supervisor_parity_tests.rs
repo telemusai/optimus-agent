@@ -122,6 +122,8 @@ impl SupervisorFixture {
             id: Mutex::new(identity.clone()),
             protocol_id: Mutex::new(None),
             subscriptions: Mutex::new(HashSet::new()),
+            attach_epoch: AtomicU64::new(0),
+            attach_memberships: Mutex::new(HashMap::new()),
             supports_extension_ui: AtomicBool::new(false),
             pause_epoch: AtomicU64::new(0),
             output: sender.clone(),
@@ -249,6 +251,7 @@ pub(super) fn add_descriptor_only_worker(
     let worker = Arc::new(Worker {
         descriptor: Mutex::new(descriptor),
         client: Mutex::new(None),
+        subscribed_client: Mutex::new(None),
         roster_epoch: AtomicU64::new(0),
         roster_stale: AtomicBool::new(false),
         last_frame_at: Mutex::new(None),
@@ -260,6 +263,8 @@ pub(super) fn add_descriptor_only_worker(
         deferred_recovery_rounds: AtomicU64::new(0),
         promoted_owner_client_id: Mutex::new(None),
         heartbeat_snapshot: Mutex::new(HeartbeatSnapshot::default()),
+        #[cfg(test)]
+        root_descriptor_sync_pause: Mutex::new(None),
     });
     fixture
         .supervisor
@@ -542,6 +547,7 @@ async fn t09_timed_out_stop_finishes_cleanup() {
     let worker = Arc::new(Worker {
         descriptor: Mutex::new(descriptor.clone()),
         client: Mutex::new(None),
+        subscribed_client: Mutex::new(None),
         roster_epoch: AtomicU64::new(0),
         roster_stale: AtomicBool::new(false),
         last_frame_at: Mutex::new(None),
@@ -553,6 +559,8 @@ async fn t09_timed_out_stop_finishes_cleanup() {
         deferred_recovery_rounds: AtomicU64::new(0),
         promoted_owner_client_id: Mutex::new(None),
         heartbeat_snapshot: Mutex::new(HeartbeatSnapshot::default()),
+        #[cfg(test)]
+        root_descriptor_sync_pause: Mutex::new(None),
     });
     fixture
         .supervisor

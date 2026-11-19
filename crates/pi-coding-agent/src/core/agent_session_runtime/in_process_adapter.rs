@@ -718,12 +718,18 @@ impl InProcessRuntimeHost for InProcessRuntimeHostAdapter {
     }
 
     fn session_export_to_html(&self, output_path: Option<&str>) -> BoxFuture<Result<String, String>> {
-        let session_file = self.session().session_file();
+        let session = self.session();
+        let session_file = session.session_file();
         let output_path = output_path.map(|path| path.to_string());
         Box::pin(async move {
             let Some(session_file) = session_file else {
                 return Err("Cannot export in-memory session to HTML".to_string());
             };
+            session
+                .session_manager
+                .lock()
+                .expect("session manager poisoned")
+                .flush_now()?;
             let options = crate::core::export_html::ExportOptions {
                 output_path,
                 ..Default::default()

@@ -3669,6 +3669,47 @@ impl SessionWriteBuffer {
             .bytes
             .is_empty()
     }
+
+    /// Serialize the file publish with timed flushes, then retarget without a
+    /// second drain. The manager has already drained accepted bytes while it
+    /// excluded new appends. Holding `inner` and `path` across the rename means
+    /// a timed flush cannot observe the staged path after its inode moves.
+    fn import_handoff<T>(
+        &self,
+        new_path: &str,
+        publish: impl FnOnce() -> Result<T, String>,
+    ) -> Result<T, String> {
+        let inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut path = self
+            .path
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !inner.timed.bytes.is_empty() {
+            return Err("Import handoff found undrained candidate bytes".to_string());
+        }
+        let published = publish()?;
+        *path = new_path.to_string();
+        Ok(published)
+    }
+
+    /// Retarget after a partially completed rollback. The caller holds the
+    /// manager lock and the import handoff has already drained this buffer.
+    /// Never drain here: the inode previously named by `path` may have moved.
+    fn retarget_after_import_handoff(&self, new_path: &str) {
+        let inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        debug_assert!(inner.timed.bytes.is_empty());
+        let mut path = self
+            .path
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *path = new_path.to_string();
+    }
 }
 
 impl TimedFlush for SessionWriteBuffer {
@@ -4085,6 +4126,18 @@ impl SessionManager {
         }
     }
 
+    /// Keep accepted entries buffered for adapter visibility regressions without
+    /// changing the process-wide flush environment used by parallel tests.
+    #[cfg(test)]
+    pub(crate) fn hold_write_buffer_for_test(&mut self) {
+        let Some(path) = self.session_file.clone() else { return; };
+        let _ = self.drain_write_buffer();
+        self.write_buffer = Some(Arc::new(SessionWriteBuffer::new(
+            &path,
+            std::time::Duration::from_secs(3600),
+        )));
+    }
+
     /// Point the write buffer at a new target file. Pending bytes belong to
     /// the previous file and are flushed to it best-effort first; a failed
     /// flush drops them (bounded by one flush period of lines) rather than
@@ -4289,6 +4342,44 @@ impl SessionManager {
         self.rewrite_file()?;
         self.flushed = true;
         Ok(self.session_file.clone().unwrap_or_default())
+    }
+
+    /// Drain this manager at its current path and serialize a caller-owned
+    /// import publish with its buffer. On success both the manager and buffer
+    /// target `session_file`; on error both retain their exact old targets.
+    /// No old-path drain is permitted after the staged inode has moved.
+    pub(crate) fn import_handoff<T>(
+        &mut self,
+        session_file: &str,
+        publish: impl FnOnce() -> Result<T, String>,
+    ) -> Result<T, String> {
+        self.flush_now()?;
+        let session_file = resolve_path(session_file);
+        let published = match &self.write_buffer {
+            Some(buffer) => buffer.import_handoff(&session_file, publish)?,
+            None => publish()?,
+        };
+        self.session_file = Some(session_file);
+        Ok(published)
+    }
+
+    /// Repair candidate targeting after a rollback moved its published file
+    /// back to staging but a later restore failed. There is no drain here: the
+    /// candidate was drained before the rollback and its old path is expired.
+    pub(crate) fn retarget_imported_session_file(&mut self, session_file: &str) {
+        let session_file = resolve_path(session_file);
+        if let Some(buffer) = &self.write_buffer {
+            buffer.retarget_after_import_handoff(&session_file);
+        }
+        self.session_file = Some(session_file);
+    }
+
+    /// A disposed, replaced manager must not recreate a retired backup when a
+    /// retained handle or timed callback runs after import cleanup.
+    pub(crate) fn retire_import_replaced_session(&mut self) {
+        self.persist = false;
+        self.session_file = None;
+        self.write_buffer = None;
     }
 
     pub fn get_session_artifact_dir(&self) -> Option<String> {

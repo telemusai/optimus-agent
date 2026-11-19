@@ -121,6 +121,9 @@ struct PublicClient {
     id: Mutex<String>,
     protocol_id: Mutex<Option<String>>,
     subscriptions: Mutex<HashSet<String>>,
+    /// Allocates the identity of one optimistic attach membership operation.
+    attach_epoch: AtomicU64,
+    attach_memberships: Mutex<HashMap<String, AttachMembership>>,
     supports_extension_ui: AtomicBool,
     pause_epoch: AtomicU64,
     output: mpsc::Sender<PublicFrame>,
@@ -138,27 +141,51 @@ struct PublicClient {
     /// `client.backpressured`: a resync is deferred while the writer is behind.
     backpressured: AtomicBool,
 }
+#[derive(Default)]
+struct AttachMembership {
+    optimistic: HashSet<u64>,
+    committed: bool,
+}
+
 struct AttachMembershipGuard {
     public: Arc<PublicClient>,
-    previous: Vec<(String, bool)>,
+    active: String,
+    previous_active: Option<String>,
+    membership_id: u64,
+    was_committed: bool,
     committed: bool,
 }
 
 impl AttachMembershipGuard {
     fn new(public: &Arc<PublicClient>, active: &str, previous_active: Option<&str>) -> Self {
-        let ids = std::iter::once(active.to_string())
-            .chain(previous_active.filter(|previous| *previous != active).map(str::to_string))
-            .collect::<Vec<_>>();
+        let membership_id = public.attach_epoch.fetch_add(1, Ordering::SeqCst) + 1;
+        let mut memberships = public.attach_memberships.lock().unwrap();
         let subscriptions = public.subscriptions.lock().unwrap();
-        let previous = ids.into_iter().map(|id| {
-            let present = subscriptions.contains(&id);
-            (id, present)
-        }).collect();
-        drop(subscriptions);
-        Self { public: Arc::clone(public), previous, committed: false }
+        let membership = memberships.entry(active.to_string()).or_default();
+        // Visible membership may itself be another operation's optimistic
+        // insertion; it is not a committed reason to retain a failed target.
+        let was_committed = membership.committed || (membership.optimistic.is_empty() && subscriptions.contains(active));
+        membership.optimistic.insert(membership_id);
+        Self {
+            public: Arc::clone(public), active: active.to_string(),
+            previous_active: previous_active.filter(|previous| *previous != active).map(str::to_string),
+            membership_id, was_committed, committed: false,
+        }
     }
 
     fn commit(mut self) {
+        let mut memberships = self.public.attach_memberships.lock().unwrap();
+        let mut subscriptions = self.public.subscriptions.lock().unwrap();
+        {
+            let membership = memberships.entry(self.active.clone()).or_default();
+            membership.optimistic.remove(&self.membership_id);
+            membership.committed = true;
+        }
+        subscriptions.insert(self.active.clone());
+        if let Some(previous) = self.previous_active.as_ref() {
+            subscriptions.remove(previous);
+            if let Some(membership) = memberships.get_mut(previous) { membership.committed = false; }
+        }
         self.committed = true;
     }
 }
@@ -166,10 +193,20 @@ impl AttachMembershipGuard {
 impl Drop for AttachMembershipGuard {
     fn drop(&mut self) {
         if self.committed { return; }
+        let mut memberships = self.public.attach_memberships.lock().unwrap();
         let mut subscriptions = self.public.subscriptions.lock().unwrap();
-        for (id, present) in &self.previous {
-            if *present { subscriptions.insert(id.clone()); }
-            else { subscriptions.remove(id); }
+        let retain = if let Some(membership) = memberships.get_mut(&self.active) {
+            membership.optimistic.remove(&self.membership_id);
+            self.was_committed || membership.committed || !membership.optimistic.is_empty()
+        } else {
+            self.was_committed
+        };
+        // Remove only this failed operation's optimistic target. A same-target
+        // success or another in-flight operation retains it; old memberships are
+        // never restored over a newer successful detach.
+        if !retain { subscriptions.remove(&self.active); }
+        if memberships.get(&self.active).is_some_and(|membership| !membership.committed && membership.optimistic.is_empty()) {
+            memberships.remove(&self.active);
         }
     }
 }
@@ -217,6 +254,8 @@ struct Worker {
     descriptor: Mutex<DaemonWorkerDescriptor>,
     /// `ResidentWorker.client`: replaced by a reconnection, so it is not `Arc`-pinned.
     client: Mutex<Option<Arc<DaemonWorkerClient>>>,
+    /// Set only after authenticate+subscribe succeeds for this exact client.
+    subscribed_client: Mutex<Option<Arc<DaemonWorkerClient>>>,
     /// Bumped per applied roster frame; a summaries pull that straddles one must not gap-fill.
     roster_epoch: AtomicU64,
     /// `worker.rosterStale`: the watchdog marks rows whose worker stopped talking.
@@ -235,7 +274,23 @@ struct Worker {
     /// of this registration completed, so a repeated `promoteOwnedWorker` is a no-op (:3244).
     promoted_owner_client_id: Mutex<Option<String>>,
     heartbeat_snapshot: Mutex<HeartbeatSnapshot>,
+    #[cfg(test)]
+    root_descriptor_sync_pause: Mutex<Option<Arc<RootDescriptorSyncPause>>>,
 }
+
+#[cfg(test)]
+struct RootDescriptorSyncPause {
+    cloned: std::sync::Barrier,
+    resume: std::sync::Barrier,
+}
+
+#[cfg(test)]
+impl RootDescriptorSyncPause {
+    fn new() -> Self {
+        Self { cloned: std::sync::Barrier::new(2), resume: std::sync::Barrier::new(2) }
+    }
+}
+
 #[derive(Clone)]
 struct InputPause { connection_id: String, worker: Arc<Worker>, active: String, requested: String }
 /// `interface SupervisorPromptAdmission` (daemon-supervisor.ts:438-447) with
@@ -574,12 +629,14 @@ impl Supervisor {
     /// cannot race them (daemon-supervisor.ts:3610).
     fn install_worker(self: &Arc<Self>, descriptor: DaemonWorkerDescriptor, client: Arc<DaemonWorkerClient>) -> Arc<Worker> {
         let worker = Arc::new(Worker {
-            descriptor: Mutex::new(descriptor), client: Mutex::new(Some(Arc::clone(&client))), roster_epoch: AtomicU64::new(0),
+            descriptor: Mutex::new(descriptor), client: Mutex::new(Some(Arc::clone(&client))), subscribed_client: Mutex::new(None), roster_epoch: AtomicU64::new(0),
             roster_stale: AtomicBool::new(false), last_frame_at: Mutex::new(None), pending_client: Mutex::new(None),
             connection: AsyncMutex::new(()), stream: Mutex::new(CompactAssistantStreamReconstructor::new()),
             recovery: AtomicBool::new(false), deferred_recovery: AtomicBool::new(false), deferred_recovery_rounds: AtomicU64::new(0),
             promoted_owner_client_id: Mutex::new(None),
             heartbeat_snapshot: Mutex::new(HeartbeatSnapshot::default()),
+            #[cfg(test)]
+            root_descriptor_sync_pause: Mutex::new(None),
         });
         self.attach_worker_listeners(&worker, &client);
         self.workers.lock().unwrap().insert(worker.descriptor.lock().unwrap().worker_id.clone(), Arc::clone(&worker));
@@ -640,6 +697,8 @@ impl Supervisor {
             let mut current = worker.client.lock().unwrap();
             if current.as_ref().map(Arc::as_ptr) != Some(Arc::as_ptr(client)) { return; }
             *current = None;
+            let mut subscribed = worker.subscribed_client.lock().unwrap();
+            if subscribed.as_ref().is_some_and(|ready| Arc::ptr_eq(ready, client)) { *subscribed = None; }
         }
         if self.stopped.is_cancelled() { return; }
         self.invalidate_worker_input_pauses(worker);
@@ -892,11 +951,36 @@ impl Supervisor {
         if result.is_err() { Self::discard_failed_worker_client(worker, &client); }
         result
     }
-    fn discard_failed_worker_client(worker: &Arc<Worker>, client: &Arc<DaemonWorkerClient>) {
+    /// Detach every cache entry that still names one of `owned`, then return each
+    /// owned transport once. Entries installed by a newer connection are outside
+    /// this cleanup's ownership and are neither cleared nor closed.
+    fn detach_owned_worker_clients(
+        worker: &Arc<Worker>,
+        owned: &[Arc<DaemonWorkerClient>],
+    ) -> Vec<Arc<DaemonWorkerClient>> {
         let mut current = worker.client.lock().unwrap();
-        if current.as_ref().is_some_and(|current| Arc::ptr_eq(current, client)) { *current = None; }
+        if current.as_ref().is_some_and(|cached| owned.iter().any(|client| Arc::ptr_eq(cached, client))) {
+            *current = None;
+        }
+        let mut subscribed = worker.subscribed_client.lock().unwrap();
+        if subscribed.as_ref().is_some_and(|cached| owned.iter().any(|client| Arc::ptr_eq(cached, client))) {
+            *subscribed = None;
+        }
+        drop(subscribed);
         drop(current);
-        client.close_now();
+        let mut detached: Vec<Arc<DaemonWorkerClient>> = Vec::with_capacity(owned.len());
+        for client in owned {
+            if !detached.iter().any(|existing| Arc::ptr_eq(existing, client)) {
+                detached.push(Arc::clone(client));
+            }
+        }
+        detached
+    }
+
+    fn discard_failed_worker_client(worker: &Arc<Worker>, client: &Arc<DaemonWorkerClient>) {
+        for discarded in Self::detach_owned_worker_clients(worker, std::slice::from_ref(client)) {
+            discarded.close_now();
+        }
     }
     fn forward_frame(&self, worker: &Worker, frame: &PrivateFrame) {
         let kind = frame.header.get("outboundType").and_then(Value::as_str).unwrap_or("");
@@ -1063,14 +1147,17 @@ impl Supervisor {
     }
     /// `this.requireWorkerClient(worker)`: reconnects a worker whose connection
     /// died, after proving the pid is still this worker's own process.
+    fn ready_connected_client(worker: &Arc<Worker>) -> Option<Arc<DaemonWorkerClient>> {
+        let current = worker.client.lock().unwrap();
+        let client = current.as_ref().filter(|client| client.is_connected())?.clone();
+        let subscribed = worker.subscribed_client.lock().unwrap();
+        subscribed.as_ref().filter(|ready| Arc::ptr_eq(ready, &client) && ready.is_connected()).cloned()
+    }
+
     async fn connected_client(self: &Arc<Self>, worker: &Arc<Worker>) -> Result<Arc<DaemonWorkerClient>, String> {
-        if let Some(client) = worker.client.lock().unwrap().as_ref().cloned() {
-            if client.is_connected() { return Ok(client); }
-        }
+        if let Some(client) = Self::ready_connected_client(worker) { return Ok(client); }
         let _connection = worker.connection.lock().await;
-        if let Some(client) = worker.client.lock().unwrap().as_ref().cloned() {
-            if client.is_connected() { return Ok(client); }
-        }
+        if let Some(client) = Self::ready_connected_client(worker) { return Ok(client); }
         let descriptor = worker.descriptor.lock().unwrap().clone();
         if !matches_exact_process_identity(&ProcessIdentity { pid: descriptor.pid as i64, process_start_id: descriptor.process_start_id.clone() }) {
             return Err(format!("Session worker {} exited; retry_worker is required", descriptor.worker_id));
@@ -1078,12 +1165,19 @@ impl Supervisor {
         let client = Arc::new(DaemonWorkerClient::new(&descriptor.socket_path));
         self.attach_worker_listeners(worker, &client);
         *worker.pending_client.lock().unwrap() = Some(Arc::clone(&client));
-        let result = self.authenticate(&client, &descriptor).await;
+        // Authentication and the initial subscription are one readiness
+        // transaction. Never publish a connected-but-unsubscribed client.
+        let result = async {
+            self.authenticate(&client, &descriptor).await?;
+            self.subscribe_client(&client, &descriptor.root_active_session_id).await?;
+            if !client.is_connected() { return Err("Session worker disconnected during subscribe".to_string()); }
+            Ok(())
+        }.await;
         *worker.pending_client.lock().unwrap() = None;
         match result {
             Ok(()) => {
                 *worker.client.lock().unwrap() = Some(Arc::clone(&client));
-                self.subscribe(worker, &descriptor.root_active_session_id).await?;
+                *worker.subscribed_client.lock().unwrap() = Some(Arc::clone(&client));
                 Ok(client)
             }
             Err(error) => { client.close_now(); Err(error) }
@@ -1091,6 +1185,14 @@ impl Supervisor {
     }
     async fn subscribe(&self, worker: &Arc<Worker>, active: &str) -> Result<(), String> {
         let client = { worker.client.lock().unwrap().as_ref().cloned().ok_or("Session worker is not connected")? };
+        self.subscribe_client(&client, active).await?;
+        let current = worker.client.lock().unwrap();
+        if current.as_ref().is_some_and(|current| Arc::ptr_eq(current, &client) && client.is_connected()) {
+            *worker.subscribed_client.lock().unwrap() = Some(client);
+        }
+        Ok(())
+    }
+    async fn subscribe_client(&self, client: &Arc<DaemonWorkerClient>, active: &str) -> Result<(), String> {
         let mut body = command("worker_subscribe");
         body.insert("activeSessionId".into(), json!(active));
         // Full snapshots avoid a private chunk cache at the public boundary.
@@ -1265,16 +1367,29 @@ impl Supervisor {
             candidate.create_command = create_command;
             candidate
         };
-        // Do not let an in-memory update suppress the next identical roster frame
-        // when the durable descriptor write failed.
-        if let Err(error) = self.persist_worker(&candidate) {
-            eprintln!("Could not persist worker descriptor {}: {error}", candidate.worker_id);
+        #[cfg(test)]
+        if let Some(pause) = worker.root_descriptor_sync_pause.lock().unwrap().clone() {
+            pause.cloned.wait();
+            pause.resume.wait();
+        }
+        // The roster frame owns only these root fields. Re-read and merge the full
+        // current descriptor so a STOPPING/archive tombstone written after the
+        // first snapshot cannot be overwritten by the stale candidate.
+        let mut descriptor = worker.descriptor.lock().unwrap();
+        let mut merged = descriptor.clone();
+        merged.root_session_id = candidate.root_session_id;
+        merged.session_file = candidate.session_file;
+        merged.create_command = candidate.create_command;
+        // Keep the descriptor lock through the durable write and its matching
+        // memory update. A failed write leaves memory untouched so an identical
+        // later frame retries, while concurrent lifecycle edits stay serialized.
+        if let Err(error) = self.persist_worker(&merged) {
+            eprintln!("Could not persist worker descriptor {}: {error}", merged.worker_id);
             return false;
         }
-        let mut descriptor = worker.descriptor.lock().unwrap();
-        descriptor.root_session_id = candidate.root_session_id;
-        descriptor.session_file = candidate.session_file;
-        descriptor.create_command = candidate.create_command;
+        descriptor.root_session_id = merged.root_session_id;
+        descriptor.session_file = merged.session_file;
+        descriptor.create_command = merged.create_command;
         true
     }
     /// `markWorkerRosterEntries(worker, statusLabel)`.
@@ -1559,8 +1674,8 @@ impl Supervisor {
             let descriptor = { worker.descriptor.lock().unwrap().clone() };
             let adopted = async {
                 self.authenticate(&client, &descriptor).await?;
-                self.refresh(&worker).await?;
-                self.subscribe(&worker, &root).await
+                self.subscribe(&worker, &root).await?;
+                self.refresh(&worker).await
             }.await;
             if let Err(error) = adopted { self.defer_worker_adoption(&worker, &client, &error); }
         }
@@ -1573,23 +1688,37 @@ impl Supervisor {
         self.defer_worker_adoption_if_current(worker, client, &id, error);
     }
     fn defer_worker_adoption_if_current(self: &Arc<Self>, worker: &Arc<Worker>, client: &Arc<DaemonWorkerClient>, id: &str, error: &str) {
-        {
+        let should_defer = {
             // Match require_worker's lock order: registry -> descriptor -> client.
             // Keep the client identity check and lifecycle transition atomic against
             // a close-triggered reconnect publishing its replacement client/READY.
             let workers = self.workers.lock().unwrap();
-            if !workers.get(id).is_some_and(|current| Arc::ptr_eq(current, worker)) { return; }
+            let registered = workers.get(id).is_some_and(|current| Arc::ptr_eq(current, worker));
             let mut descriptor = worker.descriptor.lock().unwrap();
-            if self.stopped.is_cancelled() || descriptor.stop_requested_at.is_some()
-                || descriptor.lifecycle == DAEMON_WORKER_LIFECYCLE_STOPPING { return; }
+            let active = !self.stopped.is_cancelled() && descriptor.stop_requested_at.is_none()
+                && descriptor.lifecycle != DAEMON_WORKER_LIFECYCLE_STOPPING;
             let mut current = worker.client.lock().unwrap();
-            if current.as_ref().is_some_and(|current| !Arc::ptr_eq(current, client)) { return; }
-            descriptor.lifecycle = DAEMON_WORKER_LIFECYCLE_RECOVERING.into();
-            descriptor.last_error = Some(error.into());
-            if let Err(error) = self.persist_worker(&descriptor) { eprintln!("Could not persist worker adoption retry {id}: {error}"); }
-            *current = None;
-        }
+            let current_is_owned = current.as_ref().is_none_or(|current| Arc::ptr_eq(current, client));
+            let should_defer = registered && active && current_is_owned;
+            if should_defer {
+                descriptor.lifecycle = DAEMON_WORKER_LIFECYCLE_RECOVERING.into();
+                descriptor.last_error = Some(error.into());
+                if let Err(error) = self.persist_worker(&descriptor) { eprintln!("Could not persist worker adoption retry {id}: {error}"); }
+            }
+            // Every failed-adoption exit owns the old transport, including stale
+            // and stopped races. Only matching cache entries are detached: a newer
+            // current/ready identity survives and is never closed here.
+            if current.as_ref().is_some_and(|current| Arc::ptr_eq(current, client)) {
+                *current = None;
+            }
+            let mut subscribed = worker.subscribed_client.lock().unwrap();
+            if subscribed.as_ref().is_some_and(|ready| Arc::ptr_eq(ready, client)) {
+                *subscribed = None;
+            }
+            should_defer
+        };
         client.close_now();
+        if !should_defer { return; }
         self.mark_worker_roster_entries(worker, Some(DAEMON_WORKER_LIFECYCLE_RECOVERING));
         self.schedule_deferred_worker_recovery(worker);
     }
@@ -2620,7 +2749,15 @@ impl Supervisor {
         };
         let kind = if archive { "worker_archive_and_shutdown" } else { "shutdown" };
         let client = { worker.client.lock().unwrap().clone() };
+        let subscribed = { worker.subscribed_client.lock().unwrap().clone() };
+        let owned = client.iter().chain(subscribed.iter()).cloned().collect::<Vec<_>>();
+        let owned = Self::detach_owned_worker_clients(worker, &owned);
         if let Some(client) = client {
+            // A stale readiness entry can name a different transport. It belongs
+            // to this stop just as the request transport does, but is closed once.
+            for stale in owned.iter().filter(|cached| !Arc::ptr_eq(cached, &client)) {
+                stale.close().await;
+            }
             let request_timeout = if force { 1_000 } else { 30_000 };
             // A stuck write, disconnected channel or rejected request cannot bypass
             // process cleanup. The outer deadline also bounds the transport write.
@@ -2629,10 +2766,12 @@ impl Supervisor {
                     .map_err(|error| error.to_string()).and_then(response_data)
             }).await.unwrap_or_else(|_| Err(format!("Timed out requesting {kind}")));
             if let Err(error) = requested { eprintln!("Worker {} shutdown request failed: {error}", descriptor.worker_id); }
-            assert_stop_current()?;
+            // Close every stop-owned transport before any retained/failed exit.
+            // Cache detachment above is identity-fenced, so a replacement survives.
             client.close().await;
-            let mut current = worker.client.lock().unwrap();
-            if current.as_ref().is_some_and(|current| Arc::ptr_eq(current, &client)) { *current = None; }
+            assert_stop_current()?;
+        } else {
+            for stale in owned { stale.close().await; }
         }
         self.ownership.assert_current().await.map_err(|error| error.to_string())?;
         assert_stop_current()?;
@@ -2684,8 +2823,6 @@ impl Supervisor {
         }
         self.ownership.assert_current().await.map_err(|error| error.to_string())?;
         assert_stop_current()?;
-        let client = { worker.client.lock().unwrap().take() };
-        if let Some(client) = client { client.close().await; }
         if let Err(error) = self.recover_uncertain_worker_operations(worker).await {
             if supervisor_maintenance::permanent_stop_cleanup_error(&error) {
                 self.park_worker_stop_cleanup_failure(worker, &error);
@@ -3295,7 +3432,11 @@ impl Supervisor {
             "detach" => {
                 let active = body.get("activeSessionId").and_then(Value::as_str);
                 let targets = if let Some(active) = active { vec![active.to_string()] } else { public.subscriptions.lock().unwrap().iter().cloned().collect() };
-                for active in targets { public.subscriptions.lock().unwrap().remove(&active); public.write(&json!({"type":"session_detached","activeSessionId":active})); }
+                for active in targets {
+            public.subscriptions.lock().unwrap().remove(&active);
+            public.attach_memberships.lock().unwrap().remove(&active);
+            public.write(&json!({"type":"session_detached","activeSessionId":active}));
+        }
                 self.release_client_pauses(public, active).await?;
                 return Ok(success(None));
             }
@@ -3553,7 +3694,6 @@ impl Supervisor {
         if attaching && response.success {
             if kind == "reattach" {
                 if let Some(previous) = previous_active.filter(|previous| previous != &active) {
-                    public.subscriptions.lock().unwrap().remove(&previous);
                     public.write(&json!({"type":"session_detached","activeSessionId":previous}));
                 }
             }
@@ -4173,7 +4313,7 @@ fn new_public_client(identity: String) -> (Arc<PublicClient>, mpsc::Receiver<Pub
     let (snapshot_dequeue, _) = tokio::sync::broadcast::channel::<Vec<u8>>(1024);
     let public = Arc::new(PublicClient {
         connection_id: identity.clone(), id: Mutex::new(identity.clone()), protocol_id: Mutex::new(None),
-        subscriptions: Mutex::new(HashSet::new()), supports_extension_ui: AtomicBool::new(false), pause_epoch: AtomicU64::new(0),
+        subscriptions: Mutex::new(HashSet::new()), attach_epoch: AtomicU64::new(0), attach_memberships: Mutex::new(HashMap::new()), supports_extension_ui: AtomicBool::new(false), pause_epoch: AtomicU64::new(0),
         output: sender, response_output: response_sender, snapshot_responses_pending: AtomicU64::new(0), snapshot_event_gate: AsyncMutex::new(()), snapshot_dequeue, stopped: CancellationToken::new(), roster_subscribed: AtomicBool::new(false),
         roster_resync_pending: AtomicBool::new(false), backpressured: AtomicBool::new(false),
     });
@@ -4366,6 +4506,8 @@ mod tests {
             id: Mutex::new("client".into()),
             protocol_id: Mutex::new(None),
             subscriptions: Mutex::new(subscriptions.iter().map(|id| (*id).to_string()).collect()),
+            attach_epoch: AtomicU64::new(0),
+            attach_memberships: Mutex::new(HashMap::new()),
             supports_extension_ui: AtomicBool::new(false),
             pause_epoch: AtomicU64::new(0),
             output: output.clone(),
@@ -4921,13 +5063,12 @@ mod tests {
     }
 
     #[test]
-    fn failed_attach_restores_exact_old_and_new_membership() {
+    fn failed_attach_removes_only_its_optimistic_membership() {
         let public = attach_membership_test_client(&["old", "unrelated"]);
         {
             let _guard = AttachMembershipGuard::new(&public, "new", Some("old"));
             let mut subscriptions = public.subscriptions.lock().unwrap();
             subscriptions.insert("new".into());
-            subscriptions.remove("old");
         }
         let subscriptions = public.subscriptions.lock().unwrap();
         assert_eq!(subscriptions.iter().map(String::as_str).collect::<HashSet<_>>(), HashSet::from(["old", "unrelated"]));
@@ -4938,15 +5079,68 @@ mod tests {
         let public = attach_membership_test_client(&["old"]);
         {
             let guard = AttachMembershipGuard::new(&public, "new", Some("old"));
-            let mut subscriptions = public.subscriptions.lock().unwrap();
-            subscriptions.insert("new".into());
-            subscriptions.remove("old");
-            drop(subscriptions);
+            public.subscriptions.lock().unwrap().insert("new".into());
             guard.commit();
         }
         let subscriptions = public.subscriptions.lock().unwrap();
         assert!(subscriptions.contains("new"));
         assert!(!subscriptions.contains("old"));
+    }
+
+    #[tokio::test]
+    async fn stale_attach_failure_cannot_suppress_newer_event_membership() {
+        use super::daemon_supervisor_parity_tests::{SupervisorFixture, add_descriptor_only_worker};
+        let mut fixture = SupervisorFixture::new("attach-membership-cas").await;
+        let worker = add_descriptor_only_worker(&fixture, "worker", "new", "token", DAEMON_WORKER_LIFECYCLE_READY);
+        fixture.client.subscriptions.lock().unwrap().insert("old".into());
+
+        // A starts first. B publishes a new active membership and commits while
+        // A is still awaiting its failed attach response.
+        let attach_a = AttachMembershipGuard::new(&fixture.client, "new", Some("old"));
+        fixture.client.subscriptions.lock().unwrap().insert("new".into());
+        let attach_b = AttachMembershipGuard::new(&fixture.client, "new", Some("old"));
+        fixture.client.subscriptions.lock().unwrap().insert("new".into());
+        attach_b.commit();
+        drop(attach_a);
+
+        assert!(fixture.client.subscriptions.lock().unwrap().contains("new"));
+        assert!(!fixture.client.subscriptions.lock().unwrap().contains("old"));
+        let frame = PrivateFrame {
+            header: json!({"kind":"outbound", "outboundType":"session_event", "activeSessionId":"new"}),
+            payload: serde_json::to_vec(&json!({"type":"session_event", "activeSessionId":"new", "marker":"delivered"})).unwrap(),
+        };
+        fixture.supervisor.forward_frame(&worker, &frame);
+        let event = fixture.next_frame(Duration::from_millis(250)).await.expect("B remains reachable after A rolls back");
+        assert_eq!(event["marker"], "delivered");
+    }
+
+    #[tokio::test]
+    async fn failed_attach_removes_only_its_distinct_target_without_restoring_old_membership() {
+        use super::daemon_supervisor_parity_tests::{SupervisorFixture, add_descriptor_only_worker};
+        let mut fixture = SupervisorFixture::new("attach-membership-distinct-targets").await;
+        let worker = add_descriptor_only_worker(&fixture, "worker", "live-b", "token", DAEMON_WORKER_LIFECYCLE_READY);
+        fixture.client.subscriptions.lock().unwrap().insert("old".into());
+        let attach_a = AttachMembershipGuard::new(&fixture.client, "failed-a", Some("old"));
+        fixture.client.subscriptions.lock().unwrap().insert("failed-a".into());
+        let attach_b = AttachMembershipGuard::new(&fixture.client, "live-b", Some("old"));
+        fixture.client.subscriptions.lock().unwrap().insert("live-b".into());
+        attach_b.commit();
+        drop(attach_a);
+
+        let subscriptions = fixture.client.subscriptions.lock().unwrap().clone();
+        assert!(subscriptions.contains("live-b"));
+        assert!(!subscriptions.contains("failed-a"), "failed A target must not leak");
+        assert!(!subscriptions.contains("old"), "stale A must not restore B's detached old target");
+        drop(subscriptions);
+        let frame = |active: &str, marker: &str| PrivateFrame {
+            header: json!({"kind":"outbound", "outboundType":"session_event", "activeSessionId":active}),
+            payload: serde_json::to_vec(&json!({"type":"session_event", "activeSessionId":active, "marker":marker})).unwrap(),
+        };
+        fixture.supervisor.forward_frame(&worker, &frame("live-b", "b-delivered"));
+        let event = fixture.next_frame(Duration::from_millis(250)).await.expect("B remains subscribed after A cleanup");
+        assert_eq!(event["marker"], "b-delivered");
+        fixture.supervisor.forward_frame(&worker, &frame("failed-a", "a-must-not-arrive"));
+        assert!(fixture.next_frame(Duration::from_millis(100)).await.is_none(), "failed target is not event-reachable");
     }
 
     #[tokio::test]
@@ -5000,6 +5194,76 @@ mod tests {
         assert_eq!(current.root_session_id.as_deref(), Some("saved-next"));
         assert_eq!(current.session_file.as_deref(), Some("/tmp/saved-next.jsonl"));
         assert_eq!(current.create_command.session_path.as_deref(), Some("/tmp/saved-next.jsonl"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stale_root_sync_cannot_revive_stop_tombstone_or_relaunch_adoption() {
+        use super::daemon_supervisor_parity_tests::{SupervisorFixture, add_descriptor_only_worker};
+        let fixture = SupervisorFixture::new("root-descriptor-stop-merge").await;
+        let worker = add_descriptor_only_worker(&fixture, "worker", "root", "token", DAEMON_WORKER_LIFECYCLE_READY);
+        worker.roster_epoch.store(41, Ordering::SeqCst);
+        worker.descriptor.lock().unwrap().consecutive_failures = 7;
+        let saved = fixture.root.join("saved.jsonl").to_string_lossy().into_owned();
+        let entry = WorkerRosterEntry {
+            agent_id: "root".into(), queued_child: None, seeded_cwd: None,
+            summary: RosterSessionSummary {
+                active_session_id: Some("root".into()), session_id: "saved".into(), session_file: Some(saved.clone()),
+                ..Default::default()
+            },
+        };
+        let pause = Arc::new(RootDescriptorSyncPause::new());
+        *worker.root_descriptor_sync_pause.lock().unwrap() = Some(Arc::clone(&pause));
+        let syncing = tokio::task::spawn_blocking({
+            let supervisor = Arc::clone(&fixture.supervisor);
+            let worker = Arc::clone(&worker);
+            let entry = entry.clone();
+            move || supervisor.sync_root_descriptor_from_roster_entry(&worker, &entry)
+        });
+        pause.cloned.wait();
+        {
+            let mut descriptor = worker.descriptor.lock().unwrap();
+            descriptor.lifecycle = DAEMON_WORKER_LIFECYCLE_STOPPING.into();
+            descriptor.stop_requested_at = Some(chrono::Utc::now().to_rfc3339());
+            descriptor.archive_on_stop = Some(true);
+            // The stopped process is already gone; adoption must choose cleanup,
+            // never process launch, and must never signal the fixture process.
+            descriptor.pid = i32::MAX;
+            descriptor.process_start_id = None;
+            fixture.supervisor.persist_worker(&descriptor).unwrap();
+        }
+        pause.resume.wait();
+        assert!(syncing.await.unwrap());
+
+        let current = worker.descriptor.lock().unwrap().clone();
+        assert_eq!(current.lifecycle, DAEMON_WORKER_LIFECYCLE_STOPPING);
+        assert!(current.stop_requested_at.is_some());
+        assert_eq!(current.archive_on_stop, Some(true));
+        assert_eq!(current.root_session_id.as_deref(), Some("saved"));
+        assert_eq!(current.session_file.as_deref(), Some(saved.as_str()));
+        assert_eq!(current.create_command.session_path.as_deref(), Some(saved.as_str()));
+        assert_eq!(current.consecutive_failures, 7);
+        assert_eq!(worker.roster_epoch.load(Ordering::SeqCst), 41);
+        let persisted: DaemonWorkerDescriptor = serde_json::from_slice(&std::fs::read(fixture.supervisor.descriptor_dir.join("worker.json")).unwrap()).unwrap();
+        assert_eq!(persisted.lifecycle, DAEMON_WORKER_LIFECYCLE_STOPPING);
+        assert!(persisted.stop_requested_at.is_some());
+        assert_eq!(persisted.archive_on_stop, Some(true));
+        assert_eq!(persisted.root_session_id.as_deref(), Some("saved"));
+        assert_eq!(persisted.session_file.as_deref(), Some(saved.as_str()));
+        assert_eq!(persisted.consecutive_failures, 7);
+
+        fixture.supervisor.adopt_workers().await.unwrap();
+        assert!(fixture.supervisor.workers.lock().unwrap().values().all(|worker| {
+            let descriptor = worker.descriptor.lock().unwrap();
+            descriptor.lifecycle != DAEMON_WORKER_LIFECYCLE_READY && descriptor.lifecycle != DAEMON_WORKER_LIFECYCLE_STARTING
+        }), "adoption must not relaunch the tombstoned root");
+        let descriptor_path = fixture.supervisor.descriptor_dir.join("worker.json");
+        if descriptor_path.exists() {
+            let after: DaemonWorkerDescriptor = serde_json::from_slice(&std::fs::read(descriptor_path).unwrap()).unwrap();
+            assert!(after.stop_requested_at.is_some());
+            assert_ne!(after.lifecycle, DAEMON_WORKER_LIFECYCLE_READY);
+        }
+        fixture.supervisor.stopped.cancel();
+        fixture.supervisor.ownership.release().await.unwrap();
     }
 
     #[tokio::test]
