@@ -1,0 +1,4 @@
+- Fixed bounded bash output snapshots so retained partial lines keep the same tail bytes and metadata as full-output truncation, while spill files preserve the complete output.
+- Fixed external editor drafts to expand large paste content for both host and extension flows without losing submitted text or re-expanding literal paste markers.
+- Fixed multiword resource searches, Unicode-aware vertical editor movement, early fork-message scrolling, and immediate label-filter updates.
+- Fixed queue selection and edit resets to request a repaint only when polling changes visible state.

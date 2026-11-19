@@ -63,9 +63,10 @@ impl Component for UserMessageList {
             return lines;
         }
 
-        let start_index = ((self.selected_index as i64 - (self.max_visible / 2) as i64) as usize)
-            .min(self.messages.len().saturating_sub(self.max_visible))
-            .max(0);
+        let start_index = (self.selected_index as i64 - (self.max_visible / 2) as i64).clamp(
+            0,
+            self.messages.len().saturating_sub(self.max_visible) as i64,
+        ) as usize;
         let end_index = (start_index + self.max_visible).min(self.messages.len());
 
         for i in start_index..end_index {
@@ -218,5 +219,53 @@ impl Component for UserMessageSelectorComponent {
         self.message_list.invalidate();
         self.trailing_spacer.invalidate();
         self.trailing_border.invalidate();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    fn messages() -> Vec<UserMessageItem> {
+        (0..25)
+            .map(|index| UserMessageItem {
+                id: format!("m{index}"),
+                text: format!("message {index}"),
+                timestamp: None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn early_and_late_selections_stay_inside_the_fork_dialog_viewport() {
+        crate::modes::interactive::theme::theme::init_theme(Some("prime"), false);
+        for selected in [0usize, 4, 20] {
+            let id = format!("m{selected}");
+            let mut list = UserMessageList::new(messages(), Some(&id));
+            let rendered = list.render(100.0).join("\n");
+            assert!(
+                rendered.contains(&format!("Message {} of 25", selected + 1)),
+                "selection {selected} is missing from viewport: {rendered}"
+            );
+            assert!(rendered.contains(&format!("message {selected}")));
+        }
+    }
+
+    #[test]
+    fn fork_dialog_up_down_enter_selects_the_visible_message() {
+        let selected = Rc::new(RefCell::new(Vec::<String>::new()));
+        let sink = Rc::clone(&selected);
+        let mut list = UserMessageList::new(messages(), Some("m4"));
+        list.on_select = Some(Box::new(move |id| sink.borrow_mut().push(id.to_string())));
+
+        list.handle_input("\u{1b}[A");
+        assert_eq!(list.selected_index(), 3);
+        list.handle_input("\u{1b}[B");
+        assert_eq!(list.selected_index(), 4);
+        list.handle_input("\r");
+
+        assert_eq!(selected.borrow().as_slice(), ["m4"]);
     }
 }

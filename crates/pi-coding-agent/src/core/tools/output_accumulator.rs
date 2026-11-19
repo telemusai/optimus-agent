@@ -140,7 +140,9 @@ pub struct OutputAccumulator {
     raw_chunks: Vec<Vec<u8>>,
     tail_text: String,
     tail_bytes: usize,
-    tail_starts_at_line_boundary: bool,
+    // Bounded real suffix of text trimmed from the first retained logical
+    // line. Empty means the tail starts at a line boundary.
+    tail_first_line_removed_suffix: String,
     total_raw_bytes: usize,
     total_decoded_bytes: usize,
     total_lines: usize,
@@ -168,7 +170,7 @@ impl OutputAccumulator {
             raw_chunks: Vec::new(),
             tail_text: String::new(),
             tail_bytes: 0,
-            tail_starts_at_line_boundary: true,
+            tail_first_line_removed_suffix: String::new(),
             total_raw_bytes: 0,
             total_decoded_bytes: 0,
             total_lines: 1,
@@ -301,23 +303,29 @@ impl OutputAccumulator {
             start += 1;
         }
 
-        self.tail_starts_at_line_boundary = if start == 0 {
-            self.tail_starts_at_line_boundary
-        } else {
-            buffer[start - 1] == 0x0a
-        };
+        if start > 0 {
+            let removed = match buffer[..start].iter().rposition(|byte| *byte == b'\n') {
+                Some(newline) => String::from_utf8_lossy(&buffer[newline + 1..start]).into_owned(),
+                None => {
+                    let mut removed = std::mem::take(&mut self.tail_first_line_removed_suffix);
+                    removed.push_str(&String::from_utf8_lossy(&buffer[..start]));
+                    removed
+                }
+            };
+            self.tail_first_line_removed_suffix =
+                retain_removed_line_suffix(&removed, self.max_bytes);
+        }
         self.tail_text = String::from_utf8_lossy(&buffer[start..]).into_owned();
         self.tail_bytes = byte_length(&self.tail_text);
     }
 
     fn get_snapshot_text(&self) -> String {
-        if self.tail_starts_at_line_boundary {
-            return self.tail_text.clone();
-        }
-
-        match self.tail_text.find('\n') {
-            Some(first_newline) => self.tail_text[first_newline + 1..].to_string(),
-            None => self.tail_text.clone(),
+        if self.tail_first_line_removed_suffix.is_empty() {
+            self.tail_text.clone()
+        } else {
+            let mut snapshot = self.tail_first_line_removed_suffix.clone();
+            snapshot.push_str(&self.tail_text);
+            snapshot
         }
     }
 
@@ -333,6 +341,21 @@ impl OutputAccumulator {
             .open(replay.iter().map(|chunk| chunk.as_slice()));
         self.raw_chunks = Vec::new();
     }
+}
+
+/// Keep enough real removed-prefix bytes that tail truncation never needs the
+/// unbounded history. If older bytes exist, this suffix exceeds max_bytes;
+/// otherwise it is the complete removed prefix.
+fn retain_removed_line_suffix(text: &str, max_bytes: usize) -> String {
+    let cap = max_bytes.saturating_add(1);
+    if text.len() <= cap {
+        return text.to_string();
+    }
+    let mut start = text.len() - cap;
+    while start > 0 && (text.as_bytes()[start] & 0xc0) == 0x80 {
+        start -= 1;
+    }
+    text[start..].to_string()
 }
 
 /// Streaming UTF-8 decoder mirroring `new TextDecoder()` with `{ stream: true }`.
@@ -461,6 +484,130 @@ mod tests {
         accumulator.append(&[0xff, 0xfe]).expect("append");
         accumulator.finish();
         assert_eq!(accumulator.snapshot().content, "\u{FFFD}\u{FFFD}");
+    }
+
+    fn assert_snapshot_matches_full_output(
+        accumulator: &OutputAccumulator,
+        input: &str,
+        options: &OutputAccumulatorOptions,
+    ) {
+        let expected = truncate_tail(
+            input,
+            TruncationOptions {
+                max_lines: options.max_lines,
+                max_bytes: options.max_bytes,
+            },
+        );
+        let actual = accumulator.snapshot();
+        let expected_snapshot = OutputSnapshot {
+            content: expected.content.clone(),
+            truncation: expected,
+            full_output_path: actual.full_output_path.clone(),
+        };
+        assert_eq!(actual, expected_snapshot);
+    }
+
+    #[test]
+    fn rolling_snapshot_preserves_multibyte_oob_boundaries_and_partial_metadata() {
+        for (input, max_bytes, expected_content, expected_lines) in
+            [("🙂\n", 1, "", 1), ("xxxxxxxxxx界b\n", 2, "b\n", 2)]
+        {
+            let options = OutputAccumulatorOptions {
+                max_lines: Some(2),
+                max_bytes: Some(max_bytes),
+                ..Default::default()
+            };
+            let mut accumulator =
+                OutputAccumulator::with_temp_file_prefix(options.clone(), "pi-test-boundary");
+            accumulator.append(input.as_bytes()).expect("append");
+            accumulator.finish();
+            assert_snapshot_matches_full_output(&accumulator, input, &options);
+            let actual = accumulator.snapshot();
+            assert_eq!(actual.content, expected_content);
+            assert_eq!(actual.truncation.output_lines, expected_lines);
+            assert!(actual.truncation.last_line_partial);
+            accumulator.close_temp_file();
+            if let Some(path) = accumulator.snapshot().full_output_path {
+                assert_eq!(
+                    std::fs::read_to_string(&path).expect("spilled output"),
+                    input
+                );
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
+
+    #[test]
+    fn rolling_snapshot_matches_full_tail_with_a_retained_partial_line() {
+        let input = format!("{}\ntail", "x".repeat(90));
+        let options = OutputAccumulatorOptions {
+            max_lines: Some(100),
+            max_bytes: Some(16),
+            ..Default::default()
+        };
+        let mut accumulator =
+            OutputAccumulator::with_temp_file_prefix(options.clone(), "pi-test-rolling");
+        accumulator.append(input.as_bytes()).expect("append");
+        accumulator.finish();
+
+        let expected = truncate_tail(
+            &input,
+            TruncationOptions {
+                max_lines: options.max_lines,
+                max_bytes: options.max_bytes,
+            },
+        );
+        let actual = accumulator.snapshot();
+        let expected_snapshot = OutputSnapshot {
+            content: expected.content.clone(),
+            truncation: expected,
+            full_output_path: actual.full_output_path.clone(),
+        };
+        assert_eq!(actual, expected_snapshot);
+        assert_eq!(actual.content, format!("{}\ntail", "x".repeat(11)));
+        assert!(actual.truncation.last_line_partial);
+
+        accumulator.close_temp_file();
+        let path = accumulator
+            .snapshot()
+            .full_output_path
+            .expect("complete spill");
+        assert_eq!(std::fs::read_to_string(&path).expect("full output"), input);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn bounded_rolling_snapshot_preserves_the_default_final_error_and_spill() {
+        let final_error = "FINAL ERROR: the operation failed";
+        let input = format!("{}{}", "x".repeat(220 * 1024), final_error);
+        let mut accumulator = OutputAccumulator::with_temp_file_prefix(
+            OutputAccumulatorOptions::default(),
+            "pi-test-default-rolling",
+        );
+        for chunk in input.as_bytes().chunks(4096) {
+            accumulator.append(chunk).expect("append");
+            assert!(accumulator.tail_bytes <= accumulator.max_rolling_bytes * 2);
+        }
+        accumulator.finish();
+
+        let expected = truncate_tail(&input, TruncationOptions::default());
+        let actual = accumulator.snapshot();
+        let expected_snapshot = OutputSnapshot {
+            content: expected.content.clone(),
+            truncation: expected,
+            full_output_path: actual.full_output_path.clone(),
+        };
+        assert_eq!(actual, expected_snapshot);
+        assert!(actual.content.ends_with(final_error));
+        assert!(accumulator.tail_bytes <= accumulator.max_rolling_bytes * 2);
+
+        accumulator.close_temp_file();
+        let path = accumulator
+            .snapshot()
+            .full_output_path
+            .expect("complete spill");
+        assert_eq!(std::fs::read(&path).expect("full output"), input.as_bytes());
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

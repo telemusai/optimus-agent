@@ -863,6 +863,15 @@ impl Component for ResourceList {
     fn handle_input(&mut self, data: &str) {
         let kb = get_keybindings();
 
+        if self.filtered_items.is_empty()
+            && (kb.matches(data, "tui.select.up")
+                || kb.matches(data, "tui.select.down")
+                || kb.matches(data, "tui.select.pageUp")
+                || kb.matches(data, "tui.select.pageDown"))
+        {
+            return;
+        }
+
         if kb.matches(data, "tui.select.up") {
             self.selected_index = self.find_next_item(self.selected_index, -1);
             return;
@@ -888,7 +897,13 @@ impl Component for ResourceList {
             let mut target = (self.selected_index + self.max_visible)
                 .min(self.filtered_items.len().saturating_sub(1))
                 as i64;
-            while target >= 0 && !entry_is_item(&self.filtered_items[target as usize]) {
+            while target >= 0
+                && !self
+                    .filtered_items
+                    .get(target as usize)
+                    .map(entry_is_item)
+                    .unwrap_or(false)
+            {
                 target -= 1;
             }
             if target >= 0 {
@@ -908,7 +923,8 @@ impl Component for ResourceList {
             }
             return;
         }
-        if data == " " || kb.matches(data, "tui.select.confirm") {
+        let space_toggles = data == " " && self.search_input.get_value().is_empty();
+        if space_toggles || kb.matches(data, "tui.select.confirm") {
             let entry = self.filtered_items.get(self.selected_index).cloned();
             if let Some(FlatEntry::Item { mut item }) = entry {
                 let new_enabled = !item.enabled;
@@ -1258,6 +1274,44 @@ mod tests {
         }
     }
 
+    fn empty_resource_list() -> ResourceList {
+        ResourceList::new(
+            Vec::new(),
+            SettingsManager::in_memory(Default::default()),
+            "/work".to_string(),
+            "/agent".to_string(),
+        )
+    }
+
+    #[test]
+    fn empty_resource_navigation_is_a_noop_and_still_renders() {
+        crate::modes::interactive::theme::theme::init_theme(Some("prime"), false);
+        let mut list = empty_resource_list();
+        for key in ["\u{1b}[A", "\u{1b}[B", "\u{1b}[5~", "\u{1b}[6~"] {
+            list.handle_input(key);
+            assert_eq!(list.selected_index, 0);
+            assert!(list.render(60.0).iter().any(|line| line.contains("No resources found")));
+        }
+    }
+
+    #[test]
+    fn filtered_empty_resource_navigation_is_a_noop_and_still_renders() {
+        crate::modes::interactive::theme::theme::init_theme(Some("prime"), false);
+        let groups = build_groups(&paths());
+        let mut list = ResourceList::new(
+            groups,
+            SettingsManager::in_memory(Default::default()),
+            "/work".to_string(),
+            "/agent".to_string(),
+        );
+        list.filter_items("nothing-matches-this");
+        for key in ["\u{1b}[A", "\u{1b}[B", "\u{1b}[5~", "\u{1b}[6~"] {
+            list.handle_input(key);
+            assert_eq!(list.selected_index, 0);
+            assert!(list.render(60.0).iter().any(|line| line.contains("No resources found")));
+        }
+    }
+
     #[test]
     fn cancellation_precedes_ctrl_c_exit_unless_rebound() {
         let previous = pi_tui::keybindings::get_keybindings();
@@ -1322,6 +1376,53 @@ mod tests {
     }
 
     #[test]
+    fn active_search_inserts_spaces_but_enter_still_toggles_package_and_top_level_items() {
+        for package in [true, false] {
+            let mut input = paths();
+            if package {
+                input.extensions.clear();
+                input.skills.clear();
+                input.themes.clear();
+                input.prompts[0].path = "/pkg/prompts/my note.md".into();
+            } else {
+                input.extensions[0].path = "/agent/extensions/my item/index.ts".into();
+                input.skills.clear();
+                input.prompts.clear();
+                input.themes.clear();
+            }
+            let mut settings = serde_json::Map::new();
+            if package {
+                settings.insert("packages".into(), serde_json::json!(["npm:thing"]));
+            }
+            let mut list = ResourceList::new(
+                build_groups(&input),
+                SettingsManager::in_memory(settings),
+                "/work".to_string(),
+                "/agent".to_string(),
+            );
+            let toggled = Rc::new(RefCell::new(0usize));
+            let sink = Rc::clone(&toggled);
+            list.on_toggle = Some(Box::new(move |_item, _enabled| *sink.borrow_mut() += 1));
+            let settings_before = list.settings_manager.get_global_settings();
+
+            for ch in "my".chars() {
+                list.handle_input(&ch.to_string());
+            }
+            list.handle_input(" ");
+
+            assert_eq!(list.search_input.get_value(), "my ");
+            assert_eq!(*toggled.borrow(), 0);
+            assert_eq!(list.settings_manager.get_global_settings(), settings_before);
+
+            list.handle_input("\u{7f}");
+            assert_eq!(list.search_input.get_value(), "my");
+            list.handle_input("\r");
+            assert_eq!(*toggled.borrow(), 1, "Enter remains intentional activation");
+            assert_ne!(list.settings_manager.get_global_settings(), settings_before);
+        }
+    }
+
+    #[test]
     fn typing_filters_through_the_search_input() {
         let groups = build_groups(&paths());
         let mut list = ResourceList::new(
@@ -1339,6 +1440,7 @@ mod tests {
 
     #[test]
     fn the_selector_forwards_focus_and_input_to_its_resource_list() {
+        crate::modes::interactive::theme::theme::init_theme(Some("prime"), false);
         let mut selector = ConfigSelectorComponent::new(
             &paths(),
             SettingsManager::in_memory(Default::default()),
@@ -1361,6 +1463,7 @@ mod tests {
 
     #[test]
     fn the_header_truncates_to_the_viewport() {
+        crate::modes::interactive::theme::theme::init_theme(Some("prime"), false);
         let mut header = ConfigSelectorHeader;
         let lines = header.render(10.0);
         assert_eq!(visible_width(&lines[0]), 10);

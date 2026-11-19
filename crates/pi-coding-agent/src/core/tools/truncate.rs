@@ -204,26 +204,26 @@ pub fn truncate_tail(content: &str, options: TruncationOptions) -> TruncationRes
 
         if output_bytes_count + line_bytes > max_bytes {
             truncated_by = TruncatedBy::Bytes;
-            // Trailing blanks must not defeat the oversized-line rescue; keep as
-            // many as the budget allows. CRLF content yields "\r" blank lines, so
-            // blankness and cost are measured on actual bytes instead of assuming
-            // empty LF-separated lines (each kept blank costs its own bytes plus
-            // the one "\n" separator the rejoin inserts before it).
-            if output_lines_arr.iter().all(|collected| is_blank_line(collected)) {
-                let mut kept_blanks = output_lines_arr.len();
-                let mut blanks_cost: usize =
-                    output_lines_arr.iter().map(|blank| 1 + byte_length(blank)).sum();
-                while kept_blanks > 0 && blanks_cost + 1 > max_bytes {
-                    kept_blanks -= 1;
-                    blanks_cost -= 1 + byte_length(output_lines_arr[kept_blanks]);
-                }
-                output_lines_arr.truncate(kept_blanks);
-                let truncated_line =
-                    truncate_string_to_bytes_from_end(line, max_bytes.saturating_sub(blanks_cost));
-                output_bytes_count = byte_length(&truncated_line) + blanks_cost;
-                partial_line = Some(truncated_line);
-                last_line_partial = true;
+            // Preserve the tail of an oversized first collected line together
+            // with as many later lines as the byte budget can fit. Each retained
+            // later line also needs its rejoined newline separator.
+            let mut trailing_cost: usize = output_lines_arr
+                .iter()
+                .map(|collected| 1 + byte_length(collected))
+                .sum();
+            let mut first_trailing = 0usize;
+            while first_trailing < output_lines_arr.len() && trailing_cost + 1 > max_bytes {
+                trailing_cost -= 1 + byte_length(output_lines_arr[first_trailing]);
+                first_trailing += 1;
             }
+            if first_trailing > 0 {
+                output_lines_arr.drain(..first_trailing);
+            }
+            let truncated_line =
+                truncate_string_to_bytes_from_end(line, max_bytes.saturating_sub(trailing_cost));
+            output_bytes_count = byte_length(&truncated_line) + trailing_cost;
+            partial_line = Some(truncated_line);
+            last_line_partial = true;
             break;
         }
 
@@ -257,11 +257,6 @@ pub fn truncate_tail(content: &str, options: TruncationOptions) -> TruncationRes
         max_lines,
         max_bytes,
     }
-}
-
-/// A line that renders empty: `""` from LF content or `"\r"` from CRLF content.
-fn is_blank_line(line: &str) -> bool {
-    line.is_empty() || line == "\r"
 }
 
 /// Truncate a string to fit within a byte limit (from the end).
@@ -390,6 +385,22 @@ mod tests {
         // keptBlanks = min(2, 6 - 1) = 2 -> truncated line budget = 6 - 2 = 4
         assert_eq!(result.content, "ghij\n\n");
         assert_eq!(result.output_bytes, 6);
+    }
+
+    #[test]
+    fn truncate_tail_keeps_a_partial_oversized_line_before_a_nonblank_tail() {
+        let content = format!("{}\ntail", "x".repeat(90));
+        let result = truncate_tail(
+            &content,
+            TruncationOptions {
+                max_lines: Some(100),
+                max_bytes: Some(16),
+            },
+        );
+        assert_eq!(result.content, format!("{}\ntail", "x".repeat(11)));
+        assert_eq!(result.output_lines, 2);
+        assert_eq!(result.output_bytes, 16);
+        assert!(result.last_line_partial);
     }
 
     #[test]

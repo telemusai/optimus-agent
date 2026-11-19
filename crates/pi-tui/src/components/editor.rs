@@ -1008,6 +1008,12 @@ impl Editor {
         (self.state.cursor_line, self.state.cursor_col)
     }
 
+    fn char_before_cursor(&self) -> Option<char> {
+        let current_line = self.state.lines.get(self.state.cursor_line)?;
+        let prefix = current_line.get(..self.state.cursor_col.min(current_line.len()))?;
+        prefix.chars().next_back()
+    }
+
     pub fn set_text(&mut self, text: &str) {
         self.cancel_autocomplete();
         self.last_action = None;
@@ -1278,22 +1284,11 @@ impl Editor {
         // If pasting a file path (starts with /, ~, or .) and the character before
         // the cursor is a word character, prepend a space for better readability
         if filtered_text.starts_with('/') || filtered_text.starts_with('~') || filtered_text.starts_with('.') {
-            let current_line = self
-                .state
-                .lines
-                .get(self.state.cursor_line)
-                .cloned()
-                .unwrap_or_default();
-            let char_before_cursor = if self.state.cursor_col > 0 {
-                current_line
-                    .chars()
-                    .nth(self.state.cursor_col - 1)
-                    .map(|c| c.to_string())
-                    .unwrap_or_default()
-            } else {
-                String::new()
-            };
-            if !char_before_cursor.is_empty() && is_word_char(&char_before_cursor) {
+            if self
+                .char_before_cursor()
+                .map(|character| is_word_char(&character.to_string()))
+                .unwrap_or(false)
+            {
                 filtered_text = format!(" {filtered_text}");
             }
         }
@@ -1369,18 +1364,7 @@ impl Editor {
             return false;
         }
 
-        let current_line = self
-            .state
-            .lines
-            .get(self.state.cursor_line)
-            .cloned()
-            .unwrap_or_default();
-        self.state.cursor_col > 0
-            && current_line
-                .chars()
-                .nth(self.state.cursor_col - 1)
-                .map(|c| c == '\\')
-                .unwrap_or(false)
+        self.char_before_cursor() == Some('\\')
     }
 
     fn submit_value(&mut self) {
@@ -1473,6 +1457,83 @@ impl Editor {
         self.snapped_from_cursor_col = None;
     }
 
+    fn visual_line_bounds(&self, visual_line: &VisualLine) -> (usize, usize) {
+        let line = self
+            .state
+            .lines
+            .get(visual_line.logical_line)
+            .map(String::as_str)
+            .unwrap_or("");
+        let start = visual_line.start_col.min(line.len());
+        let end = start.saturating_add(visual_line.length).min(line.len());
+        (start, end)
+    }
+
+    fn visual_column_at_byte(&self, visual_line: &VisualLine, byte_col: usize) -> usize {
+        let line = self
+            .state
+            .lines
+            .get(visual_line.logical_line)
+            .map(String::as_str)
+            .unwrap_or("");
+        let (start, end) = self.visual_line_bounds(visual_line);
+        let cursor = byte_col.clamp(start, end);
+        line.get(start..cursor).map(visible_width).unwrap_or(0)
+    }
+
+    fn visual_line_max_cursor_column(
+        &self,
+        visual_line: &VisualLine,
+        is_last_segment: bool,
+    ) -> usize {
+        let line = self
+            .state
+            .lines
+            .get(visual_line.logical_line)
+            .map(String::as_str)
+            .unwrap_or("");
+        let (start, end) = self.visual_line_bounds(visual_line);
+        let Some(text) = line.get(start..end) else {
+            return 0;
+        };
+        let width = visible_width(text);
+        if is_last_segment {
+            return width;
+        }
+        // A wrap boundary belongs to the next visual line. Exclude the final
+        // grapheme's cells instead of assuming that one byte equals one column.
+        let last_width = self
+            .segment(text)
+            .last()
+            .map(|(segment, _)| visible_width(segment))
+            .unwrap_or(0);
+        width.saturating_sub(last_width)
+    }
+
+    fn byte_at_visual_column(&self, visual_line: &VisualLine, visual_col: usize) -> usize {
+        let line = self
+            .state
+            .lines
+            .get(visual_line.logical_line)
+            .map(String::as_str)
+            .unwrap_or("");
+        let (start, end) = self.visual_line_bounds(visual_line);
+        let Some(text) = line.get(start..end) else {
+            return start;
+        };
+        if visual_col == 0 {
+            return start;
+        }
+        let mut width = 0usize;
+        for (segment, index) in graphemes_with_indices(text) {
+            width += visible_width(&segment);
+            if width >= visual_col {
+                return start + index + segment.len();
+            }
+        }
+        end
+    }
+
     /// Move cursor to a target visual line, applying sticky column logic.
     /// Shared by moveCursor() and pageScroll().
     fn move_to_visual_line(
@@ -1496,9 +1557,9 @@ impl Editor {
         let current_visual_col: usize;
         if let Some(snapped) = self.snapped_from_cursor_col {
             let vl_index = self.find_visual_line_at(visual_lines, current_vl.logical_line, snapped);
-            current_visual_col = snapped.saturating_sub(visual_lines[vl_index].start_col);
+            current_visual_col = self.visual_column_at_byte(&visual_lines[vl_index], snapped);
         } else {
-            current_visual_col = self.state.cursor_col.saturating_sub(current_vl.start_col);
+            current_visual_col = self.visual_column_at_byte(&current_vl, self.state.cursor_col);
         }
 
         // For non-last segments, clamp to length-1 to stay within the segment
@@ -1507,35 +1568,36 @@ impl Editor {
                 .get(current_visual_line + 1)
                 .map(|vl| vl.logical_line != current_vl.logical_line)
                 .unwrap_or(true);
-        let source_max_visual_col = if is_last_source_segment {
-            current_vl.length
-        } else {
-            current_vl.length.saturating_sub(1)
-        };
+        let source_max_visual_col =
+            self.visual_line_max_cursor_column(&current_vl, is_last_source_segment);
 
         let is_last_target_segment = target_visual_line == visual_lines.len() - 1
             || visual_lines
                 .get(target_visual_line + 1)
                 .map(|vl| vl.logical_line != target_vl.logical_line)
                 .unwrap_or(true);
-        let target_max_visual_col = if is_last_target_segment {
-            target_vl.length
-        } else {
-            target_vl.length.saturating_sub(1)
-        };
+        let target_max_visual_col =
+            self.visual_line_max_cursor_column(&target_vl, is_last_target_segment);
 
-        let move_to_visual_col =
-            self.compute_vertical_move_column(current_visual_col, source_max_visual_col, target_max_visual_col);
+        let move_to_visual_col = self.compute_vertical_move_column(
+            current_visual_col,
+            source_max_visual_col,
+            target_max_visual_col,
+        );
 
         self.state.cursor_line = target_vl.logical_line;
-        let target_col = target_vl.start_col + move_to_visual_col;
         let logical_line = self
             .state
             .lines
             .get(target_vl.logical_line)
             .cloned()
             .unwrap_or_default();
-        self.state.cursor_col = target_col.min(logical_line.len());
+        self.state.cursor_col = self.byte_at_visual_column(&target_vl, move_to_visual_col);
+        // A display column can fall inside a wide grapheme. Preserve the desired
+        // cell so a later ASCII line can restore it instead of drifting.
+        if self.visual_column_at_byte(&target_vl, self.state.cursor_col) != move_to_visual_col {
+            self.preferred_visual_col = Some(move_to_visual_col);
+        }
 
         // Snap cursor to atomic segment boundary (e.g. paste markers)
         // so the cursor never lands in the middle of a multi-grapheme unit.
@@ -2077,7 +2139,7 @@ impl Editor {
                     self.state.cursor_line += 1;
                     self.set_cursor_col(0);
                 } else if let Some(current_vl) = visual_lines.get(current_visual_line) {
-                    self.preferred_visual_col = Some(self.state.cursor_col.saturating_sub(current_vl.start_col));
+                    self.preferred_visual_col = Some(self.visual_column_at_byte(current_vl, self.state.cursor_col));
                 }
             } else {
                 // Moving left - move by one grapheme (handles emojis, combining characters, etc.)
@@ -3379,19 +3441,7 @@ impl Component for Editor {
 
             // Workaround for terminals without Shift+Enter support:
             // If char before cursor is \, delete it and insert newline instead of submitting.
-            let current_line = self
-                .state
-                .lines
-                .get(self.state.cursor_line)
-                .cloned()
-                .unwrap_or_default();
-            if self.state.cursor_col > 0
-                && current_line
-                    .chars()
-                    .nth(self.state.cursor_col - 1)
-                    .map(|c| c == '\\')
-                    .unwrap_or(false)
-            {
+            if self.char_before_cursor() == Some('\\') {
                 self.handle_backspace();
                 self.add_new_line();
                 return;
@@ -3892,6 +3942,117 @@ mod tests {
             editor.borrow().is_showing_autocomplete(),
             "focus alone clears nothing"
         );
+    }
+
+    fn vertical_test_editor(text: &str, width: usize, line: usize, col: usize) -> Editor {
+        let ui = Rc::new(RefCell::new(TUI::new(
+            Box::new(crate::terminal::ProcessTerminal::new()),
+            None,
+        )));
+        let mut editor = Editor::new(ui, test_theme(), EditorOptions::default());
+        editor.set_text(text);
+        editor.last_width = width;
+        editor.state.cursor_line = line;
+        editor.set_cursor_col(col);
+        editor
+    }
+
+    #[test]
+    fn vertical_movement_maps_accented_bytes_to_ascii_display_columns() {
+        let mut editor = vertical_test_editor("éx\nab", 80, 0, "é".len());
+        editor.move_cursor(1, 0);
+        assert_eq!(
+            editor.get_cursor(),
+            (1, 1),
+            "one display cell right is one ASCII byte"
+        );
+        editor.move_cursor(-1, 0);
+        assert_eq!(editor.get_cursor(), (0, "é".len()));
+    }
+
+    #[test]
+    fn wrapped_cjk_vertical_moves_keep_display_columns_and_sticky_position() {
+        let mut editor = vertical_test_editor("abcdefgh\n界界界界\nijklmnop", 4, 0, 3);
+
+        editor.move_cursor(1, 0);
+        assert_eq!(editor.get_cursor(), (0, 7));
+        editor.move_cursor(1, 0);
+        assert_eq!(
+            editor.get_cursor(),
+            (1, "界".len()),
+            "wide target clamps to two cells"
+        );
+        assert_eq!(editor.preferred_visual_col, Some(3));
+        editor.move_cursor(1, 0);
+        assert_eq!(editor.get_cursor(), (1, 4 * "界".len()));
+        assert_eq!(editor.preferred_visual_col, Some(3));
+        editor.move_cursor(1, 0);
+        assert_eq!(
+            editor.get_cursor(),
+            (2, 3),
+            "the original three-cell column remains sticky"
+        );
+        assert_eq!(editor.preferred_visual_col, Some(3));
+        editor.move_cursor(1, 0);
+        assert_eq!(editor.get_cursor(), (2, 7));
+        assert_eq!(editor.preferred_visual_col, None);
+        editor.move_cursor(-1, 0);
+        assert_eq!(editor.get_cursor(), (2, 3));
+        editor.move_cursor(-1, 0);
+        assert_eq!(editor.get_cursor(), (1, 4 * "界".len()));
+        editor.move_cursor(-1, 0);
+        assert_eq!(editor.get_cursor(), (1, "界".len()));
+        editor.move_cursor(-1, 0);
+        assert_eq!(editor.get_cursor(), (0, 7));
+        editor.move_cursor(-1, 0);
+        assert_eq!(editor.get_cursor(), (0, 3));
+    }
+
+    #[test]
+    fn page_movement_from_wrapped_cjk_uses_display_columns_without_bad_byte_slices() {
+        let mut editor = vertical_test_editor("abcdefgh\n界界界界\nijklmnop", 4, 0, 7);
+        editor.move_cursor(1, 0);
+        assert_eq!(editor.get_cursor(), (1, "界".len()));
+        assert_eq!(editor.preferred_visual_col, Some(3));
+        editor.page_scroll(1);
+        assert_eq!(editor.get_cursor(), (2, 7));
+        assert_eq!(editor.preferred_visual_col, None);
+        editor.page_scroll(-1);
+        assert_eq!(editor.get_cursor(), (0, 3));
+    }
+
+    #[test]
+    fn unicode_backslash_enter_inserts_newline_instead_of_submitting() {
+        let ui = Rc::new(RefCell::new(TUI::new(
+            Box::new(crate::terminal::ProcessTerminal::new()),
+            None,
+        )));
+        let mut editor = Editor::new(ui, test_theme(), EditorOptions::default());
+        editor.set_text("é\\");
+        let submitted = Rc::new(RefCell::new(None::<String>));
+        let submitted_slot = Rc::clone(&submitted);
+        editor.on_submit = Some(Box::new(move |text| {
+            *submitted_slot.borrow_mut() = Some(text.to_string());
+        }));
+
+        editor.handle_input("\r");
+
+        assert_eq!(editor.get_text(), "é\n");
+        assert!(submitted.borrow().is_none());
+    }
+
+    #[test]
+    fn absolute_paste_is_separated_after_a_multibyte_word_character() {
+        let ui = Rc::new(RefCell::new(TUI::new(
+            Box::new(crate::terminal::ProcessTerminal::new()),
+            None,
+        )));
+        let mut editor = Editor::new(ui, test_theme(), EditorOptions::default());
+        editor.set_text("é");
+
+        editor.handle_input("\x1b[200~/tmp/café\x1b[201~");
+
+        assert_eq!(editor.get_text(), "é /tmp/café");
     }
 
     /// Shared theme builder for the editor tests.

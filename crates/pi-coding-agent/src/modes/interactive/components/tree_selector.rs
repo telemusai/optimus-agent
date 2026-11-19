@@ -768,6 +768,7 @@ impl TreeList {
         label: Option<String>,
         label_timestamp: Option<String>,
     ) {
+        let mut updated = false;
         for flat_node in self.flat_nodes.iter_mut() {
             if flat_node.node.entry.id() == entry_id {
                 flat_node.node.label = label.clone();
@@ -775,8 +776,14 @@ impl TreeList {
                     Some(_) => Some(label_timestamp.unwrap_or_else(|| now_iso8601())),
                     None => None,
                 };
+                updated = true;
                 break;
             }
+        }
+        if updated {
+            // label changes can alter both search matches and labeled-only
+            // membership, so the visible projection is stale until rebuilt.
+            self.apply_filter();
         }
     }
 
@@ -1157,6 +1164,12 @@ impl TreeList {
     /// Port of `handleInput(keyData)`.
     pub fn handle_input(&mut self, key_data: &str) {
         let kb = get_keybindings();
+        if self.filtered_nodes.is_empty()
+            && (kb.matches(key_data, "tui.select.up")
+                || kb.matches(key_data, "tui.select.down"))
+        {
+            return;
+        }
         if kb.matches(key_data, "tui.select.up") {
             self.selected_index = if self.selected_index == 0 {
                 self.filtered_nodes.len() - 1
@@ -2155,6 +2168,86 @@ fn get_searchable_text(node: &AgentConnectionSessionTreeNode) -> String {
 #[cfg(test)]
 mod linear_storage_tests {
     use super::*;
+
+    fn custom_node(id: &str) -> AgentConnectionSessionTreeNode {
+        AgentConnectionSessionTreeNode {
+            entry: AgentConnectionSessionEntry::CustomMessage {
+                id: id.to_string(),
+                parent_id: None,
+                timestamp: "2026-09-18T00:00:00Z".into(),
+                custom_type: "test".into(),
+                content: serde_json::Value::String("payload".into()),
+                details: None,
+                display: true,
+            },
+            label: None,
+            label_timestamp: None,
+            children: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn empty_tree_up_and_down_keep_zero_selection_and_render_no_entries() {
+        crate::modes::interactive::theme::theme::init_theme(Some("prime"), false);
+        let mut list = TreeList::new(&[], None, 5, None, None);
+        for key in ["\u{1b}[A", "\u{1b}[B"] {
+            list.handle_input(key);
+            assert_eq!(list.selected_index(), 0);
+            assert!(list.render(40.0).iter().any(|line| line.contains("No entries found")));
+        }
+    }
+
+    #[test]
+    fn search_empty_tree_up_and_down_keep_zero_selection_and_render_no_entries() {
+        crate::modes::interactive::theme::theme::init_theme(Some("prime"), false);
+        let mut list = TreeList::new(&[custom_node("node")], None, 5, None, None);
+        list.handle_input("no-match");
+        assert!(list.filtered_nodes.is_empty());
+        for key in ["\u{1b}[A", "\u{1b}[B"] {
+            list.handle_input(key);
+            assert_eq!(list.selected_index(), 0);
+            assert!(list.render(40.0).iter().any(|line| line.contains("No entries found")));
+        }
+    }
+
+    #[test]
+    fn label_save_rebuilds_labeled_projection_selection_and_activation() {
+        crate::modes::interactive::theme::theme::init_theme(Some("prime"), false);
+        let nodes = vec![custom_node("node-0"), custom_node("node-1")];
+        let mut list = TreeList::new(&nodes, None, 10, None, Some("labeled-only"));
+        assert!(list.filtered_nodes.is_empty());
+        let activated = Rc::new(RefCell::new(Vec::<String>::new()));
+        let sink = Rc::clone(&activated);
+        list.on_select = Some(Box::new(move |id| sink.borrow_mut().push(id.to_string())));
+
+        list.update_node_label("node-1", Some("fresh label".into()), None);
+        assert_eq!(list.filtered_nodes.len(), 1);
+        assert_eq!(list.get_selected_node().unwrap().entry.id(), "node-1");
+        assert!(list.render(100.0).join("\n").contains("fresh label"));
+
+        list.update_node_label("node-1", Some("renamed now".into()), None);
+        let rendered = list.render(100.0).join("\n");
+        assert!(rendered.contains("renamed now"));
+        assert!(!rendered.contains("fresh label"));
+
+        list.update_node_label("node-0", Some("fallback".into()), None);
+        assert_eq!(list.filtered_nodes.len(), 2);
+        assert_eq!(list.get_selected_node().unwrap().entry.id(), "node-1");
+        list.update_node_label("node-1", None, None);
+        assert_eq!(list.filtered_nodes.len(), 1);
+        assert_eq!(list.get_selected_node().unwrap().entry.id(), "node-0");
+        list.handle_input("\r");
+        assert_eq!(activated.borrow().as_slice(), ["node-0"]);
+
+        list.update_node_label("node-0", None, None);
+        assert!(list.filtered_nodes.is_empty());
+        list.handle_input("\r");
+        assert_eq!(
+            activated.borrow().as_slice(),
+            ["node-0"],
+            "an empty projection cannot activate a stale row"
+        );
+    }
 
     #[test]
     fn long_chain_flat_rows_remain_shallow_through_label_fold_and_search() {

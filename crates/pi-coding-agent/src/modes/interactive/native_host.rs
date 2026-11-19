@@ -1150,6 +1150,9 @@ enum InputAction {
     SessionResume,
 }
 enum HostEvent {
+    /// A short-lived confirmation line (e.g. an OCC toggle acknowledgement)
+    /// that renders in the chat and auto-hides after a few seconds.
+    TransientStatus(String),
     MenuTiming(Instant),
     Extension(native_extension_bridge::Event),
     Shutdown,
@@ -1619,29 +1622,45 @@ fn open_external_editor_for(
         );
         return;
     };
-    let current_text = editor.borrow().editor().get_text().to_string();
+    let current_text =
+        crate::modes::interactive::components::extension_editor::external_editor_draft(
+            editor.borrow().editor(),
+        );
     let tmp_file = std::env::temp_dir().join(format!("pi-editor-{}.pi.md", now_ms()));
-    if std::fs::write(&tmp_file, &current_text).is_err() {
+    let mut command = match crate::modes::interactive::components::extension_editor::external_editor_command(
+        &editor_cmd,
+        &tmp_file,
+    ) {
+        Ok(command) => command,
+        Err(error) => {
+            mode.borrow_mut().show_error(&error);
+            return;
+        }
+    };
+    if let Err(error) = std::fs::write(&tmp_file, &current_text) {
+        mode.borrow_mut()
+            .show_error(&format!("Could not write the editor draft: {error}"));
         return;
     }
     tui.borrow_mut().stop(TuiStopOptions::default());
-    let parts: Vec<String> = editor_cmd.split(' ').map(|part| part.to_string()).collect();
-    let editor_program = parts.first().cloned().unwrap_or_default();
-    let mut command = std::process::Command::new(&editor_program);
-    for arg in parts.iter().skip(1) {
-        command.arg(arg);
-    }
-    command.arg(&tmp_file);
-    if let Ok(status) = command.status() {
-        if status.success() {
-            if let Ok(content) = std::fs::read_to_string(&tmp_file) {
-                let new_content =
-                crate::modes::interactive::components::extension_editor::strip_trailing_newline(
+    match command.status() {
+        Ok(status) if status.success() => match std::fs::read_to_string(&tmp_file) {
+            Ok(content) => {
+                crate::modes::interactive::components::extension_editor::apply_external_editor_content(
+                    &mut *editor.borrow_mut().editor_mut(),
                     &content,
                 );
-                editor.borrow_mut().editor_mut().set_text(&new_content);
             }
-        }
+            Err(error) => mode
+                .borrow_mut()
+                .show_error(&format!("Could not read the editor draft: {error}")),
+        },
+        Ok(status) => mode
+            .borrow_mut()
+            .show_error(&format!("External editor exited with {status}")),
+        Err(error) => mode
+            .borrow_mut()
+            .show_error(&format!("Could not start the external editor: {error}")),
     }
     let _ = std::fs::remove_file(&tmp_file);
     tui.borrow_mut().start();
@@ -2423,7 +2442,7 @@ async fn run_terminal(
                         // the ephemeral `?` guide (interactive-mode.ts:4931-4936).
                         mode.borrow_mut().handle_hotkeys_command();
                     } else if text.trim() == "/help" {
-                        mode.borrow_mut().show_status("/model  select a model\n/login  provider setup\n/new  new session\n/context  context usage\n/compact [instructions]  compact session\n/refine  refine reusable knowledge\n/goal <objective>  pursue a goal\n!<command>  run shell command\n/quit  exit\nEsc interrupts; Ctrl+C twice exits; Ctrl+D exits an empty prompt; Alt+Enter queues follow-up; Ctrl+O expands tools.", "dim");
+                        mode.borrow_mut().show_status("/model  select a model\n/login  provider setup\n/new  new session\n/context  context usage\n/compact [instructions]  compact session\n/refine  refine reusable knowledge\n/goal <objective>  pursue a goal\n!<command>  run shell command\n/quit  exit\nEsc interrupts; Ctrl+C twice exits; Ctrl+D exits an empty prompt; Enter steers the running turn while busy; Alt+Enter queues a follow-up; Shift+Enter inserts a newline; Ctrl+O expands tools.", "dim");
                     } else {
                         if submission_is_prompt(&text) { ui.borrow_mut().scroll_to_bottom(); }
                         submit_from_editor(&connection, &send, text, follow_up, &mut ui_metrics, &transcript);
@@ -3194,6 +3213,9 @@ async fn run_terminal(
                     );
                 }
                 HostEvent::Status(status) => mode.borrow_mut().show_status(&status, "dim"),
+                HostEvent::TransientStatus(status) => {
+                    mode.borrow_mut().show_transient_status(&status, "dim", Instant::now());
+                }
                 HostEvent::ClipboardNotice(message) => {
                     transcript.borrow_mut().clipboard_notice.show(message, Instant::now());
                 }
@@ -3580,7 +3602,9 @@ async fn run_terminal(
             bridge.footer_data.set_cwd(&mode.borrow().get_current_cwd());
             bridge.footer_data.set_available_provider_count(models.iter().map(|m| &m.provider).collect::<std::collections::HashSet<_>>().len());
         }
-        queue_runtime.poll();
+        if queue_runtime.poll() {
+            ui.borrow_mut().request_render();
+        }
         if state_refresh.poll(&mode, &current_session_id) {
             ui.borrow_mut().request_render();
         }
@@ -3942,6 +3966,11 @@ async fn prompt_model(
     follow_up: bool,
     images: Option<Vec<ImageContent>>,
 ) -> Result<(), String> {
+    // Enter steers the running turn while the agent is busy; the
+    // follow-up key opts into queueing an in-order follow-up instead.
+    // The core session keeps its behavior-less fallback (busy ordinary
+    // programmatic submissions queue rather than error), so every
+    // caller stays consistent.
     connection
         .prompt(
             line,
@@ -4111,6 +4140,9 @@ fn should_record_prompt_history(text: &str) -> bool {
 enum CommandOutput {
     Nothing,
     Status(String),
+    /// A confirmation that should disappear after a few moments instead of
+    /// staying in the transcript (OCC toggle acknowledgements).
+    TransientStatus(String),
     ClipboardNotice(String),
     Warning(String),
     EchoLocal(String),
@@ -4159,6 +4191,9 @@ impl CommandOutput {
             CommandOutput::Status(status) => {
                 mode.borrow_mut().show_status(&status, "dim");
             }
+            CommandOutput::TransientStatus(status) => {
+                mode.borrow_mut().show_transient_status(&status, "dim", Instant::now());
+            }
             CommandOutput::ClipboardNotice(message) => {
                 let _ = send.send(HostEvent::ClipboardNotice(message));
             }
@@ -4198,6 +4233,7 @@ impl CommandOutput {
         match self {
             CommandOutput::Nothing => Vec::new(),
             CommandOutput::Status(status) => vec![HostEvent::Status(status)],
+            CommandOutput::TransientStatus(status) => vec![HostEvent::TransientStatus(status)],
             CommandOutput::ClipboardNotice(message) => vec![HostEvent::ClipboardNotice(message)],
             CommandOutput::Warning(warning) => vec![HostEvent::Warning(warning)],
             CommandOutput::EchoLocal(text) => vec![HostEvent::EchoLocal(text)],
@@ -5035,6 +5071,7 @@ fn project_state(state: wire::AgentConnectionState) -> local::AgentConnectionSta
             percent: number(&state.context_usage, "percent"),
         },
         recap: state.recap,
+        occ3_modes: state.occ3_modes,
     }
 }
 
@@ -6264,7 +6301,7 @@ fn apply_event_legacy_for_speed(
         let (reply, wait) = tokio::sync::oneshot::channel();
         fake.prompt_replies.lock().unwrap().push_back(wait);
         let (send, receive) = host_event_channel(64 * 1024);
-        submit_from_editor(&connection, &send, "private submitted prompt".into(), true, &mut metrics, &h.transcript);
+        submit_from_editor(&connection, &send, "private submitted prompt".into(), false, &mut metrics, &h.transcript);
         assert_eq!(metrics.pending_count(), 1);
         assert!(fake.calls().is_empty(), "the receipt/ID must exist before the task runs");
         let initial = h.paint().join("\n");
@@ -6275,7 +6312,8 @@ fn apply_event_legacy_for_speed(
         h.editor.borrow_mut().handle_input("\x1b[D");
         let cursor = h.editor.borrow().editor().get_cursor();
         tokio::task::yield_now().await;
-        assert_eq!(fake.only_call("prompt"), ["private submitted prompt", "followUp", "None"]);
+        // The ordinary submit path steers; the follow-up key queues.
+        assert_eq!(fake.only_call("prompt"), ["private submitted prompt", "steer", "None"]);
         assert!(receive.try_recv().is_err(), "held reply must not claim completion");
         reply.send(Err("synthetic host rejection".into())).unwrap();
         tokio::task::yield_now().await;
@@ -7793,6 +7831,7 @@ fn apply_event_legacy_for_speed(
             own_usage: pi_ai::types::Usage::default(),
             total_usage: pi_ai::types::Usage::default(),
             context_usage: None,
+            textmas_usage: None,
             children: Vec::new(),
         };
         let text = crate::modes::interactive::components::context_tree_format::format_context_tree(
@@ -8029,6 +8068,43 @@ fn apply_event_legacy_for_speed(
         assert_eq!(mode.borrow().connection_state.as_ref().unwrap().execution_mode, Some(ExecutionMode::Direct));
     }
 
+    #[tokio::test]
+    async fn cached_textmas_activity_reconciles_and_applies_host_idle_state() {
+        let session_id = "occ31-host-refresh";
+        let mode = Rc::new(RefCell::new(stash_mode(session_id)));
+        mode.borrow_mut().apply_connection_state_snapshot(local::AgentConnectionState {
+            session_id: session_id.into(),
+            occ3_modes: Some(wire::Occ3Modes {
+                textmas_mode: crate::core::occ::textmas::TextMasMode::Sequential,
+                textmas_active: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let recorder = Arc::new(RecordingConnection::new());
+        *recorder.state.lock().unwrap() = wire::AgentConnectionState {
+            session_id: session_id.into(),
+            occ3_modes: Some(wire::Occ3Modes {
+                textmas_mode: crate::core::occ::textmas::TextMasMode::Sequential,
+                textmas_active: false,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let connection: Arc<dyn wire::AgentConnection> = recorder.clone();
+        let mut refresh = native_state::StateRefresh::new();
+        refresh.expire_reconciliation_for_tests();
+        refresh.reconcile_if_due(connection, session_id.into(), &mode.borrow());
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !refresh.poll(&mode, session_id) { tokio::task::yield_now().await; }
+        }).await.expect("cached OCC3.1 activity must cause an applied quiet refresh");
+        assert_eq!(recorder.calls().iter().filter(|(name, _)| name == "get_state").count(), 1);
+        assert_eq!(mode.borrow().connection_state.as_ref()
+            .and_then(|state| state.occ3_modes.as_ref())
+            .map(|occ| occ.textmas_active), Some(false));
+        assert!(!mode.borrow().is_agent_streaming());
+    }
+
     #[test]
     fn execution_mode_function_key_is_configurable_and_keeps_editor_draft() {
         use crate::core::keybindings::{KeybindingsConfig, KeybindingsManager, KeybindingSetting};
@@ -8190,6 +8266,56 @@ fn apply_event_legacy_for_speed(
             pasted,
             "the paste table is restored, so the marker expands again"
         );
+    }
+
+    #[test]
+    fn native_external_editor_round_trip_expands_large_pastes_before_final_submission() {
+        let tui = Rc::new(RefCell::new(TUI::new(
+            Box::new(pi_tui::terminal::ProcessTerminal::new()),
+            None,
+        )));
+        let editor = Rc::new(RefCell::new(CustomEditor::new(
+            tui,
+            editor_theme(),
+            CustomEditorOptions::default(),
+        )));
+        let pasted = (1..=12)
+            .map(|line| if line == 2 { "[paste #1]".into() } else { format!("line {line}") })
+            .collect::<Vec<String>>()
+            .join("\n");
+        pi_tui::tui::Component::handle_input(
+            &mut *editor.borrow_mut().editor_mut(),
+            &format!("\u{1b}[200~{pasted}\u{1b}[201~"),
+        );
+        assert_eq!(editor.borrow().editor().get_text(), "[paste #1 +12 lines]");
+        assert_eq!(
+            editor.borrow().editor().get_paste_snapshot().pastes.len(),
+            1
+        );
+
+        let draft = crate::modes::interactive::components::extension_editor::external_editor_draft(
+            editor.borrow().editor(),
+        );
+        assert_eq!(draft, pasted);
+        crate::modes::interactive::components::extension_editor::apply_external_editor_content(
+            &mut *editor.borrow_mut().editor_mut(),
+            &format!("{draft}\n"),
+        );
+        assert_eq!(editor.borrow().editor().get_expanded_text(), draft);
+        assert!(editor
+            .borrow()
+            .editor()
+            .get_paste_snapshot()
+            .pastes
+            .is_empty());
+
+        let edited = format!("{draft}\nexternal append\n[paste #1]");
+        crate::modes::interactive::components::extension_editor::apply_external_editor_content(
+            &mut *editor.borrow_mut().editor_mut(),
+            &format!("{edited}\n"),
+        );
+        let final_submission = editor.borrow().editor().get_expanded_text();
+        assert_eq!(final_submission, edited);
     }
 
     fn compaction_notice_end(error: Option<&str>, committed: bool, aborted: bool) -> wire::AgentConnectionSessionEvent {
