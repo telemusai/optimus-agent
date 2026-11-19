@@ -2,14 +2,14 @@ use super::*;
 use pi_tui::utils::{strip_ansi, visible_width};
 use serde_json::json;
 
-fn parent(id: &str) -> RosterParent {
+pub(super) fn parent(id: &str) -> RosterParent {
     RosterParent {
         session_id: Some(id.into()),
         active_session_id: Some(format!("active-{id}")),
         ..Default::default()
     }
 }
-fn row(id: &str, owner: Option<&str>, working: bool) -> SessionSummary {
+pub(super) fn row(id: &str, owner: Option<&str>, working: bool) -> SessionSummary {
     SessionSummary {
         id: id.into(),
         session_id: id.into(),

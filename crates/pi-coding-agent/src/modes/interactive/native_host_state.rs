@@ -159,6 +159,11 @@ pub(super) fn stop_activity(mode: &mut InteractiveMode) {
         state.is_bash_running = false;
         state.retry_attempt = 0.0;
         state.active_tool_names.clear();
+        if let Some(modes) = state.occ3_modes.as_mut() {
+            // Preserve cached calls for an authoritative reconnect. Only the
+            // owner is known to be gone; do not relabel its calls cancelled.
+            modes.textmas_active = false;
+        }
     });
     mode.stop_compaction_loader();
     mode.stop_working_loader();
@@ -331,4 +336,29 @@ mod tests {
             assert!(!event_requires_snapshot_refresh(event_name), "{event_name}");
         }
     }
+}
+
+
+#[tokio::test]
+async fn connection_stop_pauses_textmas_without_rewriting_cached_calls() {
+    use crate::core::occ::textmas::{TextMasMode, TextMasRole};
+    use crate::core::occ::textmas_activity::{TextMasActivityCall, TextMasActivitySnapshot, TextMasActivityStatus, TEXTMAS_ACTIVITY_SCHEMA};
+    let h = super::ui_tests::FrameHarness::new("textmas-native-disconnect");
+    h.mode.borrow_mut().patch_connection_state(|state| {
+        let mut call = TextMasActivityCall::queued("action", TextMasRole::Planner, None, None, Vec::new());
+        call.status = TextMasActivityStatus::Running;
+        let activity = TextMasActivitySnapshot { schema: TEXTMAS_ACTIVITY_SCHEMA.into(), session_id: "root".into(),
+            action_id: "action".into(), mode: Some(TextMasMode::Sequential), active: true, stale: false, calls: vec![call] };
+        assert!(activity.is_valid());
+        state.occ3_modes = Some(wire::Occ3Modes { textmas_mode: TextMasMode::Sequential, textmas_active: true,
+            textmas_activity: Some(activity), ..Default::default() });
+    });
+    stop_activity(&mut h.mode.borrow_mut());
+    let state = h.mode.borrow();
+    let modes = state.connection_state.as_ref().unwrap().occ3_modes.as_ref().unwrap();
+    assert!(!modes.textmas_active);
+    let cached = modes.textmas_activity.as_ref().unwrap();
+    assert!(cached.active);
+    assert_eq!(cached.calls[0].status, TextMasActivityStatus::Running);
+    assert!(cached.stale == false);
 }
