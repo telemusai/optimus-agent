@@ -1,0 +1,58 @@
+{
+  "idle_poll": {
+    "old": {
+      "iterations": 100,
+      "paints": 19,
+      "records_produced": 0,
+      "records_remaining": 0,
+      "other_ops": 795,
+      "other_bytes": 0,
+      "wall_ms": 1659.6407,
+      "other_ops_per_second": 479.01934436772973,
+      "process_user_ms": 0.0,
+      "process_kernel_ms": 46.875,
+      "kernel_cores_during_wall": 0.0282440651160218
+    },
+    "new_256": {
+      "iterations": 100,
+      "paints": 19,
+      "records_produced": 0,
+      "records_remaining": 0,
+      "other_ops": 795,
+      "other_bytes": 0,
+      "wall_ms": 1658.7701,
+      "other_ops_per_second": 479.27075608609056,
+      "process_user_ms": 0.0,
+      "process_kernel_ms": 31.25,
+      "kernel_cores_during_wall": 0.018839259280113624
+    }
+  },
+  "saturated_poll": {
+    "old": {
+      "iterations": 16,
+      "paints": 15,
+      "records_produced": 60000,
+      "records_remaining": 0,
+      "other_ops": 120190,
+      "other_bytes": 1200000,
+      "wall_ms": 3670.3602,
+      "other_ops_per_second": 32746.104864585224,
+      "process_user_ms": 78.125,
+      "process_kernel_ms": 1296.875,
+      "kernel_cores_during_wall": 0.3533372555641814
+    },
+    "new_256": {
+      "iterations": 236,
+      "paints": 78,
+      "records_produced": 60000,
+      "records_remaining": 0,
+      "other_ops": 122045,
+      "other_bytes": 1200000,
+      "wall_ms": 7220.3081999999995,
+      "other_ops_per_second": 16903.018073383628,
+      "process_user_ms": 31.25,
+      "process_kernel_ms": 1218.75,
+      "kernel_cores_during_wall": 0.16879473372064643
+    }
+  }
+}

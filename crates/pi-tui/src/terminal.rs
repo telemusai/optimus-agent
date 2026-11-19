@@ -304,6 +304,10 @@ fn set_raw_mode(raw: bool) -> std::io::Result<()> {
 
 enum NativeInput { Pending, Ignored, Closed, Bytes(Vec<u8>) }
 
+// Bound the work performed before the owner's next render opportunity. Unread
+// native records stay in the OS queue and resume in order on the next poll.
+const NATIVE_INPUT_POLL_BUDGET: usize = 256;
+
 #[cfg(unix)]
 fn read_available_input() -> std::io::Result<NativeInput> {
     let mut fd = libc::pollfd { fd: libc::STDIN_FILENO, events: libc::POLLIN, revents: 0 };
@@ -904,7 +908,7 @@ impl ProcessTerminal {
         // their text together until the native queue is empty, including when
         // a large paste spans several bounded polls. Otherwise pasted Enter
         // reaches the editor as Submit instead of part of the pasted text.
-        let budget = if coalesce_native { 4096 } else { 64 };
+        let budget = if coalesce_native { NATIVE_INPUT_POLL_BUDGET } else { 64 };
         for _ in 0..budget {
             match read()? {
                 NativeInput::Pending => {
@@ -1737,13 +1741,36 @@ mod tests {
     }
 
     #[test]
+    fn windows_native_records_yield_then_resume_in_order() {
+        let (mut terminal, received) = native_input_fixture();
+        let mut records = std::collections::VecDeque::new();
+        for _ in 0..NATIVE_INPUT_POLL_BUDGET + 2 {
+            records.push_back(NativeInput::Ignored);
+        }
+        records.push_back(NativeInput::Bytes(b"a".to_vec()));
+        records.push_back(NativeInput::Bytes(b"b".to_vec()));
+        let initial_count = records.len();
+
+        terminal.poll_input_from(|| Ok(records.pop_front().unwrap_or(NativeInput::Pending)), true).unwrap();
+        assert_eq!(initial_count - records.len(), NATIVE_INPUT_POLL_BUDGET, "one poll must leave a render opportunity");
+        assert_eq!(records.len(), 4);
+        assert!(received.borrow().is_empty(), "a full native batch remains pending");
+
+        while !records.is_empty() {
+            assert!(terminal.poll_input_from(|| Ok(records.pop_front().unwrap_or(NativeInput::Pending)), true).unwrap());
+        }
+        terminal.poll_input_from(|| Ok(NativeInput::Pending), true).unwrap();
+        assert_eq!(received.borrow().concat(), "ab", "eventual delivery preserves byte order");
+    }
+
+    #[test]
     fn windows_native_paste_survives_poll_budget_without_submitting_fragments() {
         let (mut terminal, received) = native_input_fixture();
         let text = format!("{}\r{}\rFinal line", "a".repeat(5000), "界".repeat(5000));
         let mut records = native_paste_records(&text);
         let initial_count = records.len();
         assert!(terminal.poll_input_from(|| Ok(records.pop_front().unwrap_or(NativeInput::Pending)), true).unwrap());
-        assert_eq!(initial_count - records.len(), 4096, "each poll remains bounded");
+        assert_eq!(initial_count - records.len(), NATIVE_INPUT_POLL_BUDGET, "each poll yields for rendering");
         assert!(received.borrow().is_empty(), "do not dispatch an unfinished native batch");
         while !records.is_empty() {
             assert!(terminal.poll_input_from(|| Ok(records.pop_front().unwrap_or(NativeInput::Pending)), true).unwrap());

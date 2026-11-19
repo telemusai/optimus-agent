@@ -1,0 +1,1 @@
+- Fixed Windows console input polling to yield for rendering between bounded native-record batches while preserving ordered, lossless delivery.

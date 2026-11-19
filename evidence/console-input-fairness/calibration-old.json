@@ -1,0 +1,118 @@
+{
+  "format": 1,
+  "executable": "C:\\Users\\openclawuser\\optimus-agent-console-input-lag\\target\\debug\\examples\\windows_console_input_probe.exe",
+  "direct_api": [
+    {
+      "case": "get_number_count",
+      "requested": 5000,
+      "completed": 5000,
+      "measurement": {
+        "read_ops": 0,
+        "read_bytes": 0,
+        "write_ops": 0,
+        "write_bytes": 0,
+        "other_ops": 5000,
+        "other_bytes": 0,
+        "process_user_ms": 31.25,
+        "process_kernel_ms": 0.0,
+        "thread_user_ms": 31.25,
+        "thread_kernel_ms": 0.0,
+        "wall_ms": 132.6106
+      }
+    },
+    {
+      "case": "get_console_mode",
+      "requested": 5000,
+      "completed": 5000,
+      "measurement": {
+        "read_ops": 0,
+        "read_bytes": 0,
+        "write_ops": 0,
+        "write_bytes": 0,
+        "other_ops": 5000,
+        "other_bytes": 0,
+        "process_user_ms": 0.0,
+        "process_kernel_ms": 62.5,
+        "thread_user_ms": 0.0,
+        "thread_kernel_ms": 62.5,
+        "wall_ms": 136.4878
+      }
+    },
+    {
+      "case": "get_screen_buffer_info",
+      "requested": 5000,
+      "completed": 5000,
+      "measurement": {
+        "read_ops": 0,
+        "read_bytes": 0,
+        "write_ops": 0,
+        "write_bytes": 0,
+        "other_ops": 5000,
+        "other_bytes": 0,
+        "process_user_ms": 0.0,
+        "process_kernel_ms": 78.125,
+        "thread_user_ms": 0.0,
+        "thread_kernel_ms": 78.125,
+        "wall_ms": 129.45229999999998
+      }
+    },
+    {
+      "case": "get_number_plus_read_one",
+      "requested": 4096,
+      "completed": 4096,
+      "measurement": {
+        "read_ops": 0,
+        "read_bytes": 0,
+        "write_ops": 0,
+        "write_bytes": 0,
+        "other_ops": 8192,
+        "other_bytes": 81920,
+        "process_user_ms": 0.0,
+        "process_kernel_ms": 46.875,
+        "thread_user_ms": 0.0,
+        "thread_kernel_ms": 46.875,
+        "wall_ms": 230.9965
+      }
+    }
+  ],
+  "idle_poll": {
+    "case": "idle_16ms_poll_80ms_paint",
+    "iterations": 100,
+    "paints": 19,
+    "records_produced": 0,
+    "records_remaining": 0,
+    "measurement": {
+      "read_ops": 0,
+      "read_bytes": 0,
+      "write_ops": 19,
+      "write_bytes": 380,
+      "other_ops": 795,
+      "other_bytes": 0,
+      "process_user_ms": 0.0,
+      "process_kernel_ms": 46.875,
+      "thread_user_ms": 0.0,
+      "thread_kernel_ms": 46.875,
+      "wall_ms": 1659.6407
+    }
+  },
+  "saturated_poll": {
+    "case": "saturated_focus_records_60000",
+    "iterations": 16,
+    "paints": 15,
+    "records_produced": 60000,
+    "records_remaining": 0,
+    "measurement": {
+      "read_ops": 0,
+      "read_bytes": 0,
+      "write_ops": 15,
+      "write_bytes": 300,
+      "other_ops": 120190,
+      "other_bytes": 1200000,
+      "process_user_ms": 78.125,
+      "process_kernel_ms": 1296.875,
+      "thread_user_ms": 78.125,
+      "thread_kernel_ms": 1296.875,
+      "wall_ms": 3670.3602
+    }
+  }
+}
