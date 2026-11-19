@@ -93,6 +93,8 @@ pub struct OpenAIResponsesStreamOptions {
     pub resolve_service_tier: Option<ResolveServiceTier>,
     pub apply_service_tier_pricing: Option<ApplyServiceTierPricing>,
     pub on_usage_observation: Option<crate::types::OnUsageObservation>,
+    /// Optional transport-idle backstop. Pure parsing callers leave this disabled.
+    pub idle_timeout: Option<std::time::Duration>,
 }
 
 /// The Rust counterpart of a `throw` inside the TypeScript stream loop.
@@ -727,6 +729,75 @@ fn note_empty_completion(output: &mut AssistantMessage, reason: &str) {
     append_assistant_message_diagnostic(output, diagnostic);
 }
 
+/// Apply the terminal response's accounting before either returning its successful
+/// terminal message or surfacing its provider failure. Failed/cancelled aliases
+/// carry the same valid usage and service-tier fields as completed Responses.
+fn record_terminal_response(
+    response: &Value,
+    output: &mut AssistantMessage,
+    stream: &AssistantMessageEventStream,
+    model: &Model,
+    options: Option<&OpenAIResponsesStreamOptions>,
+) {
+    if let Some(id) = get_str(response, "id") {
+        output.response_id = Some(id.to_string());
+    }
+    if let Some(usage) = get(response, "usage") {
+        if !usage.is_null() {
+            let observation = ProviderUsageObservation {
+                input_tokens: Some(finite_token(get(usage, "input_tokens"))),
+                cached_input_tokens: Some(finite_token(
+                    get(usage, "input_tokens_details").and_then(|details| get(details, "cached_tokens")),
+                )),
+                output_tokens: Some(finite_token(get(usage, "output_tokens"))),
+                reasoning_tokens: Some(finite_token(
+                    get(usage, "output_tokens_details").and_then(|details| get(details, "reasoning_tokens")),
+                )),
+                total_tokens: Some(finite_token(get(usage, "total_tokens"))),
+                cached_input_included_in_input: Some(Some(true)),
+                reasoning_included_in_output: Some(Some(true)),
+            };
+            if let Some(observer) = options.and_then(|options| options.on_usage_observation.clone()) {
+                // A disposable local observer cannot change provider behavior.
+                let model_for_observer = model.clone();
+                let observed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    observer(observation, &model_for_observer)
+                }));
+                if let Ok(future) = observed {
+                    stream.try_spawn(async move {
+                        let _ = future.await;
+                    });
+                }
+            }
+
+            let cached_tokens =
+                number_or_zero(get(usage, "input_tokens_details").and_then(|details| get(details, "cached_tokens")));
+            output.usage = Usage {
+                // OpenAI includes cached tokens in input_tokens, so subtract to get
+                // non-cached input
+                input: (number_or_zero(get(usage, "input_tokens")) - cached_tokens).max(0.0),
+                output: number_or_zero(get(usage, "output_tokens")),
+                cache_read: cached_tokens,
+                cache_write: 0.0,
+                total_tokens: 0.0,
+                cost: Default::default(),
+            };
+            output.usage.total_tokens = output.usage.input + output.usage.output
+                + output.usage.cache_read + output.usage.cache_write;
+        }
+    }
+    calculate_cost(model, &mut output.usage, None);
+    if let Some(apply) = options.and_then(|options| options.apply_service_tier_pricing.clone()) {
+        let response_service_tier = get_str(response, "service_tier");
+        let request_service_tier = options.and_then(|options| options.service_tier.as_deref());
+        let service_tier = match options.and_then(|options| options.resolve_service_tier.clone()) {
+            Some(resolve) => resolve(response_service_tier, request_service_tier),
+            None => response_service_tier.or(request_service_tier).map(str::to_string),
+        };
+        apply(&mut output.usage, service_tier.as_deref());
+    }
+}
+
 /// The TypeScript `for await (const event of openaiStream) { ... }` body.
 pub async fn process_responses_stream(
     mut openai_stream: ResponsesEventStream,
@@ -737,9 +808,25 @@ pub async fn process_responses_stream(
 ) -> Result<(), ResponsesStreamError> {
     let mut current_item: Option<Value> = None;
     let mut current_block: Option<CurrentBlock> = None;
+    let mut terminal_received = false;
 
     let result = async {
-    while let Some(event) = openai_stream.next().await {
+    loop {
+        let event = if let Some(idle_timeout) = options.and_then(|options| options.idle_timeout) {
+            tokio::select! {
+                event = openai_stream.next() => event,
+                _ = tokio::time::sleep(idle_timeout) => {
+                    return Err(stream_failure(
+                        format!("SSE stream stalled: no data received within {}ms", idle_timeout.as_millis()),
+                        "sse_idle_timeout",
+                        Some("sse_idle_timeout"),
+                    ));
+                }
+            }
+        } else {
+            openai_stream.next().await
+        };
+        let Some(event) = event else { break; };
         let event_type = get_str(&event, "type").unwrap_or_default();
 
         if event_type == "response.created" {
@@ -1128,74 +1215,28 @@ pub async fn process_responses_stream(
             }
         } else if event_type == "response.completed" || event_type == "response.incomplete" {
             let response = get(&event, "response").cloned().unwrap_or(Value::Null);
-            if let Some(id) = get_str(&response, "id") {
-                output.response_id = Some(id.to_string());
+            let expected_status = if event_type == "response.completed" { "completed" } else { "incomplete" };
+            if get_str(&response, "status") != Some(expected_status) {
+                return Err(ResponsesStreamError::Message(format!(
+                    "Invalid terminal response status for {event_type}: expected {expected_status}"
+                )));
             }
-            if let Some(usage) = get(&response, "usage") {
-                if !usage.is_null() {
-                    let observation = ProviderUsageObservation {
-                        input_tokens: Some(finite_token(get(usage, "input_tokens"))),
-                        cached_input_tokens: Some(finite_token(
-                            get(usage, "input_tokens_details").and_then(|details| get(details, "cached_tokens")),
-                        )),
-                        output_tokens: Some(finite_token(get(usage, "output_tokens"))),
-                        reasoning_tokens: Some(finite_token(
-                            get(usage, "output_tokens_details").and_then(|details| get(details, "reasoning_tokens")),
-                        )),
-                        total_tokens: Some(finite_token(get(usage, "total_tokens"))),
-                        cached_input_included_in_input: Some(Some(true)),
-                        reasoning_included_in_output: Some(Some(true)),
-                    };
-                    if let Some(observer) = options.and_then(|options| options.on_usage_observation.clone()) {
-                        // A disposable local observer cannot change provider behavior.
-                        let model_for_observer = model.clone();
-                        let observed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            observer(observation, &model_for_observer)
-                        }));
-                        if let Ok(future) = observed {
-                            tokio::spawn(async move {
-                                let _ = future.await;
-                            });
-                        }
-                    }
-
-                    let cached_tokens =
-                        number_or_zero(get(usage, "input_tokens_details").and_then(|details| get(details, "cached_tokens")));
-                    output.usage = Usage {
-                        // OpenAI includes cached tokens in input_tokens, so subtract to get
-                        // non-cached input
-                        input: (number_or_zero(get(usage, "input_tokens")) - cached_tokens).max(0.0),
-                        output: number_or_zero(get(usage, "output_tokens")),
-                        cache_read: cached_tokens,
-                        cache_write: 0.0,
-                        total_tokens: 0.0,
-                        cost: Default::default(),
-                    };
-                    output.usage.total_tokens = output.usage.input + output.usage.output
-                        + output.usage.cache_read + output.usage.cache_write;
-                }
-            }
-            calculate_cost(model, &mut output.usage, None);
-            if let Some(apply) = options.and_then(|options| options.apply_service_tier_pricing.clone()) {
-                let response_service_tier = get_str(&response, "service_tier");
-                let request_service_tier = options.and_then(|options| options.service_tier.as_deref());
-                let service_tier = match options.and_then(|options| options.resolve_service_tier.clone()) {
-                    Some(resolve) => resolve(response_service_tier, request_service_tier),
-                    None => response_service_tier.or(request_service_tier).map(str::to_string),
-                };
-                apply(&mut output.usage, service_tier.as_deref());
-            }
-            let status = if event_type == "response.incomplete" {
-                Some("incomplete")
+            record_terminal_response(&response, output, stream, model, options);
+            terminal_received = true;
+            let status = Some(expected_status);
+            let incomplete_reason = (status == Some("incomplete"))
+                .then(|| response.get("incomplete_details")
+                    .and_then(|details| get_str(details, "reason")))
+                .flatten();
+            output.stop_reason = if incomplete_reason == Some("content_filter") {
+                "error".to_string()
             } else {
-                get_str(&response, "status")
+                map_stop_reason(status)?
             };
-            output.stop_reason = map_stop_reason(status)?;
             if status == Some("incomplete") && output.stop_reason_raw.is_none() {
                 // Keep the provider's explicit reason: generic incomplete is
                 // not proof of an output-token limit (it may be filtering).
-                output.stop_reason_raw = response.get("incomplete_details")
-                    .and_then(|details| get_str(details, "reason")).map(str::to_string);
+                output.stop_reason_raw = incomplete_reason.map(str::to_string);
             }
             if response.get("error").is_some_and(|error| !error.is_null()) {
                 output.stop_reason = "error".to_string();
@@ -1227,6 +1268,9 @@ pub async fn process_responses_stream(
             {
                 note_empty_completion(output, "completed_without_deliverable_content");
             }
+            // A valid terminal is complete without EOF or a later `[DONE]` frame.
+            // Dropping the transport here also releases a still-open response body.
+            break;
         } else if event_type == "error" {
             let code = get(&event, "code");
             let message = format!(
@@ -1239,6 +1283,8 @@ pub async fn process_responses_stream(
             return Err(stream_failure(message, kind, provider_error_type.as_deref()));
         } else if event_type == "response.failed" {
             let response = get(&event, "response").cloned().unwrap_or(Value::Null);
+            record_terminal_response(&response, output, stream, model, options);
+            output.stop_reason = "error".to_string();
             let error = get(&response, "error");
             let details = get(&response, "incomplete_details");
             let provider_error_type = error
@@ -1250,7 +1296,9 @@ pub async fn process_responses_stream(
                         .and_then(|details| get(details, "reason"))
                         .filter(|value| !value.is_null())
                         .map(|value| js_display(Some(value)))
-                });
+                })
+                .or_else(|| get_str(&response, "status").map(str::to_string));
+            output.stop_reason_raw = provider_error_type.clone();
             let message = if let Some(error) = error.filter(|error| !error.is_null()) {
                 format!(
                     "{}: {}",
@@ -1276,6 +1324,11 @@ pub async fn process_responses_stream(
         }
     }
 
+    if !terminal_received {
+        return Err(ResponsesStreamError::Message(
+            "Response stream ended before a terminal response was received".to_string(),
+        ));
+    }
     Ok(())
     }.await;
     // A failure or early EOF can leave a throttled preview behind the actual
@@ -2059,7 +2112,7 @@ mod tests {
             let stream = AssistantMessageEventStream::new();
             let events = if index == 0 {
                 vec![
-                    json!({ "type": "response.completed", "response": response }),
+                    json!({ "type": "response.incomplete", "response": response }),
                 ]
             } else {
                 vec![
@@ -2309,11 +2362,12 @@ mod tests {
             }
             if ending == "end" {
                 events.push(json!({"type":"response.output_item.done","item":{"type":"function_call","arguments":encoded}}));
+                events.push(json!({"type":"response.completed","response":{"status":"completed"}}));
             } else if ending == "error" {
                 events.push(json!({"type":"error","code":"server_error","message":"fixture disconnect"}));
             }
             let result = process_responses_stream(event_stream(events), &mut output, &AssistantMessageEventStream::new(), &model, None).await;
-            assert_eq!(result.is_err(), ending == "error");
+            assert_eq!(result.is_err(), ending != "end");
             assert_eq!(output.content[0].as_tool_call().unwrap().arguments, arguments.as_object().unwrap().clone(), "{ending}");
         }
     }
@@ -2373,6 +2427,7 @@ mod tests {
             json!({ "type": "response.reasoning_summary_part.done" }),
             json!({ "type": "response.reasoning_summary_text.delta", "delta": "more" }),
             json!({ "type": "response.output_item.done", "item": item }),
+            json!({ "type": "response.completed", "response": { "status": "completed" } }),
         ];
         process_responses_stream(event_stream(events), &mut output, &stream, &model, None)
             .await
@@ -2469,45 +2524,156 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn map_stop_reason_matches_typescript() {
+    async fn clean_eof_without_terminal_is_an_error_and_preserves_partial_output() {
         let model = text_model();
-        for (status, expected) in [
-            (Some("completed"), "stop"),
-            (Some("incomplete"), "length"),
-            (Some("failed"), "error"),
-            (Some("cancelled"), "error"),
-            (Some("in_progress"), "stop"),
-            (Some("queued"), "stop"),
-            (None, "stop"),
-        ] {
-            let mut output = empty_output(&model);
-            let stream = AssistantMessageEventStream::new();
-            let events = vec![json!({
-                "type": "response.completed",
-                "response": match status {
-                    Some(status) => json!({ "status": status }),
-                    None => json!({}),
-                }
-            })];
-            process_responses_stream(event_stream(events), &mut output, &stream, &model, None)
-                .await
-                .unwrap();
-            assert_eq!(output.stop_reason, expected, "status {:?}", status);
-        }
-
         let mut output = empty_output(&model);
         let stream = AssistantMessageEventStream::new();
-        let events = vec![json!({ "type": "response.completed", "response": { "status": "unknown-status" } })];
+        let events = vec![
+            json!({"type":"response.output_item.added", "item":{"type":"message", "id":"msg_1"}}),
+            json!({"type":"response.content_part.added", "part":{"type":"output_text", "text":""}}),
+            json!({"type":"response.output_text.delta", "delta":"partial"}),
+        ];
         let error = process_responses_stream(event_stream(events), &mut output, &stream, &model, None)
             .await
             .unwrap_err();
-        assert_eq!(error.message(), "Unhandled stop reason: unknown-status");
+        assert_eq!(
+            error.message(),
+            "Response stream ended before a terminal response was received"
+        );
+        assert!(matches!(&output.content[0], ContentBlock::Text(text) if text.text == "partial"));
+    }
+
+    #[tokio::test]
+    async fn clean_eof_preserves_partial_tool_arguments_without_accepting_the_call() {
+        let model = text_model();
+        let mut output = empty_output(&model);
+        let stream = AssistantMessageEventStream::new();
+        let events = vec![
+            json!({"type":"response.output_item.added", "item":{
+                "type":"function_call", "id":"fn_1", "call_id":"call_1", "name":"read"
+            }}),
+            json!({"type":"response.function_call_arguments.delta", "delta":"{\"path\":\"/tmp"}),
+        ];
+        let error = process_responses_stream(event_stream(events), &mut output, &stream, &model, None)
+            .await
+            .unwrap_err();
+        assert!(error.message().contains("terminal response"));
+        let Some(ContentBlock::ToolCall(call)) = output.content.first() else {
+            panic!("partial call must remain attached to the error output");
+        };
+        assert_eq!(call.arguments.get("path").and_then(Value::as_str), Some("/tmp"));
+        // The processor never synthesizes a terminal event for an open call.
+        assert!(!stream.is_done());
+    }
+
+    #[tokio::test]
+    async fn usage_observer_is_owned_until_its_async_effect_settles() {
+        let model = text_model();
+        let mut output = empty_output(&model);
+        let stream = AssistantMessageEventStream::new_owned();
+        let receipt = stream.task_receipt();
+        let (release, gate) = tokio::sync::oneshot::channel();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observer_calls = calls.clone();
+        let gate = Arc::new(std::sync::Mutex::new(Some(gate)));
+        let options = OpenAIResponsesStreamOptions {
+            on_usage_observation: Some(Arc::new(move |_, _| {
+                observer_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let gate = gate.lock().unwrap().take().expect("one observation");
+                Box::pin(async move {
+                    let _ = gate.await;
+                })
+            })),
+            ..Default::default()
+        };
+        let events = vec![json!({"type":"response.completed", "response":{
+            "status":"completed", "usage":{"input_tokens":1, "output_tokens":1}
+        }})];
+        process_responses_stream(event_stream(events), &mut output, &stream, &model, Some(&options))
+            .await
+            .unwrap();
+        // Invocation is synchronous; only the returned effect remains owned.
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(receipt.status().pending_tasks, 1);
+        release.send(()).unwrap();
+        let status = receipt.settle(std::time::Duration::from_secs(1)).await;
+        assert_eq!(status.pending_tasks, 0);
+        assert_eq!(status.completed_tasks, 1);
+    }
+
+    #[tokio::test]
+    async fn pending_usage_observer_is_cancelled_with_its_stream() {
+        let model = text_model();
+        let mut output = empty_output(&model);
+        let stream = AssistantMessageEventStream::new_owned();
+        let receipt = stream.task_receipt();
+        let options = OpenAIResponsesStreamOptions {
+            on_usage_observation: Some(Arc::new(|_, _| Box::pin(std::future::pending()))),
+            ..Default::default()
+        };
+        let events = vec![json!({"type":"response.completed", "response":{
+            "status":"completed", "usage":{"input_tokens":1}
+        }})];
+        process_responses_stream(event_stream(events), &mut output, &stream, &model, Some(&options))
+            .await
+            .unwrap();
+        assert_eq!(receipt.status().pending_tasks, 1);
+        receipt.request_cancel();
+        let status = receipt.settle(std::time::Duration::from_secs(1)).await;
+        assert_eq!(status.pending_tasks, 0);
+        assert_eq!(status.cancelled_tasks, 1);
+        assert!(status.settled);
+    }
+
+    #[tokio::test]
+    async fn response_completed_requires_completed_status() {
+        let model = text_model();
+        let mut output = empty_output(&model);
+        let stream = AssistantMessageEventStream::new();
+        let events = vec![json!({
+            "type": "response.completed", "response": { "status": "completed" }
+        })];
+        process_responses_stream(event_stream(events), &mut output, &stream, &model, None)
+            .await.unwrap();
+        assert_eq!(output.stop_reason, "stop");
+
+        for status in ["in_progress", "queued", "incomplete", "failed", "cancelled", "unknown-status"] {
+            let mut output = empty_output(&model);
+            let stream = AssistantMessageEventStream::new();
+            let events = vec![json!({
+                "type": "response.completed", "response": { "status": status }
+            })];
+            let error = process_responses_stream(event_stream(events), &mut output, &stream, &model, None)
+                .await.unwrap_err();
+            assert!(error.message().contains("expected completed"), "status {status}");
+            assert!(!stream.is_done());
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_terminal_status_cannot_authorize_partial_tool_arguments() {
+        let model = text_model();
+        let mut output = empty_output(&model);
+        let stream = AssistantMessageEventStream::new();
+        let events = vec![
+            json!({"type":"response.output_item.added", "item":{
+                "type":"function_call", "id":"fn_1", "call_id":"call_1", "name":"read"
+            }}),
+            json!({"type":"response.function_call_arguments.delta", "delta":"{\"path\":\"/tmp"}),
+            json!({"type":"response.completed", "response":{"status":"in_progress"}}),
+        ];
+        let error = process_responses_stream(event_stream(events), &mut output, &stream, &model, None)
+            .await.unwrap_err();
+        assert!(error.message().contains("expected completed"));
+        assert!(!stream.is_done());
+        let ContentBlock::ToolCall(call) = &output.content[0] else { panic!("tool call") };
+        assert_eq!(call.arguments.get("path").and_then(Value::as_str), Some("/tmp"));
     }
 
     #[tokio::test]
     async fn incomplete_terminals_preserve_exact_reason_and_usage() {
         let model = text_model();
-        for kind in ["response.completed", "response.incomplete"] {
+        for kind in ["response.incomplete"] {
             for reason in [Some("max_output_tokens"), Some("content_filter"), Some("unknown"), None] {
                 let mut output = empty_output(&model);
                 let stream = AssistantMessageEventStream::new();
@@ -2518,7 +2684,7 @@ mod tests {
                             "output_tokens_details": { "reasoning_tokens":4834 } } }
                 })];
                 process_responses_stream(event_stream(events), &mut output, &stream, &model, None).await.unwrap();
-                assert_eq!(output.stop_reason, "length");
+                assert_eq!(output.stop_reason, if reason == Some("content_filter") { "error" } else { "length" });
                 assert_eq!(output.stop_reason_raw.as_deref(), reason);
                 assert_eq!(output.usage.output, 13107.0);
                 assert_eq!(output.response_id.as_deref(), Some("bounded-summary"));
@@ -2527,14 +2693,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn incomplete_terminal_without_status_is_not_success_and_cannot_erase_refusal() {
+    async fn incomplete_terminal_preserves_exact_reason_and_existing_refusal() {
         let model = text_model();
         for raw in [None, Some("refusal")] {
             let mut output = empty_output(&model);
             output.stop_reason_raw = raw.map(str::to_string);
             let stream = AssistantMessageEventStream::new();
             let events = vec![json!({ "type":"response.incomplete",
-                "response": { "incomplete_details": { "reason":"max_output_tokens" } } })];
+                "response": { "status":"incomplete", "incomplete_details": { "reason":"max_output_tokens" } } })];
             process_responses_stream(event_stream(events), &mut output, &stream, &model, None).await.unwrap();
             assert_eq!(output.stop_reason, "length");
             assert_eq!(output.stop_reason_raw.as_deref(), Some(raw.unwrap_or("max_output_tokens")));
@@ -2547,7 +2713,7 @@ mod tests {
         let mut output = empty_output(&model);
         let stream = AssistantMessageEventStream::new();
         let events = vec![json!({ "type":"response.incomplete", "response": {
-            "incomplete_details": { "reason":"max_output_tokens" },
+            "status":"incomplete", "incomplete_details": { "reason":"max_output_tokens" },
             "error": { "code":"content_filter", "message":"filtered" }
         } })];
         process_responses_stream(event_stream(events), &mut output, &stream, &model, None).await.unwrap();
@@ -2581,12 +2747,20 @@ mod tests {
         let stream = AssistantMessageEventStream::new();
         let events = vec![json!({
             "type": "response.failed",
-            "response": { "error": { "code": "rate_limit_exceeded", "message": "slow down" } }
+            "response": {
+                "id":"direct-failed-control", "status":"failed",
+                "error": { "code": "rate_limit_exceeded", "message": "slow down" },
+                "usage":{"input_tokens":4,"output_tokens":6,"total_tokens":10}
+            }
         })];
         let error = process_responses_stream(event_stream(events), &mut output, &stream, &model, None)
             .await
             .unwrap_err();
         assert_eq!(error.message(), "rate_limit_exceeded: slow down");
+        assert_eq!(output.stop_reason, "error");
+        assert_eq!(output.stop_reason_raw.as_deref(), Some("rate_limit_exceeded"));
+        assert_eq!(output.response_id.as_deref(), Some("direct-failed-control"));
+        assert_eq!(output.usage.output, 6.0);
         match error {
             ResponsesStreamError::StreamFailure(failure) => assert_eq!(failure.info.kind, "rate_limit"),
             other => panic!("unexpected error {}", other.message()),
@@ -2636,6 +2810,7 @@ mod tests {
                 "type": "response.output_item.done",
                 "item": { "type": "message", "id": "msg_1", "content": [{ "type": "output_text", "text": "Hello" }] }
             }),
+            json!({ "type": "response.completed", "response": { "status": "completed" } }),
         ];
         process_responses_stream(event_stream(events), &mut output, &stream, &model, Some(&options))
             .await

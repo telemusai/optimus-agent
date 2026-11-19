@@ -137,12 +137,12 @@ pub fn stream_google(
 	context: &Context,
 	options: Option<GoogleOptions>,
 ) -> AssistantMessageEventStream {
-	let stream = create_assistant_message_event_stream();
-	let out = stream.clone();
+	let stream = AssistantMessageEventStream::new_owned();
+	let out = stream.producer_handle();
 	let model = model.clone();
 	let context = context.clone();
 	let options = options.unwrap_or_default();
-	tokio::spawn(async move {
+	stream.spawn(async move {
 		let mut output = AssistantMessage {
 			content: Vec::new(),
 			api: "google-generative-ai".to_string(),
@@ -221,8 +221,21 @@ async fn run_stream_google(
 	stream.push(AssistantMessageEvent::Start {
 		partial: output.clone(),
 	});
+	let chunks = SseChunkStream::new(response, options.stream.signal.clone());
+	process_google_chunks(chunks, model, options, output, stream).await
+}
+
+/// Consume parsed SSE chunks and settle only on an explicit provider terminal.
+async fn process_google_chunks(
+	mut chunks: SseChunkStream,
+	model: &Model,
+	options: &GoogleOptions,
+	output: &mut AssistantMessage,
+	stream: &AssistantMessageEventStream,
+) -> Result<(), GoogleStreamError> {
 	let mut current_block: Option<CurrentBlock> = None;
-	let mut chunks = SseChunkStream::new(response, options.stream.signal.clone());
+	let mut terminal_received = false;
+	let mut prompt_feedback_detail: Option<String> = None;
 
 	while let Some(chunk) = chunks.next().await? {
 		// Typed shape for the common chunk; Value fallback keeps the exact
@@ -248,19 +261,31 @@ async fn run_stream_google(
 				}
 
 				if let Some(finish_reason) = candidate.and_then(|candidate| candidate.finish_reason.as_deref()) {
-					output.stop_reason = map_stop_reason(finish_reason).map_err(GoogleStreamError::Message)?;
-					if output
-						.content
-						.iter()
-						.any(|block| matches!(block, ContentBlock::ToolCall(_)))
-					{
-						output.stop_reason = "toolUse".to_string();
-					}
-					if output.stop_reason == "error" {
+					let stop_reason = map_stop_reason(finish_reason).map_err(GoogleStreamError::Message)?;
+					terminal_received = true;
+					if stop_reason == "error" {
+						output.stop_reason = stop_reason;
 						output.stop_reason_raw = Some(finish_reason.to_string());
+					} else if output.stop_reason != "error" {
+						output.stop_reason = stop_reason;
+						if output
+							.content
+							.iter()
+							.any(|block| matches!(block, ContentBlock::ToolCall(_)))
+						{
+							output.stop_reason = "toolUse".to_string();
+						}
 					}
 				}
 
+				if let Some(feedback) = typed.prompt_feedback.as_ref().filter(|feedback| !feedback.is_null()) {
+					if let Some(detail) = apply_prompt_feedback(output, feedback) {
+						terminal_received = true;
+						if let Some(detail) = detail {
+							prompt_feedback_detail = Some(detail);
+						}
+					}
+				}
 				if let Some(usage_metadata) = &typed.usage_metadata {
 					output.usage = super::google_usage::normalize(usage_metadata);
 					calculate_cost(model, &mut output.usage, None);
@@ -291,19 +316,31 @@ async fn run_stream_google(
 					.and_then(|candidate| candidate.get("finishReason"))
 					.and_then(Value::as_str)
 				{
-					output.stop_reason = map_stop_reason(finish_reason).map_err(GoogleStreamError::Message)?;
-					if output
-						.content
-						.iter()
-						.any(|block| matches!(block, ContentBlock::ToolCall(_)))
-					{
-						output.stop_reason = "toolUse".to_string();
-					}
-					if output.stop_reason == "error" {
+					let stop_reason = map_stop_reason(finish_reason).map_err(GoogleStreamError::Message)?;
+					terminal_received = true;
+					if stop_reason == "error" {
+						output.stop_reason = stop_reason;
 						output.stop_reason_raw = Some(finish_reason.to_string());
+					} else if output.stop_reason != "error" {
+						output.stop_reason = stop_reason;
+						if output
+							.content
+							.iter()
+							.any(|block| matches!(block, ContentBlock::ToolCall(_)))
+						{
+							output.stop_reason = "toolUse".to_string();
+						}
 					}
 				}
 
+				if let Some(feedback) = chunk.get("promptFeedback").filter(|feedback| !feedback.is_null()) {
+					if let Some(detail) = apply_prompt_feedback(output, feedback) {
+						terminal_received = true;
+						if let Some(detail) = detail {
+							prompt_feedback_detail = Some(detail);
+						}
+					}
+				}
 				if let Some(usage_metadata) = chunk.get("usageMetadata") {
 					output.usage = super::google_usage::normalize(usage_metadata);
 					calculate_cost(model, &mut output.usage, None);
@@ -312,6 +349,11 @@ async fn run_stream_google(
 		}
 	}
 
+	if !terminal_received {
+		return Err(GoogleStreamError::Message(
+			"Stream ended without a finishReason or promptFeedback".to_string(),
+		));
+	}
 	if let Some(block) = current_block {
 		finish_block(&block, output, stream);
 	}
@@ -327,10 +369,11 @@ async fn run_stream_google(
 	}
 
 	if output.stop_reason == "aborted" || output.stop_reason == "error" {
-		return Err(GoogleStreamError::Failure(stream_failure_from_stop_reason(
-			output.stop_reason_raw.as_deref(),
-			None,
-		)));
+		let mut failure = stream_failure_from_stop_reason(output.stop_reason_raw.as_deref(), None);
+		if let Some(detail) = prompt_feedback_detail {
+			failure.message = format!("{}: {}", failure.message, detail);
+		}
+		return Err(GoogleStreamError::Failure(failure));
 	}
 
 	stream.push(AssistantMessageEvent::Done {
@@ -339,6 +382,36 @@ async fn run_stream_google(
 	});
 	stream.end(None);
 	Ok(())
+}
+
+/// Preserve a blocked-prompt or prompt-level API failure as an error terminal.
+/// Outer `Some` marks a prompt failure; its inner value is provider detail for the classified message.
+fn apply_prompt_feedback(output: &mut AssistantMessage, feedback: &Value) -> Option<Option<String>> {
+	if let Some(reason) = feedback.get("blockReason").and_then(Value::as_str) {
+		output.stop_reason = "error".to_string();
+		output.stop_reason_raw = Some(reason.to_string());
+		return Some(
+			feedback
+				.get("blockReasonMessage")
+				.and_then(Value::as_str)
+				.map(str::to_string),
+		);
+	}
+
+	if let Some(error) = feedback.get("error").filter(|error| !error.is_null()) {
+		output.stop_reason = "error".to_string();
+		output.stop_reason_raw = Some(
+			error
+				.get("status")
+				.and_then(Value::as_str)
+				.or_else(|| error.as_str())
+				.map(str::to_string)
+				.unwrap_or_else(|| error.to_string()),
+		);
+		return Some(error.get("message").and_then(Value::as_str).map(str::to_string));
+	}
+
+	None
 }
 
 /// The block the streaming loop is currently filling.
@@ -1180,6 +1253,8 @@ struct TypedGoogleChunk {
 	candidates: Vec<TypedGoogleCandidate>,
 	#[serde(rename = "usageMetadata", default, deserialize_with = "crate::utils::typed_json::optional_value")]
 	usage_metadata: Option<Value>,
+	#[serde(rename = "promptFeedback", default)]
+	pub prompt_feedback: Option<Value>,
 }
 
 #[derive(serde::Deserialize, Default)]
@@ -1271,7 +1346,29 @@ impl SseChunkStream {
 					return Err(GoogleStreamError::Message("Request was aborted".to_string()));
 				}
 			}
-			match self.chunks.next().await {
+			let next_chunk = self.chunks.next();
+			tokio::pin!(next_chunk);
+			let idle_timeout = crate::utils::sse_frames::resolve_sse_idle_timeout();
+			let idle = tokio::time::sleep(idle_timeout);
+			tokio::pin!(idle);
+			let read = if let Some(signal) = &self.signal {
+				tokio::select! {
+					biased;
+					_ = signal.cancelled() => return Err(GoogleStreamError::Message("Request was aborted".to_string())),
+					_ = idle.as_mut() => return Err(GoogleStreamError::Message(format!(
+						"SSE stream stalled: no data received within {}ms", idle_timeout.as_millis()
+					))),
+					read = next_chunk.as_mut() => read,
+				}
+			} else {
+				tokio::select! {
+					_ = idle.as_mut() => return Err(GoogleStreamError::Message(format!(
+						"SSE stream stalled: no data received within {}ms", idle_timeout.as_millis()
+					))),
+					read = next_chunk.as_mut() => read,
+				}
+			};
+			match read {
 				None => {
 					self.finished = true;
 				}
@@ -1688,6 +1785,204 @@ mod tests {
 
 	fn base_options() -> StreamOptions {
 		StreamOptions::default()
+	}
+
+	async fn run_fixture_events(
+		events: Vec<GoogleChunkEvent>,
+	) -> (Result<(), GoogleStreamError>, AssistantMessage, AssistantMessageEventStream) {
+		let model = model("gemini-3-pro");
+		let options = GoogleOptions::default();
+		let mut output = AssistantMessage::new(model.api.clone(), model.provider.clone(), model.id.clone(), 0);
+		output.stop_reason = "stop".to_string();
+		let stream = AssistantMessageEventStream::new_owned();
+		let chunks = SseChunkStream {
+			chunks: Box::pin(futures::stream::empty()),
+			buffer: String::new(),
+			pending: events,
+			byte_pending: Vec::new(),
+			finished: true,
+			signal: None,
+		};
+		let result = process_google_chunks(chunks, &model, &options, &mut output, &stream).await;
+		(result, output, stream)
+	}
+
+	async fn run_fixture_frames(
+		frames: &[&str],
+	) -> (Result<(), GoogleStreamError>, AssistantMessage, AssistantMessageEventStream) {
+		let body = frames.iter().map(|frame| format!("data: {frame}\n\n")).collect::<String>();
+		let model = model("gemini-3-pro");
+		let options = GoogleOptions::default();
+		let mut output = AssistantMessage::new(model.api.clone(), model.provider.clone(), model.id.clone(), 0);
+		output.stop_reason = "stop".to_string();
+		let stream = AssistantMessageEventStream::new_owned();
+		let chunks = SseChunkStream {
+			chunks: Box::pin(futures::stream::iter(vec![Ok::<_, reqwest::Error>(bytes::Bytes::from(body))])),
+			buffer: String::new(),
+			pending: Vec::new(),
+			byte_pending: Vec::new(),
+			finished: false,
+			signal: None,
+		};
+		let result = process_google_chunks(chunks, &model, &options, &mut output, &stream).await;
+		(result, output, stream)
+	}
+
+	/// Local mirror of agent_loop.rs:988-1028 for the provider-handoff contract only.
+	/// Real AgentEvent collection needs a pi-agent-core integration test outside this crate.
+	fn agent_loop_reachable_tool_call_count(output: &AssistantMessage) -> usize {
+		if matches!(output.stop_reason.as_str(), "error" | "aborted") {
+			return 0;
+		}
+		output.content.iter().filter(|block| matches!(block, ContentBlock::ToolCall(_))).count()
+	}
+
+	#[tokio::test]
+	async fn safety_after_tool_call_preserves_error_in_typed_and_value_paths() {
+		let tool = r#"{"candidates":[{"content":{"parts":[{"functionCall":{"id":"call-1","name":"read","args":{"path":"fixture.txt"}}}]}}]}"#;
+		let safety = r#"{"candidates":[{"finishReason":"SAFETY"}]}"#;
+		let cases = vec![
+			(
+				"typed",
+				vec![
+					GoogleChunkEvent::Typed(parse_typed_google_chunk(tool).unwrap()),
+					GoogleChunkEvent::Typed(parse_typed_google_chunk(safety).unwrap()),
+				],
+			),
+			(
+				"value",
+				vec![
+					GoogleChunkEvent::Value(serde_json::from_str(tool).unwrap()),
+					GoogleChunkEvent::Value(serde_json::from_str(safety).unwrap()),
+				],
+			),
+		];
+
+		for (path, events) in cases {
+			let (result, output, stream) = run_fixture_events(events).await;
+			let failure = match result.unwrap_err() {
+				GoogleStreamError::Failure(failure) => failure,
+				other => panic!("{path}: expected classified failure, got {}", other.message()),
+			};
+			assert_eq!(output.stop_reason, "error", "{path}");
+			assert_eq!(output.stop_reason_raw.as_deref(), Some("SAFETY"), "{path}");
+			assert_eq!(failure.info.provider_error_type.as_deref(), Some("SAFETY"), "{path}");
+			assert!(failure.message.contains("SAFETY"), "{path}: {}", failure.message);
+			let ContentBlock::ToolCall(call) = &output.content[0] else {
+				panic!("{path}: provider tool details must remain attached")
+			};
+			assert_eq!(call.id, "call-1", "{path}");
+			assert_eq!(call.name, "read", "{path}");
+			assert_eq!(call.arguments.get("path").and_then(Value::as_str), Some("fixture.txt"), "{path}");
+			assert_eq!(agent_loop_reachable_tool_call_count(&output), 0, "{path}: provider handoff leaves no agent-reachable tool call");
+			assert!(!stream.is_done(), "{path}: an error terminal must not emit Done");
+		}
+
+		let (result, output, stream) = run_fixture_events(vec![
+			GoogleChunkEvent::Typed(parse_typed_google_chunk(tool).unwrap()),
+			GoogleChunkEvent::Typed(parse_typed_google_chunk(r#"{"candidates":[{"finishReason":"STOP"}]}"#).unwrap()),
+		])
+		.await;
+		assert!(result.is_ok());
+		assert_eq!(output.stop_reason, "toolUse");
+		assert_eq!(output.stop_reason_raw, None);
+		assert_eq!(agent_loop_reachable_tool_call_count(&output), 1, "legal tool call remains agent-reachable control");
+		assert!(stream.is_done());
+	}
+
+	#[tokio::test]
+	async fn blocked_prompt_feedback_is_an_error_in_typed_and_value_fixtures() {
+		for (path, frame, raw_reason, detail) in [
+			(
+				"typed",
+				r#"{"responseId":"resp-1","promptFeedback":{"blockReason":"SAFETY","blockReasonMessage":"policy details"}}"#,
+				"SAFETY",
+				Some("policy details"),
+			),
+			(
+				"value",
+				r#"{"promptFeedback":{"blockReason":"OTHER"}}"#,
+				"OTHER",
+				None,
+			),
+		] {
+			let (result, output, stream) = run_fixture_frames(&[frame]).await;
+			let failure = match result.unwrap_err() {
+				GoogleStreamError::Failure(failure) => failure,
+				other => panic!("{path}: expected classified failure, got {}", other.message()),
+			};
+			assert!(output.content.is_empty(), "{path}: blocked prompt unexpectedly produced content");
+			assert_eq!(output.stop_reason, "error", "{path}");
+			assert_eq!(output.stop_reason_raw.as_deref(), Some(raw_reason), "{path}");
+			assert_eq!(failure.info.provider_error_type.as_deref(), Some(raw_reason), "{path}");
+			assert!(failure.message.contains(raw_reason), "{path}: {}", failure.message);
+			if let Some(detail) = detail {
+				assert!(failure.message.contains(detail), "{path}: provider detail lost: {}", failure.message);
+			}
+			assert!(!stream.is_done(), "{path}: blocked prompt must not become a successful empty Done");
+
+			let stop = r#"{"candidates":[{"content":{"parts":[{"text":"late legal text"}]},"finishReason":"STOP"}]}"#;
+			let events = match path {
+				"typed" => vec![
+					GoogleChunkEvent::Typed(parse_typed_google_chunk(frame).unwrap()),
+					GoogleChunkEvent::Typed(parse_typed_google_chunk(stop).unwrap()),
+				],
+				_ => vec![
+					GoogleChunkEvent::Value(serde_json::from_str(frame).unwrap()),
+					GoogleChunkEvent::Value(serde_json::from_str(stop).unwrap()),
+				],
+			};
+			let (result, output, stream) = run_fixture_events(events).await;
+			assert!(result.is_err(), "{path}: later STOP replaced an earlier blocked-prompt error");
+			assert_eq!(output.stop_reason, "error", "{path}: existing prompt error must win");
+			assert_eq!(output.stop_reason_raw.as_deref(), Some(raw_reason), "{path}");
+			assert!(!stream.is_done(), "{path}: later STOP must not emit Done after blocked feedback");
+		}
+	}
+
+	#[tokio::test]
+	async fn prompt_feedback_error_fails_and_nonblocking_feedback_keeps_legal_terminal() {
+		let (result, output, stream) = run_fixture_frames(&[
+			r#"{"promptFeedback":{"error":{"code":400,"message":"bad prompt","status":"INVALID_ARGUMENT"}}}"#,
+		])
+		.await;
+		let failure = match result.unwrap_err() {
+			GoogleStreamError::Failure(failure) => failure,
+			other => panic!("expected classified prompt failure, got {}", other.message()),
+		};
+		assert_eq!(output.stop_reason, "error");
+		assert_eq!(output.stop_reason_raw.as_deref(), Some("INVALID_ARGUMENT"));
+		assert_eq!(failure.info.kind, "unknown", "prompt error keeps the raw provider status without inventing an HTTP status");
+		assert!(failure.message.contains("INVALID_ARGUMENT"), "{}", failure.message);
+		assert!(failure.message.contains("bad prompt"), "{}", failure.message);
+		assert!(!stream.is_done());
+
+		let (result, output, stream) = run_fixture_frames(&[
+			r#"{"promptFeedback":{"error":{"code":400,"message":"bad prompt","status":"INVALID_ARGUMENT"}}}"#,
+			r#"{"candidates":[{"finishReason":"STOP"}]}"#,
+		])
+		.await;
+		assert!(result.is_err(), "later STOP replaced a prompt-level API error");
+		assert_eq!(output.stop_reason, "error");
+		assert_eq!(output.stop_reason_raw.as_deref(), Some("INVALID_ARGUMENT"));
+		assert!(!stream.is_done());
+
+		let (result, output, stream) =
+			run_fixture_frames(&[r#"{"responseId":"resp-2","promptFeedback":{"blockReason":null,"error":null}}"#]).await;
+		assert!(result.is_err(), "nonblocking feedback alone must not settle a successful empty stream");
+		assert!(output.content.is_empty());
+		assert!(!stream.is_done());
+
+		let (result, output, stream) = run_fixture_frames(&[
+			r#"{"responseId":"resp-2","promptFeedback":{"blockReason":null,"error":null}}"#,
+			r#"{"candidates":[{"content":{"parts":[{"text":"legal"}]},"finishReason":"STOP"}]}"#,
+		])
+		.await;
+		assert!(result.is_ok());
+		assert_eq!(output.stop_reason, "stop");
+		assert_eq!(output.stop_reason_raw, None);
+		assert!(matches!(output.content.as_slice(), [ContentBlock::Text(text)] if text.text == "legal"));
+		assert!(stream.is_done());
 	}
 
 	#[test]
@@ -2279,6 +2574,63 @@ mod t15_controls_tests {
 
 	/// (a) `Some("")` must omit `systemInstruction` exactly like the TS spread
 	/// guard; `Some("rules")` must still be sent; `None` must stay absent.
+	#[tokio::test]
+	async fn clean_eof_requires_finish_reason_or_prompt_feedback() {
+		for (frame, succeeds) in [
+			(r#"data: {"candidates":[{"content":{"parts":[{"text":"partial"}]}}]}
+
+"#, false),
+			(r#"data: {"candidates":[{"content":{"parts":[{"text":"short"}]},"finishReason":"STOP"}]}
+
+"#, true),
+			(r#"data: {"candidates":[{"content":{"parts":[{"text":"partial"}]}}],"promptFeedback":{"blockReason":null,"error":null}}
+
+"#, false),
+		] {
+			let model = t15_model();
+			let options = GoogleOptions::default();
+			let mut output = AssistantMessage::new(model.api.clone(), model.provider.clone(), model.id.clone(), 0);
+			output.stop_reason = "stop".to_string();
+			let stream = AssistantMessageEventStream::new_owned();
+			let chunks = SseChunkStream {
+				chunks: Box::pin(futures::stream::iter(vec![Ok::<_, reqwest::Error>(bytes::Bytes::from(frame))])),
+				buffer: String::new(),
+				pending: Vec::new(),
+				byte_pending: Vec::new(),
+				finished: false,
+				signal: None,
+			};
+			let result = process_google_chunks(chunks, &model, &options, &mut output, &stream).await;
+			assert_eq!(result.is_ok(), succeeds, "frame: {frame:?}; result: {result:?}");
+			assert_eq!(stream.is_done(), succeeds, "no Done without terminal");
+			if !succeeds {
+				assert_eq!(output.content.len(), 1, "partial output stays attached to its error");
+			}
+		}
+	}
+
+	#[tokio::test]
+	async fn pending_body_read_responds_to_cancellation() {
+		let signal = tokio_util::sync::CancellationToken::new();
+		let stream = SseChunkStream {
+			chunks: Box::pin(futures::stream::pending()),
+			buffer: String::new(),
+			pending: Vec::new(),
+			byte_pending: Vec::new(),
+			finished: false,
+			signal: Some(signal.clone()),
+		};
+		let reader = tokio::spawn(async move {
+			let mut stream = stream;
+			stream.next().await
+		});
+		tokio::task::yield_now().await;
+		signal.cancel();
+		let error = tokio::time::timeout(std::time::Duration::from_secs(1), reader)
+			.await.expect("body read must settle").unwrap().unwrap_err();
+		assert_eq!(error.message(), "Request was aborted");
+	}
+
 	#[test]
 	fn t15_empty_optional_values_match_contract_system_prompt() {
 		let model = t15_model();

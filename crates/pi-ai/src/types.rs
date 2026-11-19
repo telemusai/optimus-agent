@@ -22,7 +22,7 @@ use serde_json::{Map, Value};
 use tokio_util::sync::CancellationToken;
 
 use crate::compaction::{
-    CompactionOptions, ProviderCompactionCheckpoint, ProviderCompactionResult,
+    CompactionOptions, CompactionRequestError, ProviderCompactionCheckpoint, ProviderCompactionResult,
 };
 use crate::utils::diagnostics::AssistantMessageDiagnostic;
 use crate::utils::event_stream::AssistantMessageEventStream;
@@ -405,7 +405,7 @@ pub type CompactFunction = Arc<
             &Model,
             &Context,
             Option<&CompactionOptions>,
-        ) -> BoxFuture<Option<ProviderCompactionResult>>
+        ) -> BoxFuture<Result<Option<ProviderCompactionResult>, CompactionRequestError>>
         + Send
         + Sync,
 >;

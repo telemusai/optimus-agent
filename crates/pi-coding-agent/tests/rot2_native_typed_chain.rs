@@ -22,7 +22,7 @@ use std::sync::{Arc, Mutex};
 
 use pi_agent_core::types::{AgentMessage, CustomMessageContent};
 use pi_ai::api_registry::{register_api_provider_simple, ApiProviderSimple};
-use pi_ai::compaction::{CompactionOptions, ProviderCompactionCheckpoint, ProviderCompactionResult};
+use pi_ai::compaction::{CompactionOptions, CompactionRequestError, ProviderCompactionCheckpoint, ProviderCompactionResult};
 use pi_ai::types::{
     AssistantMessage, AssistantMessageEvent, ContentBlock, Context, Message, Model, TextContent,
     ToolResultMessage, UserContent, UserMessage,
@@ -381,12 +381,12 @@ fn dual_fixture(api: &str) -> DualFixture {
                 let served = Arc::clone(&served);
                 Box::pin(async move {
                     *served.lock().unwrap() += 1;
-                    Some(ProviderCompactionResult {
+                    Ok(Some(ProviderCompactionResult {
                         checkpoint: native_checkpoint(&model),
                         usage: None,
-                    })
+                    }))
                 })
-                    as Pin<Box<dyn std::future::Future<Output = Option<ProviderCompactionResult>> + Send>>
+                    as Pin<Box<dyn std::future::Future<Output = Result<Option<ProviderCompactionResult>, CompactionRequestError>> + Send>>
             })),
             supports_compaction: Some(Arc::new(|_| true)),
         },

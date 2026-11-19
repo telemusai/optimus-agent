@@ -718,7 +718,18 @@ fn transport_error(message: &str) -> Value {
     json!({"type":"error","code":"responses_request_interrupted","message":message})
 }
 
-fn normalize_event(event: &mut Value) {
+/// Map the legal Codex `response.done` alias without losing a failed or
+/// cancelled provider status. Other statuses retain the completed envelope so
+/// the shared parser's strict status validation still rejects them.
+pub(crate) fn response_done_terminal_kind(status: Option<&str>) -> &'static str {
+    match status {
+        Some("failed" | "cancelled") => "response.failed",
+        Some("incomplete") => "response.incomplete",
+        _ => "response.completed",
+    }
+}
+
+pub(crate) fn normalize_event(event: &mut Value) {
     if !event.is_object() {
         *event = transport_error("Invalid WebSocket event envelope");
         return;
@@ -741,11 +752,12 @@ fn normalize_event(event: &mut Value) {
             }
         }
         Some("response.incomplete") => {
-            event["type"] = json!("response.completed");
             event["response"]["status"] = json!("incomplete");
         }
         Some("response.done") => {
-            event["type"] = json!("response.completed");
+            let status = event["response"]["status"].as_str();
+            let kind = response_done_terminal_kind(status);
+            event["type"] = json!(kind);
         }
         _ => {}
     }
@@ -757,19 +769,66 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    #[test]
-    fn transport_errors_and_incomplete_responses_keep_shared_parser_contract() {
+    #[tokio::test]
+    async fn normalized_websocket_terminal_reaches_shared_parser() {
         let mut error =
             json!({"type":"error","error":{"code":"rate_limit_error","message":"wait"}});
         normalize_event(&mut error);
         assert_eq!(error["message"], "wait");
         assert_eq!(error["code"], "rate_limit_error");
         let mut incomplete =
-            json!({"type":"response.incomplete","response":{"id":"r","usage":{"output_tokens":3}}});
+            json!({"type":"response.incomplete","response":{"id":"r","usage":{"output_tokens":3},"incomplete_details":{"reason":"max_output_tokens"}}});
         normalize_event(&mut incomplete);
         assert_eq!(incomplete["response"]["status"], "incomplete");
-        assert_eq!(incomplete["type"], "response.completed");
+        assert_eq!(incomplete["type"], "response.incomplete");
         assert_eq!(incomplete["response"]["usage"]["output_tokens"], 3);
+
+        let model = Model::default();
+        let mut output = crate::types::AssistantMessage::new(
+            model.api.clone(), model.provider.clone(), model.id.clone(), 0,
+        );
+        let stream = crate::utils::event_stream::AssistantMessageEventStream::new();
+        crate::providers::openai_responses_shared::process_responses_stream(
+            Box::pin(futures::stream::iter(vec![incomplete])),
+            &mut output, &stream, &model, None,
+        ).await.unwrap();
+        assert_eq!(output.stop_reason, "length");
+        assert_eq!(output.stop_reason_raw.as_deref(), Some("max_output_tokens"));
+    }
+
+    #[tokio::test]
+    async fn normalized_done_failures_reach_shared_error_details_and_usage() {
+        for status in ["failed", "cancelled"] {
+            let mut event = json!({
+                "type":"response.done",
+                "response":{
+                    "id":"normalized-failure",
+                    "status":status,
+                    "error":{"code":"server_error","message":"provider rejected response"},
+                    "incomplete_details":{"reason":status},
+                    "usage":{"input_tokens":3,"output_tokens":7,"total_tokens":10}
+                }
+            });
+            normalize_event(&mut event);
+            assert_eq!(event["type"], "response.failed");
+            assert_eq!(event["response"]["status"], status, "raw terminal status must survive normalization");
+
+            let model = Model::default();
+            let mut output = crate::types::AssistantMessage::new(
+                model.api.clone(), model.provider.clone(), model.id.clone(), 0,
+            );
+            let stream = crate::utils::event_stream::AssistantMessageEventStream::new();
+            let error = crate::providers::openai_responses_shared::process_responses_stream(
+                Box::pin(futures::stream::iter(vec![event])),
+                &mut output, &stream, &model, None,
+            ).await.unwrap_err();
+            assert_eq!(error.message(), "server_error: provider rejected response");
+            assert_eq!(output.stop_reason, "error");
+            assert_eq!(output.stop_reason_raw.as_deref(), Some("server_error"));
+            assert_eq!(output.response_id.as_deref(), Some("normalized-failure"));
+            assert_eq!(output.usage.input, 3.0);
+            assert_eq!(output.usage.output, 7.0);
+        }
     }
 
     #[tokio::test]

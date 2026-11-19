@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use crate::api_registry::{get_api_provider, get_api_providers, ApiProviderInternal};
-use crate::compaction::{CompactionOptions, ProviderCompactionResult};
+use crate::compaction::{CompactionOptions, CompactionRequestError, ProviderCompactionResult};
 use crate::types::{
     AssistantMessage, BoxFuture, Context, Model, ProviderStreamOptions, SimpleStreamOptions,
 };
@@ -50,9 +50,9 @@ pub fn compact_simple(
     model: &Model,
     context: &Context,
     options: Option<&CompactionOptions>,
-) -> BoxFuture<Option<ProviderCompactionResult>> {
+) -> BoxFuture<Result<Option<ProviderCompactionResult>, CompactionRequestError>> {
     if !supports_compaction(model) {
-        return Box::pin(async { None });
+        return Box::pin(async { Ok(None) });
     }
     let compact = resolve_api_provider(&model.api)
         .compact

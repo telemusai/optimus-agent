@@ -1,0 +1,6 @@
+- Fixed detached proxy producers and unbounded proxy header/error-body waits by retaining task receipts and racing cancellation and deadlines.
+- Fixed normalized `response.done` failures losing provider details or valid usage, and valid completed/incomplete Responses waiting unnecessarily for EOF or `[DONE]`.
+- Fixed Google and Vertex safety/prompt-block errors being overwritten by tool-use completion or reported as successful empty responses.
+- Fixed session replacement leaving the current session without hosted/local children when late disposal fails.
+- Fixed `content_filter` Responses incompletes entering the opt-in output-length retry path instead of preserving a safety error.
+- Fixed native Responses/Codex compaction coercing HTTP, transport, malformed-response, and decode failures into unsupported fallback; typed status and `Retry-After` metadata now reach the existing request retry contract, while genuine unsupported responses still return `None`.
