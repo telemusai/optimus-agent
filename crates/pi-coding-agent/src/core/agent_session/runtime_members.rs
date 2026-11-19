@@ -471,6 +471,46 @@ fn build_extension_actions(weak: Weak<AgentSession>, runner: ExtensionRunner) ->
 }
 
 /// `_bindExtensionCore` context-action half (agent-session.ts:9921-9943).
+fn finish_extension_compaction(
+    result: Result<crate::core::compaction::compaction::CompactionResult, String>,
+    on_complete: Option<
+        Arc<dyn Fn(crate::core::extensions::types::CompactionResult) + Send + Sync>,
+    >,
+    on_error: Option<Arc<dyn Fn(String) + Send + Sync>>,
+) {
+    let result = result.and_then(|result| {
+        let details = result
+            .details
+            .map(serde_json::to_value)
+            .transpose()
+            .map_err(|error| format!("Could not serialize compaction details: {error}"))?;
+        let usage = result
+            .usage
+            .map(serde_json::to_value)
+            .transpose()
+            .map_err(|error| format!("Could not serialize compaction usage: {error}"))?;
+        Ok(crate::core::extensions::types::CompactionResult {
+            summary: result.summary,
+            first_kept_entry_id: result.first_kept_entry_id,
+            tokens_before: result.tokens_before,
+            details,
+            usage,
+        })
+    });
+    match result {
+        Ok(result) => {
+            if let Some(on_complete) = on_complete {
+                on_complete(result);
+            }
+        }
+        Err(error) => {
+            if let Some(on_error) = on_error {
+                on_error(error);
+            }
+        }
+    }
+}
+
 fn build_extension_context_actions(weak: Weak<AgentSession>) -> ExtensionContextActions {
     let model_weak = weak.clone();
     let get_model =
@@ -516,9 +556,6 @@ fn build_extension_context_actions(weak: Weak<AgentSession>) -> ExtensionContext
     });
     let compact_weak = weak.clone();
     let compact = Arc::new(move |options: Option<CompactOptions>| {
-        let Some(session) = compact_weak.upgrade() else {
-            return;
-        };
         let (custom_instructions, on_complete, on_error) = match options {
             Some(options) => (
                 options.custom_instructions,
@@ -527,27 +564,26 @@ fn build_extension_context_actions(weak: Weak<AgentSession>) -> ExtensionContext
             ),
             None => (None, None, None),
         };
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            handle.spawn(async move {
-                // REPAIR CURSOR: the TypeScript hands the `CompactionResult` to
-                // `options.onComplete` (agent-session.ts:9934). The public Rust
-                // owner `compact_with_options` returns `Result<(), String>`; the
-                // result object is only built by the private
-                // `perform_compaction_unmeasured_full`. Expose that result on the
-                // public path and forward it here.
-                match session
-                    .compact_with_options(custom_instructions.as_deref(), false)
-                    .await
-                {
-                    Ok(()) => {}
-                    Err(error) => {
-                        if let Some(on_error) = on_error {
-                            on_error(error);
-                        }
-                    }
+        let Some(session) = compact_weak.upgrade() else {
+            if let Some(on_error) = on_error {
+                on_error("Cannot compact: the session is no longer available.".to_string());
+            }
+            return;
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(async move {
+                    let result = session
+                        .compact_with_options(custom_instructions.as_deref(), false)
+                        .await;
+                    finish_extension_compaction(result, on_complete, on_error);
+                });
+            }
+            Err(error) => {
+                if let Some(on_error) = on_error {
+                    on_error(format!("Cannot compact without a Tokio runtime: {error}"));
                 }
-                let _ = on_complete;
-            });
+            }
         }
     });
     let prompt_weak = weak.clone();
@@ -4877,5 +4913,109 @@ mod tests {
         assert_eq!(mode(&nested_child), 0o700);
         std::fs::remove_dir_all(ephemeral).unwrap();
         std::fs::remove_dir_all(parent).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod compaction_callback_tests {
+    use super::*;
+    use crate::core::compaction::compaction::{CompactionDetails, CompactionResult};
+    use std::sync::atomic::AtomicUsize;
+
+    fn result_fixture() -> CompactionResult {
+        CompactionResult {
+            summary: "persisted fixture summary".to_string(),
+            first_kept_entry_id: "entry-42".to_string(),
+            tokens_before: 1234.0,
+            details: Some(CompactionDetails {
+                read_files: vec!["src/kept.rs".to_string()],
+                modified_files: vec!["src/changed.rs".to_string()],
+                provider_checkpoint: None,
+                deadline_fallback: None,
+                task_state: None,
+                typed_state: None,
+                typed_verification: None,
+            }),
+            usage: Some(Usage {
+                input: 900.0,
+                output: 12.0,
+                ..Default::default()
+            }),
+        }
+    }
+
+    #[test]
+    fn completion_receives_the_actual_result_and_false_success_does_not_complete() {
+        let expected = result_fixture();
+        let completed = Arc::new(Mutex::new(Vec::new()));
+        let errors = Arc::new(Mutex::new(Vec::new()));
+        let completed_sink = completed.clone();
+        let error_sink = errors.clone();
+        finish_extension_compaction(
+            Ok(expected.clone()),
+            Some(Arc::new(move |result| completed_sink.lock().unwrap().push(result))),
+            Some(Arc::new(move |error| error_sink.lock().unwrap().push(error))),
+        );
+        let completed_results = completed.lock().unwrap();
+        assert_eq!(completed_results.len(), 1);
+        assert_eq!(completed_results[0].summary, expected.summary);
+        assert_eq!(
+            completed_results[0].first_kept_entry_id,
+            expected.first_kept_entry_id
+        );
+        assert_eq!(completed_results[0].tokens_before, expected.tokens_before);
+        assert_eq!(
+            completed_results[0]
+                .details
+                .as_ref()
+                .and_then(|details| details.get("readFiles"))
+                .and_then(serde_json::Value::as_array)
+                .and_then(|files| files.first())
+                .and_then(serde_json::Value::as_str),
+            Some("src/kept.rs")
+        );
+        assert_eq!(
+            completed_results[0]
+                .usage
+                .as_ref()
+                .and_then(|usage| usage.get("input"))
+                .and_then(serde_json::Value::as_f64),
+            Some(900.0)
+        );
+        drop(completed_results);
+        assert!(errors.lock().unwrap().is_empty());
+
+        let completed_sink = completed.clone();
+        let error_sink = errors.clone();
+        finish_extension_compaction(
+            Err("actual persist failure".to_string()),
+            Some(Arc::new(move |result| completed_sink.lock().unwrap().push(result))),
+            Some(Arc::new(move |error| error_sink.lock().unwrap().push(error))),
+        );
+        assert_eq!(completed.lock().unwrap().len(), 1, "an error is never a short-Ok completion");
+        assert_eq!(
+            errors.lock().unwrap().as_slice(),
+            &["actual persist failure".to_string()]
+        );
+    }
+
+    #[test]
+    fn early_weak_session_failure_invokes_only_on_error() {
+        let actions = build_extension_context_actions(Weak::<AgentSession>::new());
+        let completions = Arc::new(AtomicUsize::new(0));
+        let errors = Arc::new(Mutex::new(Vec::new()));
+        let completion_counter = completions.clone();
+        let error_sink = errors.clone();
+        (actions.compact)(Some(CompactOptions {
+            custom_instructions: Some("retain these instructions".to_string()),
+            on_complete: Some(Arc::new(move |_| {
+                completion_counter.fetch_add(1, Ordering::SeqCst);
+            })),
+            on_error: Some(Arc::new(move |error| error_sink.lock().unwrap().push(error))),
+        }));
+        assert_eq!(completions.load(Ordering::SeqCst), 0);
+        let errors = errors.lock().unwrap();
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("no longer available"), "{errors:?}");
     }
 }

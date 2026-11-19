@@ -2038,17 +2038,21 @@ pub fn prepare_compaction(
     // ledger, `typed` (W15) builds the v2 provenance-typed ledger.
     let task_state_mode = resolve_task_state_mode(settings.task_state.as_deref(), None);
     let task_state = if task_state_mode == TASK_STATE_MODE_PROMPT {
-        let previous_ledger = if prev_compaction_index >= 0 {
-            match &path_entries[prev_compaction_index as usize] {
-                CompactionSessionEntry::Compaction { details, .. } => details
+        // Native checkpoints are excluded from the text-summary boundary above,
+        // but their v1 ledger is still the previous durable state for this chain.
+        // Read only the newest compaction (including native) so an absent or
+        // malformed newest ledger has the same no-fallback semantics as text.
+        let previous_ledger = path_entries.iter().rev().find_map(|entry| match entry {
+            CompactionSessionEntry::Compaction { details, .. } => Some(
+                details
                     .as_ref()
                     .and_then(|details| details.get("taskState"))
-                    .and_then(|value| serde_json::from_value::<TaskStateLedger>(value.clone()).ok()),
-                _ => None,
-            }
-        } else {
-            None
-        };
+                    .and_then(|value| {
+                        serde_json::from_value::<TaskStateLedger>(value.clone()).ok()
+                    }),
+            ),
+            _ => None,
+        }).flatten();
         let ledger = build_ledger(
             &path_entries[boundary_start..history_end],
             previous_ledger.as_ref(),
@@ -2957,7 +2961,10 @@ pub async fn compact_with_metrics(
                         modified_files,
                         provider_checkpoint: Some(remote.checkpoint),
                         deadline_fallback: None,
-                        task_state: None,
+                        // The native summary replaces prose only. Carry the same
+                        // merged v1 ledger as the text and deadline-fallback paths
+                        // so the next preparation can merge old and new constraints.
+                        task_state: task_state.clone(),
                         // D28: the server-side summary replaces only the
                         // conversation text. The typed ledger this episode
                         // merged (the previous durable chain plus the
@@ -4307,5 +4314,175 @@ mod task_state_mode_tests {
             TASK_STATE_MODE_OFF
         );
         assert_eq!(resolve_task_state_mode(None, Some("enabled")), TASK_STATE_MODE_OFF);
+    }
+}
+
+#[cfg(test)]
+mod native_task_state_tests {
+    use super::*;
+    use crate::core::compaction::task_state::TaskStateItem;
+    use pi_ai::types::{UserContent, UserMessage};
+
+    fn constraint(id: &str, text: &str, entry: &str) -> TaskStateItem {
+        TaskStateItem {
+            id: id.to_string(),
+            text: text.to_string(),
+            entry: entry.to_string(),
+            ..Default::default()
+        }
+    }
+
+    fn user_entry(id: &str, parent_id: Option<&str>, text: &str) -> CompactionSessionEntry {
+        CompactionSessionEntry::Message {
+            id: id.to_string(),
+            parent_id: parent_id.map(str::to_string),
+            message: AgentMessage::Message(Message::User(UserMessage::new(
+                UserContent::Text(text.to_string()),
+                0,
+            ))),
+        }
+    }
+
+    /// A native result must persist the exact v1 chain consumed by the next
+    /// preparation, without adding transcript/history payloads to details.
+    #[tokio::test]
+    async fn native_success_carries_v1_state_into_the_next_preparation() {
+        let api = format!("native-task-state-{}", uuid::Uuid::new_v4());
+        pi_ai::api_registry::register_api_provider_simple(
+            pi_ai::api_registry::ApiProviderSimple {
+                api: api.clone(),
+                stream: Arc::new(|_, _, _| panic!("unexpected base stream")),
+                stream_simple: Arc::new(|_, _, _| panic!("native compaction must not summarize text")),
+                compact: Some(Arc::new(|model, _, _| {
+                    let checkpoint = ProviderCompactionCheckpoint {
+                        version: 1,
+                        provider: model.provider.clone(),
+                        api: model.api.clone(),
+                        model: model.id.clone(),
+                        base_url: model.base_url.clone(),
+                        endpoint: None,
+                        items: vec![serde_json::Map::new()],
+                        estimated_tokens: 1.0,
+                    };
+                    Box::pin(async move {
+                        Ok(Some(pi_ai::compaction::ProviderCompactionResult {
+                            checkpoint,
+                            usage: None,
+                        }))
+                    })
+                })),
+                supports_compaction: None,
+            },
+            None,
+        );
+        let mut model = Model::new(
+            "native-task-state-model",
+            "native-task-state-model",
+            api,
+            "faux",
+            "https://fixture.invalid",
+        );
+        model.context_window = 100_000.0;
+        model.max_tokens = 4_000.0;
+        let previous = TaskStateLedger {
+            constraints: vec![constraint("C-old", "must keep alpha", "old")],
+            ..Default::default()
+        };
+        let current = TaskStateLedger {
+            constraints: vec![constraint("C-new", "must keep beta", "new")],
+            ..Default::default()
+        };
+        let merged = TaskStateLedger {
+            constraints: vec![
+                previous.constraints[0].clone(),
+                current.constraints[0].clone(),
+            ],
+            ..Default::default()
+        };
+        let typed = TypedStateLedger::default();
+        let mut preparation = CompactionPreparation {
+            first_kept_entry_id: "retained".to_string(),
+            messages_to_summarize: vec![AgentMessage::Message(Message::User(UserMessage::new(
+                UserContent::Text("must keep beta".to_string()),
+                0,
+            )))],
+            turn_prefix_messages: Vec::new(),
+            is_split_turn: false,
+            tokens_before: 10.0,
+            previous_summary: None,
+            retained_state_anchor: None,
+            file_ops: create_file_ops(),
+            settings: default_compaction_settings(),
+            task_state: Some(merged.clone()),
+            typed_state: Some(typed.clone()),
+        };
+        preparation.settings.task_state = Some(TASK_STATE_MODE_PROMPT.to_string());
+        let provider_context = Context {
+            system_prompt: None,
+            messages: Vec::new(),
+            tools: Some(Vec::new()),
+        };
+        let options = CompactionOptions::default();
+        let metrics = CompactionMetrics::new(None, &model);
+        let result = compact_with_metrics(
+            &preparation,
+            &model,
+            "unused",
+            None,
+            None,
+            None,
+            None,
+            default_summary_call_runner(None),
+            Some(&ProviderRetryPolicy {
+                enabled: false,
+                ..DEFAULT_PROVIDER_RETRY_POLICY
+            }),
+            Some((&provider_context, Some(&options))),
+            &metrics,
+        )
+        .await
+        .expect("offline native fixture succeeds");
+        let details = result.details.clone().expect("native details");
+        assert_eq!(details.task_state, Some(merged));
+        assert_eq!(details.typed_state, Some(typed));
+        assert!(details.provider_checkpoint.is_some());
+        let serialized_details = serde_json::to_value(&details).expect("persisted details JSON");
+        assert!(serialized_details.get("taskState").is_some());
+        assert!(serialized_details.get("history").is_none());
+        assert!(serialized_details.get("messages").is_none());
+        assert!(serialized_details.get("rawTranscript").is_none());
+
+        let native_entry = CompactionSessionEntry::Compaction {
+            id: "compact-native".to_string(),
+            parent_id: Some("old".to_string()),
+            summary: result.summary.clone(),
+            first_kept_entry_id: "new".to_string(),
+            tokens_before: result.tokens_before,
+            details: Some(serialized_details),
+            from_hook: Some(false),
+            custom_instructions: None,
+            harness_digest: None,
+            timestamp: "2026-01-01T00:00:00.000Z".to_string(),
+        };
+        let path = vec![
+            user_entry("old", None, "must keep alpha"),
+            native_entry,
+            user_entry("new", Some("compact-native"), "must keep beta"),
+            user_entry("gamma", Some("new"), "must keep gamma"),
+            user_entry("retained", Some("gamma"), "latest retained turn"),
+        ];
+        let mut settings = default_compaction_settings();
+        settings.task_state = Some(TASK_STATE_MODE_PROMPT.to_string());
+        settings.keep_recent_tokens = 1.0;
+        let next = prepare_compaction(&path, &settings, &|_| 100.0)
+            .expect("the post-native branch has a new window to compact");
+        let next_state = next.task_state.expect("native taskState remains readable");
+        for text in ["must keep alpha", "must keep beta", "must keep gamma"] {
+            assert!(
+                next_state.constraints.iter().any(|item| item.text.contains(text)),
+                "next preparation lost {text}: {:?}",
+                next_state.constraints
+            );
+        }
     }
 }

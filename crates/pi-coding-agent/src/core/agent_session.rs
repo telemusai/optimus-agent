@@ -94,7 +94,7 @@ use crate::core::compaction::branch_summarization::{
 };
 use crate::core::compaction::checkpoint::has_provider_checkpoint;
 use crate::core::compaction::compaction::{
-    calculate_context_tokens, compact, default_compaction_settings, estimate_context_tokens,
+    calculate_context_tokens, default_compaction_settings, estimate_context_tokens,
     estimate_tokens, prepare_compaction, should_compact_for_model, CompactionPreparation,
     CompactionRetryConfig, CompactionResult, CompactionSessionEntry, CompactionSettings,
     COMPACT_SKILL_NAME,
@@ -2734,12 +2734,20 @@ pub struct AgentSession {
     autonomous_state: Mutex<crate::core::autonomous::AutonomousRuntimeState>,
     autonomous_continuation_suppression_depth: AtomicU64,
     autonomous_continuation_suppressed_messages: Mutex<HashSet<String>>,
+    /// Serialize every automatic and manual abort -> snapshot -> restore ->
+    /// finish episode. Holding this guard across the operation's terminal tail
+    /// closes the registration gap between an old operation resolving and its
+    /// replacement publishing the next owner.
+    compaction_admission: tokio::sync::Mutex<()>,
     compaction_abort_controller: Mutex<Option<CancellationToken>>,
     auto_compaction_abort_controller: Mutex<Option<CancellationToken>>,
     /// `_compactionOperation` (`Promise<void> | undefined`).
     compaction_operation: Mutex<Option<CompactionOperation>>,
     /// `"idle" | "attempted" | "reported"`
     overflow_recovery: Mutex<String>,
+    /// Overflow AgentEnd admitted while another compaction owns admission.
+    /// The successful owner redrives this exact failed turn without a second compaction.
+    pending_overflow_recovery: Mutex<Option<AssistantMessage>>,
     continue_after_threshold_compaction: AtomicBool,
     /// A2 (durable-summary input release): set once a compaction's summary is
     /// persisted AND the live agent context has been swapped to the compacted
@@ -3146,10 +3154,12 @@ impl AgentSession {
             )),
             autonomous_continuation_suppression_depth: AtomicU64::new(0),
             autonomous_continuation_suppressed_messages: Mutex::new(HashSet::new()),
+            compaction_admission: tokio::sync::Mutex::new(()),
             compaction_abort_controller: Mutex::new(None),
             auto_compaction_abort_controller: Mutex::new(None),
             compaction_operation: Mutex::new(None),
             overflow_recovery: Mutex::new("idle".to_string()),
+            pending_overflow_recovery: Mutex::new(None),
             continue_after_threshold_compaction: AtomicBool::new(false),
             compaction_input_admission_released: AtomicBool::new(false),
             threshold_compaction_failure_streak: Mutex::new(None),
@@ -14695,67 +14705,11 @@ async fn sender_queue_idle_tick(
         self: &Arc<Self>,
         custom_instructions: Option<&str>,
         skip_abort: bool,
-    ) -> Result<(), String> {
-        if !skip_abort {
-            self.abort_compaction();
-        }
-        if self.is_compacting() {
-            return Ok(());
-        }
-        let controller = CancellationToken::new();
-        *self.compaction_abort_controller.lock().unwrap() = Some(controller.clone());
-        self.emit(AgentSessionEvent::CompactionStart {
-            reason: COMPACTION_REASON_MANUAL.to_string(),
-            custom_instructions: custom_instructions.map(|value| value.to_string()),
-        });
-        let result = self
-            .perform_compaction_unmeasured(
-                custom_instructions.map(|value| value.to_string()),
-                controller.clone(),
-            )
-            .await;
-        *self.compaction_abort_controller.lock().unwrap() = None;
-        // TS 8129/9519-9541: EVERY manual attempt reports a terminal
-        // `compaction_end`. A cancelled attempt is reported as aborted and carries
-        // no error message; a skipped attempt is a warning; anything else failed.
-        let outcome = match &result {
-            Ok(compaction_result) => AgentSessionEvent::CompactionEnd {
-                reason: COMPACTION_REASON_MANUAL.to_string(),
-                result: Some(compaction_result.clone()),
-                aborted: false,
-                will_retry: false,
-                error_message: None,
-                error_severity: None,
-                custom_instructions: custom_instructions.map(|value| value.to_string()),
-            },
-            Err(error) => {
-                let message = self.as_error(error);
-                let aborted = message == "Compaction cancelled"
-                    || error == COMPACTION_CANCELLED_ERROR_MESSAGE
-                    || message == "Aborted";
-                let skipped = error == COMPACTION_SKIPPED_ERROR_MESSAGE
-                    || error == COMPACTION_ALREADY_COMPACTED_ERROR_MESSAGE;
-                AgentSessionEvent::CompactionEnd {
-                    reason: COMPACTION_REASON_MANUAL.to_string(),
-                    result: None,
-                    aborted,
-                    will_retry: false,
-                    error_message: if aborted {
-                        None
-                    } else if skipped {
-                        Some(message)
-                    } else {
-                        Some(format!("Compaction failed: {message}"))
-                    },
-                    error_severity: Some(if skipped { "warning" } else { "error" }.to_string()),
-                    custom_instructions: custom_instructions.map(|value| value.to_string()),
-                }
-            }
-        };
-        self.emit(outcome);
+    ) -> Result<CompactionResult, String> {
+        let result = self.compact(custom_instructions, skip_abort).await;
         self.reap_deleted_rlm_subagent_runtimes_after_compaction()
             .await;
-        result.map(|_| ())
+        result
     }
 
     /// `_reapDeletedRlmSubagentRuntimesAfterCompaction()`.
@@ -14893,10 +14847,14 @@ async fn sender_queue_idle_tick(
 
     /// `this._compactionOperation = compactionOperation` plus its resolver
     /// (agent-session.ts:8089-8092 manual, 9607-9610 auto).
-    fn begin_compaction_operation(&self) -> SharedVoidFuture {
+    fn begin_compaction_operation(&self) -> Result<SharedVoidFuture, String> {
+        let mut slot = self.compaction_operation.lock().unwrap();
+        if slot.is_some() {
+            return Err("Cannot register compaction while another operation is active".to_string());
+        }
         let (operation, shared) = create_compaction_operation();
-        *self.compaction_operation.lock().unwrap() = Some(operation);
-        shared
+        *slot = Some(operation);
+        Ok(shared)
     }
 
     /// `if (this._compactionOperation === compactionOperation) { this._compactionOperation = undefined; }`
@@ -17423,14 +17381,31 @@ async fn sender_queue_idle_tick(
                 }
                 return Some(false);
             }
-            *recovery = "attempted".to_string();
         }
+        // Admission must be decided before marking the one attempt or removing
+        // the failed assistant. During manual event-queue drain, waiting here
+        // would deadlock and a plain busy false would release the goal/RLM turn.
+        let Ok(compaction_admission) = self.compaction_admission.try_lock() else {
+            let mut pending = self.pending_overflow_recovery.lock().unwrap();
+            if pending.is_none() {
+                *pending = Some(assistant.clone());
+            }
+            // Existing will_retry handling retains RLM/goal work. The admitted
+            // successful compaction owner consumes this exact handoff below.
+            return Some(true);
+        };
+        *self.overflow_recovery.lock().unwrap() = "attempted".to_string();
         // TS 9470-9476: drop the error message from agent state (history keeps it).
         self.remove_failed_assistant_from_state(assistant);
-        // TS 9477.
+        // TS 9477. Keep the acquired guard across mutation and the full body;
+        // a second try_lock here would reopen the loss-of-retry race.
         Some(
-            self.run_auto_compaction(COMPACTION_REASON_OVERFLOW, true)
-                .await,
+            self.run_auto_compaction_admitted(
+                COMPACTION_REASON_OVERFLOW,
+                true,
+                compaction_admission,
+            )
+            .await,
         )
     }
 
@@ -17545,6 +17520,26 @@ async fn sender_queue_idle_tick(
     /// Returns the TS `boolean`: true only for a successful compaction with
     /// `willRetry` (overflow recovery), which tells the caller to keep the loop.
     async fn run_auto_compaction(self: &Arc<Self>, reason: &str, will_retry: bool) -> bool {
+        // Auto and manual attempts share one admission owner. Automatic entry is
+        // deliberately nonblocking: manual replacement can be waiting for this
+        // very caller to drain from the agent-event queue. Return before taking
+        // pending requested/threshold intent so the replacement (or a later
+        // guarded preturn evaluation) remains responsible for it exactly once.
+        let Ok(compaction_admission) = self.compaction_admission.try_lock() else {
+            return false;
+        };
+        self.run_auto_compaction_admitted(reason, will_retry, compaction_admission)
+            .await
+    }
+
+    /// Automatic body with admission already claimed. Overflow uses this form so
+    /// its state/message mutations cannot fall into a second acquisition gap.
+    async fn run_auto_compaction_admitted(
+        self: &Arc<Self>,
+        reason: &str,
+        will_retry: bool,
+        _compaction_admission: tokio::sync::MutexGuard<'_, ()>,
+    ) -> bool {
         if self.explicitly_stopped() {
             return false;
         }
@@ -17599,7 +17594,10 @@ async fn sender_queue_idle_tick(
             if self.explicitly_stopped() {
                 return false;
             }
-            let operation = self.begin_compaction_operation();
+            let operation = match self.begin_compaction_operation() {
+                Ok(operation) => operation,
+                Err(_) => return false,
+            };
             *self.auto_compaction_abort_controller.lock().unwrap() = Some(controller.clone());
             operation
         };
@@ -17671,21 +17669,27 @@ async fn sender_queue_idle_tick(
                         // starts clean instead of inheriting the failed streak.
                         self.clear_threshold_compaction_failure_streak();
                         *self.compaction_attempt_evidence.lock().unwrap() = None;
+                        let has_pending_overflow =
+                            self.pending_overflow_recovery.lock().unwrap().is_some();
                         // TS 9638-9645.
                         self.emit(AgentSessionEvent::CompactionEnd {
                             reason: reason.to_string(),
                             result: Some(compaction_result.clone()),
                             aborted: false,
-                            will_retry,
+                            will_retry: will_retry || has_pending_overflow,
                             error_message: None,
                             error_severity: None,
                             custom_instructions: custom_instructions.clone(),
                         });
                         self.queue_pending_rlm_continuation();
+                        let resumed_pending_overflow =
+                            self.resume_pending_overflow_after_compaction();
                         let has_queued_messages =
                             self.agent.has_queued_messages() || self.has_pending_session_work();
-                        let will_continue =
-                            will_retry || should_continue_after_compaction || has_queued_messages;
+                        let will_continue = will_retry
+                            || should_continue_after_compaction
+                            || has_queued_messages
+                            || resumed_pending_overflow;
                         if will_retry {
                             // TS 9651-9657: strip a trailing error assistant message.
                             let mut state = self.agent.state();
@@ -17984,6 +17988,20 @@ async fn sender_queue_idle_tick(
             });
             state.messages.push(agent_message);
         }));
+    }
+
+    /// Redrive an overflow AgentEnd that arrived while this successful
+    /// compaction owned admission. History still contains the failed assistant;
+    /// restored live context drops it before the single existing retry executor.
+    fn resume_pending_overflow_after_compaction(self: &Arc<Self>) -> bool {
+        let assistant = self.pending_overflow_recovery.lock().unwrap().take();
+        let Some(assistant) = assistant else {
+            return false;
+        };
+        *self.overflow_recovery.lock().unwrap() = "attempted".to_string();
+        self.remove_failed_assistant_from_state(&assistant);
+        self.schedule_post_compaction_continue(true);
+        true
     }
 
     /// The TS `resumeAfterFailure` closure (agent-session.ts:9594-9602).
@@ -18636,6 +18654,66 @@ pub struct RlmSubagentRuntimeOptionsInput {
 /// `ActionExecution` alias used by the appended members.
 pub type ActionExecutionAlias = crate::core::session_action_store::ActionExecution;
 
+const IMAGE_READING_DISABLED: &str = "Image reading is disabled.";
+
+/// The same image-blocking projection as `convertToLlmWithBlockImages`: replace
+/// user/custom and tool-result images and coalesce adjacent disabled notices.
+fn block_compaction_images_in_message(message: Message) -> Message {
+    let replace = |content: &mut Vec<pi_ai::types::ImageOrTextContent>| {
+        if !content
+            .iter()
+            .any(|block| matches!(block, pi_ai::types::ImageOrTextContent::Image(_)))
+        {
+            return;
+        }
+        let mapped: Vec<pi_ai::types::ImageOrTextContent> = content
+            .iter()
+            .map(|block| match block {
+                pi_ai::types::ImageOrTextContent::Image(_) => {
+                    pi_ai::types::ImageOrTextContent::Text(TextContent::new(
+                        IMAGE_READING_DISABLED,
+                    ))
+                }
+                other => other.clone(),
+            })
+            .collect();
+        let mut filtered: Vec<pi_ai::types::ImageOrTextContent> = Vec::new();
+        for block in &mapped {
+            let is_duplicate_disabled_text = match block {
+                pi_ai::types::ImageOrTextContent::Text(text) => {
+                    text.text == IMAGE_READING_DISABLED
+                        && filtered.last().is_some_and(|previous| match previous {
+                            pi_ai::types::ImageOrTextContent::Text(previous) => {
+                                previous.text == IMAGE_READING_DISABLED
+                            }
+                            pi_ai::types::ImageOrTextContent::Image(_) => false,
+                        })
+                }
+                pi_ai::types::ImageOrTextContent::Image(_) => false,
+            };
+            if is_duplicate_disabled_text && !filtered.is_empty() {
+                continue;
+            }
+            filtered.push(block.clone());
+        }
+        *content = filtered;
+    };
+
+    match message {
+        Message::User(mut user) => {
+            if let UserContent::Blocks(blocks) = &mut user.content {
+                replace(blocks);
+            }
+            Message::User(user)
+        }
+        Message::ToolResult(mut result) => {
+            replace(&mut result.content);
+            Message::ToolResult(result)
+        }
+        other => other,
+    }
+}
+
 impl AgentSession {
     /// `compact(customInstructions, options)`.
     async fn compact(
@@ -18646,6 +18724,30 @@ impl AgentSession {
         if skip_abort && self.is_streaming() {
             return Err("Cannot compact without aborting while the agent is running.".to_string());
         }
+        let _compaction_admission = self.compaction_admission.lock().await;
+        if !skip_abort {
+            self.abort_compaction();
+        }
+        // Cancelling a controller is only a request. Wait for the previous
+        // operation's terminal cleanup before installing this attempt's state.
+        // The lock above closes the equivalent race with another manual caller.
+        loop {
+            let previous_operation = self
+                .compaction_operation
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|operation| operation.operation.clone());
+            match previous_operation {
+                Some(operation) => {
+                    let _ = operation.await;
+                }
+                None => break,
+            }
+        }
+        // Capture intent only after the previous auto/manual tail is terminal.
+        // The common admission guard now prevents a newer auto attempt from
+        // changing this state before the replacement abort consumes it.
         let had_post_compaction_continue = self
             .post_compaction_continuation_scheduled
             .load(Ordering::SeqCst);
@@ -18657,18 +18759,32 @@ impl AgentSession {
             .map(|settlement| settlement.lock().unwrap().continue_after_session_input)
             .unwrap_or(false);
         self.disconnect_from_agent();
-        if !skip_abort {
+        let aborted = if !skip_abort {
             // Compaction's internal settlement is not an explicit user stop.
-            self.abort_inner(false).await?;
+            // This awaits the active agent, MessageEnd persistence queue and
+            // active-child cancellation before any branch/context snapshot.
+            self.abort_inner(false).await
+        } else {
+            Ok(())
+        };
+        if let Err(error) = aborted {
+            self.reconnect_to_agent();
+            self.resume_session_input_admission();
+            return Err(error);
         }
-        // REPAIR CURSOR: the TypeScript tracks `didCompact` for the `finally` tail;
-        // the port runs that tail from the success arm (`finish_successful_manual_compaction`)
-        // and the failure arm separately, so no flag is needed.
         let compaction_abort = CancellationToken::new();
         *self.compaction_abort_controller.lock().unwrap() = Some(compaction_abort.clone());
         // agent-session.ts:8088-8092 publishes the in-flight manual compaction before
         // the work starts; the `finally` tail below clears it (TS 8141-8149).
-        let compaction_operation = self.begin_compaction_operation();
+        let compaction_operation = match self.begin_compaction_operation() {
+            Ok(operation) => operation,
+            Err(error) => {
+                *self.compaction_abort_controller.lock().unwrap() = None;
+                self.reconnect_to_agent();
+                self.resume_session_input_admission();
+                return Err(error);
+            }
+        };
         self.emit(AgentSessionEvent::CompactionStart {
             reason: COMPACTION_REASON_MANUAL.to_string(),
             custom_instructions: custom_instructions.map(|value| value.to_string()),
@@ -18689,11 +18805,13 @@ impl AgentSession {
                 // unblock: the automatic threshold backoff starts clean
                 // instead of inheriting the failed streak.
                 self.clear_threshold_compaction_failure_streak();
+                let has_pending_overflow =
+                    self.pending_overflow_recovery.lock().unwrap().is_some();
                 self.emit(AgentSessionEvent::CompactionEnd {
                     reason: COMPACTION_REASON_MANUAL.to_string(),
                     result: Some(result.clone()),
                     aborted: false,
-                    will_retry: false,
+                    will_retry: has_pending_overflow,
                     error_message: None,
                     error_severity: None,
                     custom_instructions: custom_instructions.map(|value| value.to_string()),
@@ -18709,6 +18827,9 @@ impl AgentSession {
                 Ok(result)
             }
             Err(error) => {
+                if !skip_abort {
+                    self.resume_session_input_admission();
+                }
                 let message = self.as_error(&error);
                 let aborted = message == "Compaction cancelled"
                     || error == COMPACTION_CANCELLED_ERROR_MESSAGE;
@@ -18784,25 +18905,17 @@ impl AgentSession {
         if had_post_compaction_continue {
             self.schedule_post_compaction_continue(continue_after_session_input);
         }
+        let resumed_pending_overflow = self.resume_pending_overflow_after_compaction();
         // Queued agent or session-owned inputs resume the loop; defer refine
         // behind them instead of interleaving it before their turns.
         self.schedule_auto_refine_after_compaction(
             self.goal_continuation_awaits_rlm_work
                 .load(Ordering::SeqCst)
                 || had_post_compaction_continue
+                || resumed_pending_overflow
                 || self.agent.has_queued_messages()
                 || self.unfinished_action_count() > 0,
         );
-    }
-
-    /// `_performCompactionUnmeasured(options)`.
-    async fn perform_compaction_unmeasured(
-        self: &Arc<Self>,
-        custom_instructions: Option<String>,
-        signal: CancellationToken,
-    ) -> Result<crate::core::compaction::compaction::CompactionResult, String> {
-        self.perform_compaction_unmeasured_full(custom_instructions, signal, None, false)
-            .await
     }
 
     /// TS 8324-8334 `context` for the compaction summary call: the session's system
@@ -18844,16 +18957,18 @@ impl AgentSession {
         // `signal` stays unused because `emitContext` (runner.rs:1124) takes no
         // signal, unlike `transformContext(messages, signal)` (TS 8329).
         let _ = signal;
-        // `this.agent.convertToLlm` is `convertToLlmWithBlockImages` (core/sdk.rs:454):
-        // the model-tool-output policy plus the session scope, then image blocking.
-        // The `blockImages` half is not reproducible here because
-        // `block_images_in_message` is private to `core/sdk.rs`.
+        // `this.agent.convertToLlm` is `convertToLlmWithBlockImages`: the native
+        // provider consumes this same retained context, so blockImages must be
+        // applied here as well as on the ordinary model-request path.
         // Persist listeners read settings while holding the session manager.
         // Release settings before taking that manager to avoid the reverse order.
-        let policy = {
+        let (policy, block_images) = {
             let settings = self.settings_manager.lock().unwrap();
-            crate::core::model_tool_output_policy::resolve_model_tool_output_policy(
-                Some(&settings.get_model_tool_output_policy()),
+            (
+                crate::core::model_tool_output_policy::resolve_model_tool_output_policy(
+                    Some(&settings.get_model_tool_output_policy()),
+                ),
+                settings.get_block_images(),
             )
         };
         let scope = {
@@ -18872,6 +18987,14 @@ impl AgentSession {
                 scope,
             },
         );
+        let converted = if block_images {
+            converted
+                .into_iter()
+                .map(block_compaction_images_in_message)
+                .collect()
+        } else {
+            converted
+        };
         pi_ai::types::Context {
             system_prompt: Some(system_prompt),
             messages: converted,
@@ -21112,11 +21235,16 @@ mod post_compaction_continuation_tests {
         let agent = ScriptedAgent::new(vec![]);
         let session = test_session(agent);
         assert!(session.compaction_operation.lock().unwrap().is_none());
-        let operation = session.begin_compaction_operation();
+        let operation = session.begin_compaction_operation().unwrap();
         assert!(
             session.compaction_operation.lock().unwrap().is_some(),
             "the in-flight compaction is visible to the runner (TS 8598)"
         );
+        assert!(
+            session.begin_compaction_operation().is_err(),
+            "registration must never replace an active owner"
+        );
+        assert!(session.compaction_operation.lock().unwrap().is_some());
         session.end_compaction_operation(&operation);
         assert!(
             session.compaction_operation.lock().unwrap().is_none(),
@@ -23918,13 +24046,11 @@ mod post_compaction_continuation_tests {
             session.dispose_async(Some(false)).await;
         }
 
-        /// A fully seeded in-memory session whose summary call succeeds: proves a
-        /// successful threshold compaction clears the cooldown so later failures
-        /// start a fresh streak instead of inheriting the old one.
-        #[tokio::test]
-        async fn successful_threshold_compaction_clears_the_streak() {
+        fn successful_compaction_session(
+            api: &str,
+            agent: Arc<ScriptedAgent>,
+        ) -> Arc<AgentSession> {
             const VALID_SUMMARY: &str = "## Goal\nComplete.\n## Constraints & Preferences\nNone.\n## Progress\nDone.\n## Key Decisions\nWait.\n## Next Steps\nReview.\n## Critical Context\nSaved.";
-            let api = "summary-backoff-success";
             let registered = api.to_string();
             let _ = register_api_provider_simple(
                 ApiProviderSimple {
@@ -23949,7 +24075,6 @@ mod post_compaction_continuation_tests {
                 },
                 None,
             );
-            let agent = ScriptedAgent::new(vec![]);
             let session = test_session(agent);
             session
                 .model_registry
@@ -24015,6 +24140,17 @@ mod post_compaction_continuation_tests {
             let mut state = session.agent.state();
             state.model = model;
             session.agent.set_state(state);
+            session
+        }
+
+        /// A fully seeded in-memory session whose summary call succeeds: proves a
+        /// successful threshold compaction clears the cooldown so later failures
+        /// start a fresh streak instead of inheriting the old one.
+        #[tokio::test]
+        async fn successful_threshold_compaction_clears_the_streak() {
+            let api = "summary-backoff-success";
+            let agent = ScriptedAgent::new(vec![]);
+            let session = successful_compaction_session(api, agent.clone());
 
             // Arm the cooldown, then succeed: the streak must be gone afterwards.
             session.record_threshold_compaction_failure(SummaryFailureKind::Other);
@@ -24059,16 +24195,594 @@ mod post_compaction_continuation_tests {
             }
             session.record_threshold_compaction_failure(SummaryFailureKind::FilteredOrRefused);
             assert!(session.threshold_compaction_retry_in_cooldown());
-            // Verify the actual manual-compaction path (the /compact command
-            // flow), not only the requested-reason arm of run_auto_compaction.
+            // Verify the public daemon/extension manual path, not only the
+            // requested-reason arm of run_auto_compaction. A pending post-
+            // compaction continuation must settle exactly once in the tail.
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let event_sink = events.clone();
+            session.subscribe(Arc::new(move |event| {
+                event_sink.lock().unwrap().push(event);
+            }));
+            let (previous, _previous_operation) = create_compaction_operation();
+            let previous_resolver = previous.deferred.clone();
+            *session.compaction_operation.lock().unwrap() = Some(previous);
+            let previous_controller = CancellationToken::new();
+            *session.compaction_abort_controller.lock().unwrap() =
+                Some(previous_controller.clone());
+            *session.post_compaction_continuation_messages.lock().unwrap() =
+                vec![AgentMessage::Message(Message::User(UserMessage::new(
+                    UserContent::Text("continue exactly once after compaction".to_string()),
+                    0,
+                )))];
             session
-                .compact(None, true)
+                .post_compaction_continuation_scheduled
+                .store(false, Ordering::SeqCst);
+            let compactions_before = session
+                .session_manager
+                .lock()
+                .unwrap()
+                .get_branch(None)
+                .iter()
+                .filter(|entry| entry.get("type").and_then(Value::as_str) == Some("compaction"))
+                .count();
+            let manual_session = session.clone();
+            let mut manual = tokio::spawn(async move {
+                manual_session
+                    .compact_with_options(Some("second instructions must run"), false)
+                    .await
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                while !previous_controller.is_cancelled() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the replacement cancels the previous controller");
+            assert!(
+                !manual.is_finished(),
+                "the replacement waits for the cancelled operation's terminal cleanup"
+            );
+            // A model-requested pending compaction forces the real preturn
+            // checker to enter run_auto_compaction even while the threshold
+            // cooldown fixture above is armed.
+            *session.pending_requested_compaction.lock().unwrap() =
+                Some(PendingRequestedCompaction {
+                    custom_instructions: None,
+                });
+            let automatic_session = session.clone();
+            let mut automatic = tokio::spawn(async move {
+                automatic_session.run_pre_turn_compaction().await;
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(3), &mut automatic)
                 .await
+                .expect("preturn automatic admission skips instead of waiting on replacement")
+                .expect("preturn task joins");
+            assert!(
+                session
+                    .pending_requested_compaction
+                    .lock()
+                    .unwrap()
+                    .is_some(),
+                "busy automatic entry does not consume the pending model request"
+            );
+            assert!(
+                session
+                    .auto_compaction_abort_controller
+                    .lock()
+                    .unwrap()
+                    .is_none(),
+                "the automatic caller cannot register in the old/new-owner gap"
+            );
+            assert!(
+                session.compaction_operation.lock().unwrap().is_some(),
+                "the previous owner was not replaced by automatic registration"
+            );
+            assert_eq!(
+                compaction_starts(&events.lock().unwrap())
+                    .iter()
+                    .filter(|reason| *reason == COMPACTION_REASON_REQUESTED)
+                    .count(),
+                0,
+                "busy preturn admission skips without emitting a start"
+            );
+            // Simulate the previous automatic tail publishing required
+            // continuation intent after the old early-capture point.
+            session
+                .post_compaction_continuation_scheduled
+                .store(true, Ordering::SeqCst);
+            // Match end_compaction_operation: remove the completed operation
+            // before waking the replacement waiter.
+            session.compaction_operation.lock().unwrap().take();
+            previous_resolver.resolve();
+            let manual_result = tokio::time::timeout(std::time::Duration::from_secs(10), &mut manual)
+                .await
+                .expect("the replacement runs after the old operation completes")
+                .expect("manual task joins")
                 .expect("manual compaction succeeds on the seeded fixture");
+            assert!(!manual_result.first_kept_entry_id.is_empty());
+            assert!(manual_result.summary.contains("## Goal"));
+            assert!(
+                session
+                    .pending_requested_compaction
+                    .lock()
+                    .unwrap()
+                    .is_none(),
+                "successful manual replacement consumes the preserved model request"
+            );
+            let events = events.lock().unwrap();
+            assert_eq!(
+                compaction_starts(&events)
+                    .iter()
+                    .filter(|reason| *reason == COMPACTION_REASON_REQUESTED)
+                    .count(),
+                0,
+                "the coalesced preturn attempt does not add a second compaction"
+            );
+            let manual_starts: Vec<_> = events
+                .iter()
+                .filter_map(|event| match event {
+                    AgentSessionEvent::CompactionStart {
+                        reason,
+                        custom_instructions,
+                    } if reason == COMPACTION_REASON_MANUAL => {
+                        Some(custom_instructions.clone())
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                manual_starts,
+                vec![Some("second instructions must run".to_string())],
+                "the second request executes with its own instructions"
+            );
+            let manual_ends = events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    AgentSessionEvent::CompactionEnd { reason, result: Some(_), aborted: false, .. }
+                        if reason == COMPACTION_REASON_MANUAL
+                ))
+                .count();
+            assert_eq!(manual_ends, 1, "one real replacement result is reported once");
+            drop(events);
+            let compactions_after = session
+                .session_manager
+                .lock()
+                .unwrap()
+                .get_branch(None)
+                .iter()
+                .filter(|entry| entry.get("type").and_then(Value::as_str) == Some("compaction"))
+                .count();
+            assert_eq!(compactions_after, compactions_before + 1);
+            tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                while agent.continue_calls() == 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the successful manual tail resumes its pending continuation");
+            for _ in 0..10 {
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(
+                agent.continue_calls(),
+                1,
+                "the unified public lifecycle must not duplicate its continuation"
+            );
             assert!(
                 !session.threshold_compaction_retry_in_cooldown(),
                 "a successful manual compaction clears the filtered backoff"
             );
+
+            // Reverse intent race: true at the old early-capture point, then
+            // consumed before the previous operation completes. The replacement
+            // must not resurrect that stale continuation.
+            {
+                let mut manager = session.session_manager.lock().unwrap();
+                let text = "user turn 3 ".repeat(200);
+                manager
+                    .append_message(AgentMessage::Message(Message::User(UserMessage::new(
+                        UserContent::Text(text),
+                        3,
+                    ))))
+                    .unwrap();
+                manager
+                    .append_message(AgentMessage::Message(Message::Assistant(
+                        AssistantMessage {
+                            content: vec![pi_ai::types::ContentBlock::Text(
+                                pi_ai::types::TextContent::new("assistant reply 3"),
+                            )],
+                            stop_reason: STOP_REASON_STOP.to_string(),
+                            timestamp: 3,
+                            usage: Usage {
+                                input: 900.0,
+                                ..Default::default()
+                            },
+                            ..Default::default()
+                        },
+                    )))
+                    .unwrap();
+            }
+            session.cancel_post_compaction_continue();
+            let (stale_previous, _stale_operation) = create_compaction_operation();
+            let stale_resolver = stale_previous.deferred.clone();
+            *session.compaction_operation.lock().unwrap() = Some(stale_previous);
+            let stale_controller = CancellationToken::new();
+            *session.compaction_abort_controller.lock().unwrap() = Some(stale_controller.clone());
+            *session.post_compaction_continuation_messages.lock().unwrap() =
+                vec![AgentMessage::Message(Message::User(UserMessage::new(
+                    UserContent::Text("stale continuation must stay consumed".to_string()),
+                    0,
+                )))];
+            session
+                .post_compaction_continuation_scheduled
+                .store(true, Ordering::SeqCst);
+            let stale_session = session.clone();
+            let mut stale_manual = tokio::spawn(async move {
+                stale_session.compact_with_options(None, false).await
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                while !stale_controller.is_cancelled() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the stale-intent replacement cancels the old controller");
+            session
+                .post_compaction_continuation_scheduled
+                .store(false, Ordering::SeqCst);
+            session.compaction_operation.lock().unwrap().take();
+            stale_resolver.resolve();
+            tokio::time::timeout(std::time::Duration::from_secs(10), &mut stale_manual)
+                .await
+                .expect("the stale-intent replacement completes")
+                .expect("stale-intent manual task joins")
+                .expect("second real compaction succeeds");
+            for _ in 0..20 {
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(
+                agent.continue_calls(),
+                1,
+                "continuation intent consumed before terminal cleanup is not resurrected"
+            );
+            session.dispose_async(Some(false)).await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn queued_agent_end_auto_admission_does_not_deadlock_manual_abort() {
+            let api = "queued-agent-end-manual-compaction";
+            let agent = ScriptedAgent::new(vec![]);
+            let session = successful_compaction_session(api, agent.clone());
+            let overrides = serde_json::json!({
+                "compaction": {"triggerThreshold": 0.005}
+            })
+            .as_object()
+            .unwrap()
+            .clone();
+            session
+                .settings_manager
+                .lock()
+                .unwrap()
+                .apply_overrides(&overrides);
+            let model = session.model().expect("fixture model");
+            let assistant = AssistantMessage {
+                content: vec![pi_ai::types::ContentBlock::Text(
+                    pi_ai::types::TextContent::new("assistant before queued agent end"),
+                )],
+                api: model.api.clone(),
+                provider: model.provider.clone(),
+                model: model.id.clone(),
+                stop_reason: STOP_REASON_STOP.to_string(),
+                timestamp: 3,
+                usage: Usage {
+                    input: 900.0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let mut state = session.agent.state();
+            state.messages = vec![AgentMessage::Message(Message::Assistant(
+                assistant.clone(),
+            ))];
+            session.agent.set_state(state);
+            *session.last_assistant_message.lock().unwrap() = Some(assistant.clone());
+            assert!(session.threshold_auto_compaction_ready(
+                &session.compaction_settings(),
+                &assistant
+            ));
+
+            // Preserve one threshold continuation and one already-scheduled post
+            // compaction continuation across the queued automatic busy refusal.
+            let queued_goal = AgentMessage::Message(Message::User(UserMessage::new(
+                UserContent::Text("retain this threshold continuation".to_string()),
+                0,
+            )));
+            *session.queued_goal_threshold_continuation.lock().unwrap() =
+                Some(queued_goal.clone());
+            session
+                .continue_after_threshold_compaction
+                .store(true, Ordering::SeqCst);
+            *session.post_compaction_continuation_messages.lock().unwrap() =
+                vec![AgentMessage::Message(Message::User(UserMessage::new(
+                    UserContent::Text("continue once after the queue drains".to_string()),
+                    0,
+                )))];
+            session
+                .post_compaction_continuation_scheduled
+                .store(true, Ordering::SeqCst);
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let event_sink = events.clone();
+            session.subscribe(Arc::new(move |event| {
+                event_sink.lock().unwrap().push(event);
+            }));
+
+            // Queue AgentEnd behind a deterministic predecessor. Manual abort
+            // subsequently waits for this exact tail while holding admission.
+            let (release_queue, queue_gate) = tokio::sync::oneshot::channel();
+            session.push_agent_event_task(async move {
+                let _ = queue_gate.await;
+            });
+            session.handle_agent_event(AgentEvent::AgentEnd {
+                messages: vec![AgentMessage::Message(Message::Assistant(
+                    assistant.clone(),
+                ))],
+            });
+            let manual_session = session.clone();
+            let mut manual = tokio::spawn(async move {
+                manual_session.compact_with_options(None, false).await
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                while agent.wait_for_idle_calls.load(Ordering::SeqCst) == 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("manual abort reaches its agent-event queue drain");
+            assert!(
+                session.compaction_admission.try_lock().is_err(),
+                "manual replacement owns admission while awaiting the queued AgentEnd"
+            );
+            assert!(compaction_starts(&events.lock().unwrap()).is_empty());
+
+            release_queue.send(()).expect("queue gate is still armed");
+            let result = tokio::time::timeout(std::time::Duration::from_secs(10), &mut manual)
+                .await
+                .expect("queued AgentEnd automatic admission skips; manual queue drain completes")
+                .expect("manual task joins")
+                .expect("manual compaction succeeds after the real queued AgentEnd");
+            let events = events.lock().unwrap();
+            assert_eq!(
+                compaction_starts(&events),
+                vec![COMPACTION_REASON_MANUAL.to_string()],
+                "the skipped automatic attempt never mixes a snapshot into manual replacement"
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(
+                        event,
+                        AgentSessionEvent::CompactionEnd { reason, result: Some(_), .. }
+                            if reason == COMPACTION_REASON_MANUAL
+                    ))
+                    .count(),
+                1
+            );
+            assert!(session.continue_after_threshold_compaction.load(Ordering::SeqCst));
+            assert_eq!(
+                session
+                    .queued_goal_threshold_continuation
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .map(agent_message_key_of),
+                Some(agent_message_key_of(&queued_goal)),
+                "busy admission leaves threshold continuation intent for the next guarded evaluation"
+            );
+            drop(events);
+
+            let entry_values = session
+                .session_manager
+                .lock()
+                .unwrap()
+                .get_branch(None);
+            let entries: Vec<_> = entry_values
+                .iter()
+                .filter_map(|entry| compaction_session_entry_from(entry))
+                .collect();
+            let compactions: Vec<_> = entries
+                .iter()
+                .filter_map(|entry| match entry {
+                    CompactionSessionEntry::Compaction {
+                        summary,
+                        first_kept_entry_id,
+                        ..
+                    } => Some((summary.as_str(), first_kept_entry_id.as_str())),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(compactions.len(), 1, "only the manual snapshot is persisted");
+            assert_eq!(compactions[0].0, result.summary.as_str());
+            assert_eq!(compactions[0].1, result.first_kept_entry_id.as_str());
+            assert!(entries
+                .iter()
+                .any(|entry| entry.id() == result.first_kept_entry_id.as_str()));
+            tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                while agent.continue_calls() == 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("manual tail resumes the preserved post-compaction work");
+            for _ in 0..10 {
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(agent.continue_calls(), 1, "post-compaction work runs exactly once");
+            session.dispose_async(Some(false)).await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn queued_overflow_agent_end_hands_retry_to_manual_compaction() {
+            let api = "queued-overflow-agent-end-manual-compaction";
+            let agent = ScriptedAgent::new(vec![]);
+            let session = successful_compaction_session(api, agent.clone());
+            session
+                .start_goal("retain overflow recovery until redrive", None)
+                .unwrap();
+            let model = session.model().expect("fixture model");
+            let failed_assistant = AssistantMessage {
+                content: vec![pi_ai::types::ContentBlock::Text(
+                    pi_ai::types::TextContent::new("overflow response"),
+                )],
+                api: model.api.clone(),
+                provider: model.provider.clone(),
+                model: model.id.clone(),
+                stop_reason: STOP_REASON_ERROR.to_string(),
+                error_message: Some(
+                    "Requested token count exceeds the model's maximum context length of 262144 tokens"
+                        .to_string(),
+                ),
+                timestamp: 3,
+                usage: Usage {
+                    input: 900.0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            assert!(is_context_overflow(
+                &failed_assistant,
+                Some(get_model_input_limit(&model))
+            ));
+            assert_eq!(session.overflow_recovery.lock().unwrap().as_str(), "idle");
+            let mut state = session.agent.state();
+            state.messages = vec![AgentMessage::Message(Message::Assistant(
+                failed_assistant.clone(),
+            ))];
+            session.agent.set_state(state);
+            *session.last_assistant_message.lock().unwrap() = Some(failed_assistant.clone());
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let event_sink = events.clone();
+            session.subscribe(Arc::new(move |event| {
+                event_sink.lock().unwrap().push(event);
+            }));
+
+            // The real serialized AgentEnd is queued before manual disconnect.
+            let (release_queue, queue_gate) = tokio::sync::oneshot::channel();
+            session.push_agent_event_task(async move {
+                let _ = queue_gate.await;
+            });
+            session.handle_agent_event(AgentEvent::AgentEnd {
+                messages: vec![AgentMessage::Message(Message::Assistant(
+                    failed_assistant.clone(),
+                ))],
+            });
+            let manual_session = session.clone();
+            let mut manual = tokio::spawn(async move {
+                manual_session.compact_with_options(None, false).await
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                while agent.wait_for_idle_calls.load(Ordering::SeqCst) == 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("manual abort reaches its queue drain");
+            assert!(session.compaction_admission.try_lock().is_err());
+            // Nonexplicit abort legitimately cancelled the earlier retry state.
+            // Arm an active retry here so a busy overflow terminal would have
+            // observable false AutoRetryEnd/RLM/goal behavior after queue release.
+            session.retry_attempt.store(1, Ordering::SeqCst);
+            events.lock().unwrap().clear();
+
+            release_queue.send(()).expect("queue gate is still armed");
+            let result = tokio::time::timeout(std::time::Duration::from_secs(10), &mut manual)
+                .await
+                .expect("queued overflow handoff lets manual queue drain finish")
+                .expect("manual task joins")
+                .expect("manual compaction completes the claimed overflow handoff");
+            assert_eq!(session.retry_attempt.load(Ordering::SeqCst), 1);
+            assert_eq!(session.goal_state().status, GoalStatus::Active);
+            assert_eq!(session.overflow_recovery.lock().unwrap().as_str(), "attempted");
+            assert!(session.pending_overflow_recovery.lock().unwrap().is_none());
+            let events = events.lock().unwrap();
+            assert_eq!(
+                compaction_starts(&events),
+                vec![COMPACTION_REASON_MANUAL.to_string()],
+                "busy overflow never starts another compactor"
+            );
+            assert!(
+                !events.iter().any(|event| matches!(
+                    event,
+                    AgentSessionEvent::AutoRetryEnd { success: false, .. }
+                )),
+                "a deferred recovery must not publish a false retry terminal"
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(
+                        event,
+                        AgentSessionEvent::CompactionEnd {
+                            reason,
+                            result: Some(_),
+                            will_retry: true,
+                            ..
+                        } if reason == COMPACTION_REASON_MANUAL
+                    ))
+                    .count(),
+                1,
+                "the successful owner reports its pending overflow redrive"
+            );
+            drop(events);
+
+            let entry_values = session
+                .session_manager
+                .lock()
+                .unwrap()
+                .get_branch(None);
+            let entries: Vec<_> = entry_values
+                .iter()
+                .filter_map(|entry| compaction_session_entry_from(entry))
+                .collect();
+            let compactions: Vec<_> = entries
+                .iter()
+                .filter_map(|entry| match entry {
+                    CompactionSessionEntry::Compaction {
+                        summary,
+                        first_kept_entry_id,
+                        ..
+                    } => Some((summary.as_str(), first_kept_entry_id.as_str())),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(compactions.len(), 1);
+            assert_eq!(compactions[0].0, result.summary.as_str());
+            assert_eq!(compactions[0].1, result.first_kept_entry_id.as_str());
+            assert!(entries
+                .iter()
+                .any(|entry| entry.id() == result.first_kept_entry_id.as_str()));
+            tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                while agent.continue_calls() == 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the successful manual tail invokes the original failed-turn redrive");
+            for _ in 0..10 {
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(agent.continue_calls(), 1, "the overflow turn redrives exactly once");
+            assert!(!session
+                .agent
+                .state()
+                .messages
+                .iter()
+                .any(|message| matches!(message, AgentMessage::Message(Message::Assistant(assistant))
+                    if assistant.stop_reason == STOP_REASON_ERROR
+                        && assistant.timestamp == failed_assistant.timestamp)),
+                "the failed assistant is not left in live context without its redrive");
+            assert_eq!(session.retry_attempt.load(Ordering::SeqCst), 1);
+            assert_eq!(session.goal_state().status, GoalStatus::Active);
             session.dispose_async(Some(false)).await;
         }
 
@@ -27592,6 +28306,123 @@ mod post_compaction_continuation_tests {
                 "H-13: a cancelled round must not mutate the harness state"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn compaction_provider_context_applies_block_images_to_native_input() {
+        let session = test_session(ScriptedAgent::new(vec![]));
+        let messages = vec![
+            AgentMessage::Message(Message::User(UserMessage::new(
+                UserContent::Blocks(vec![
+                    pi_ai::types::ImageOrTextContent::Image(ImageContent::new(
+                        "user-base64-a",
+                        "image/png",
+                    )),
+                    pi_ai::types::ImageOrTextContent::Image(ImageContent::new(
+                        "user-base64-b",
+                        "image/png",
+                    )),
+                    pi_ai::types::ImageOrTextContent::Text(TextContent::new("keep user text")),
+                ]),
+                1,
+            ))),
+            AgentMessage::Message(Message::Assistant(AssistantMessage {
+                content: vec![pi_ai::types::ContentBlock::Text(TextContent::new(
+                    "assistant text remains",
+                ))],
+                ..Default::default()
+            })),
+            AgentMessage::Custom(CustomAgentMessage::Custom {
+                custom_type: "fixture_blocks".to_string(),
+                content: CustomMessageContent::Blocks(vec![
+                    pi_agent_core::types::ContentBlock::Image(ImageContent::new(
+                        "custom-base64",
+                        "image/png",
+                    )),
+                    pi_agent_core::types::ContentBlock::Text(TextContent::new(
+                        "custom text remains",
+                    )),
+                ]),
+                display: true,
+                details: None,
+                timestamp: 2,
+            }),
+            AgentMessage::Message(Message::ToolResult(pi_ai::types::ToolResultMessage::new(
+                "call-1",
+                "fixture",
+                vec![
+                    pi_ai::types::ImageOrTextContent::Image(ImageContent::new(
+                        "tool-base64-a",
+                        "image/png",
+                    )),
+                    pi_ai::types::ImageOrTextContent::Image(ImageContent::new(
+                        "tool-base64-b",
+                        "image/png",
+                    )),
+                    pi_ai::types::ImageOrTextContent::Text(TextContent::new("tool text remains")),
+                ],
+                false,
+                3,
+            ))),
+        ];
+        session
+            .settings_manager
+            .lock()
+            .unwrap()
+            .set_block_images(true);
+        let blocked = session
+            .compaction_provider_context(&messages, &CancellationToken::new())
+            .await;
+        let blocked_json = serde_json::to_string(&blocked.messages).unwrap();
+        for marker in [
+            "user-base64-a",
+            "user-base64-b",
+            "custom-base64",
+            "tool-base64-a",
+            "tool-base64-b",
+        ] {
+            assert!(!blocked_json.contains(marker), "blocked native input retained {marker}");
+        }
+        assert!(blocked_json.contains("Image reading is disabled."));
+        for text in [
+            "keep user text",
+            "assistant text remains",
+            "custom text remains",
+            "tool text remains",
+        ] {
+            assert!(blocked_json.contains(text), "non-image content was changed: {text}");
+        }
+        assert!(
+            !blocked.messages.iter().any(|message| match message {
+                Message::User(user) => match &user.content {
+                    UserContent::Blocks(blocks) => blocks.iter().any(|block| matches!(
+                        block,
+                        pi_ai::types::ImageOrTextContent::Image(_)
+                    )),
+                    UserContent::Text(_) => false,
+                },
+                Message::ToolResult(result) => result.content.iter().any(|block| matches!(
+                    block,
+                    pi_ai::types::ImageOrTextContent::Image(_)
+                )),
+                Message::Assistant(_) => false,
+            }),
+            "no raw image block reaches the native provider"
+        );
+
+        session
+            .settings_manager
+            .lock()
+            .unwrap()
+            .set_block_images(false);
+        let allowed = session
+            .compaction_provider_context(&messages, &CancellationToken::new())
+            .await;
+        let allowed_json = serde_json::to_string(&allowed.messages).unwrap();
+        for marker in ["user-base64-a", "custom-base64", "tool-base64-a"] {
+            assert!(allowed_json.contains(marker), "blockImages=false changed {marker}");
+        }
+        assert!(!allowed_json.contains("Image reading is disabled."));
     }
 }
 // ---------------------------------------------------------------------------

@@ -3764,6 +3764,41 @@ pub struct SessionManager {
     write_buffer: Option<Arc<SessionWriteBuffer>>,
 }
 
+#[cfg(test)]
+thread_local! {
+    static FAIL_NEXT_STAGED_SESSION_FILE_WRITE: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// Fallible disk half of a session-file replacement. It has no access to the
+/// live manager, so callers can build and write a candidate before committing
+/// any in-memory identity, index, or write-buffer state.
+fn write_session_file_entries(session_file: &str, entries: &[FileEntry]) -> Result<(), String> {
+    #[cfg(test)]
+    if FAIL_NEXT_STAGED_SESSION_FILE_WRITE.with(|fail| fail.replace(false)) {
+        return Err("injected staged session-file write failure".to_string());
+    }
+    let content = format!(
+        "{}\n",
+        entries
+            .iter()
+            .map(serialize_session_file_entry)
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    let target_path = realpath_if_present_sync(session_file);
+    let directory = dirname(&target_path);
+    create_private_session_dir(Path::new(&directory), false).map_err(|error| error.to_string())?;
+    let metadata = stat_metadata_if_present(&target_path);
+    let mode = metadata.as_ref().map(|_| 0o600);
+    write_file_atomic_sync(
+        &target_path,
+        &content,
+        WriteFileAtomicOptions { mode, fsync: false },
+        None,
+    )
+}
+
 impl SessionManager {
     /// Snapshot an in-memory manager before a fallible replacement build. The
     /// candidate owns its mutations and listener list; failure leaves the live
@@ -4185,25 +4220,12 @@ impl SessionManager {
             return Ok(());
         }
         let session_file = self.session_file.clone().unwrap_or_default();
-        let content = format!(
-            "{}\n",
-            self.file_entries
-                .iter()
-                .map(serialize_session_file_entry)
-                .collect::<Vec<_>>()
-                .join("\n")
-        );
-        let target_path = realpath_if_present_sync(&session_file);
-        let directory = dirname(&target_path);
-        create_private_session_dir(Path::new(&directory), false).map_err(|error| error.to_string())?;
-        let metadata = stat_metadata_if_present(&target_path);
-        let mode = metadata.as_ref().map(|_| 0o600);
-        write_file_atomic_sync(
-            &target_path,
-            &content,
-            WriteFileAtomicOptions { mode, fsync: false },
-            None,
-        )?;
+        write_session_file_entries(&session_file, &self.file_entries)?;
+        self.complete_rewrite_file();
+        Ok(())
+    }
+
+    fn complete_rewrite_file(&mut self) {
         // The rewrite serializes every in-memory entry, so it supersedes any
         // buffered lines (they are part of `file_entries`): clear the buffer
         // instead of letting stale bytes append after the rename.
@@ -4217,7 +4239,6 @@ impl SessionManager {
         self.persist_write_epoch += 1;
         // Observers see committed writes only.
         self.notify_persist_listeners();
-        Ok(())
     }
 
     /// Current count of this manager's successful disk writes.
@@ -5482,6 +5503,22 @@ impl SessionManager {
                 .unwrap_or_default()];
             entries.extend(path_without_labels);
             entries.extend(label_entries);
+            // Only write the file now if it contains an assistant message.
+            // Otherwise defer to _persist(), which creates the file on the
+            // first assistant response, matching the newSession() contract.
+            let has_assistant = entries
+                .iter()
+                .any(|entry| entry_type(entry) == "message" && message_role(entry) == "assistant");
+            if has_assistant {
+                let new_path = new_session_file
+                    .as_ref()
+                    .expect("persisted branches always have a candidate path");
+                // Write the detached candidate first. A failure returns before
+                // any active-manager identity, index, or buffer mutation.
+                write_session_file_entries(new_path, &entries)?;
+            }
+
+            // Infallible commit: the candidate file (when required) now exists.
             self.file_entries = entries;
             self.session_id = new_session_id;
             self.session_file = new_session_file.clone();
@@ -5489,19 +5526,9 @@ impl SessionManager {
                 self.retarget_write_buffer(new_path);
             }
             self.build_index();
-
-            // Only write the file now if it contains an assistant message.
-            // Otherwise defer to _persist(), which creates the file on the
-            // first assistant response, matching the newSession() contract.
-            let has_assistant = self
-                .file_entries
-                .iter()
-                .any(|entry| entry_type(entry) == "message" && message_role(entry) == "assistant");
+            self.flushed = has_assistant;
             if has_assistant {
-                self.rewrite_file()?;
-                self.flushed = true;
-            } else {
-                self.flushed = false;
+                self.complete_rewrite_file();
             }
 
             return Ok(new_session_file);
@@ -7350,5 +7377,112 @@ mod tests {
             .expect("a healthy writer completes the fork");
         assert_eq!(enough.written, expected.as_bytes(), "the fork is header plus every entry");
         assert_eq!(enough.bytes_left, 0, "the writer consumed exactly the fork bytes");
+    }
+}
+
+#[cfg(test)]
+mod transactional_branch_tests {
+    use super::*;
+    use pi_ai::types::{AssistantMessage, UserContent, UserMessage};
+
+    fn file_names(dir: &Path) -> BTreeSet<String> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn failed_direct_branch_write_rolls_back_live_identity_before_successor_commit() {
+        let dir = tempfile::tempdir().expect("private session directory");
+        let mut manager = SessionManager::create(
+            "/definitely/not/a/repo",
+            Some(&dir.path().to_string_lossy()),
+        )
+        .expect("persisted manager");
+        let original_file = manager.new_session(None).unwrap().unwrap();
+        let first = manager
+            .append_message(AgentMessage::Message(Message::Assistant(
+                AssistantMessage::new("faux", "faux", "fixture-model", 1),
+            )))
+            .unwrap();
+        let original_id = manager.get_session_id();
+        let original_header = manager.get_header();
+        let original_entries = manager.file_entries.clone();
+        let original_by_id = manager.by_id.clone();
+        let original_labels = manager.labels_by_id.clone();
+        let original_label_timestamps = manager.label_timestamps_by_id.clone();
+        let original_leaf = manager.leaf_id.clone();
+        let original_epoch = manager.persist_write_epoch;
+        let original_flushed = manager.flushed;
+        let original_bytes = std::fs::read(&original_file).unwrap();
+        let original_names = file_names(dir.path());
+        let original_buffer = manager.write_buffer.clone().unwrap();
+        let original_buffer_path = original_buffer.path.lock().unwrap().clone();
+        let original_pending = original_buffer.inner.lock().unwrap().timed.bytes.clone();
+
+        // Invalid candidates are a no-op: no target is allocated and no live
+        // identity field or buffer is touched.
+        assert!(manager.create_branched_session("missing").is_err());
+        assert_eq!(manager.get_session_id(), original_id);
+        assert_eq!(manager.get_session_file().as_deref(), Some(original_file.as_str()));
+        assert_eq!(manager.file_entries, original_entries);
+        assert_eq!(file_names(dir.path()), original_names);
+
+        FAIL_NEXT_STAGED_SESSION_FILE_WRITE.with(|fail| fail.set(true));
+        let error = manager
+            .create_branched_session(&first)
+            .expect_err("the staged candidate write fails");
+        assert!(error.contains("injected staged"), "{error}");
+        assert_eq!(manager.session_id, original_id);
+        assert_eq!(manager.session_file.as_deref(), Some(original_file.as_str()));
+        assert_eq!(manager.get_header(), original_header);
+        assert_eq!(manager.file_entries, original_entries);
+        assert_eq!(manager.by_id, original_by_id);
+        assert_eq!(manager.labels_by_id, original_labels);
+        assert_eq!(manager.label_timestamps_by_id, original_label_timestamps);
+        assert_eq!(manager.leaf_id, original_leaf);
+        assert_eq!(manager.persist_write_epoch, original_epoch);
+        assert_eq!(manager.flushed, original_flushed);
+        assert_eq!(std::fs::read(&original_file).unwrap(), original_bytes);
+        assert_eq!(file_names(dir.path()), original_names, "no candidate or temp file remains");
+        let current_buffer = manager.write_buffer.as_ref().unwrap();
+        assert!(Arc::ptr_eq(current_buffer, &original_buffer));
+        assert_eq!(current_buffer.path.lock().unwrap().as_str(), original_buffer_path);
+        assert_eq!(current_buffer.inner.lock().unwrap().timed.bytes, original_pending);
+
+        // A fresh candidate succeeds after the fault. Subsequent appends use its
+        // own id/path, never the restored old identity or the old file's buffer.
+        let branched_file = manager
+            .create_branched_session(&first)
+            .unwrap()
+            .expect("new persisted branch path");
+        assert_ne!(branched_file, original_file);
+        assert_ne!(manager.get_session_id(), original_id);
+        assert_eq!(manager.get_session_file().as_deref(), Some(branched_file.as_str()));
+        let branched_id = manager.get_session_id();
+        manager
+            .append_message(AgentMessage::Message(Message::User(UserMessage::new(
+                UserContent::Text("successor-only".to_string()),
+                2,
+            ))))
+            .unwrap();
+        manager.flush_now().unwrap();
+        let branched_text = std::fs::read_to_string(&branched_file).unwrap();
+        let original_text = std::fs::read_to_string(&original_file).unwrap();
+        assert!(branched_text.contains("successor-only"));
+        assert!(!original_text.contains("successor-only"));
+        assert_eq!(
+            manager.get_header().unwrap().get("id").and_then(Value::as_str),
+            Some(branched_id.as_str())
+        );
+        assert_eq!(
+            manager
+                .get_header()
+                .unwrap()
+                .get("parentSession")
+                .and_then(Value::as_str),
+            Some(original_file.as_str())
+        );
     }
 }
