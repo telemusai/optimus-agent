@@ -2338,8 +2338,9 @@ mod tests {
         let error = resolve_config_value_or_throw("!exit 1", "API key for provider \"x\"").unwrap_err();
         assert_eq!(
             error,
-            "Failed to resolve API key for provider \"x\" from shell command: exit 1"
+            "Failed to resolve API key for provider \"x\" from shell command"
         );
+        assert!(!error.contains("exit 1"));
     }
 
     #[cfg(windows)]
@@ -2409,7 +2410,7 @@ Write-Output ('isolated-test-key-' + $count)"#,
         let (_dir, config) = fake_powershell_credential_helper("Write-Output 'not-a-valid-key'\nexit 9");
         assert_eq!(resolve_config_value_uncached(&config), None);
         let error = resolve_config_value_or_throw(&config, "isolated test credential").unwrap_err();
-        assert!(error.starts_with("Failed to resolve isolated test credential from shell command:"));
+        assert_eq!(error, "Failed to resolve isolated test credential from shell command");
     }
 
     #[test]

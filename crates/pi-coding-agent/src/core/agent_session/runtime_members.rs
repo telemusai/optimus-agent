@@ -48,6 +48,51 @@ use crate::core::source_info::{create_synthetic_source_info, SyntheticSourceInfo
 const DELETE_OUTCOME_NOT_FOUND_LITERAL: &str = "not_found";
 const DELETE_OUTCOME_RUNNING_LITERAL: &str = "running";
 
+fn tighten_rlm_session_dir_permissions(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+    Ok(())
+}
+
+fn create_rlm_session_dir(path: &Path, recursive: bool) -> std::io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(recursive);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(path)?;
+    tighten_rlm_session_dir_permissions(path)
+}
+
+fn create_ephemeral_rlm_session_dir_path() -> Result<String, String> {
+    let dir = std::env::temp_dir().join(format!("prime-agent-rlm-{}", uuid::Uuid::new_v4()));
+    create_rlm_session_dir(&dir, true).map_err(|error| error.to_string())?;
+    Ok(dir.to_string_lossy().to_string())
+}
+
+fn create_child_rlm_session_dir_in(parent: &str) -> Result<String, String> {
+    create_rlm_session_dir(Path::new(parent), true).map_err(|error| error.to_string())?;
+    for _ in 0..100 {
+        let id = uuid::Uuid::new_v4().to_string();
+        let dir = PathBuf::from(parent).join(format!("sub-{}", &id[..8]));
+        match create_rlm_session_dir(&dir, false) {
+            Ok(()) => return Ok(dir.to_string_lossy().into_owned()),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    Err("Unable to create unique RLM child session directory".to_string())
+}
+
 /// `new ExtensionRunner(..., sessionManager, modelRegistry)`.
 ///
 /// The TypeScript hands the runner the live `sessionManager` and
@@ -1517,25 +1562,12 @@ impl AgentSession {
             .rlm_session_dir_for_reading()
             .map(Ok)
             .unwrap_or_else(|| self.create_ephemeral_rlm_session_dir())?;
-        std::fs::create_dir_all(&parent).map_err(|error| error.to_string())?;
-        for _ in 0..100 {
-            let id = uuid::Uuid::new_v4().to_string();
-            let dir = PathBuf::from(&parent).join(format!("sub-{}", &id[..8]));
-            match std::fs::create_dir(&dir) {
-                Ok(()) => return Ok(dir.to_string_lossy().into_owned()),
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(error) => return Err(error.to_string()),
-            }
-        }
-        Err("Unable to create unique RLM child session directory".to_string())
+        create_child_rlm_session_dir_in(&parent)
     }
 
     /// `_createEphemeralRlmSessionDir()`.
     pub(super) fn create_ephemeral_rlm_session_dir(&self) -> Result<String, String> {
-        let dir = PathBuf::from(std::env::temp_dir())
-            .join(format!("prime-agent-rlm-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
-        Ok(dir.to_string_lossy().to_string())
+        create_ephemeral_rlm_session_dir_path()
     }
 
     /// `_contextTokensForCurrentMessages()`.
@@ -4707,5 +4739,53 @@ mod tests {
         .await
         .expect_err("out-of-range exit code must be reported");
         assert!(error.contains("out-of-range exit code"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rlm_session_directories_are_private_under_permissive_umask() {
+        const CHILD: &str = "PRIME_AGENT_TEST_RLM_PRIVATE_DIRS";
+        if std::env::var_os(CHILD).is_none() {
+            let test = "rlm_session_directories_are_private_under_permissive_umask";
+            let output = std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg("umask 000; exec \"$@\"")
+                .arg("sh")
+                .arg(std::env::current_exe().unwrap())
+                .arg(test)
+                .arg("--nocapture")
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && stdout.contains("1 passed"),
+                "isolated umask test did not run exactly one passing test: {stdout}{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |path: &Path| {
+            std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+        };
+        let ephemeral = PathBuf::from(create_ephemeral_rlm_session_dir_path().unwrap());
+        assert_eq!(mode(&ephemeral), 0o700);
+        let parent = std::env::temp_dir().join(format!("rlm-parent-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&parent).unwrap();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let child = PathBuf::from(create_child_rlm_session_dir_in(&parent.to_string_lossy()).unwrap());
+        assert_eq!(mode(&parent), 0o700, "existing parent must be tightened");
+        assert_eq!(mode(&child), 0o700);
+        let nested_parent = parent.join("new/ancestors");
+        let nested_child = PathBuf::from(
+            create_child_rlm_session_dir_in(&nested_parent.to_string_lossy()).unwrap(),
+        );
+        assert_eq!(mode(&parent.join("new")), 0o700);
+        assert_eq!(mode(&nested_parent), 0o700);
+        assert_eq!(mode(&nested_child), 0o700);
+        std::fs::remove_dir_all(ephemeral).unwrap();
+        std::fs::remove_dir_all(parent).unwrap();
     }
 }

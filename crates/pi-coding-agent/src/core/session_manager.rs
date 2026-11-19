@@ -90,7 +90,7 @@ fn write_file_atomic_sync(
 ) -> Result<(), String> {
     let temp_path = format!("{path}.{}.{}.tmp", std::process::id(), uuid::Uuid::new_v4());
     let result = (|| -> Result<(), String> {
-        let mut file = std::fs::File::create(&temp_path).map_err(|error| error.to_string())?;
+        let mut file = create_private_session_file(&temp_path).map_err(|error| error.to_string())?;
         use std::io::Write;
         file.write_all(data.as_bytes()).map_err(|error| error.to_string())?;
         if options.fsync {
@@ -121,6 +121,67 @@ fn set_file_mode(path: &str, mode: u32) {
     {
         let _ = (path, mode);
     }
+}
+
+fn create_private_session_dir(path: &Path, tighten_existing: bool) -> std::io::Result<()> {
+    let existed = path.exists();
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(path)?;
+    #[cfg(unix)]
+    if tighten_existing || !existed {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, tighten_existing, existed);
+    }
+    Ok(())
+}
+
+fn create_private_session_file(path: &str) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options.open(path)?;
+    tighten_private_session_file(&file)?;
+    Ok(file)
+}
+
+fn open_private_session_file_append(path: &str) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options.open(path)?;
+    tighten_private_session_file(&file)?;
+    Ok(file)
+}
+
+fn tighten_private_session_file(file: &std::fs::File) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = file;
+    }
+    Ok(())
 }
 
 const WIN32_RENAME_ATTEMPTS: usize = 5;
@@ -1430,9 +1491,7 @@ pub fn get_default_session_dir(_cwd: &str, agent_dir: Option<&str>) -> String {
         .map(str::to_string)
         .unwrap_or_else(get_default_agent_dir);
     let session_dir = get_sessions_dir(&agent_dir);
-    if !Path::new(&session_dir).exists() {
-        let _ = std::fs::create_dir_all(&session_dir);
-    }
+    let _ = create_private_session_dir(Path::new(&session_dir), true);
     session_dir
 }
 
@@ -1629,7 +1688,7 @@ fn repair_jsonl_damage_checked(file_path: &str) -> Result<bool, String> {
             .join("\n");
         format!("{joined}\n")
     };
-    let mode = metadata.as_ref().map(|metadata| metadata.mode);
+    let mode = metadata.as_ref().map(|_| 0o600);
     let before_rename = |_temp_path: &str| -> Result<(), String> {
         // A concurrent appender wins; this opener must fail rather than append to an unrepaired tail.
         match std::fs::metadata(&target_path) {
@@ -3479,11 +3538,7 @@ impl SessionWriteBuffer {
             }
             return Ok(());
         }
-        let opened = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .map_err(|error| error.to_string());
+        let opened = open_private_session_file_append(&path).map_err(|error| error.to_string());
         let mut file = match opened {
             Ok(file) => file,
             Err(error) => {
@@ -3544,11 +3599,7 @@ impl SessionWriteBuffer {
             }
             return Ok(());
         }
-        let opened = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .map_err(|error| error.to_string());
+        let opened = open_private_session_file_append(&path).map_err(|error| error.to_string());
         let mut file = match opened {
             Ok(file) => file,
             Err(error) => {
@@ -3697,8 +3748,8 @@ impl SessionManager {
                 None
             },
         };
-        if persist && !manager.session_dir.is_empty() && !Path::new(&manager.session_dir).exists() {
-            let _ = std::fs::create_dir_all(&manager.session_dir);
+        if persist && !manager.session_dir.is_empty() {
+            create_private_session_dir(Path::new(&manager.session_dir), session_file.is_none()).map_err(|error| error.to_string())?;
         }
 
         match session_file {
@@ -4057,9 +4108,9 @@ impl SessionManager {
         );
         let target_path = realpath_if_present_sync(&session_file);
         let directory = dirname(&target_path);
-        std::fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
+        create_private_session_dir(Path::new(&directory), false).map_err(|error| error.to_string())?;
         let metadata = stat_metadata_if_present(&target_path);
-        let mode = metadata.as_ref().map(|metadata| metadata.mode);
+        let mode = metadata.as_ref().map(|_| 0o600);
         write_file_atomic_sync(
             &target_path,
             &content,
@@ -4168,9 +4219,7 @@ impl SessionManager {
                 self.session_dir.clone()
             }
         });
-        if !Path::new(&dir).exists() {
-            let _ = std::fs::create_dir_all(&dir);
-        }
+        create_private_session_dir(Path::new(&dir), true).map_err(|error| error.to_string())?;
         let previous_header = self.get_header();
         let target = create_unique_session_file_target(&dir)?;
         self.session_dir = dir;
@@ -5584,9 +5633,7 @@ impl SessionManager {
         let dir = session_dir
             .map(str::to_string)
             .unwrap_or_else(|| get_default_session_dir(target_cwd, None));
-        if !Path::new(&dir).exists() {
-            let _ = std::fs::create_dir_all(&dir);
-        }
+        create_private_session_dir(Path::new(&dir), true).map_err(|error| error.to_string())?;
 
         let target = create_unique_session_file_target(&dir)?;
         let new_session_id = target.0;
@@ -5607,10 +5654,7 @@ impl SessionManager {
         // must fail the fork instead of leaving a truncated target that a
         // later open would silently "repair" (drop the torn tail).
         {
-            let mut file = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&new_session_file)
+            let mut file = open_private_session_file_append(&new_session_file)
                 .map_err(|error| error.to_string())?;
             if let Err(error) = Self::write_fork_target(&mut file, &new_header, &source_entries) {
                 drop(file);
@@ -5752,6 +5796,95 @@ mod tests {
         message.usage.total_tokens = 15.0;
         message.usage.cost.total = 0.25;
         AgentMessage::Message(Message::Assistant(message))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn daemon_subagent_transcript_is_private_under_permissive_umask() {
+        const CHILD: &str = "PRIME_AGENT_TEST_PRIVATE_SESSION_TRANSCRIPT";
+        if std::env::var_os(CHILD).is_none() {
+            let test = "daemon_subagent_transcript_is_private_under_permissive_umask";
+            let output = std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg("umask 000; exec \"$@\"")
+                .arg("sh")
+                .arg(std::env::current_exe().unwrap())
+                .arg(test)
+                .arg("--nocapture")
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && stdout.contains("1 passed"),
+                "isolated umask test did not run exactly one passing test: {stdout}{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        use std::os::unix::fs::PermissionsExt;
+        let root = temp_dir();
+        let session_dir = root.join("subagent-sessions");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        std::fs::set_permissions(&session_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let nested = root.join("new/ancestors");
+        create_private_session_dir(&nested, true).unwrap();
+        assert_eq!(std::fs::metadata(root.join("new")).unwrap().permissions().mode() & 0o777, 0o700);
+        assert_eq!(std::fs::metadata(&nested).unwrap().permissions().mode() & 0o777, 0o700);
+        let mut manager = SessionManager::create(
+            &root.to_string_lossy(),
+            Some(&session_dir.to_string_lossy()),
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::metadata(&session_dir).unwrap().permissions().mode() & 0o777,
+            0o700,
+            "existing session directory must be tightened"
+        );
+        let session_file = manager.session_file().unwrap();
+        manager
+            .append_message(user_message("prompt-canary", 1))
+            .unwrap();
+        manager.flush_now().unwrap();
+        manager
+            .append_entry(serde_json::json!({
+                "type": "message",
+                "id": "tool-1",
+                "parentId": Value::Null,
+                "timestamp": "2026-01-01T00:00:00Z",
+                "message": {
+                    "role": "toolResult",
+                    "toolCallId": "call-1",
+                    "toolName": "read",
+                    "content": [{"type": "text", "text": "tool-output-canary"}],
+                    "isError": false,
+                    "timestamp": 2
+                }
+            }).as_object().unwrap().clone())
+            .unwrap();
+        manager.flush_now().unwrap();
+        assert_eq!(
+            std::fs::metadata(&session_file).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let transcript = std::fs::read_to_string(&session_file).unwrap();
+        assert!(transcript.contains("prompt-canary"));
+        assert!(transcript.contains("tool-output-canary"));
+        drop(manager);
+
+        std::fs::set_permissions(&session_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut reopened = SessionManager::open(&session_file, None, None).unwrap();
+        reopened.append_message(user_message("reopened", 3)).unwrap();
+        reopened.flushed = false;
+        reopened.flush_now().unwrap();
+        assert_eq!(
+            std::fs::metadata(&session_dir).unwrap().permissions().mode() & 0o777,
+            0o755,
+            "opening an existing transcript must not chmod its arbitrary parent directory"
+        );
+        drop(reopened);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

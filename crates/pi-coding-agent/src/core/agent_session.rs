@@ -3571,13 +3571,34 @@ impl AgentSession {
             crate::core::tools::acp_mcp::acp_mcp_tool_names(&acp_mcp_tool_configs(&servers))
                 .unwrap_or_default();
         let _ = self.assert_acp_mcp_tool_names_available(&next_tool_names);
+        let allowed_tool_names = self.allowed_tool_names.lock().unwrap().clone();
+        let permitted = |name: &str| {
+            allowed_tool_names
+                .as_ref()
+                .map_or(true, |allowed| allowed.contains(name))
+        };
         let mut active_tool_names: Vec<String> = self
             .get_active_tool_names()
             .into_iter()
             .filter(|name| !previous_tool_names.contains(name))
             .collect();
-        active_tool_names.extend(next_tool_names);
-        self.build_runtime(Some(active_tool_names), true);
+        active_tool_names.extend(
+            next_tool_names
+                .iter()
+                .filter(|name| permitted(name))
+                .cloned(),
+        );
+        self.build_runtime(Some(active_tool_names.clone()), true);
+        if allowed_tool_names.is_some() {
+            // build_runtime generates every configured ACP definition and also
+            // inserts their names into allowed_tool_names. That bookkeeping must
+            // not widen noTools=all or an explicit allowlist. Restore the policy,
+            // then rebuild both the registry and AgentState.tools from the same
+            // permitted active set; filtering only the request schema would leave
+            // the unauthorized ACP tools executable.
+            *self.allowed_tool_names.lock().unwrap() = allowed_tool_names;
+            self.refresh_tool_registry(false, Some(active_tool_names));
+        }
         *self.base_system_prompt.lock().unwrap() =
             self.rebuild_system_prompt(&self.get_active_tool_names());
         let mut state = self.agent.state();
@@ -22035,6 +22056,132 @@ mod post_compaction_continuation_tests {
 
         session_b.dispose_async(None).await;
         crate::core::tools::ipython::set_kernel_client_factory_override(None);
+    }
+
+    fn acp_test_server(name: &str) -> crate::core::mcp::acp_mcp_types::AcpMcpServerConfig {
+        crate::core::mcp::acp_mcp_types::AcpMcpServerConfig::Http(
+            crate::core::mcp::acp_mcp_types::AcpMcpHttpServerConfig {
+                name: name.to_string(),
+                url: "http://127.0.0.1:9/mcp".to_string(),
+                headers: serde_json::Map::new(),
+            },
+        )
+    }
+
+    #[track_caller]
+    fn assert_acp_tool_policy(
+        session: &Arc<AgentSession>,
+        expected_active: &[&str],
+        expected_allowed: Option<&[&str]>,
+    ) {
+        let mut expected_active: Vec<String> = expected_active
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect();
+        expected_active.sort();
+
+        let mut active = session.get_active_tool_names();
+        active.sort();
+        assert_eq!(active, expected_active, "active ACP tool policy");
+
+        // AgentState.tools is the execution surface. Registry and definitions are
+        // checked too, so a schema-only filter cannot make this test pass.
+        let state = session.state();
+        let mut executable: Vec<String> = state
+            .tools
+            .unwrap_or_default()
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect();
+        executable.sort();
+        assert_eq!(executable, expected_active, "executable ACP tool policy");
+
+        for name in ["mcp_list_tools_alpha", "mcp_call_alpha"] {
+            let permitted = expected_active
+                .iter()
+                .any(|expected| expected.as_str() == name);
+            assert_eq!(
+                session.tool_registry.lock().unwrap().contains_key(name),
+                permitted,
+                "registry membership for {name}"
+            );
+            assert_eq!(
+                session.get_tool_definition(name).is_some(),
+                permitted,
+                "tool definition membership for {name}"
+            );
+        }
+
+        let actual_allowed = session.allowed_tool_names.lock().unwrap().clone();
+        match expected_allowed {
+            Some(expected) => {
+                let expected: HashSet<String> = expected
+                    .iter()
+                    .map(|name| (*name).to_string())
+                    .collect();
+                assert_eq!(actual_allowed, Some(expected), "preserved allowlist");
+            }
+            None => assert_eq!(
+                actual_allowed, None,
+                "unrestricted sessions stay unrestricted"
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn acp_mcp_rebuild_respects_no_tools_all() {
+        // The SDK maps noTools=all to Some([]) when no explicit allowlist exists.
+        let session = test_session_with_credentials_and_tools(0, None).await;
+        session
+            .replace_acp_mcp_servers(&[acp_test_server("alpha")], "test-owner")
+            .expect("ACP MCP server registration");
+        assert_acp_tool_policy(&session, &[], Some(&[]));
+    }
+
+    #[tokio::test]
+    async fn acp_mcp_rebuild_respects_explicit_ipython_only_allowlist() {
+        let session = test_session_with_credentials_and_tools(
+            0,
+            Some(vec!["ipython".to_string()]),
+        )
+        .await;
+        session
+            .replace_acp_mcp_servers(&[acp_test_server("alpha")], "test-owner")
+            .expect("ACP MCP server registration");
+        assert_acp_tool_policy(&session, &["ipython"], Some(&["ipython"]));
+    }
+
+    #[tokio::test]
+    async fn acp_mcp_rebuild_activates_exactly_one_explicitly_allowed_acp_tool() {
+        let session = test_session_with_credentials_and_tools(
+            0,
+            Some(vec!["mcp_call_alpha".to_string()]),
+        )
+        .await;
+        session
+            .replace_acp_mcp_servers(&[acp_test_server("alpha")], "test-owner")
+            .expect("ACP MCP server registration");
+        assert_acp_tool_policy(
+            &session,
+            &["mcp_call_alpha"],
+            Some(&["mcp_call_alpha"]),
+        );
+    }
+
+    #[tokio::test]
+    async fn acp_mcp_rebuild_activates_all_tools_when_unrestricted() {
+        let mcp_manager = Arc::new(Mutex::new(crate::core::mcp::mcp_manager::McpManager::new(
+            crate::core::mcp::mcp_manager::McpManagerOptions::default(),
+        )));
+        let session = test_session_with_mcp(ScriptedAgent::new(vec![]), mcp_manager);
+        session
+            .replace_acp_mcp_servers(&[acp_test_server("alpha")], "test-owner")
+            .expect("ACP MCP server registration");
+        assert_acp_tool_policy(
+            &session,
+            &["ipython", "mcp_list_tools_alpha", "mcp_call_alpha"],
+            None,
+        );
     }
 
     /// T03: ACP MCP tools execute their kernel cells through the SAME

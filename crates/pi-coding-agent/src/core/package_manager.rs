@@ -155,6 +155,14 @@ pub struct NpmSource {
     pub pinned: bool,
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct GitInstallCompletion {
+    repo: String,
+    reference: Option<String>,
+    head: String,
+    package_json_sha256: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalSource {
     pub path: String,
@@ -1128,7 +1136,7 @@ impl DefaultPackageManager {
                 }
             }
             ParsedSource::Git(parsed) => {
-                let path = self.get_git_install_path(&parsed, scope);
+                let path = self.validated_git_install_path(&parsed, scope).ok()?;
                 if Path::new(&path).exists() {
                     Some(path)
                 } else {
@@ -1348,10 +1356,7 @@ impl DefaultPackageManager {
                     self.uninstall_npm(npm, scope).await?;
                     Ok(())
                 }
-                ParsedSource::Git(git) => {
-                    self.remove_git(git, scope);
-                    Ok(())
-                }
+                ParsedSource::Git(git) => self.remove_git(git, scope),
                 ParsedSource::Local(_) => Ok(()),
             }
         }))
@@ -1624,8 +1629,10 @@ impl DefaultPackageManager {
                     })
                 }
                 ParsedSource::Git(git) => {
-                    let installed_path = self.get_git_install_path(&git, &scope);
-                    if !Path::new(&installed_path).exists() {
+                    let installed_path = self.validated_git_install_path(&git, &scope).ok()?;
+                    if !Path::new(&installed_path).exists()
+                        || !self.git_install_is_ready(&git, &installed_path).await
+                    {
                         return None;
                     }
                     if !self.git_has_available_update(&installed_path).await {
@@ -1699,8 +1706,10 @@ impl DefaultPackageManager {
                     self.collect_package_resources(&installed_path, accumulator, filter.as_ref(), metadata);
                 }
                 ParsedSource::Git(git) => {
-                    let installed_path = self.get_git_install_path(git, scope);
-                    if !Path::new(&installed_path).exists() {
+                    let installed_path = self.validated_git_install_path(git, scope)?;
+                    if !Path::new(&installed_path).exists()
+                        || !self.git_install_is_ready(git, &installed_path).await
+                    {
                         let installed = install_missing().await?;
                         if !installed {
                             continue;
@@ -2294,10 +2303,145 @@ impl DefaultPackageManager {
         .await
     }
 
-    async fn install_git(&self, source: &GitSource, scope: &str) -> Result<(), String> {
-        let target_dir = self.get_git_install_path(source, scope);
-        if Path::new(&target_dir).exists() {
+    fn git_install_completion_path(target_dir: &str) -> String {
+        join_path(&join_path(target_dir, ".git"), "prime-agent-install.json")
+    }
+
+    fn git_package_json_hash(target_dir: &str) -> Option<String> {
+        let bytes = std::fs::read(join_path(target_dir, "package.json")).ok()?;
+        let mut hasher = Sha256::new();
+        hasher.update(&bytes);
+        Some(hasher.finalize().iter().map(|byte| format!("{byte:02x}")).collect())
+    }
+
+    fn git_dependencies_ready(target_dir: &str) -> bool {
+        let package_json_path = join_path(target_dir, "package.json");
+        if !Path::new(&package_json_path).exists() {
+            return true;
+        }
+        let Ok(package) = std::fs::read_to_string(package_json_path)
+            .map_err(|error| error.to_string())
+            .and_then(|text| serde_json::from_str::<Value>(&text).map_err(|error| error.to_string()))
+        else {
+            return false;
+        };
+        for section in ["dependencies"] {
+            if let Some(dependencies) = package.get(section).and_then(Value::as_object) {
+                for name in dependencies.keys() {
+                    let dependency_manifest = Path::new(target_dir)
+                        .join("node_modules")
+                        .join(name)
+                        .join("package.json");
+                    if !dependency_manifest.is_file() {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    async fn git_install_is_ready(&self, source: &GitSource, target_dir: &str) -> bool {
+        let completion_path = Self::git_install_completion_path(target_dir);
+        let Some(completion) = std::fs::read_to_string(completion_path)
+            .ok()
+            .and_then(|text| serde_json::from_str::<GitInstallCompletion>(&text).ok())
+        else {
+            return false;
+        };
+        if completion.repo != source.repo
+            || completion.reference != source.reference
+            || completion.package_json_sha256 != Self::git_package_json_hash(target_dir)
+            || !Self::git_dependencies_ready(target_dir)
+        {
+            return false;
+        }
+        let Ok(head) = self
+            .run_command_capture(
+                "git",
+                &["rev-parse".to_string(), "HEAD".to_string()],
+                Some(target_dir),
+                Some(NETWORK_TIMEOUT_MS),
+                None,
+            )
+            .await
+        else {
+            return false;
+        };
+        if head.trim() != completion.head {
+            return false;
+        }
+        if let Some(reference) = &source.reference {
+            let Ok(reference_head) = self
+                .run_command_capture(
+                    "git",
+                    &[
+                        "rev-parse".to_string(),
+                        "--verify".to_string(),
+                        "--end-of-options".to_string(),
+                        format!("{reference}^{{commit}}"),
+                    ],
+                    Some(target_dir),
+                    Some(NETWORK_TIMEOUT_MS),
+                    None,
+                )
+                .await
+            else {
+                return false;
+            };
+            if reference_head.trim() != head.trim() {
+                return false;
+            }
+        }
+        true
+    }
+
+    async fn write_git_install_completion(
+        &self,
+        source: &GitSource,
+        target_dir: &str,
+    ) -> Result<(), String> {
+        let head = self
+            .run_command_capture(
+                "git",
+                &["rev-parse".to_string(), "HEAD".to_string()],
+                Some(target_dir),
+                Some(NETWORK_TIMEOUT_MS),
+                None,
+            )
+            .await?;
+        if !Self::git_dependencies_ready(target_dir) {
+            return Err("Git package dependencies are incomplete after installation".to_string());
+        }
+        let completion = GitInstallCompletion {
+            repo: source.repo.clone(),
+            reference: source.reference.clone(),
+            head: head.trim().to_string(),
+            package_json_sha256: Self::git_package_json_hash(target_dir),
+        };
+        let text = serde_json::to_string_pretty(&completion).map_err(|error| error.to_string())?;
+        std::fs::write(Self::git_install_completion_path(target_dir), text)
+            .map_err(|error| error.to_string())
+    }
+
+    fn remove_managed_git_target(target_dir: &str) -> Result<(), String> {
+        let Ok(metadata) = std::fs::symlink_metadata(target_dir) else {
             return Ok(());
+        };
+        if metadata.is_dir() && !metadata.file_type().is_symlink() {
+            std::fs::remove_dir_all(target_dir).map_err(|error| error.to_string())
+        } else {
+            std::fs::remove_file(target_dir).map_err(|error| error.to_string())
+        }
+    }
+
+    async fn install_git(&self, source: &GitSource, scope: &str) -> Result<(), String> {
+        let target_dir = self.validated_git_install_path(source, scope)?;
+        if Path::new(&target_dir).exists() {
+            if self.git_install_is_ready(source, &target_dir).await {
+                return Ok(());
+            }
+            Self::remove_managed_git_target(&target_dir)?;
         }
         let git_root = self.get_git_install_root(scope);
         if let Some(git_root) = git_root {
@@ -2305,30 +2449,40 @@ impl DefaultPackageManager {
         }
         let _ = std::fs::create_dir_all(parent_path(&target_dir));
 
-        self.run_command(
-            "git",
-            &["clone".to_string(), source.repo.clone(), target_dir.clone()],
-            None,
-        )
-        .await?;
-        if let Some(reference) = &source.reference {
+        let result = async {
             self.run_command(
                 "git",
-                &["checkout".to_string(), reference.clone()],
-                Some(&target_dir),
+                &["clone".to_string(), source.repo.clone(), target_dir.clone()],
+                None,
             )
             .await?;
+            if let Some(reference) = &source.reference {
+                self.run_command(
+                    "git",
+                    &["checkout".to_string(), reference.clone()],
+                    Some(&target_dir),
+                )
+                .await?;
+            }
+            let package_json_path = join_path(&target_dir, "package.json");
+            if Path::new(&package_json_path).exists() {
+                let args = self.get_git_dependency_install_args();
+                self.run_npm_command(&args, Some(&target_dir)).await?;
+            }
+            self.write_git_install_completion(source, &target_dir).await
         }
-        let package_json_path = join_path(&target_dir, "package.json");
-        if Path::new(&package_json_path).exists() {
-            let args = self.get_git_dependency_install_args();
-            self.run_npm_command(&args, Some(&target_dir)).await?;
+        .await;
+        if result.is_err() {
+            Self::remove_managed_git_target(&target_dir)?;
         }
-        Ok(())
+        result
     }
 
     async fn update_git(&self, source: &GitSource, scope: &str) -> Result<(), String> {
-        let target_dir = self.get_git_install_path(source, scope);
+        let target_dir = self.validated_git_install_path(source, scope)?;
+        if Path::new(&target_dir).exists() && !self.git_install_is_ready(source, &target_dir).await {
+            Self::remove_managed_git_target(&target_dir)?;
+        }
         if !Path::new(&target_dir).exists() {
             return self.install_git(source, scope).await;
         }
@@ -2360,6 +2514,7 @@ impl DefaultPackageManager {
             return Ok(());
         }
 
+        let _ = std::fs::remove_file(Self::git_install_completion_path(&target_dir));
         self.run_command(
             "git",
             &["reset".to_string(), "--hard".to_string(), target_ref],
@@ -2380,7 +2535,7 @@ impl DefaultPackageManager {
             let args = self.get_git_dependency_install_args();
             self.run_npm_command(&args, Some(&target_dir)).await?;
         }
-        Ok(())
+        self.write_git_install_completion(source, &target_dir).await
     }
 
     async fn refresh_temporary_git_source(&self, source: &GitSource, source_str: &str) {
@@ -2399,13 +2554,14 @@ impl DefaultPackageManager {
             .await;
     }
 
-    fn remove_git(&self, source: &GitSource, scope: &str) {
-        let target_dir = self.get_git_install_path(source, scope);
+    fn remove_git(&self, source: &GitSource, scope: &str) -> Result<(), String> {
+        let target_dir = self.validated_git_install_path(source, scope)?;
         if !Path::new(&target_dir).exists() {
-            return;
+            return Ok(());
         }
-        let _ = std::fs::remove_dir_all(&target_dir);
+        Self::remove_managed_git_target(&target_dir)?;
         self.prune_empty_git_parents(&target_dir, self.get_git_install_root(scope).as_deref());
+        Ok(())
     }
 
     fn prune_empty_git_parents(&self, target_dir: &str, install_root: Option<&str>) {
@@ -2523,6 +2679,58 @@ impl DefaultPackageManager {
         }
         let user_git = join_path(&self.agent_dir, "git");
         join_path(&join_path(&user_git, &source.host), &source.path)
+    }
+
+    fn get_git_install_containment_anchor(&self, scope: &str) -> String {
+        if scope == SOURCE_SCOPE_TEMPORARY {
+            return join_path(&std::env::temp_dir().to_string_lossy(), "pi-extensions");
+        }
+        if scope == SOURCE_SCOPE_PROJECT {
+            return self.cwd.clone();
+        }
+        self.agent_dir.clone()
+    }
+
+    fn get_git_install_containment_root(&self, source: &GitSource, scope: &str) -> String {
+        if scope != SOURCE_SCOPE_TEMPORARY {
+            return self.get_git_install_root(scope).unwrap_or_default();
+        }
+        let prefix = format!("git-{}", source.host);
+        let hash = sha256_hex_8(&format!("{prefix}-{}", source.path));
+        let temp_root = std::env::temp_dir().to_string_lossy().to_string();
+        join_path(
+            &join_path(&join_path(&temp_root, "pi-extensions"), &prefix),
+            &hash,
+        )
+    }
+
+    fn validated_git_install_path(&self, source: &GitSource, scope: &str) -> Result<String, String> {
+        validate_git_source_path_parts(source)?;
+        let anchor = self.get_git_install_containment_anchor(scope);
+        let root = self.get_git_install_containment_root(source, scope);
+        if anchor.is_empty() || root.is_empty() {
+            return Err("Unsafe git package scope".to_string());
+        }
+        let target = self.get_git_install_path(source, scope);
+        let lexical_anchor = lexical_absolute_path(Path::new(&anchor))?;
+        let lexical_root = lexical_absolute_path(Path::new(&root))?;
+        let lexical_target = lexical_absolute_path(Path::new(&target))?;
+        if !lexical_root.starts_with(&lexical_anchor)
+            || !lexical_target.starts_with(&lexical_root)
+            || lexical_target == lexical_root
+        {
+            return Err(format!("Unsafe git package path: {}/{}", source.host, source.path));
+        }
+        let canonical_anchor = canonicalize_with_missing_components(&lexical_anchor)?;
+        let canonical_root = canonicalize_with_missing_components(&lexical_root)?;
+        let canonical_target = canonicalize_with_missing_components(&lexical_target)?;
+        if !canonical_root.starts_with(&canonical_anchor)
+            || !canonical_target.starts_with(&canonical_root)
+            || canonical_target == canonical_root
+        {
+            return Err(format!("Git package path escapes its install root: {}/{}", source.host, source.path));
+        }
+        Ok(target)
     }
 
     fn get_git_install_root(&self, scope: &str) -> Option<String> {
@@ -3306,6 +3514,81 @@ fn parse_npm_spec(spec: &str) -> (String, Option<String>) {
         ),
         None => (spec.to_string(), None),
     }
+}
+
+fn validate_git_source_path_parts(source: &GitSource) -> Result<(), String> {
+    let invalid = || format!("Unsafe git package path: {}/{}", source.host, source.path);
+    if source.host.is_empty()
+        || source.host.trim() != source.host
+        || source.host == "."
+        || source.host == ".."
+        || source.host.contains(['/', '\\', ':', '@'])
+        || source.host.chars().any(char::is_control)
+        || source.host.split('.').any(str::is_empty)
+        || source.path.is_empty()
+        || source.path.trim() != source.path
+        || source.path.starts_with(['/', '\\'])
+        || source.path.contains('\\')
+        || source.path.chars().any(char::is_control)
+    {
+        return Err(invalid());
+    }
+    for segment in source.path.split('/') {
+        if segment.is_empty()
+            || segment == "."
+            || segment == ".."
+            || segment.contains(':')
+            || segment.ends_with([' ', '.'])
+        {
+            return Err(invalid());
+        }
+    }
+    Ok(())
+}
+
+fn lexical_absolute_path(path: &Path) -> Result<PathBuf, String> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|error| error.to_string())?
+            .join(path)
+    };
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if !normalized.pop() {
+                    return Err(format!("Path escapes its root: {}", absolute.display()));
+                }
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    Ok(normalized)
+}
+
+fn canonicalize_with_missing_components(path: &Path) -> Result<PathBuf, String> {
+    let mut existing = path.to_path_buf();
+    let mut missing = Vec::new();
+    while !existing.exists() {
+        let name = existing
+            .file_name()
+            .ok_or_else(|| format!("Cannot resolve install path: {}", path.display()))?;
+        missing.push(name.to_os_string());
+        existing = existing
+            .parent()
+            .ok_or_else(|| format!("Cannot resolve install path: {}", path.display()))?
+            .to_path_buf();
+    }
+    let mut resolved = std::fs::canonicalize(&existing).map_err(|error| {
+        format!("Cannot resolve install path {}: {error}", existing.display())
+    })?;
+    for component in missing.into_iter().rev() {
+        resolved.push(component);
+    }
+    Ok(resolved)
 }
 
 fn join_path(base: &str, name: &str) -> String {
@@ -4151,6 +4434,198 @@ mod tests {
         });
         let value = serde_json::to_value(&source).unwrap();
         assert_eq!(package_source_string(&value), "./x");
+    }
+
+    fn local_git_source(repo: &str, reference: Option<&str>) -> GitSource {
+        GitSource {
+            kind: "git".to_string(),
+            repo: repo.to_string(),
+            host: "example.com".to_string(),
+            path: "team/repo".to_string(),
+            reference: reference.map(str::to_string),
+            pinned: reference.is_some(),
+        }
+    }
+
+    fn git_fixture(name: &str, with_dependency: bool) -> (String, String, String) {
+        let root = temp_dir(name);
+        let repo = Path::new(&root).join("source");
+        std::fs::create_dir_all(&repo).unwrap();
+        let run = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&output.stderr));
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        };
+        run(&["init", "-q", "-b", "main"]);
+        run(&["config", "user.email", "synthetic@example.test"]);
+        run(&["config", "user.name", "Synthetic Test"]);
+        if with_dependency {
+            std::fs::write(
+                repo.join("package.json"),
+                r#"{"name":"fixture","private":true,"dependencies":{"left-pad":"1.0.0"}}"#,
+            )
+            .unwrap();
+        }
+        std::fs::write(repo.join("index.ts"), "export const fixture = true;\n").unwrap();
+        run(&["add", "-A"]);
+        run(&["commit", "-q", "-m", "fixture"]);
+        let head = run(&["rev-parse", "HEAD"]);
+        run(&["branch", "exact-ref"]);
+        (root, repo.to_string_lossy().to_string(), head)
+    }
+
+    fn failing_once_npm_settings(root: &str) -> Value {
+        let counter = Path::new(root).join("npm-calls");
+        let script = Path::new(root).join(if cfg!(windows) { "npm-fixture.cmd" } else { "npm-fixture.sh" });
+        if cfg!(windows) {
+            std::fs::write(
+                &script,
+                format!(
+                    "@echo off\r\nsetlocal EnableExtensions\r\nset \"count=0\"\r\nif exist \"{}\" set /p count=<\"{}\"\r\nset /a count=count+1\r\n>\"{}\" echo %count%\r\nif \"%count%\"==\"1\" exit /b 19\r\nif not exist node_modules\\left-pad mkdir node_modules\\left-pad\r\n>node_modules\\left-pad\\package.json echo {{\"name\":\"left-pad\",\"version\":\"1.0.0\"}}\r\n",
+                    counter.display(), counter.display(), counter.display()
+                ),
+            )
+            .unwrap();
+            serde_json::json!({"npmCommand": ["cmd", "/c", script.to_string_lossy()]})
+        } else {
+            std::fs::write(
+                &script,
+                format!(
+                    "#!/bin/sh\ncount=0\nif [ -f '{0}' ]; then count=$(cat '{0}'); fi\ncount=$((count+1))\nprintf '%s' \"$count\" > '{0}'\nif [ \"$count\" -eq 1 ]; then exit 19; fi\nmkdir -p node_modules/left-pad\nprintf '%s' '{{\"name\":\"left-pad\",\"version\":\"1.0.0\"}}' > node_modules/left-pad/package.json\n",
+                    counter.display()
+                ),
+            )
+            .unwrap();
+            serde_json::json!({"npmCommand": ["/bin/sh", script.to_string_lossy()]})
+        }
+    }
+
+    #[tokio::test]
+    async fn git_package_paths_reject_escapes_before_remove() {
+        let cwd = temp_dir("unsafe-git-remove");
+        let agent = temp_dir("unsafe-git-agent");
+        let manager = manager(&cwd, &agent, serde_json::json!({}));
+        let canary = Path::new(&cwd).join("outside-canary");
+        std::fs::write(&canary, "keep").unwrap();
+        for (host, path) in [
+            ("/tmp", "team/repo"),
+            ("..", "team/repo"),
+            ("C:", "team/repo"),
+            ("example.com", "../outside-canary"),
+            ("example.com", "team/../../outside-canary"),
+            ("example.com", "/tmp/repo"),
+            ("example.com", "team\\..\\outside-canary"),
+            ("example.com", "C:/outside-canary"),
+            ("example.com", "team\nbad"),
+        ] {
+            let mut source = local_git_source("unused", None);
+            source.host = host.to_string();
+            source.path = path.to_string();
+            let error = manager.remove_git(&source, SOURCE_SCOPE_PROJECT).unwrap_err();
+            assert!(error.contains("Unsafe git package path"), "{host} {path}: {error}");
+            assert_eq!(std::fs::read_to_string(&canary).unwrap(), "keep");
+        }
+        let error = manager
+            .remove("git:example.com/team/../../outside-canary", true)
+            .await
+            .unwrap_err();
+        assert!(error.contains("Unsafe git package path"));
+        assert_eq!(std::fs::read_to_string(&canary).unwrap(), "keep");
+        let scp = parse_git_url("git:git@github.com:user/repo").unwrap();
+        assert!(manager.validated_git_install_path(&scp, SOURCE_SCOPE_PROJECT).is_ok());
+        let _ = std::fs::remove_dir_all(cwd);
+        let _ = std::fs::remove_dir_all(agent);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_package_paths_reject_existing_symlink_escapes() {
+        use std::os::unix::fs::symlink;
+        let cwd = temp_dir("unsafe-git-symlink");
+        let agent = temp_dir("unsafe-git-symlink-agent");
+        let manager = manager(&cwd, &agent, serde_json::json!({}));
+        let root = Path::new(&cwd).join(CONFIG_DIR_NAME).join("git");
+        std::fs::create_dir_all(&root).unwrap();
+        let outside = Path::new(&cwd).join("outside");
+        std::fs::create_dir_all(outside.join("team")).unwrap();
+        let canary = outside.join("canary");
+        std::fs::write(&canary, "keep").unwrap();
+        symlink(&outside, root.join("example.com")).unwrap();
+        let source = local_git_source("unused", None);
+        assert!(manager.validated_git_install_path(&source, SOURCE_SCOPE_PROJECT).is_err());
+        assert!(manager.remove_git(&source, SOURCE_SCOPE_PROJECT).is_err());
+        assert_eq!(std::fs::read_to_string(&canary).unwrap(), "keep");
+        std::fs::remove_file(root.join("example.com")).unwrap();
+        std::fs::remove_dir(&root).unwrap();
+        symlink(&outside, &root).unwrap();
+        assert!(manager.validated_git_install_path(&source, SOURCE_SCOPE_PROJECT).is_err());
+        assert!(manager.remove_git(&source, SOURCE_SCOPE_PROJECT).is_err());
+        assert_eq!(std::fs::read_to_string(canary).unwrap(), "keep");
+        let _ = std::fs::remove_dir_all(cwd);
+        let _ = std::fs::remove_dir_all(agent);
+    }
+
+    #[tokio::test]
+    async fn failed_git_checkout_is_not_cached_and_retry_uses_the_exact_ref() {
+        let (root, repo, expected_head) = git_fixture("git-checkout-retry", false);
+        let cwd = temp_dir("git-checkout-cwd");
+        let agent = temp_dir("git-checkout-agent");
+        let manager = manager(&cwd, &agent, serde_json::json!({}));
+        let missing = local_git_source(&repo, Some("missing-ref"));
+        manager.install_git(&missing, SOURCE_SCOPE_PROJECT).await.unwrap_err();
+        let target = manager.get_git_install_path(&missing, SOURCE_SCOPE_PROJECT);
+        assert!(!Path::new(&target).exists());
+        let exact = local_git_source(&repo, Some("exact-ref"));
+        manager.install_git(&exact, SOURCE_SCOPE_PROJECT).await.unwrap();
+        let output = std::process::Command::new("git")
+            .args(["-C", &target, "rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), expected_head);
+        manager.install_git(&exact, SOURCE_SCOPE_PROJECT).await.unwrap();
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(cwd);
+        let _ = std::fs::remove_dir_all(agent);
+    }
+
+    #[tokio::test]
+    async fn failed_git_dependency_install_is_cleaned_and_cache_revalidates_dependencies() {
+        let (root, repo, expected_head) = git_fixture("git-npm-retry", true);
+        let cwd = temp_dir("git-npm-cwd");
+        let agent = temp_dir("git-npm-agent");
+        let manager = manager(&cwd, &agent, failing_once_npm_settings(&root));
+        let source = local_git_source(&repo, Some("exact-ref"));
+        manager.install_git(&source, SOURCE_SCOPE_PROJECT).await.unwrap_err();
+        let target = manager.get_git_install_path(&source, SOURCE_SCOPE_PROJECT);
+        assert!(!Path::new(&target).exists());
+
+        manager.install_git(&source, SOURCE_SCOPE_PROJECT).await.unwrap();
+        let dependency = Path::new(&target).join("node_modules/left-pad/package.json");
+        assert!(dependency.is_file());
+        let calls = std::fs::read_to_string(Path::new(&root).join("npm-calls")).unwrap();
+        assert_eq!(calls.trim(), "2");
+        manager.install_git(&source, SOURCE_SCOPE_PROJECT).await.unwrap();
+        let calls = std::fs::read_to_string(Path::new(&root).join("npm-calls")).unwrap();
+        assert_eq!(calls.trim(), "2", "complete cache must not rerun npm");
+
+        std::fs::remove_file(dependency).unwrap();
+        manager.install_git(&source, SOURCE_SCOPE_PROJECT).await.unwrap();
+        let calls = std::fs::read_to_string(Path::new(&root).join("npm-calls")).unwrap();
+        assert_eq!(calls.trim(), "3", "incomplete cached dependencies must be repaired");
+        let head = std::process::Command::new("git")
+            .args(["-C", &target, "rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&head.stdout).trim(), expected_head);
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(cwd);
+        let _ = std::fs::remove_dir_all(agent);
     }
 
     // `${command} ${args.join(" ")} timed out after ${options?.timeoutMs}ms`

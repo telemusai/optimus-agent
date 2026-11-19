@@ -1,0 +1,3 @@
+- Fixed git package installs to reject paths outside managed roots, clean up incomplete installs, and validate cached refs and dependencies before reuse.
+- Fixed ACP MCP tool activation to honor disabled-tool and explicit tool-allowlist policies.
+- Fixed UNC path resolution, redacted shell-backed credential errors, and restricted new session directories and transcripts on Unix.
