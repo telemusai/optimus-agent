@@ -6,12 +6,24 @@
 //!       classes, sizes from 10 KiB to ~40 MiB plus a near-threshold case).
 //!       Each case dir contains `transcript.json` and `manifest.json`.
 //!   replay --fixture <dir|case> --out <json> [--provider-delay-ms N]
-//!          [--summary-failure MSG] [--context-window N] [--keep-recent N]
-//!          [--work DIR] [--stamp SHA256] [--git DESCRIBE] [--timeout-secs N]
+//!          [--summary-failure MSG] [--expect-outcome successful-compaction|summary-failure]
+//!          --expect-summary-calls N  Exact provider-summary attempt budget for this fixture/options.
+//!          [--context-window N] [--keep-recent N] [--work DIR]
+//!          [--stamp SHA256] [--git DESCRIBE] [--timeout-secs N]
 //!       Runs the REAL auto-compaction path end to end offline: private roots,
 //!       in-process fixture provider with canned deterministic summaries, real
 //!       SessionManager JSONL, CompactionMetrics phase rows via the recorder
-//!       injection seam, provider call log, retained-state digests.
+//!       injection seam, provider call log, retained-state digests. Every case
+//!       must pass expected-outcome admission and fresh-OS-process durable reopen parity.
+//!   verify-reopen --expectation <json> --out <json>
+//!       Read-only fresh-process reopen used by replay; report is outside the case root.
+//!   self-test-r1 --work DIR --out <json>
+//!       Deterministic positive and negative admission/reopen controls.
+//!   verify-local --fixture <dir|case> --out <json> --arm <reviewed-r1-baseline|r2-candidate>
+//!          --adapter-diff <complete-diff> [--expectation FROZEN_R1_BASELINE]
+//!       Non-timed full-output local-kernel capture or exact semantic comparison.
+//!   self-test-r2 --fixture <case> --work DIR --out <json>
+//!       Deterministic R2 rejection controls, including invalid numeric CLI values.
 //!   bench-local --fixture <dir|case> --iters N --out <json> [--warmup N]
 //!          [--stamp SHA256] [--git DESCRIBE] [--chunk-context-window N]
 //!       Microbenchmarks of the pure local kernels through their real entry
@@ -23,7 +35,8 @@
 //! it must keep working unchanged BEFORE and AFTER optimization work.
 
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -67,7 +80,7 @@ use pi_coding_agent::core::messages::convert_to_llm;
 use pi_coding_agent::core::model_registry::ModelRegistry;
 use pi_coding_agent::core::model_tool_output_policy::ModelToolOutputPolicyOptions;
 use pi_coding_agent::core::resource_loader::DefaultResourceLoaderOptions;
-use pi_coding_agent::core::session_manager::SessionManager;
+use pi_coding_agent::core::session_manager::{CustomMessageEntryContent, SessionManager};
 use pi_coding_agent::core::settings_manager::SettingsManager;
 use pi_jev::compaction::CompactionConfig;
 use rand::rngs::StdRng;
@@ -75,6 +88,11 @@ use rand::seq::SliceRandom;
 use rand::{Rng, SeedableRng};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
+
+#[path = "compaction_replay/local_parity.rs"]
+mod local_parity;
+#[path = "compaction_replay/candidate_review.rs"]
+mod candidate_review;
 
 // ---------------------------------------------------------------------------
 // Counting global allocator (std-only)
@@ -137,6 +155,228 @@ fn sha256_hex(bytes: &[u8]) -> String {
         .collect()
 }
 
+fn semantic_sha256<T: serde::Serialize + ?Sized>(value: &T) -> Result<String, String> {
+    let encoded = serde_json::to_string(value).map_err(|error| error.to_string())?;
+    Ok(sha256_hex(encoded.as_bytes()))
+}
+
+/// Select the current branch from the exact durable JSONL values, without the
+/// read-path rehydration used for model/UI callers. This is the byte-projection
+/// counterpart to SessionManager::build_index + get_branch. Any malformed entry,
+/// duplicate ID, broken parent, cycle, or missing header fails closed.
+#[derive(Debug)]
+struct RawDurableGraph {
+    branch: Vec<Value>,
+    entry_count: usize,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+struct DurableMessageCounts {
+    user: usize,
+    assistant: usize,
+    tool_result: usize,
+    other: usize,
+}
+
+fn durable_message_counts(entries: &[Value]) -> Result<DurableMessageCounts, String> {
+    let mut counts = DurableMessageCounts::default();
+    for entry in entries {
+        if entry.get("type").and_then(Value::as_str) != Some("message") {
+            continue;
+        }
+        match entry.pointer("/message/role").and_then(Value::as_str) {
+            Some("user") => counts.user += 1,
+            Some("assistant") => counts.assistant += 1,
+            Some("toolResult") => counts.tool_result += 1,
+            Some("custom") | Some("branchSummary") | Some("compactionSummary") => {
+                counts.other += 1
+            }
+            Some(other) => {
+                return Err(stage_error(
+                    "durable-message-shape",
+                    format!("unsupported durable message role {other}"),
+                ))
+            }
+            None => {
+                return Err(stage_error(
+                    "durable-message-shape",
+                    "durable message has no role",
+                ))
+            }
+        }
+    }
+    Ok(counts)
+}
+
+fn stage_error(stage: &str, reason: impl AsRef<str>) -> String {
+    format!("[{stage}] {}", reason.as_ref())
+}
+
+fn ensure_stage(condition: bool, stage: &str, reason: impl AsRef<str>) -> Result<(), String> {
+    if condition {
+        Ok(())
+    } else {
+        Err(stage_error(stage, reason))
+    }
+}
+
+/// Parse and validate the COMPLETE durable graph before selecting any branch.
+/// SessionManager deliberately indexes current UI state and can hide malformed
+/// off-branch entries; that behavior is not an admission check. This projection
+/// retains exact JSON values while rejecting malformed/truncated lines, header
+/// multiplicity, duplicate IDs, missing parents, disallowed roots and cycles.
+fn raw_durable_graph(bytes: &[u8]) -> Result<RawDurableGraph, String> {
+    let text = std::str::from_utf8(bytes)
+        .map_err(|error| stage_error("durable-jsonl", format!("invalid UTF-8: {error}")))?;
+    ensure_stage(
+        !text.is_empty(),
+        "durable-jsonl",
+        "durable session file is empty",
+    )?;
+    ensure_stage(
+        text.ends_with('\n'),
+        "durable-jsonl",
+        "last durable JSONL line is unterminated or truncated",
+    )?;
+    let mut by_id = HashMap::<String, Value>::new();
+    let mut leaf_id = None::<String>;
+    let mut header_count = 0usize;
+    for (index, line) in text.strip_suffix('\n').unwrap_or(text).split('\n').enumerate() {
+        ensure_stage(
+            !line.is_empty() && !line.ends_with('\r'),
+            "durable-jsonl",
+            format!("blank or non-canonical durable JSONL line {}", index + 1),
+        )?;
+        let entry: Value = serde_json::from_str(line).map_err(|error| {
+            stage_error(
+                "durable-jsonl",
+                format!("invalid durable JSONL line {}: {error}", index + 1),
+            )
+        })?;
+        ensure_stage(
+            entry.is_object(),
+            "durable-jsonl",
+            format!("non-object durable JSONL line {}", index + 1),
+        )?;
+        if entry.get("type").and_then(Value::as_str) == Some("session") {
+            ensure_stage(
+                entry.get("id").and_then(Value::as_str).is_some_and(|id| !id.is_empty()),
+                "session-header",
+                "durable session header has no nonempty ID",
+            )?;
+            header_count += 1;
+            continue;
+        }
+        let id = entry
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| {
+                stage_error(
+                    "full-graph-integrity",
+                    format!("durable JSONL line {} has no nonempty ID", index + 1),
+                )
+            })?
+            .to_string();
+        match entry.get("parentId") {
+            None | Some(Value::Null) => {}
+            Some(Value::String(parent)) if parent.is_empty() => {
+                return Err(stage_error(
+                    "full-graph-integrity",
+                    format!("durable entry {id} has an empty parent ID"),
+                ))
+            }
+            Some(Value::String(_)) => {}
+            Some(_) => {
+                return Err(stage_error(
+                    "full-graph-integrity",
+                    format!("durable entry {id} has a non-string parent ID"),
+                ))
+            }
+        }
+        ensure_stage(
+            by_id.insert(id.clone(), entry).is_none(),
+            "full-graph-integrity",
+            format!("duplicate durable entry ID {id}"),
+        )?;
+        leaf_id = Some(id);
+    }
+    ensure_stage(
+        header_count == 1,
+        "session-header",
+        format!("expected exactly one session header, found {header_count}"),
+    )?;
+
+    // Validate every component, not just the branch reachable from the leaf.
+    let mut complete = HashSet::<String>::new();
+    for start_id in by_id.keys() {
+        if complete.contains(start_id) {
+            continue;
+        }
+        let mut path = Vec::<String>::new();
+        let mut local = HashSet::<String>::new();
+        let mut current_id = start_id.clone();
+        loop {
+            if complete.contains(&current_id) {
+                break;
+            }
+            ensure_stage(
+                local.insert(current_id.clone()),
+                "full-graph-integrity",
+                format!("cycle reaches durable entry {current_id}"),
+            )?;
+            let entry = by_id.get(&current_id).ok_or_else(|| {
+                stage_error(
+                    "full-graph-integrity",
+                    format!("dangling parent ID {current_id}"),
+                )
+            })?;
+            path.push(current_id.clone());
+            current_id = match entry.get("parentId") {
+                None | Some(Value::Null) => {
+                    // SessionManager permits a transcript-rooted graph when no
+                    // model/control entry was written first. A null parent is
+                    // therefore a root for any otherwise well-formed entry.
+                    break;
+                }
+                Some(Value::String(parent)) => parent.clone(),
+                Some(_) => unreachable!("parent shape was validated above"),
+            };
+        }
+        complete.extend(path);
+    }
+
+    let mut current_id = leaf_id.ok_or_else(|| {
+        stage_error("full-graph-integrity", "durable JSONL has no branch entries")
+    })?;
+    let mut visited = HashSet::<String>::new();
+    let mut branch = Vec::new();
+    loop {
+        ensure_stage(
+            visited.insert(current_id.clone()),
+            "full-graph-integrity",
+            format!("selected durable branch cycle at {current_id}"),
+        )?;
+        let entry = by_id.get(&current_id).ok_or_else(|| {
+            stage_error(
+                "full-graph-integrity",
+                format!("selected durable parent {current_id} is missing"),
+            )
+        })?;
+        branch.push(entry.clone());
+        current_id = match entry.get("parentId") {
+            None | Some(Value::Null) => break,
+            Some(Value::String(parent)) => parent.clone(),
+            Some(_) => unreachable!("parent shape was validated above"),
+        };
+    }
+    branch.reverse();
+    Ok(RawDurableGraph {
+        branch,
+        entry_count: by_id.len(),
+    })
+}
+
 fn elapsed_ms(start: Instant) -> f64 {
     start.elapsed().as_secs_f64() * 1000.0
 }
@@ -174,6 +414,20 @@ fn write_json(path: &Path, value: &Value) -> Result<(), String> {
     .map(|_| ())
 }
 
+fn write_new_json(path: &Path, value: &Value) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| format!("mkdir: {error}"))?;
+    }
+    let body = serde_json::to_string_pretty(value).map_err(|error| error.to_string())?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|error| format!("create_new {}: {error}", path.display()))?;
+    file.write_all(body.as_bytes())
+        .map_err(|error| format!("write {}: {error}", path.display()))
+}
+
 fn exe_sha256() -> Result<String, String> {
     let exe = std::env::current_exe().map_err(|error| error.to_string())?;
     let bytes = std::fs::read(&exe).map_err(|error| format!("read exe: {error}"))?;
@@ -202,14 +456,18 @@ impl Cli {
                 continue;
             }
             if let Some(rest) = arg.strip_prefix("--") {
-                if let Some((key, value)) = rest.split_once('=') {
-                    options.insert(key.to_string(), value.to_string());
+                let (key, value) = if let Some((key, value)) = rest.split_once('=') {
+                    (key, value.to_string())
                 } else if index < args.len() && !args[index].starts_with("--") {
                     // `--key value` form.
-                    options.insert(rest.to_string(), args[index].clone());
+                    let value = args[index].clone();
                     index += 1;
+                    (rest, value)
                 } else {
-                    options.insert(rest.to_string(), String::new());
+                    (rest, String::new())
+                };
+                if options.insert(key.to_string(), value).is_some() {
+                    return Err(format!("[cli-parse] duplicate option --{key}"));
                 }
             } else {
                 return Err(format!("unexpected positional argument: {arg}"));
@@ -236,13 +494,52 @@ impl Cli {
             .filter(|value| !value.is_empty())
     }
 
-    fn number(&self, key: &str, default: f64) -> Result<f64, String> {
-        match self.optional(key) {
-            None => Ok(default),
+    fn integer(
+        &self,
+        key: &str,
+        default: usize,
+        minimum: usize,
+        maximum: usize,
+    ) -> Result<usize, String> {
+        let value = match self.options.get(key) {
+            None => default,
+            Some(raw) if raw.is_empty() => {
+                return Err(stage_error(
+                    &format!("cli-{key}"),
+                    format!("--{key} is present but empty; a numeric value is required"),
+                ))
+            }
+            Some(raw) => raw
+                .parse::<usize>()
+                .map_err(|error| stage_error(&format!("cli-{key}"), error.to_string()))?,
+        };
+        ensure_stage(
+            (minimum..=maximum).contains(&value),
+            &format!("cli-{key}"),
+            format!("--{key} must be an integer in {minimum}..={maximum}, got {value}"),
+        )?;
+        Ok(value)
+    }
+
+    fn positive_number(&self, key: &str, default: f64, maximum: f64) -> Result<f64, String> {
+        let value = match self.options.get(key) {
+            None => default,
+            Some(raw) if raw.is_empty() => {
+                return Err(stage_error(
+                    &format!("cli-{key}"),
+                    format!("--{key} is present but empty; a numeric value is required"),
+                ))
+            }
             Some(raw) => raw
                 .parse::<f64>()
-                .map_err(|error| format!("--{key}: {error}")),
-        }
+                .map_err(|error| stage_error(&format!("cli-{key}"), error.to_string()))?,
+        };
+        ensure_stage(
+            value.is_finite() && value > 0.0 && value <= maximum,
+            &format!("cli-{key}"),
+            format!("--{key} must be finite and in (0, {maximum}], got {value}"),
+        )?;
+        Ok(value)
     }
 }
 
@@ -1489,7 +1786,11 @@ fn record_call(
     service_ms: f64,
     payload_sha256: String,
     system_prompt_chars: Option<usize>,
+    reply: &AssistantMessage,
 ) {
+    let response_sha256 = serde_json::to_string(reply)
+        .map(|encoded| sha256_hex(encoded.as_bytes()))
+        .unwrap_or_default();
     state.calls.lock().unwrap().push(json!({
         "seq": seq,
         "is_summary_call": is_summary_call,
@@ -1500,6 +1801,9 @@ fn record_call(
         "service_ms": service_ms,
         "payload_sha256": payload_sha256,
         "system_prompt_chars": system_prompt_chars,
+        "stop_reason": reply.stop_reason,
+        "error_message": reply.error_message,
+        "response_sha256": response_sha256,
     }));
 }
 
@@ -1527,7 +1831,7 @@ fn respond(
         for event in events_for(reply.clone()) {
             stream.push(event);
         }
-        stream.end(Some(reply));
+        stream.end(Some(reply.clone()));
         record_call(
             state,
             seq,
@@ -1539,6 +1843,7 @@ fn respond(
             elapsed_ms(started),
             payload_sha256,
             system_prompt_chars,
+            &reply,
         );
         return stream;
     }
@@ -1553,7 +1858,7 @@ fn respond(
                 for event in events_for(reply.clone()) {
                     task_stream.push(event);
                 }
-                task_stream.end(Some(reply));
+                task_stream.end(Some(reply.clone()));
                 record_call(
                     &state_for_task,
                     seq,
@@ -1565,6 +1870,7 @@ fn respond(
                     elapsed_ms(started),
                     payload_sha256,
                     system_prompt_chars,
+                    &reply,
                 );
             });
         }
@@ -1572,7 +1878,7 @@ fn respond(
             for event in events_for(reply.clone()) {
                 stream.push(event);
             }
-            stream.end(Some(reply));
+            stream.end(Some(reply.clone()));
             record_call(
                 state,
                 seq,
@@ -1584,6 +1890,7 @@ fn respond(
                 elapsed_ms(started),
                 payload_sha256,
                 system_prompt_chars,
+                &reply,
             );
         }
     }
@@ -1857,57 +2164,287 @@ fn normalize_custom(custom: &CustomAgentMessage) -> Value {
     }
 }
 
+#[derive(Debug, Default, Clone, Copy)]
 struct PairingStats {
     tool_calls: usize,
     tool_results: usize,
     matched_results: usize,
     unmatched_results: usize,
     calls_without_result: usize,
+    duplicate_tool_call_ids: usize,
+    duplicate_tool_result_ids: usize,
+}
+
+fn record_tool_call(stats: &mut PairingStats, calls: &mut HashMap<String, bool>, id: &str) {
+    stats.tool_calls += 1;
+    if calls.insert(id.to_string(), false).is_some() {
+        stats.duplicate_tool_call_ids += 1;
+    }
+}
+
+fn record_tool_result(stats: &mut PairingStats, calls: &mut HashMap<String, bool>, id: &str) {
+    stats.tool_results += 1;
+    match calls.get_mut(id) {
+        Some(seen) if *seen => stats.duplicate_tool_result_ids += 1,
+        Some(seen) => {
+            stats.matched_results += 1;
+            *seen = true;
+        }
+        None => stats.unmatched_results += 1,
+    }
 }
 
 fn pairing_stats(messages: &[AgentMessage]) -> PairingStats {
-    let mut call_ordinals: HashMap<String, bool> = HashMap::new();
-    let mut stats = PairingStats {
-        tool_calls: 0,
-        tool_results: 0,
-        matched_results: 0,
-        unmatched_results: 0,
-        calls_without_result: 0,
-    };
+    let mut calls = HashMap::<String, bool>::new();
+    let mut stats = PairingStats::default();
     for message in messages {
         match message {
             AgentMessage::Message(Message::Assistant(assistant)) => {
                 for block in &assistant.content {
                     if let ContentBlock::ToolCall(call) = block {
-                        stats.tool_calls += 1;
-                        call_ordinals.insert(call.id.clone(), false);
+                        record_tool_call(&mut stats, &mut calls, &call.id);
                     }
                 }
             }
             AgentMessage::Message(Message::ToolResult(result)) => {
-                stats.tool_results += 1;
-                match call_ordinals.get_mut(&result.tool_call_id) {
-                    Some(seen) => {
-                        stats.matched_results += 1;
-                        *seen = true;
-                    }
-                    None => stats.unmatched_results += 1,
-                }
+                record_tool_result(&mut stats, &mut calls, &result.tool_call_id);
             }
             _ => {}
         }
     }
-    stats.calls_without_result = call_ordinals.values().filter(|seen| !**seen).count();
+    stats.calls_without_result = calls.values().filter(|seen| !**seen).count();
     stats
+}
+
+/// Pair durable tool records directly, before compaction can trim a duplicate
+/// or malformed record out of the live projection. ID multiplicity is counted
+/// independently of one-to-one pairing so duplicate IDs cannot balance counts.
+fn raw_durable_pairing(entries: &[Value]) -> Result<PairingStats, String> {
+    let mut calls = HashMap::<String, bool>::new();
+    let mut stats = PairingStats::default();
+    for entry in entries {
+        if entry.get("type").and_then(Value::as_str) != Some("message") {
+            continue;
+        }
+        let message = entry.get("message").ok_or_else(|| {
+            stage_error("tool-record", "durable message entry has no message object")
+        })?;
+        match message.get("role").and_then(Value::as_str) {
+            Some("assistant") => {
+                let content = message.get("content").and_then(Value::as_array).ok_or_else(|| {
+                    stage_error("tool-record", "assistant message content is not an array")
+                })?;
+                for block in content {
+                    if block.get("type").and_then(Value::as_str) == Some("toolCall") {
+                        let id = block.get("id").and_then(Value::as_str).filter(|id| !id.is_empty()).ok_or_else(|| {
+                            stage_error("tool-record", "tool call has no nonempty ID")
+                        })?;
+                        record_tool_call(&mut stats, &mut calls, id);
+                    }
+                }
+            }
+            Some("toolResult") => {
+                let id = message.get("toolCallId").and_then(Value::as_str).filter(|id| !id.is_empty()).ok_or_else(|| {
+                    stage_error("tool-record", "tool result has no nonempty toolCallId")
+                })?;
+                record_tool_result(&mut stats, &mut calls, id);
+            }
+            _ => {}
+        }
+    }
+    stats.calls_without_result = calls.values().filter(|seen| !**seen).count();
+    Ok(stats)
+}
+
+fn pairing_value(pairing: &PairingStats) -> Value {
+    json!({
+        "tool_calls": pairing.tool_calls,
+        "tool_results": pairing.tool_results,
+        "matched_results": pairing.matched_results,
+        "unmatched_results": pairing.unmatched_results,
+        "calls_without_result": pairing.calls_without_result,
+        "duplicate_tool_call_ids": pairing.duplicate_tool_call_ids,
+        "duplicate_tool_result_ids": pairing.duplicate_tool_result_ids,
+    })
+}
+
+fn protected_state_projection(entries: &[Value]) -> Value {
+    let custom_messages: Vec<Value> = entries
+        .iter()
+        .filter(|entry| entry.get("type").and_then(Value::as_str) == Some("custom_message"))
+        .cloned()
+        .collect();
+    let checkpoints: Vec<Value> = entries
+        .iter()
+        .filter(|entry| entry.get("type").and_then(Value::as_str) == Some("compaction"))
+        .cloned()
+        .collect();
+    let session_controls: Vec<Value> = entries
+        .iter()
+        .filter(|entry| {
+            matches!(
+                entry.get("type").and_then(Value::as_str),
+                Some("model_change" | "thinking_level_change" | "service_tier_change" | "custom" | "custom_message" | "branch_summary" | "session_info" | "label")
+            )
+        })
+        .cloned()
+        .collect();
+    json!({
+        "custom_messages": custom_messages,
+        "checkpoints": checkpoints,
+        "session_controls": session_controls,
+    })
+}
+
+fn validate_checkpoint_links(entries: &[Value]) -> Result<(), String> {
+    let ids: HashSet<&str> = entries.iter().filter_map(|entry| entry.get("id").and_then(Value::as_str)).collect();
+    for entry in entries {
+        if entry.get("type").and_then(Value::as_str) != Some("compaction") {
+            continue;
+        }
+        let kept = entry.get("firstKeptEntryId").and_then(Value::as_str).filter(|id| !id.is_empty()).ok_or_else(|| {
+            stage_error("checkpoint", "compaction has no nonempty firstKeptEntryId")
+        })?;
+        ensure_stage(ids.contains(kept), "checkpoint", format!("checkpoint firstKeptEntryId {kept} is missing from the durable graph"))?;
+        ensure_stage(entry.get("summary").and_then(Value::as_str).is_some_and(|summary| !summary.is_empty()), "checkpoint", "compaction has an empty durable summary")?;
+    }
+    Ok(())
+}
+
+fn validate_durable_turn_delta(
+    seeded: &[Value],
+    final_branch: &[Value],
+    total_entry_count: usize,
+    expected: ReplayOutcomeExpectation,
+) -> Result<Value, String> {
+    // A replay writes a linear local branch. Anything else is durable state an
+    // ordinary reopen can silently ignore and therefore must not be admitted.
+    ensure_stage(
+        total_entry_count == final_branch.len(),
+        "unexpected-durable-entry",
+        format!("durable graph has {} entries outside the selected branch", total_entry_count.saturating_sub(final_branch.len())),
+    )?;
+    let final_by_id: HashMap<&str, &Value> = final_branch
+        .iter()
+        .filter_map(|entry| entry.get("id").and_then(Value::as_str).map(|id| (id, entry)))
+        .collect();
+    for entry in seeded {
+        let id = entry.get("id").and_then(Value::as_str).ok_or_else(|| stage_error("durable-seed", "seed entry has no ID"))?;
+        ensure_stage(
+            final_by_id.get(id).is_some_and(|final_entry| *final_entry == entry),
+            "durable-seed",
+            format!("seeded entry {id} was changed or removed by the single replay turn"),
+        )?;
+    }
+    let seeded_ids: HashSet<&str> = seeded.iter().filter_map(|entry| entry.get("id").and_then(Value::as_str)).collect();
+    let added: Vec<&Value> = final_branch.iter().filter(|entry| {
+        entry.get("id").and_then(Value::as_str).is_none_or(|id| !seeded_ids.contains(id))
+    }).collect();
+    let mut added_messages = DurableMessageCounts::default();
+    let mut added_compactions = 0usize;
+    let mut added_custom_types = Vec::<String>::new();
+    for entry in &added {
+        match entry.get("type").and_then(Value::as_str) {
+            Some("message") => match entry.pointer("/message/role").and_then(Value::as_str) {
+                Some("user") => added_messages.user += 1,
+                Some("assistant") => added_messages.assistant += 1,
+                Some("toolResult") => added_messages.tool_result += 1,
+                Some(_) => added_messages.other += 1,
+                None => return Err(stage_error("durable-message-shape", "new durable message lacks a role")),
+            },
+            Some("compaction") => added_compactions += 1,
+            Some("custom_message") => {
+                let custom_type = entry.get("customType").and_then(Value::as_str).unwrap_or_default();
+                added_custom_types.push(custom_type.to_string());
+            }
+            Some(other) => {
+                return Err(stage_error(
+                    "unexpected-durable-turns",
+                    format!("single replay turn added unexpected durable entry type {other}"),
+                ))
+            }
+            None => return Err(stage_error("durable-entry-shape", "new durable entry has no type")),
+        }
+    }
+    ensure_stage(
+        added_messages.user == 1 && added_messages.assistant == 1
+            && added_messages.tool_result == 0 && added_messages.other == 0,
+        "unexpected-durable-turns",
+        format!("expected exactly one added user and assistant message and no others; got {added_messages:?}"),
+    )?;
+    let expected_compactions = if expected == ReplayOutcomeExpectation::SuccessfulCompaction { 1 } else { 0 };
+    ensure_stage(
+        added_compactions == expected_compactions,
+        "checkpoint-count",
+        format!("expected {expected_compactions} added compaction entries, got {added_compactions}"),
+    )?;
+    added_custom_types.sort();
+    let mut expected_custom_types = vec!["harness_digest".to_string()];
+    if expected == ReplayOutcomeExpectation::SummaryFailure {
+        expected_custom_types.push("compaction_outcome".to_string());
+        expected_custom_types.sort();
+    }
+    ensure_stage(
+        added_custom_types == expected_custom_types,
+        "protected-custom-state",
+        format!("expected added custom types {expected_custom_types:?}, got {added_custom_types:?}"),
+    )?;
+    let expected_total = if expected == ReplayOutcomeExpectation::SuccessfulCompaction { 4 } else { 4 };
+    ensure_stage(
+        added.len() == expected_total,
+        "unexpected-durable-turns",
+        format!("expected exactly {expected_total} added durable entries, got {}", added.len()),
+    )?;
+    Ok(json!({
+        "added_entry_count": added.len(),
+        "added_message_counts": {
+            "user": added_messages.user,
+            "assistant": added_messages.assistant,
+            "tool_results": added_messages.tool_result,
+            "other": added_messages.other,
+        },
+        "added_compaction_entries": added_compactions,
+        "added_custom_types": added_custom_types,
+        "seed_unchanged": true,
+        "graph_entry_count": total_entry_count,
+        "branch_entry_count": final_branch.len(),
+    }))
 }
 
 // ---------------------------------------------------------------------------
 // replay subcommand
 // ---------------------------------------------------------------------------
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReplayOutcomeExpectation {
+    SuccessfulCompaction,
+    SummaryFailure,
+}
+
+impl ReplayOutcomeExpectation {
+    fn parse(raw: &str) -> Result<Self, String> {
+        match raw {
+            "successful-compaction" => Ok(Self::SuccessfulCompaction),
+            "summary-failure" => Ok(Self::SummaryFailure),
+            other => Err(format!(
+                "invalid --expect-outcome {other:?}: expected successful-compaction or summary-failure"
+            )),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::SuccessfulCompaction => "successful-compaction",
+            Self::SummaryFailure => "summary-failure",
+        }
+    }
+}
+
 struct ReplayOptions {
     provider_delay_ms: u64,
     summary_failure: Option<String>,
+    expected_outcome: ReplayOutcomeExpectation,
+    expected_summary_calls: usize,
     context_window: f64,
     keep_recent: Option<f64>,
     work: PathBuf,
@@ -1948,6 +2485,81 @@ fn export_case_env(root: &Path) {
     std::env::set_var("TMPDIR", temp_dir.to_string_lossy().to_string());
     std::env::set_var("TEMP", temp_dir.to_string_lossy().to_string());
     std::env::set_var("TMP", temp_dir.to_string_lossy().to_string());
+}
+
+fn json_type_name(value: Option<&Value>) -> &'static str {
+    match value {
+        None => "missing",
+        Some(Value::Null) => "null",
+        Some(Value::Bool(_)) => "boolean",
+        Some(Value::Number(_)) => "number",
+        Some(Value::String(_)) => "string",
+        Some(Value::Array(_)) => "array",
+        Some(Value::Object(_)) => "object",
+    }
+}
+
+fn json_mismatch_detail(expected: Option<&Value>, actual: Option<&Value>, pointer: &str) -> Value {
+    let expected_sha = expected
+        .map(|value| sha256_hex(value.to_string().as_bytes()))
+        .unwrap_or_else(|| "missing".to_string());
+    let actual_sha = actual
+        .map(|value| sha256_hex(value.to_string().as_bytes()))
+        .unwrap_or_else(|| "missing".to_string());
+    json!({
+        "pointer": pointer,
+        "expected_type": json_type_name(expected),
+        "actual_type": json_type_name(actual),
+        "expected_sha256": expected_sha,
+        "actual_sha256": actual_sha,
+    })
+}
+
+fn first_json_difference(expected: Option<&Value>, actual: Option<&Value>, pointer: &str) -> Option<Value> {
+    if expected == actual {
+        return None;
+    }
+    match (expected, actual) {
+        (Some(Value::Array(expected_items)), Some(Value::Array(actual_items))) => {
+            if expected_items.len() != actual_items.len() {
+                let mut difference = json_mismatch_detail(expected, actual, pointer);
+                difference["expected_length"] = json!(expected_items.len());
+                difference["actual_length"] = json!(actual_items.len());
+                return Some(difference);
+            }
+            for (index, (expected_item, actual_item)) in
+                expected_items.iter().zip(actual_items).enumerate()
+            {
+                if let Some(difference) = first_json_difference(
+                    Some(expected_item),
+                    Some(actual_item),
+                    &format!("{pointer}/{index}"),
+                ) {
+                    return Some(difference);
+                }
+            }
+        }
+        (Some(Value::Object(expected_items)), Some(Value::Object(actual_items))) => {
+            let mut keys: Vec<&str> = expected_items
+                .keys()
+                .chain(actual_items.keys())
+                .map(String::as_str)
+                .collect();
+            keys.sort_unstable();
+            keys.dedup();
+            for key in keys {
+                if let Some(difference) = first_json_difference(
+                    expected_items.get(key),
+                    actual_items.get(key),
+                    &format!("{pointer}/{key}"),
+                ) {
+                    return Some(difference);
+                }
+            }
+        }
+        _ => {}
+    }
+    Some(json_mismatch_detail(expected, actual, pointer))
 }
 
 async fn run_replay_case(
@@ -2160,6 +2772,41 @@ async fn run_replay_case(
         agent_state.messages = session.build_session_context().messages;
         session.agent.set_state(agent_state);
     }
+    // Snapshot the exact durable seed bytes, not get_branch()'s rehydrated
+    // public values. Disk serialization may replace repeated tool-detail text
+    // with an inline reference; get_branch reconstructs it for model/UI use.
+    let seeded_session_file = {
+        let mut manager = session.session_manager.lock().unwrap();
+        manager.flush_now().map_err(|error| stage_error("durable-seed", format!("flush seeded session: {error}")))?;
+        manager.get_session_file().ok_or_else(|| stage_error("durable-seed", "seeded durable session has no file path"))?
+    };
+    let seeded_bytes = std::fs::read(&seeded_session_file)
+        .map_err(|error| stage_error("durable-seed", format!("read exact seeded JSONL: {error}")))?;
+    let seeded_graph = raw_durable_graph(&seeded_bytes)?;
+    ensure_stage(
+        seeded_graph.entry_count == seeded_graph.branch.len(),
+        "durable-seed",
+        "seed contains entries outside its selected durable branch",
+    )?;
+    let seeded_branch = seeded_graph.branch;
+    let seeded_message_counts = durable_message_counts(&seeded_branch)?;
+    ensure_stage(
+        seeded_message_counts.user + seeded_message_counts.assistant
+            + seeded_message_counts.tool_result + seeded_message_counts.other == messages.len(),
+        "durable-seed",
+        "durable seed count differs from the loaded fixture messages",
+    )?;
+    let seeded_evidence = json!({
+        "fixture_message_count": messages.len(),
+        "branch_entry_count": seeded_branch.len(),
+        "message_counts": {
+            "user": seeded_message_counts.user,
+            "assistant": seeded_message_counts.assistant,
+            "tool_results": seeded_message_counts.tool_result,
+            "other": seeded_message_counts.other,
+        },
+        "branch_sha256": semantic_sha256(&seeded_branch)?,
+    });
     let seed_ms = elapsed_ms(seed_started);
 
     // Drive the session so the threshold check fires at turn end. The reply's
@@ -2220,19 +2867,36 @@ async fn run_replay_case(
             .map_err(|error| error.to_string())?
             .as_bytes(),
     );
+    // Fresh reopen parity uses the durable semantic projection. In particular,
+    // an intentional summary failure has a live-only auto_compaction_failure_notice;
+    // requiring that transient UI notice to survive reopen would reject valid
+    // persistence. The live digest above and notice count below remain intact.
+    let writer_restored_messages = session
+        .session_manager
+        .lock()
+        .unwrap()
+        .build_session_context(None)
+        .messages;
+    let normalized_for_reopen = normalize_messages(&writer_restored_messages);
+    let reopen_context_sha256 = semantic_sha256(&normalized_for_reopen)?;
+    let transient_failure_notice_count = normalized
+        .as_array()
+        .map(|messages| {
+            messages
+                .iter()
+                .filter(|message| {
+                    message.get("role").and_then(Value::as_str) == Some("custom")
+                        && message.get("custom_type").and_then(Value::as_str)
+                            == Some("auto_compaction_failure_notice")
+                })
+                .count()
+        })
+        .unwrap_or(0);
     let summary_sha256 = sha256_hex(summary_text.as_bytes());
     let pairing = pairing_stats(&live);
-    let session_file = session.session_file();
-    let session_file_stats = session_file
-        .as_deref()
-        .map(|path| {
-            let bytes = std::fs::metadata(path).map(|meta| meta.len()).unwrap_or(0);
-            let lines = std::fs::read_to_string(path)
-                .map(|body| body.lines().count())
-                .unwrap_or(0);
-            json!({ "path": path, "bytes": bytes, "lines": lines })
-        })
-        .unwrap_or(Value::Null);
+    let session_file = session
+        .session_file()
+        .ok_or_else(|| "durable replay has no session JSONL path".to_string())?;
 
     let events = recorder.events.lock().unwrap().clone();
     let starts = observed.starts.lock().unwrap().clone();
@@ -2261,13 +2925,54 @@ async fn run_replay_case(
 
     session.dispose_async(Some(false)).await;
 
-    let pairing_json = json!({
-        "tool_calls": pairing.tool_calls,
-        "tool_results": pairing.tool_results,
-        "matched_results": pairing.matched_results,
-        "unmatched_results": pairing.unmatched_results,
-        "calls_without_result": pairing.calls_without_result,
+    let session_file_bytes = std::fs::read(&session_file)
+        .map_err(|error| format!("read durable session JSONL after dispose: {error}"))?;
+    let session_file_text = String::from_utf8(session_file_bytes.clone())
+        .map_err(|error| format!("durable session JSONL is not UTF-8: {error}"))?;
+    let raw_durable_graph = raw_durable_graph(&session_file_bytes)?;
+    let raw_durable_state = raw_durable_graph.branch;
+    let turn_delta = validate_durable_turn_delta(
+        &seeded_branch,
+        &raw_durable_state,
+        raw_durable_graph.entry_count,
+        options.expected_outcome,
+    )?;
+    validate_checkpoint_links(&raw_durable_state)?;
+    let raw_durable_pairing = raw_durable_pairing(&raw_durable_state)?;
+    let restored_pairing = pairing_stats(&writer_restored_messages);
+    let protected_state = protected_state_projection(&raw_durable_state);
+    let expected_admission = json!({
+        "summary_calls": options.expected_summary_calls,
+        "turn_calls": 1,
+        "injected_summary_failure": options.summary_failure,
     });
+    let reopen_evidence = json!({
+        "expected_admission": expected_admission,
+        "seeded_state": seeded_evidence,
+        "turn_delta": turn_delta,
+        "raw_durable_pairing": pairing_value(&raw_durable_pairing),
+        "restored_pairing": pairing_value(&restored_pairing),
+        "protected_state": protected_state,
+    });
+    let reopen_started = Instant::now();
+    let fresh_process_reopen = fresh_process_reopen(
+        &case_root,
+        case_counter,
+        &session_file,
+        &raw_durable_state,
+        &normalized_for_reopen,
+        &reopen_evidence,
+        options.timeout_secs,
+    )
+    .await?;
+    let fresh_reopen_ms = elapsed_ms(reopen_started);
+    let session_file_stats = json!({
+        "path": session_file,
+        "bytes": session_file_bytes.len(),
+        "lines": session_file_text.lines().count(),
+    });
+
+    let pairing_json = pairing_value(&pairing);
     let determinism_key = json!({
         "fixture": fixture.name,
         "retained_state_sha256": retained_state_sha256,
@@ -2307,9 +3012,16 @@ async fn run_replay_case(
         "stage_totals_ms": {
             "seed": seed_ms,
             "turn_and_compaction": turn_ms,
+            "fresh_process_reopen": fresh_reopen_ms,
         },
         "phases": phase_rows(&events),
         "provider_attempts": provider_attempt_rows(&events),
+        "expected_admission": expected_admission,
+        "seeded_state": seeded_evidence,
+        "durable_turn_delta": turn_delta,
+        "raw_durable_pairing": pairing_value(&raw_durable_pairing),
+        "restored_pairing": pairing_value(&restored_pairing),
+        "protected_state": protected_state,
         "provider_calls": provider_calls,
         "provider_call_counts": {
             "summary": summary_calls,
@@ -2322,15 +3034,20 @@ async fn run_replay_case(
             "tokens_before": tokens_before,
             "summary_chars": summary_text.chars().count(),
             "live_message_count": live.len(),
+            "writer_restored_message_count": writer_restored_messages.len(),
+            "live_minus_restored_message_count": live.len() as i64 - writer_restored_messages.len() as i64,
+            "transient_failure_notice_count": transient_failure_notice_count,
             "branch_entry_count": branch.len(),
         },
         "digests": {
             "retained_state_sha256": retained_state_sha256,
+            "reopen_context_sha256": reopen_context_sha256,
             "summary_sha256": summary_sha256,
             "pairing": pairing_json,
             "provider_requests_sha256": provider_requests_sha256,
         },
         "session_file": session_file_stats,
+        "fresh_process_reopen": fresh_process_reopen,
         "determinism_key": determinism_key,
     });
     Ok(case_result)
@@ -2350,24 +3067,600 @@ fn env_stamp(cli: &Cli) -> Value {
     })
 }
 
+fn runtime_stamp() -> Value {
+    let available = std::thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(1);
+    json!({
+        "charcount": {
+            "requested_mode": std::env::var("PRIME_AGENT_COMPACT_RUST_COUNT").unwrap_or_else(|_| "auto".to_string()),
+            "effective_backend": pi_coding_agent::core::compaction::charcount::backend().name(),
+            "dispatch_diagnostic": pi_coding_agent::core::compaction::charcount::diagnostic(),
+        },
+        "parallel": {
+            "requested_mode": std::env::var("PRIME_AGENT_COMPACTION_PARALLEL").unwrap_or_else(|_| "auto".to_string()),
+            "available_parallelism": available,
+            "effective_workers": available.min(6),
+            "fallback_count": pi_coding_agent::core::compaction::parallel::parallel_fallback_count(),
+        }
+    })
+}
+
+
+
+fn reopen_expectation_value<'a>(expected: &'a Value, pointer: &str) -> Result<&'a str, String> {
+    required_replay_value(expected, pointer)?
+        .as_str()
+        .ok_or_else(|| format!("reopen expectation {pointer} is not text"))
+}
+
+fn reopen_expectation_json<'a>(expected: &'a Value, pointer: &str) -> Result<&'a Value, String> {
+    expected
+        .pointer(pointer)
+        .ok_or_else(|| format!("reopen expectation lacks {pointer}"))
+}
+
+fn reopen_projection_difference(
+    expected: &Value,
+    actual: &Value,
+    pointer: &str,
+    stage: &str,
+) -> Result<(), String> {
+    if let Some(difference) = first_json_difference(Some(expected), Some(actual), pointer) {
+        return Err(stage_error(stage, format!("projection mismatch: {difference}")));
+    }
+    Ok(())
+}
+
+fn verify_reopen_projection(expected: &Value) -> Result<Value, String> {
+    let session_file = reopen_expectation_value(expected, "/session_file")?;
+    let input = PathBuf::from(session_file);
+    ensure_stage(input.is_file(), "session-open", format!("reopen input is not a readable file: {session_file}"))?;
+    let session_root = input
+        .parent()
+        .and_then(Path::parent)
+        .ok_or_else(|| stage_error("report-confinement", "reopen input is not under sessions/<file>"))?;
+    let expected_writer = required_replay_u64(expected, "/writer_pid")?;
+    ensure_stage(
+        expected_writer != std::process::id() as u64,
+        "fresh-process",
+        "verify-reopen must run in a fresh OS process",
+    )?;
+    let before = std::fs::read(&input)
+        .map_err(|error| stage_error("session-open", format!("read reopen input {session_file}: {error}")))?;
+    ensure_stage(!before.is_empty(), "session-open", "reopen input is empty")?;
+    let before_sha = sha256_hex(&before);
+    ensure_stage(
+        before_sha == reopen_expectation_value(expected, "/input_sha256")?,
+        "fixture-input-hash",
+        "reopen input differs from the writer's closed-session bytes",
+    )?;
+
+    // This is deliberately before SessionManager::open or any selected-branch
+    // operation. Off-branch corruption must not be hidden by the production UI index.
+    let graph = raw_durable_graph(&before)?;
+    let raw_branch = graph.branch;
+    let raw_graph_sha = semantic_sha256(&raw_branch)?;
+    let expected_durable = reopen_expectation_json(expected, "/durable_branch")?;
+    let actual_durable = serde_json::to_value(&raw_branch).map_err(|error| error.to_string())?;
+    reopen_projection_difference(expected_durable, &actual_durable, "/durable_branch", "raw-durable-parity")?;
+    ensure_stage(
+        raw_graph_sha == reopen_expectation_value(expected, "/durable_sha256")?,
+        "raw-durable-hash",
+        "reopened durable branch hash differs from the writer",
+    )?;
+    ensure_stage(
+        graph.entry_count == required_replay_u64(expected, "/graph_entry_count")? as usize,
+        "full-graph-integrity",
+        "full graph size differs from the writer",
+    )?;
+    validate_checkpoint_links(&raw_branch)?;
+
+    let expected_protected = reopen_expectation_json(expected, "/protected_state")?;
+    let actual_protected = protected_state_projection(&raw_branch);
+    reopen_projection_difference(
+        expected_protected.pointer("/checkpoints").ok_or_else(|| stage_error("checkpoint", "missing checkpoint expectation"))?,
+        actual_protected.pointer("/checkpoints").unwrap_or(&Value::Null),
+        "/protected_state/checkpoints",
+        "checkpoint",
+    )?;
+    reopen_projection_difference(
+        expected_protected.pointer("/custom_messages").ok_or_else(|| stage_error("protected-custom-state", "missing custom-state expectation"))?,
+        actual_protected.pointer("/custom_messages").unwrap_or(&Value::Null),
+        "/protected_state/custom_messages",
+        "protected-custom-state",
+    )?;
+    reopen_projection_difference(
+        expected_protected.pointer("/session_controls").ok_or_else(|| stage_error("protected-custom-state", "missing control-state expectation"))?,
+        actual_protected.pointer("/session_controls").unwrap_or(&Value::Null),
+        "/protected_state/session_controls",
+        "protected-custom-state",
+    )?;
+    let raw_pairing = raw_durable_pairing(&raw_branch)?;
+    let expected_raw_pairing = reopen_expectation_json(expected, "/raw_durable_pairing")?;
+    reopen_projection_difference(expected_raw_pairing, &pairing_value(&raw_pairing), "/raw_durable_pairing", "durable-tool-pairing")?;
+    validate_pairing_value(expected_raw_pairing, "durable-tool-pairing")?;
+
+    let session_dir = input
+        .parent()
+        .ok_or_else(|| stage_error("session-open", "reopen input has no session directory"))?;
+    let manager = SessionManager::open(session_file, Some(&session_dir.to_string_lossy()), None)
+        .map_err(|error| stage_error("session-open", error))?;
+    let rehydrated_branch = manager.get_branch(None);
+    let rehydrated_sha = semantic_sha256(&rehydrated_branch)?;
+    let restored_messages = manager.build_session_context(None).messages;
+    let normalized_restored_messages = normalize_messages(&restored_messages);
+    let retained_sha = semantic_sha256(&normalized_restored_messages)?;
+    let restored_message_count = restored_messages.len();
+    let branch_entry_count = raw_branch.len();
+    drop(manager);
+
+    let expected_normalized = reopen_expectation_json(expected, "/normalized_messages")?;
+    reopen_projection_difference(
+        expected_normalized,
+        &normalized_restored_messages,
+        "/normalized_messages",
+        "normalized-message-parity",
+    )?;
+    ensure_stage(
+        retained_sha == reopen_expectation_value(expected, "/retained_state_sha256")?,
+        "retained-state-hash",
+        "reopened restored message hash differs from the writer",
+    )?;
+    ensure_stage(
+        restored_message_count == required_replay_u64(expected, "/restored_message_count")? as usize,
+        "normalized-message-count",
+        "restored message count differs from the writer",
+    )?;
+    let restored_pairing = pairing_stats(&restored_messages);
+    let expected_restored_pairing = reopen_expectation_json(expected, "/restored_pairing")?;
+    reopen_projection_difference(expected_restored_pairing, &pairing_value(&restored_pairing), "/restored_pairing", "restored-tool-pairing")?;
+    validate_pairing_value(expected_restored_pairing, "restored-tool-pairing")?;
+
+    // Test-only fault injection for self-test-r1's disposable session. A normal
+    // expectation never sets this marker. The guard below must still reject the
+    // mutation even though the writer's input SHA matched on entry.
+    if expected.get("selftest_mutate_input_after_open").and_then(Value::as_bool) == Some(true) {
+        let mut mutated = before.clone();
+        mutated.extend_from_slice(b"selftest reader mutation\n");
+        std::fs::write(&input, &mutated)
+            .map_err(|error| stage_error("reader-mutation", format!("write selftest reader mutation: {error}")))?;
+    }
+    let after = std::fs::read(&input)
+        .map_err(|error| stage_error("raw-byte-integrity", format!("read reopen input after open/drop {session_file}: {error}")))?;
+    ensure_stage(after == before, "raw-byte-integrity", "read-only reopen changed the session JSONL bytes")?;
+    // Revalidate after close too: the opener must not hide or normalize an
+    // initially malformed graph while keeping the selected branch superficially valid.
+    raw_durable_graph(&after)?;
+    Ok(json!({
+        "schema": 1,
+        "operation": "verify-reopen",
+        "reader": {
+            "pid": std::process::id(),
+            "exe_sha256": exe_sha256()?,
+        },
+        "session_root": session_root,
+        "session_file": session_file,
+        "input_bytes_before_after": before.len(),
+        "input_sha256_before_after": before_sha,
+        "durable_sha256": raw_graph_sha,
+        "graph_entry_count": graph.entry_count,
+        "rehydrated_branch_sha256": rehydrated_sha,
+        "retained_state_sha256": retained_sha,
+        "branch_entry_count": branch_entry_count,
+        "restored_message_count": restored_message_count,
+        "raw_durable_pairing": pairing_value(&raw_pairing),
+        "restored_pairing": pairing_value(&restored_pairing),
+        "additional_user_or_provider_turns": 0,
+        "read_only_reopen": true,
+        "fresh_process": true,
+        "parity": "full graph + exact raw durable branch + normalized durable build_session_context + protected custom/checkpoint state",
+    }))
+}
+fn run_verify_reopen(cli: &Cli) -> Result<i32, String> {
+    let expectation_path = PathBuf::from(cli.required("expectation")?);
+    let out = PathBuf::from(cli.required("out")?);
+    let expected: Value = serde_json::from_str(
+        &std::fs::read_to_string(&expectation_path)
+            .map_err(|error| format!("read expectation: {error}"))?,
+    )
+    .map_err(|error| format!("parse expectation: {error}"))?;
+    let input = PathBuf::from(reopen_expectation_value(&expected, "/session_file")?);
+    let session_root = input
+        .parent()
+        .and_then(Path::parent)
+        .ok_or_else(|| stage_error("report-confinement", "reopen expectation has no case root"))?;
+    if out.starts_with(session_root) {
+        return Err(stage_error("report-confinement", "reopen report must be outside the measured case root"));
+    }
+    let report = verify_reopen_projection(&expected)?;
+    write_new_json(&out, &report)?;
+    Ok(0)
+}
+
+async fn execute_verify_reopen(
+    expectation_path: &Path,
+    report_path: &Path,
+    timeout_secs: u64,
+) -> Result<Value, String> {
+    let exe = std::env::current_exe().map_err(|error| error.to_string())?;
+    let mut command = tokio::process::Command::new(exe);
+    command
+        .arg("verify-reopen")
+        .arg("--expectation")
+        .arg(expectation_path)
+        .arg("--out")
+        .arg(report_path)
+        .kill_on_drop(true);
+    let output = tokio::time::timeout(Duration::from_secs(timeout_secs), command.output())
+        .await
+        .map_err(|_| format!("fresh-process reopen timed out after {timeout_secs}s"))?
+        .map_err(|error| format!("spawn fresh-process reopen: {error}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        return Err(format!(
+            "fresh-process reopen failed ({}): {} {}",
+            output.status,
+            stderr.chars().take(4000).collect::<String>(),
+            stdout.chars().take(1000).collect::<String>()
+        ));
+    }
+    let report: Value = serde_json::from_str(
+        &std::fs::read_to_string(report_path)
+            .map_err(|error| format!("read reopen report: {error}"))?,
+    )
+    .map_err(|error| format!("parse reopen report: {error}"))?;
+    if required_replay_u64(&report, "/reader/pid")? == std::process::id() as u64 {
+        return Err("reopen evidence was not produced by a fresh process".to_string());
+    }
+    let reader_exe = reopen_expectation_value(&report, "/reader/exe_sha256")?;
+    if reader_exe != exe_sha256()? {
+        return Err("reader executable identity differs from replay writer".to_string());
+    }
+    if !required_replay_bool(&report, "/read_only_reopen")?
+        || !required_replay_bool(&report, "/fresh_process")?
+        || required_replay_u64(&report, "/additional_user_or_provider_turns")? != 0
+    {
+        return Err("reopen evidence contract is incomplete".to_string());
+    }
+    Ok(report)
+}
+
+async fn fresh_process_reopen(
+    case_root: &Path,
+    case_counter: &AtomicU64,
+    session_file: &str,
+    durable_branch: &[Value],
+    normalized_messages: &Value,
+    reopen_evidence: &Value,
+    timeout_secs: u64,
+) -> Result<Value, String> {
+    let verification_root = case_root
+        .parent()
+        .ok_or_else(|| "case root has no parent for external verification".to_string())?
+        .join("r1-verification");
+    let sequence = case_counter.fetch_add(1, Ordering::SeqCst);
+    let stem = format!("reopen-{}-{sequence}", std::process::id());
+    let expectation_path = verification_root.join(format!("{stem}-expectation.json"));
+    let report_path = verification_root.join(format!("{stem}-report.json"));
+    let mut expected = json!({
+        "schema": 1,
+        "writer_pid": std::process::id(),
+        "session_file": session_file,
+        "input_sha256": sha256_hex(&std::fs::read(session_file).map_err(|error| format!("read closed session: {error}"))?),
+        "durable_sha256": semantic_sha256(durable_branch)?,
+        "retained_state_sha256": semantic_sha256(normalized_messages)?,
+        "durable_branch": durable_branch,
+        "normalized_messages": normalized_messages,
+        "restored_message_count": normalized_messages.as_array().map_or(0, Vec::len),
+        "graph_entry_count": durable_branch.len(),
+    });
+    let evidence = reopen_evidence.as_object().ok_or_else(|| stage_error("admission-evidence", "reopen evidence is not an object"))?;
+    expected.as_object_mut().ok_or_else(|| stage_error("admission-evidence", "reopen expectation is not an object"))?
+        .extend(evidence.clone());
+    write_new_json(&expectation_path, &expected)?;
+
+    let report = execute_verify_reopen(&expectation_path, &report_path, timeout_secs).await?;
+    Ok(json!({
+        "expectation": expectation_path,
+        "report_path": report_path,
+        "report": report,
+    }))
+}
+
+fn required_replay_value<'a>(case: &'a Value, pointer: &str) -> Result<&'a Value, String> {
+    case.pointer(pointer)
+        .ok_or_else(|| stage_error("admission-evidence", format!("missing replay evidence field {pointer}")))
+}
+
+fn required_replay_bool(case: &Value, pointer: &str) -> Result<bool, String> {
+    required_replay_value(case, pointer)?
+        .as_bool()
+        .ok_or_else(|| stage_error("admission-evidence", format!("replay evidence {pointer} is not boolean")))
+}
+
+fn required_replay_u64(case: &Value, pointer: &str) -> Result<u64, String> {
+    required_replay_value(case, pointer)?
+        .as_u64()
+        .ok_or_else(|| stage_error("admission-evidence", format!("replay evidence {pointer} is not a nonnegative integer")))
+}
+
+fn required_replay_nonempty_string(case: &Value, pointer: &str) -> Result<(), String> {
+    let value = required_replay_value(case, pointer)?
+        .as_str()
+        .ok_or_else(|| stage_error("admission-evidence", format!("replay evidence {pointer} is not text")))?;
+    if value.is_empty() {
+        return Err(stage_error("admission-evidence", format!("replay evidence {pointer} is empty")));
+    }
+    Ok(())
+}
+
+fn validate_pairing_value(pairing: &Value, stage: &str) -> Result<(), String> {
+    let tool_calls = required_replay_u64(pairing, "/tool_calls")?;
+    let tool_results = required_replay_u64(pairing, "/tool_results")?;
+    let matched = required_replay_u64(pairing, "/matched_results")?;
+    let unmatched = required_replay_u64(pairing, "/unmatched_results")?;
+    let calls_without_result = required_replay_u64(pairing, "/calls_without_result")?;
+    let duplicate_calls = required_replay_u64(pairing, "/duplicate_tool_call_ids")?;
+    let duplicate_results = required_replay_u64(pairing, "/duplicate_tool_result_ids")?;
+    ensure_stage(
+        tool_calls == tool_results && matched == tool_results && unmatched == 0
+            && calls_without_result == 0 && duplicate_calls == 0 && duplicate_results == 0,
+        stage,
+        format!(
+            "tool pairing is not one-to-one: calls={tool_calls} results={tool_results} matched={matched} unmatched={unmatched} missing={calls_without_result} duplicate_call_ids={duplicate_calls} duplicate_result_ids={duplicate_results}"
+        ),
+    )
+}
+
+fn validate_provider_calls(case: &Value, expected: ReplayOutcomeExpectation) -> Result<(), String> {
+    let expected_summaries = required_replay_u64(case, "/expected_admission/summary_calls")?;
+    let expected_turns = required_replay_u64(case, "/expected_admission/turn_calls")?;
+    let summaries = required_replay_u64(case, "/provider_call_counts/summary")?;
+    let turns = required_replay_u64(case, "/provider_call_counts/turn")?;
+    ensure_stage(
+        summaries == expected_summaries,
+        "summary-call-count",
+        format!("expected exactly {expected_summaries} summary calls, observed {summaries}"),
+    )?;
+    ensure_stage(
+        turns == expected_turns && expected_turns == 1,
+        "provider-turn-count",
+        format!("expected exactly one ordinary provider turn, observed {turns}"),
+    )?;
+    let calls = required_replay_value(case, "/provider_calls")?
+        .as_array()
+        .ok_or_else(|| stage_error("provider-call-record", "provider_calls is not an array"))?;
+    ensure_stage(
+        calls.len() as u64 == summaries + turns,
+        "provider-call-record",
+        format!("provider row count {} differs from typed counters {}", calls.len(), summaries + turns),
+    )?;
+    let injected_failure = match expected {
+        ReplayOutcomeExpectation::SummaryFailure => Some(
+            required_replay_value(case, "/expected_admission/injected_summary_failure")?
+                .as_str()
+                .filter(|error| !error.is_empty())
+                .ok_or_else(|| stage_error("summary-error-admission", "summary failure requires a nonempty injected provider error"))?,
+        ),
+        ReplayOutcomeExpectation::SuccessfulCompaction => None,
+    };
+    let mut summary_rows = 0u64;
+    let mut turn_rows = 0u64;
+    let mut seen_sequences = HashSet::<(bool, u64)>::new();
+    for (index, call) in calls.iter().enumerate() {
+        let is_summary = call.get("is_summary_call").and_then(Value::as_bool).ok_or_else(|| {
+            stage_error("provider-call-record", format!("provider row {index} has no Boolean is_summary_call"))
+        })?;
+        if is_summary {
+            summary_rows += 1;
+        } else {
+            turn_rows += 1;
+        }
+        let seq = call.get("seq").and_then(Value::as_u64).filter(|seq| *seq > 0).ok_or_else(|| {
+            stage_error("provider-call-record", format!("provider row {index} has no positive sequence"))
+        })?;
+        ensure_stage(
+            seen_sequences.insert((is_summary, seq)),
+            "provider-call-record",
+            format!("duplicate provider sequence for summary={is_summary}, seq={seq}"),
+        )?;
+        required_replay_nonempty_string(call, "/response_sha256")?;
+        required_replay_nonempty_string(call, "/payload_sha256")?;
+        let stop_reason = call.get("stop_reason").and_then(Value::as_str).ok_or_else(|| {
+            stage_error("provider-outcome", format!("provider row {index} has no typed stop_reason"))
+        })?;
+        let provider_error = match call.get("error_message") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(error)) if error.is_empty() => None,
+            Some(Value::String(error)) => Some(error.as_str()),
+            Some(_) => return Err(stage_error("provider-outcome", format!("provider row {index} has a non-string error_message"))),
+        };
+        if is_summary {
+            match injected_failure {
+                Some(injected) => {
+                    ensure_stage(
+                        stop_reason == "error" && provider_error == Some(injected),
+                        "summary-provider-outcome",
+                        format!("summary provider row {index} did not return the exact injected error"),
+                    )?;
+                }
+                None => {
+                    ensure_stage(
+                        stop_reason == "stop" && provider_error.is_none(),
+                        "summary-provider-outcome",
+                        format!("successful summary provider row {index} is not a clean stop"),
+                    )?;
+                }
+            }
+        } else {
+            ensure_stage(
+                stop_reason == "stop" && provider_error.is_none(),
+                "ordinary-provider-outcome",
+                format!("ordinary provider row {index} failed or stopped unexpectedly"),
+            )?;
+        }
+    }
+    ensure_stage(
+        summary_rows == expected_summaries && turn_rows == expected_turns,
+        "provider-call-record",
+        format!("typed provider rows summary={summary_rows} turn={turn_rows} do not match the exact expectation"),
+    )
+}
+
+fn validate_replay_case(
+    case: &Value,
+    expected: ReplayOutcomeExpectation,
+) -> Result<(), String> {
+    ensure_stage(required_replay_bool(case, "/roots_private")?, "private-roots", "session roots escaped the private case root")?;
+    ensure_stage(required_replay_bool(case, "/trigger/expected_fire")?, "expected-fire", "fixture threshold unexpectedly did not expect compaction")?;
+    ensure_stage(required_replay_bool(case, "/trigger/fired")?, "expected-fire", "expected compaction did not fire")?;
+    ensure_stage(
+        required_replay_u64(case, "/determinism_key/starts")? == 1
+            && required_replay_u64(case, "/determinism_key/ends")? == 1,
+        "compaction-event-pair",
+        "expected exactly one compaction start/end pair",
+    )?;
+    // Keep the original ordinary-turn gate and add the independently supplied exact budget.
+    ensure_stage(
+        required_replay_u64(case, "/provider_call_counts/turn")? == 1,
+        "provider-turn-count",
+        "expected exactly one ordinary provider turn and no synthetic extra turn",
+    )?;
+    ensure_stage(
+        required_replay_u64(case, "/provider_call_counts/summary")? > 0,
+        "summary-call-count",
+        "compaction fired without a summary request",
+    )?;
+    ensure_stage(
+        required_replay_u64(case, "/session_file/bytes")? > 0
+            && required_replay_u64(case, "/session_file/lines")? > 0,
+        "durable-session",
+        "durable session JSONL is empty or unreadable",
+    )?;
+    required_replay_nonempty_string(case, "/session_file/path")?;
+    for pointer in [
+        "/digests/retained_state_sha256",
+        "/digests/reopen_context_sha256",
+        "/digests/summary_sha256",
+        "/digests/provider_requests_sha256",
+        "/fresh_process_reopen/report/durable_sha256",
+        "/fresh_process_reopen/report/retained_state_sha256",
+    ] {
+        required_replay_nonempty_string(case, pointer)?;
+    }
+    validate_pairing_value(required_replay_value(case, "/digests/pairing")?, "live-tool-pairing")?;
+    validate_pairing_value(required_replay_value(case, "/raw_durable_pairing")?, "durable-tool-pairing")?;
+    validate_pairing_value(required_replay_value(case, "/restored_pairing")?, "restored-tool-pairing")?;
+    validate_provider_calls(case, expected)?;
+
+    let delta = required_replay_value(case, "/durable_turn_delta")?;
+    ensure_stage(required_replay_bool(delta, "/seed_unchanged")?, "durable-seed", "the single replay turn changed its seeded durable history")?;
+    ensure_stage(required_replay_u64(delta, "/added_entry_count")? == 4, "unexpected-durable-turns", "single replay turn must add exactly four durable entries")?;
+    ensure_stage(
+        required_replay_u64(delta, "/added_message_counts/user")? == 1
+            && required_replay_u64(delta, "/added_message_counts/assistant")? == 1
+            && required_replay_u64(delta, "/added_message_counts/tool_results")? == 0
+            && required_replay_u64(delta, "/added_message_counts/other")? == 0,
+        "unexpected-durable-turns",
+        "durable turn delta is not exactly one user plus one assistant message",
+    )?;
+    ensure_stage(
+        required_replay_u64(delta, "/graph_entry_count")? == required_replay_u64(delta, "/branch_entry_count")?
+            && required_replay_u64(delta, "/branch_entry_count")? == required_replay_u64(case, "/outcome/branch_entry_count")?,
+        "unexpected-durable-entry",
+        "full graph, selected branch and outcome counts disagree",
+    )?;
+    ensure_stage(
+        required_replay_u64(case, "/fresh_process_reopen/report/restored_message_count")?
+            == required_replay_u64(case, "/outcome/writer_restored_message_count")?,
+        "normalized-message-count",
+        "fresh-process restored message count differs from the writer",
+    )?;
+
+    match expected {
+        ReplayOutcomeExpectation::SuccessfulCompaction => {
+            ensure_stage(required_replay_u64(case, "/outcome/compaction_entries")? == 1, "successful-compaction", "successful-compaction requires exactly one durable compaction entry")?;
+            ensure_stage(required_replay_u64(delta, "/added_compaction_entries")? == 1, "checkpoint-count", "successful replay must add exactly one checkpoint")?;
+            ensure_stage(required_replay_u64(case, "/outcome/summary_chars")? > 0, "successful-compaction", "successful-compaction returned an empty summary")?;
+            required_replay_nonempty_string(case, "/outcome/first_kept_entry_id")?;
+            ensure_stage(required_replay_u64(case, "/outcome/live_message_count")? > 0, "successful-compaction", "successful-compaction has an empty restored context")?;
+            let end = required_replay_value(case, "/compaction_end_events/0")?;
+            ensure_stage(end.get("aborted").and_then(Value::as_bool) == Some(false), "successful-compaction", "successful-compaction ended aborted")?;
+            ensure_stage(end.get("will_retry").and_then(Value::as_bool) == Some(false), "successful-compaction", "successful-compaction unexpectedly requires retry")?;
+            ensure_stage(
+                end.get("error_message").is_none_or(|value| value.is_null() || value.as_str().is_none_or(str::is_empty)),
+                "successful-compaction",
+                "successful-compaction ended with an error",
+            )?;
+            ensure_stage(end.get("tokens_before").and_then(Value::as_f64).is_some(), "successful-compaction", "successful-compaction has no tokens_before result")?;
+            ensure_stage(required_replay_u64(case, "/outcome/transient_failure_notice_count")? == 0, "summary-error-persistence", "successful-compaction has a transient failure notice")?;
+            ensure_stage(
+                required_replay_value(case, "/outcome/live_minus_restored_message_count")?.as_i64() == Some(0),
+                "normalized-message-count",
+                "successful live and durable restored projections have unexpected extra turns",
+            )?;
+        }
+        ReplayOutcomeExpectation::SummaryFailure => {
+            ensure_stage(required_replay_u64(case, "/outcome/compaction_entries")? == 0, "summary-failure", "summary-failure unexpectedly committed compaction")?;
+            ensure_stage(required_replay_u64(delta, "/added_compaction_entries")? == 0, "checkpoint-count", "summary failure must add no checkpoint")?;
+            let injected = required_replay_value(case, "/expected_admission/injected_summary_failure")?.as_str().ok_or_else(|| stage_error("summary-error-admission", "injected failure is not text"))?;
+            let error = required_replay_value(case, "/compaction_end_events/0/error_message")?.as_str().ok_or_else(|| stage_error("end-summary-error", "summary-failure ended without an error message"))?;
+            let intended = format!("Auto-compaction failed: Summarization failed: {injected}");
+            ensure_stage(error == intended, "end-summary-error", format!("summary-failure end error {error:?} does not match the exact injected summarization outcome {intended:?}"))?;
+            ensure_stage(required_replay_u64(case, "/outcome/transient_failure_notice_count")? == 1, "summary-error-persistence", "summary-failure does not have exactly one live failure notice")?;
+            ensure_stage(
+                required_replay_value(case, "/outcome/live_minus_restored_message_count")?.as_i64() == Some(1),
+                "summary-error-persistence",
+                "summary-failure durable context must contain zero transient notices while live state contains exactly one",
+            )?;
+        }
+    }
+    let report = required_replay_value(case, "/fresh_process_reopen/report")?;
+    ensure_stage(required_replay_bool(report, "/fresh_process")? && required_replay_bool(report, "/read_only_reopen")?, "fresh-process", "fresh-process and read-only evidence is required")?;
+    ensure_stage(required_replay_u64(report, "/additional_user_or_provider_turns")? == 0, "unexpected-durable-turns", "reopen reported an additional user/provider turn")?;
+    Ok(())
+}
 async fn run_replay(cli: &Cli) -> Result<i32, String> {
     let fixture_path = PathBuf::from(cli.required("fixture")?);
     let out = PathBuf::from(cli.required("out")?);
     let cases = discover_fixtures(&fixture_path)?;
+    let summary_failure = cli.optional("summary-failure");
+    let expected_outcome = match cli.optional("expect-outcome") {
+        Some(raw) => ReplayOutcomeExpectation::parse(&raw)?,
+        None if summary_failure.is_some() => ReplayOutcomeExpectation::SummaryFailure,
+        None => ReplayOutcomeExpectation::SuccessfulCompaction,
+    };
+    if expected_outcome == ReplayOutcomeExpectation::SuccessfulCompaction && summary_failure.is_some() {
+        return Err(
+            "--expect-outcome successful-compaction conflicts with --summary-failure".to_string(),
+        );
+    }
+    if expected_outcome == ReplayOutcomeExpectation::SummaryFailure && summary_failure.is_none() {
+        return Err("--expect-outcome summary-failure requires --summary-failure MSG".to_string());
+    }
+    ensure_stage(
+        cli.options.contains_key("expect-summary-calls"),
+        "cli-expect-summary-calls",
+        "--expect-summary-calls N is required and must come from the fixture/options baseline, never the observed call count",
+    )?;
+    let expected_summary_calls = cli.integer("expect-summary-calls", 1, 1, 1_000_000)?;
     let options = ReplayOptions {
-        provider_delay_ms: cli.number("provider-delay-ms", 0.0)? as u64,
-        summary_failure: cli.optional("summary-failure"),
-        context_window: cli.number("context-window", 1_000_000.0)?,
-        keep_recent: match cli.number("keep-recent", f64::NAN) {
-            Ok(value) if value.is_finite() => Some(value),
-            Ok(_) => None,
-            Err(error) => return Err(error),
+        provider_delay_ms: cli.integer("provider-delay-ms", 0, 0, 3_600_000)? as u64,
+        summary_failure,
+        expected_outcome,
+        expected_summary_calls,
+        context_window: cli.positive_number("context-window", 1_000_000.0, 1_000_000_000.0)?,
+        keep_recent: match cli.options.contains_key("keep-recent") {
+            true => Some(cli.positive_number("keep-recent", 1.0, 1_000_000_000.0)?),
+            false => None,
         },
         work: cli
             .optional("work")
             .map(PathBuf::from)
             .unwrap_or_else(|| std::env::temp_dir().join("compaction-replay-work")),
-        timeout_secs: cli.number("timeout-secs", 900.0)? as u64,
+        timeout_secs: cli.integer("timeout-secs", 900, 1, 86_400)? as u64,
     };
     std::fs::create_dir_all(&options.work).map_err(|error| format!("mkdir work: {error}"))?;
     let counter = AtomicU64::new(0);
@@ -2382,7 +3675,14 @@ async fn run_replay(cli: &Cli) -> Result<i32, String> {
         )
         .await;
         match case {
-            Ok(Ok(value)) => case_results.push(value),
+            Ok(Ok(value)) => match validate_replay_case(&value, options.expected_outcome) {
+                Ok(()) => case_results.push(value),
+                Err(error) => {
+                    let failure = format!("{}: admission failed: {error}", fixture.name);
+                    eprintln!("replay failed: {failure}");
+                    failures.push(failure);
+                }
+            },
             Ok(Err(error)) => {
                 let failure = format!("{}: {error}", fixture.name);
                 eprintln!("replay failed: {failure}");
@@ -2400,9 +3700,12 @@ async fn run_replay(cli: &Cli) -> Result<i32, String> {
         "subcommand": "replay",
         "schema": 1,
         "env": env_stamp(cli),
+        "runtime": runtime_stamp(),
         "config": {
             "provider_delay_ms": options.provider_delay_ms,
             "summary_failure": options.summary_failure,
+            "expect_outcome": options.expected_outcome.as_str(),
+            "expect_summary_calls": options.expected_summary_calls,
             "context_window": options.context_window,
             "keep_recent": options.keep_recent,
             "timeout_secs": options.timeout_secs,
@@ -2411,7 +3714,7 @@ async fn run_replay(cli: &Cli) -> Result<i32, String> {
         "cases": case_results,
         "failures": failures,
     });
-    write_json(&out, &output)?;
+    write_new_json(&out, &output)?;
     println!("wrote {} ({} cases, {} failures)", out.display(), output["case_count"], failures.len());
     if failures.is_empty() {
         Ok(0)
@@ -2453,11 +3756,13 @@ fn bench_kernel(
         }
     }
     let (alloc_count, alloc_bytes) = allocs.unwrap_or((0, 0));
+    let stats = timing_stats(samples);
+    assert_eq!(stats["n"].as_u64(), Some(iters as u64), "timed sample count must equal requested iterations");
     json!({
         "name": name,
         "detail": detail,
         "warmup": warmup,
-        "stats": timing_stats(samples),
+        "stats": stats,
         "allocs_first_iter": {
             "count": alloc_count,
             "bytes": alloc_bytes,
@@ -2466,13 +3771,81 @@ fn bench_kernel(
     })
 }
 
+fn bench_kernel_fallible(
+    name: &str,
+    detail: Value,
+    warmup: usize,
+    iters: usize,
+    mut kernel: impl FnMut() -> Result<f64, String>,
+) -> Result<Value, String> {
+    ensure_stage(warmup > 0 && iters > 0, "bench-config", "warmup and iterations must be positive")?;
+    let mut checksum = 0.0f64;
+    for _ in 0..warmup {
+        checksum += kernel()?;
+    }
+    let mut samples = Vec::with_capacity(iters);
+    let mut allocs = None;
+    let before_first = alloc_snapshot();
+    for index in 0..iters {
+        let started = Instant::now();
+        checksum += kernel()?;
+        samples.push(elapsed_ms(started));
+        if index == 0 {
+            let after_first = alloc_snapshot();
+            allocs = Some((
+                after_first.0.saturating_sub(before_first.0),
+                after_first.1.saturating_sub(before_first.1),
+            ));
+        }
+    }
+    let (alloc_count, alloc_bytes) = allocs.unwrap_or((0, 0));
+    let stats = timing_stats(samples);
+    ensure_stage(stats["n"].as_u64() == Some(iters as u64), "timed-sample-count", "sample count differs from requested iterations")?;
+    Ok(json!({
+        "name": name,
+        "detail": detail,
+        "warmup": warmup,
+        "stats": stats,
+        "allocs_first_iter": {"count": alloc_count, "bytes": alloc_bytes},
+        "checksum": checksum,
+    }))
+}
+
+fn jev_expected_skip_value(
+    message_count: usize,
+    skip: pi_jev::compaction::CompactionSkip,
+) -> Value {
+    json!({
+        "name": "jev_prepare_context",
+        "detail": {"messages": message_count},
+        "outcome": "expected-skip",
+        "skip_class": skip.as_str(),
+        "stats": Value::Null,
+        "checksum": Value::Null,
+        "note": "Named expected-skip lane; no numeric timing or sentinel is admitted",
+    })
+}
+
 fn run_bench_local(cli: &Cli) -> Result<i32, String> {
     let fixture_path = PathBuf::from(cli.required("fixture")?);
     let out = PathBuf::from(cli.required("out")?);
-    let iters = cli.number("iters", 20.0)? as usize;
-    let warmup = cli.number("warmup", 3.0)? as usize;
-    let chunk_context_window = cli.number("chunk-context-window", 32_768.0)?;
+    let iters = cli.integer("iters", 20, 1, 100_000)?;
+    let warmup = cli.integer("warmup", 3, 1, 100_000)?;
+    let chunk_context_window = cli.positive_number("chunk-context-window", 32_768.0, 1_000_000_000.0)?;
     let cases = discover_fixtures(&fixture_path)?;
+    // All fallible production entries are validated for all cases before any
+    // timer starts. Full-output comparison is the separate verify-local gate.
+    let mut preflight = Vec::new();
+    for case_dir in &cases {
+        let fixture = load_fixture(case_dir)?;
+        let projection = local_parity::case_projection(&fixture, chunk_context_window)
+            .map_err(|error| format!("{}: non-timed preflight failed: {error}", fixture.name))?;
+        preflight.push(json!({
+            "case": fixture.name,
+            "full_output_sha256": semantic_sha256(&projection)?,
+            "note": "preflight digest only; use verify-local for exact full-output parity",
+        }));
+    }
 
     let mut results: Vec<Value> = Vec::new();
     for case_dir in &cases {
@@ -2582,7 +3955,7 @@ fn run_bench_local(cli: &Cli) -> Result<i32, String> {
             let entries = entries.clone();
             let settings = settings.clone();
             let messages = messages.clone();
-            kernels.push(bench_kernel(
+            kernels.push(bench_kernel_fallible(
                 "prepare_compaction",
                 json!({
                     "entries": entries.len(),
@@ -2592,17 +3965,15 @@ fn run_bench_local(cli: &Cli) -> Result<i32, String> {
                 warmup,
                 iters,
                 move || {
-                    // Mirrors the production context builder: the threshold
-                    // estimate over the live message list.
                     prepare_compaction(
                         &entries,
                         &settings,
                         &|_entries| estimate_context_tokens(&messages).tokens,
                     )
                     .map(|preparation| preparation.tokens_before)
-                    .unwrap_or(-1.0)
+                    .ok_or_else(|| stage_error("prepare-compaction", "production prepare_compaction returned None during timing; rejecting the run"))
                 },
-            ));
+            )?);
         }
         // 5. convert_to_llm.
         let llm = {
@@ -2793,24 +4164,24 @@ fn run_bench_local(cli: &Cli) -> Result<i32, String> {
         {
             let messages = messages.clone();
             let config = CompactionConfig::default();
-            let mut skip_note: Option<String> = None;
-            if let Err(skip) = prepare_context(&messages, &config) {
-                skip_note = Some(skip.to_string());
+            match prepare_context(&messages, &config) {
+                Err(skip @ (pi_jev::compaction::CompactionSkip::NoCandidates | pi_jev::compaction::CompactionSkip::InsufficientReduction)) => {
+                    kernels.push(jev_expected_skip_value(messages.len(), skip));
+                }
+                Err(skip) => return Err(stage_error("jev-prepare", format!("unexpected Jev error: {}", skip.as_str()))),
+                Ok(_) => {
+                    kernels.push(bench_kernel_fallible(
+                        "jev_prepare_context",
+                        json!({"messages": messages.len(), "outcome": "prepared"}),
+                        warmup,
+                        iters,
+                        move || match prepare_context(&messages, &config) {
+                            Ok(prepared) => Ok(prepared.baseline.estimated_tokens_before as f64),
+                            Err(skip) => Err(stage_error("jev-prepare", format!("unexpected Jev error during timing: {}", skip.as_str()))),
+                        },
+                    )?);
+                }
             }
-            let note = skip_note;
-            kernels.push(bench_kernel(
-                "jev_prepare_context",
-                json!({
-                    "messages": messages.len(),
-                    "skip_on_first_call": note,
-                }),
-                warmup,
-                iters,
-                move || match prepare_context(&messages, &config) {
-                    Ok(prepared) => prepared.baseline.estimated_tokens_before as f64,
-                    Err(_) => -1.0,
-                },
-            ));
         }
 
         results.push(json!({
@@ -2824,6 +4195,7 @@ fn run_bench_local(cli: &Cli) -> Result<i32, String> {
         "subcommand": "bench-local",
         "schema": 1,
         "env": env_stamp(cli),
+        "runtime": runtime_stamp(),
         "config": {
             "iters": iters,
             "warmup": warmup,
@@ -2835,13 +4207,572 @@ fn run_bench_local(cli: &Cli) -> Result<i32, String> {
             "Peak RSS is not measured: sysinfo is not a dependency of pi-coding-agent and no new dependencies are allowed.",
             "Allocation counts are process-global deltas around the first measured iteration (counting global allocator, std-only).",
         ],
+        "non_timed_preflight": preflight,
+        "parity_gate": "verify-local; scalar checksums are auxiliary only",
         "cases": results,
     });
-    write_json(&out, &output)?;
+    write_new_json(&out, &output)?;
     println!("wrote {}", out.display());
     Ok(0)
 }
 
+
+fn seed_reopen_selftest_case(case_root: &Path) -> Result<(PathBuf, Value), String> {
+    let cwd = case_root.join("workspace");
+    let sessions = case_root.join("sessions");
+    std::fs::create_dir_all(&cwd).map_err(|error| format!("mkdir selftest cwd: {error}"))?;
+    std::fs::create_dir_all(&sessions).map_err(|error| format!("mkdir selftest sessions: {error}"))?;
+    let mut manager = SessionManager::create(
+        &cwd.to_string_lossy(),
+        Some(&sessions.to_string_lossy()),
+    )?;
+    for text in ["first retained sentinel user", "second retained user"] {
+        manager.append_message(AgentMessage::Message(Message::User(UserMessage::new(
+            UserContent::Text(text.to_string()),
+            FIXTURE_TIMESTAMP_BASE,
+        ))))?;
+    }
+    let first_id = manager
+        .get_branch(None)
+        .first()
+        .and_then(|entry| entry.get("id"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| "selftest first entry id missing".to_string())?
+        .to_string();
+    manager.append_compaction(
+        "## Goal\nR1 selftest summary.",
+        &first_id,
+        42.0,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )?;
+    let custom = CustomMessageEntryContent::Text("retained protected custom content".to_string());
+    manager.append_custom_message_entry(
+        "r1_protected_custom",
+        &custom,
+        false,
+        Some(json!({"opaque_state": {"version": 7, "retained": true}})),
+    )?;
+    // Extension-owned data is not part of LLM message conversion. It must still
+    // survive as exact durable protected state rather than disappear silently.
+    manager.append_custom_entry(
+        "r1_extension_state",
+        Some(json!({"opaque_bytes": [0, 1, 2, 255], "schema": "r1-selftest"})),
+    )?;
+    manager.flush_now()?;
+    let session_file = manager
+        .get_session_file()
+        .ok_or_else(|| "selftest session file missing".to_string())?;
+    let messages = manager.build_session_context(None).messages;
+    let normalized = normalize_messages(&messages);
+    let restored_pairing = pairing_stats(&messages);
+    let retained_state_sha256 = semantic_sha256(&normalized)?;
+    drop(manager);
+    let bytes = std::fs::read(&session_file).map_err(|error| format!("read selftest session: {error}"))?;
+    let graph = raw_durable_graph(&bytes)?;
+    let durable_branch = graph.branch;
+    let raw_pairing = raw_durable_pairing(&durable_branch)?;
+    let durable_sha256 = semantic_sha256(&durable_branch)?;
+    let protected_state = protected_state_projection(&durable_branch);
+    validate_checkpoint_links(&durable_branch)?;
+    let expected = json!({
+        "schema": 1,
+        "writer_pid": std::process::id(),
+        "session_file": session_file,
+        "input_sha256": sha256_hex(&bytes),
+        "durable_sha256": durable_sha256,
+        "retained_state_sha256": retained_state_sha256,
+        "durable_branch": durable_branch,
+        "normalized_messages": normalized,
+        "restored_message_count": messages.len(),
+        "graph_entry_count": graph.entry_count,
+        "raw_durable_pairing": pairing_value(&raw_pairing),
+        "restored_pairing": pairing_value(&restored_pairing),
+        "protected_state": protected_state,
+    });
+    Ok((PathBuf::from(session_file), expected))
+}
+fn selftest_admission_success() -> Value {
+    let pairing = json!({
+        "tool_calls": 0,
+        "tool_results": 0,
+        "matched_results": 0,
+        "unmatched_results": 0,
+        "calls_without_result": 0,
+        "duplicate_tool_call_ids": 0,
+        "duplicate_tool_result_ids": 0,
+    });
+    json!({
+        "roots_private": true,
+        "trigger": {"expected_fire": true, "fired": true},
+        "determinism_key": {"starts": 1, "ends": 1},
+        "expected_admission": {"summary_calls": 1, "turn_calls": 1, "injected_summary_failure": null},
+        "provider_call_counts": {"turn": 1, "summary": 1},
+        "provider_calls": [
+            {"seq": 1, "is_summary_call": true, "stop_reason": "stop", "error_message": null, "response_sha256": "summary-response", "payload_sha256": "summary-request"},
+            {"seq": 1, "is_summary_call": false, "stop_reason": "stop", "error_message": null, "response_sha256": "turn-response", "payload_sha256": "turn-request"}
+        ],
+        "session_file": {"path": "private-case/session.jsonl", "bytes": 100, "lines": 6},
+        "seeded_state": {"fixture_message_count": 1, "branch_entry_count": 1},
+        "durable_turn_delta": {
+            "added_entry_count": 4,
+            "added_message_counts": {"user": 1, "assistant": 1, "tool_results": 0, "other": 0},
+            "added_compaction_entries": 1,
+            "added_custom_types": ["harness_digest"],
+            "seed_unchanged": true,
+            "graph_entry_count": 5,
+            "branch_entry_count": 5
+        },
+        "digests": {
+            "retained_state_sha256": "retained",
+            "reopen_context_sha256": "reopen",
+            "summary_sha256": "summary",
+            "provider_requests_sha256": "requests",
+            "pairing": pairing,
+        },
+        "raw_durable_pairing": pairing,
+        "restored_pairing": pairing,
+        "outcome": {
+            "compaction_entries": 1,
+            "transient_failure_notice_count": 0,
+            "summary_chars": 32,
+            "first_kept_entry_id": "entry",
+            "live_message_count": 3,
+            "writer_restored_message_count": 3,
+            "live_minus_restored_message_count": 0,
+            "branch_entry_count": 5,
+        },
+        "compaction_end_events": [{
+            "aborted": false,
+            "will_retry": false,
+            "error_message": null,
+            "tokens_before": 42.0,
+        }],
+        "fresh_process_reopen": {"report": {
+            "fresh_process": true,
+            "read_only_reopen": true,
+            "additional_user_or_provider_turns": 0,
+            "durable_sha256": "durable",
+            "retained_state_sha256": "reopen",
+            "restored_message_count": 3
+        }}
+    })
+}
+
+fn expect_admission_rejection(
+    checks: &mut Vec<Value>,
+    name: &str,
+    case: &Value,
+    expected: ReplayOutcomeExpectation,
+    stage: &str,
+    required_reason: &str,
+) -> Result<(), String> {
+    match validate_replay_case(case, expected) {
+        Err(message)
+            if message.contains(&format!("[{stage}]")) && message.contains(required_reason) =>
+        {
+            checks.push(json!({"name": name, "rejected": true, "intended_stage": stage, "error": message}));
+            Ok(())
+        }
+        other => Err(format!("{name} negative control did not reject at {stage}: {other:?}")),
+    }
+}
+
+async fn expect_reopen_rejection(
+    checks: &mut Vec<Value>,
+    name: &str,
+    expected: &Value,
+    verification: &Path,
+    stage: &str,
+) -> Result<(), String> {
+    let expectation_path = verification.join(format!("{name}-expectation.json"));
+    let report_path = verification.join(format!("{name}-report.json"));
+    write_new_json(&expectation_path, expected)?;
+    let input = PathBuf::from(reopen_expectation_value(expected, "/session_file")?);
+    // Some controls deliberately make the on-disk input differ from the writer's
+    // expected input hash. Compare before/after reader bytes, not that stale
+    // expectation, when proving that the reader itself did not mutate the file.
+    let original_input_bytes = std::fs::read(&input).map_err(|error| error.to_string())?;
+    match execute_verify_reopen(&expectation_path, &report_path, 60).await {
+        Err(message) if message.contains(&format!("[{stage}]")) => {
+            ensure_stage(
+                !report_path.exists(),
+                "selftest-control",
+                format!("{name} wrote an accepted report despite intended rejection"),
+            )?;
+            let after = std::fs::read(&input).map_err(|error| error.to_string())?;
+            ensure_stage(
+                after == original_input_bytes,
+                "selftest-control",
+                format!("{name} reader modified the input while rejecting"),
+            )?;
+            checks.push(json!({
+                "name": name,
+                "rejected": true,
+                "intended_stage": stage,
+                "error": message,
+                "input_unchanged_by_reader": true,
+            }));
+            Ok(())
+        }
+        other => Err(format!("{name} did not reject at {stage}: {other:?}")),
+    }
+}
+
+fn tool_pairing_fixture(call_ids: &[&str], result_ids: &[&str]) -> Vec<AgentMessage> {
+    let calls = call_ids
+        .iter()
+        .map(|id| ContentBlock::ToolCall(ToolCall::new(id.to_string(), "read".to_string(), Map::new())))
+        .collect();
+    let mut messages = vec![AgentMessage::Message(Message::Assistant(AssistantMessage {
+        content: calls,
+        api: "r1-selftest".to_string(),
+        provider: "r1-selftest".to_string(),
+        model: "r1-selftest".to_string(),
+        stop_reason: "stop".to_string(),
+        timestamp: FIXTURE_TIMESTAMP_BASE,
+        usage: Usage::zero(),
+        ..Default::default()
+    }))];
+    for (index, id) in result_ids.iter().enumerate() {
+        messages.push(AgentMessage::Message(Message::ToolResult(ToolResultMessage::new(
+            id.to_string(),
+            "read".to_string(),
+            vec![ImageOrTextContent::Text(TextContent::new("tool output".to_string()))],
+            false,
+            FIXTURE_TIMESTAMP_BASE + index as i64 + 1,
+        ))));
+    }
+    messages
+}
+
+fn append_raw_jsonl(input: &Path, entries: &[Value]) -> Result<Vec<u8>, String> {
+    let mut bytes = std::fs::read(input).map_err(|error| error.to_string())?;
+    for entry in entries {
+        bytes.extend_from_slice(serde_json::to_string(entry).map_err(|error| error.to_string())?.as_bytes());
+        bytes.push(b'\n');
+    }
+    std::fs::write(input, &bytes).map_err(|error| error.to_string())?;
+    Ok(bytes)
+}
+
+// Test-only selected-branch walker: it deliberately ignores unrelated
+// components. The genuinely off-branch controls must reach this branch through
+// a new valid child while remaining invisible to this walker.
+fn loose_selected_branch_ids(input: &Path) -> Result<HashSet<String>, String> {
+    let bytes = std::fs::read(input).map_err(|error| error.to_string())?;
+    let entries = bytes.split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_slice::<Value>(line).map_err(|error| error.to_string()))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut current = entries.iter().rev()
+        .find(|entry| entry["type"] != "session")
+        .and_then(|entry| entry["id"].as_str())
+        .map(str::to_owned)
+        .ok_or_else(|| "no durable leaf in selected-branch control".to_string())?;
+    let mut selected = HashSet::new();
+    loop {
+        ensure_stage(selected.insert(current.clone()), "selftest-control", "selected control branch unexpectedly cycles")?;
+        let entry = entries.iter().find(|entry| entry["id"].as_str() == Some(&current))
+            .ok_or_else(|| format!("selected control entry {current} is missing"))?;
+        match entry["parentId"].as_str() {
+            Some(parent) => current = parent.to_owned(),
+            None => return Ok(selected),
+        }
+    }
+}
+
+async fn run_r1_self_test(cli: &Cli) -> Result<i32, String> {
+    let work = PathBuf::from(cli.required("work")?);
+    let out = PathBuf::from(cli.required("out")?);
+    let root = work.join(format!("r1-selftest-{}", std::process::id()));
+    let verification = root.join("verification");
+    std::fs::create_dir_all(&verification).map_err(|error| format!("mkdir selftest: {error}"))?;
+    let mut checks = Vec::new();
+
+    let no_fire = json!({
+        "roots_private": true,
+        "trigger": {"expected_fire": true, "fired": false},
+    });
+    for (name, expected) in [
+        ("successful_no_fire_rejected", ReplayOutcomeExpectation::SuccessfulCompaction),
+        ("summary_failure_no_fire_rejected", ReplayOutcomeExpectation::SummaryFailure),
+    ] {
+        expect_admission_rejection(&mut checks, name, &no_fire, expected, "expected-fire", "did not fire")?;
+    }
+
+    let valid_success = selftest_admission_success();
+    validate_replay_case(&valid_success, ReplayOutcomeExpectation::SuccessfulCompaction)
+        .map_err(|error| format!("selftest valid-success fixture is invalid: {error}"))?;
+    checks.push(json!({"name": "valid_success_admission_accepted", "accepted": true}));
+    let injected = "R1 intentional summary failure";
+    let mut valid_failure = valid_success.clone();
+    valid_failure["expected_admission"]["injected_summary_failure"] = json!(injected);
+    valid_failure["provider_calls"][0]["stop_reason"] = json!("error");
+    valid_failure["provider_calls"][0]["error_message"] = json!(injected);
+    valid_failure["outcome"]["compaction_entries"] = json!(0);
+    valid_failure["outcome"]["transient_failure_notice_count"] = json!(1);
+    valid_failure["outcome"]["first_kept_entry_id"] = Value::Null;
+    valid_failure["outcome"]["summary_chars"] = json!(0);
+    valid_failure["outcome"]["live_message_count"] = json!(4);
+    valid_failure["outcome"]["live_minus_restored_message_count"] = json!(1);
+    valid_failure["compaction_end_events"][0]["error_message"] = json!(format!("Auto-compaction failed: Summarization failed: {injected}"));
+    valid_failure["durable_turn_delta"]["added_compaction_entries"] = json!(0);
+    valid_failure["durable_turn_delta"]["added_custom_types"] = json!(["compaction_outcome", "harness_digest"]);
+    validate_replay_case(&valid_failure, ReplayOutcomeExpectation::SummaryFailure)
+        .map_err(|error| format!("selftest valid-failure fixture is invalid: {error}"))?;
+    checks.push(json!({"name": "valid_summary_failure_admission_accepted", "accepted": true}));
+    let mut success_reported_as_failure = valid_success.clone();
+    success_reported_as_failure["expected_admission"]["injected_summary_failure"] = json!(injected);
+    expect_admission_rejection(
+        &mut checks,
+        "success_reported_as_summary_failure_rejected",
+        &success_reported_as_failure,
+        ReplayOutcomeExpectation::SummaryFailure,
+        "summary-provider-outcome",
+        "exact injected error",
+    )?;
+    let mut failure_reported_as_success = valid_failure.clone();
+    failure_reported_as_success["expected_admission"]["injected_summary_failure"] = Value::Null;
+    expect_admission_rejection(
+        &mut checks,
+        "summary_failure_reported_as_success_rejected",
+        &failure_reported_as_success,
+        ReplayOutcomeExpectation::SuccessfulCompaction,
+        "summary-provider-outcome",
+        "clean stop",
+    )?;
+
+    let mut missing_compaction = valid_success.clone();
+    missing_compaction["outcome"]["compaction_entries"] = json!(0);
+    expect_admission_rejection(&mut checks, "missing_compaction_rejected", &missing_compaction, ReplayOutcomeExpectation::SuccessfulCompaction, "successful-compaction", "exactly one durable compaction entry")?;
+    let mut wrong_end_error = valid_failure.clone();
+    wrong_end_error["compaction_end_events"][0]["error_message"] = json!("Auto-compaction failed: session persistence failed");
+    expect_admission_rejection(&mut checks, "unrelated_end_error_rejected", &wrong_end_error, ReplayOutcomeExpectation::SummaryFailure, "end-summary-error", "exact injected summarization outcome")?;
+    let mut wrong_provider_error = valid_failure.clone();
+    wrong_provider_error["provider_calls"][0]["error_message"] = json!("session persistence failed");
+    expect_admission_rejection(&mut checks, "unrelated_provider_error_rejected", &wrong_provider_error, ReplayOutcomeExpectation::SummaryFailure, "summary-provider-outcome", "exact injected error")?;
+    let mut extra_turn = valid_success.clone();
+    extra_turn["provider_call_counts"]["turn"] = json!(2);
+    expect_admission_rejection(&mut checks, "extra_provider_turn_rejected", &extra_turn, ReplayOutcomeExpectation::SuccessfulCompaction, "provider-turn-count", "exactly one ordinary provider turn")?;
+    let mut extra_summary = valid_success.clone();
+    extra_summary["provider_call_counts"]["summary"] = json!(2);
+    expect_admission_rejection(&mut checks, "extra_summary_call_rejected", &extra_summary, ReplayOutcomeExpectation::SuccessfulCompaction, "summary-call-count", "expected exactly 1 summary calls")?;
+    let mut extra_durable_turn = valid_success.clone();
+    extra_durable_turn["durable_turn_delta"]["added_message_counts"]["assistant"] = json!(2);
+    expect_admission_rejection(&mut checks, "extra_durable_assistant_rejected", &extra_durable_turn, ReplayOutcomeExpectation::SuccessfulCompaction, "unexpected-durable-turns", "exactly one user plus one assistant")?;
+
+    for (name, calls, results, failure_pointer) in [
+        ("duplicate_tool_call_id_rejected", vec!["same", "same"], vec!["same"], "/duplicate_tool_call_ids"),
+        ("duplicate_tool_result_rejected", vec!["same"], vec!["same", "same"], "/duplicate_tool_result_ids"),
+        ("missing_tool_result_rejected", vec!["missing"], vec![], "/calls_without_result"),
+        ("unmatched_tool_result_rejected", vec!["call"], vec!["unmatched"], "/unmatched_results"),
+    ] {
+        let messages = tool_pairing_fixture(&calls, &results);
+        let pairing = pairing_value(&pairing_stats(&messages));
+        ensure_stage(
+            required_replay_u64(&pairing, failure_pointer)? > 0,
+            "selftest-control",
+            format!("{name} did not inject the intended tool-record defect"),
+        )?;
+        match validate_pairing_value(&pairing, "tool-pairing-selftest") {
+            Err(message) if message.contains("[tool-pairing-selftest]") => {
+                checks.push(json!({"name": name, "rejected": true, "intended_stage": "tool-pairing-selftest", "error": message, "pairing": pairing}));
+            }
+            other => return Err(format!("{name} was not rejected for its intended stage: {other:?}")),
+        }
+    }
+
+    let (positive_input, positive_expected) = seed_reopen_selftest_case(&root.join("positive"))?;
+    let positive_expectation = verification.join("positive-expectation.json");
+    let positive_report = verification.join("positive-report.json");
+    write_new_json(&positive_expectation, &positive_expected)?;
+    let positive_before = std::fs::read(&positive_input).map_err(|error| error.to_string())?;
+    let positive = execute_verify_reopen(&positive_expectation, &positive_report, 60).await?;
+    let positive_after = std::fs::read(&positive_input).map_err(|error| error.to_string())?;
+    ensure_stage(positive_after == positive_before, "selftest-control", "positive reopen changed input bytes")?;
+    ensure_stage(
+        required_replay_u64(&positive, "/restored_message_count")? == required_replay_u64(&positive_expected, "/restored_message_count")?,
+        "selftest-control",
+        "positive fixture did not exercise its exact restored message count",
+    )?;
+    checks.push(json!({"name": "fresh_process_positive", "accepted": true, "report": positive}));
+
+    let (mutation_input, mut mutation_expected) = seed_reopen_selftest_case(&root.join("reader-mutation"))?;
+    let mutation_original = std::fs::read(&mutation_input).map_err(|error| error.to_string())?;
+    mutation_expected["selftest_mutate_input_after_open"] = json!(true);
+    let mutation_expectation = verification.join("reader-mutation-expectation.json");
+    let mutation_report = verification.join("reader-mutation-report.json");
+    write_new_json(&mutation_expectation, &mutation_expected)?;
+    match execute_verify_reopen(&mutation_expectation, &mutation_report, 60).await {
+        Err(message) if message.contains("[raw-byte-integrity]") && message.contains("read-only reopen changed") => {
+            let after = std::fs::read(&mutation_input).map_err(|error| error.to_string())?;
+            if after == mutation_original || after.len() != mutation_original.len() + b"selftest reader mutation\n".len() {
+                return Err("reader-mutation control did not perform its exact recorded write".to_string());
+            }
+            checks.push(json!({"name": "reader_input_mutation_rejected", "rejected": true, "intended_stage": "raw-byte-integrity", "error": message}));
+        }
+        other => return Err(format!("reader-mutation control produced unexpected result: {other:?}")),
+    }
+
+    let outside_root_cli = Cli {
+        subcommand: "verify-reopen".to_string(),
+        options: HashMap::from([
+            ("expectation".to_string(), positive_expectation.to_string_lossy().to_string()),
+            ("out".to_string(), positive_input.parent().and_then(Path::parent)
+                .ok_or_else(|| "positive case root missing".to_string())?
+                .join("forbidden-reader-report.json").to_string_lossy().to_string()),
+        ]),
+    };
+    match run_verify_reopen(&outside_root_cli) {
+        Err(message) if message.contains("[report-confinement]") && message.contains("outside the measured case root") => {
+            checks.push(json!({"name": "report_inside_root_rejected", "rejected": true, "intended_stage": "report-confinement", "error": message}));
+        }
+        other => return Err(format!("report location negative control failed: {other:?}")),
+    }
+
+    // The old input-hash control remains. Raw JSONL corruption with a matching
+    // input hash is separate from report-only semantic corruptions below.
+    let (raw_input, mut raw_expected) = seed_reopen_selftest_case(&root.join("raw-jsonl-corruption"))?;
+    let original = std::fs::read_to_string(&raw_input).map_err(|error| error.to_string())?;
+    let corrupted = original.replacen("sentinel", "SENTINEL", 1);
+    ensure_stage(corrupted.len() == original.len() && corrupted != original, "selftest-control", "raw corruption must be same-length and effective")?;
+    std::fs::write(&raw_input, &corrupted).map_err(|error| error.to_string())?;
+    raw_expected["input_sha256"] = json!(sha256_hex(corrupted.as_bytes()));
+    expect_reopen_rejection(&mut checks, "raw_jsonl_corruption_rejected", &raw_expected, &verification, "raw-durable-parity").await?;
+
+    let (hash_input, hash_expected) = seed_reopen_selftest_case(&root.join("corrupt-input-hash"))?;
+    let original = std::fs::read_to_string(&hash_input).map_err(|error| error.to_string())?;
+    let corrupted = original.replacen("sentinel", "SENTINEL", 1);
+    std::fs::write(&hash_input, &corrupted).map_err(|error| error.to_string())?;
+    expect_reopen_rejection(&mut checks, "fixture_input_hash_rejected", &hash_expected, &verification, "fixture-input-hash").await?;
+
+    let (_, mut normalized_expected) = seed_reopen_selftest_case(&root.join("normalized-message-corruption"))?;
+    let normalized_before = normalized_expected["normalized_messages"].clone();
+    if let Some(summary) = normalized_expected["normalized_messages"][0].get_mut("summary") {
+        *summary = json!("report-only semantic corruption");
+    } else {
+        normalized_expected["normalized_messages"][0]["normalized_integrity"] = json!("corrupted");
+    }
+    ensure_stage(normalized_expected["normalized_messages"] != normalized_before, "selftest-control", "normalized-message mutation was ineffective")?;
+    expect_reopen_rejection(&mut checks, "normalized_message_corruption_rejected", &normalized_expected, &verification, "normalized-message-parity").await?;
+
+    let (_, mut retained_expected) = seed_reopen_selftest_case(&root.join("retained-hash-corruption"))?;
+    retained_expected["retained_state_sha256"] = json!("0".repeat(64));
+    expect_reopen_rejection(&mut checks, "retained_hash_corruption_rejected", &retained_expected, &verification, "retained-state-hash").await?;
+
+    let (_, mut raw_report_expected) = seed_reopen_selftest_case(&root.join("raw-report-corruption"))?;
+    raw_report_expected["durable_branch"][0]["r1_report_only_corruption"] = json!(true);
+    expect_reopen_rejection(&mut checks, "raw_report_corruption_rejected", &raw_report_expected, &verification, "raw-durable-parity").await?;
+
+    for kind in ["offbranch-dangling", "offbranch-cycle", "duplicate-id", "duplicate-header", "unterminated-jsonl", "truncated-jsonl"] {
+        let (input, mut expected) = seed_reopen_selftest_case(&root.join(kind))?;
+        let original_leaf = expected["durable_branch"].as_array()
+            .and_then(|branch| branch.last())
+            .and_then(|leaf| leaf["id"].as_str())
+            .ok_or_else(|| "original durable leaf is missing".to_string())?
+            .to_owned();
+        // This child makes every side component below genuinely unreachable
+        // from the selected leaf. The original expectations remain unchanged.
+        let valid_leaf = json!({
+            "type": "custom", "customType": "r1_valid_leaf_guard",
+            "id": format!("{kind}-valid-leaf"), "parentId": original_leaf,
+            "timestamp": "2026-01-02T03:04:05.000Z",
+            "data": {"purpose": "select the original valid branch, not the injected side component"}
+        });
+        let original_graph_count = required_replay_u64(&expected, "/graph_entry_count")?;
+        let original_durable_expectation = expected["durable_branch"].clone();
+        let original_normalized_expectation = expected["normalized_messages"].clone();
+        match kind {
+            "offbranch-dangling" => {
+                append_raw_jsonl(&input, &[
+                    json!({"type": "custom", "customType": "offbranch", "id": "dangling", "parentId": "missing-parent"}),
+                    valid_leaf.clone(),
+                ])?;
+                expected["graph_entry_count"] = json!(original_graph_count + 2);
+                let selected = loose_selected_branch_ids(&input)?;
+                ensure_stage(selected.contains(&format!("{kind}-valid-leaf")) && !selected.contains("dangling"), "selftest-control", "dangling ID is unexpectedly reachable from the new valid leaf")?;
+            }
+            "offbranch-cycle" => {
+                append_raw_jsonl(&input, &[
+                    json!({"type": "custom", "customType": "offbranch", "id": "cycle-a", "parentId": "cycle-b"}),
+                    json!({"type": "custom", "customType": "offbranch", "id": "cycle-b", "parentId": "cycle-a"}),
+                    valid_leaf.clone(),
+                ])?;
+                expected["graph_entry_count"] = json!(original_graph_count + 3);
+                let selected = loose_selected_branch_ids(&input)?;
+                ensure_stage(selected.contains(&format!("{kind}-valid-leaf")) && !selected.contains("cycle-a") && !selected.contains("cycle-b"), "selftest-control", "cycle IDs are unexpectedly reachable from the new valid leaf")?;
+            }
+            "duplicate-id" => {
+                let duplicate = expected["durable_branch"][0].clone();
+                append_raw_jsonl(&input, &[duplicate])?;
+            }
+            "duplicate-header" => {
+                append_raw_jsonl(&input, &[json!({"type": "session", "version": 3, "id": "duplicate-session-header", "timestamp": "2026-01-01T00:00:00.000Z", "cwd": root.to_string_lossy()})])?;
+            }
+            "unterminated-jsonl" => {
+                let mut bytes = std::fs::read(&input).map_err(|error| error.to_string())?;
+                ensure_stage(bytes.pop() == Some(b'\n'), "selftest-control", "unterminated control did not remove the final newline")?;
+                std::fs::write(&input, &bytes).map_err(|error| error.to_string())?;
+            }
+            "truncated-jsonl" => {
+                let mut bytes = std::fs::read(&input).map_err(|error| error.to_string())?;
+                bytes.truncate(bytes.len() / 2);
+                std::fs::write(&input, &bytes).map_err(|error| error.to_string())?;
+            }
+            _ => unreachable!(),
+        }
+        ensure_stage(expected["durable_branch"] == original_durable_expectation && expected["normalized_messages"] == original_normalized_expectation, "selftest-control", "a mutation changed the original durable or normalized expectations")?;
+        ensure_stage(expected["graph_entry_count"].as_u64() == Some(original_graph_count + match kind { "offbranch-dangling" => 2, "offbranch-cycle" => 3, _ => 0 }), "selftest-control", "expected graph count does not match the actual valid-leaf and side-entry construction")?;
+        expected["input_sha256"] = json!(sha256_hex(&std::fs::read(&input).map_err(|error| error.to_string())?));
+        let stage = if kind == "duplicate-header" { "session-header" } else if matches!(kind, "unterminated-jsonl" | "truncated-jsonl") { "durable-jsonl" } else { "full-graph-integrity" };
+        expect_reopen_rejection(&mut checks, &format!("{kind}_rejected"), &expected, &verification, stage).await?;
+    }
+
+    let (_, mut checkpoint_expected) = seed_reopen_selftest_case(&root.join("checkpoint-corruption"))?;
+    ensure_stage(!checkpoint_expected["protected_state"]["checkpoints"].as_array().is_none_or(Vec::is_empty), "selftest-control", "checkpoint control has no checkpoint")?;
+    checkpoint_expected["protected_state"]["checkpoints"][0]["tokensBefore"] = json!(43.0);
+    expect_reopen_rejection(&mut checks, "checkpoint_state_corruption_rejected", &checkpoint_expected, &verification, "checkpoint").await?;
+
+    let (_, mut custom_expected) = seed_reopen_selftest_case(&root.join("custom-corruption"))?;
+    custom_expected["protected_state"]["custom_messages"][0]["details"]["opaque_state"]["version"] = json!(8);
+    expect_reopen_rejection(&mut checks, "protected_custom_state_corruption_rejected", &custom_expected, &verification, "protected-custom-state").await?;
+
+    let (_, mut extension_expected) = seed_reopen_selftest_case(&root.join("extension-corruption"))?;
+    let controls = extension_expected["protected_state"]["session_controls"].as_array_mut().ok_or_else(|| "missing protected session controls".to_string())?;
+    let extension = controls.iter_mut().find(|entry| entry.get("customType").and_then(Value::as_str) == Some("r1_extension_state")).ok_or_else(|| "missing extension state control".to_string())?;
+    extension["data"]["opaque_bytes"][0] = json!(9);
+    expect_reopen_rejection(&mut checks, "protected_extension_state_corruption_rejected", &extension_expected, &verification, "protected-custom-state").await?;
+
+    let missing_expectation = verification.join("missing-input-expectation.json");
+    let missing_report = verification.join("missing-input-report.json");
+    write_new_json(&missing_expectation, &json!({
+        "schema": 1,
+        "writer_pid": std::process::id(),
+        "session_file": root.join("missing/sessions/missing.jsonl"),
+        "input_sha256": "0".repeat(64),
+    }))?;
+    match execute_verify_reopen(&missing_expectation, &missing_report, 60).await {
+        Err(message) if message.contains("[session-open]") && message.contains("not a readable file") => {
+            checks.push(json!({"name": "persistence_failure_rejected", "rejected": true, "intended_stage": "session-open", "error": message}));
+        }
+        other => return Err(format!("persistence negative control produced unexpected result: {other:?}")),
+    }
+
+    write_new_json(&out, &json!({
+        "schema": 2,
+        "self_test": "compaction-replay-r1",
+        "status": "ok",
+        "check_count": checks.len(),
+        "named_rejection_stages": true,
+        "checks": checks,
+    }))?;
+    println!("wrote {} ({} R1 self-test checks)", out.display(), checks.len());
+    Ok(0)
+}
 // ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
@@ -2866,6 +4797,18 @@ fn main() {
             runtime.block_on(run_replay(&cli))
         }
         "bench-local" => run_bench_local(&cli),
+        "verify-local" => local_parity::run_verify_local(&cli),
+        "capture-local" => candidate_review::run_capture(&cli),
+        "self-test-r2-review" => candidate_review::run_candidate_controls(&cli),
+        "self-test-r2" => local_parity::run_r2_self_test(&cli),
+        "verify-reopen" => run_verify_reopen(&cli),
+        "self-test-r1" => {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("tokio runtime");
+            runtime.block_on(run_r1_self_test(&cli))
+        }
         other => Err(format!("unknown subcommand: {other}\n{}", usage())),
     };
     match code {

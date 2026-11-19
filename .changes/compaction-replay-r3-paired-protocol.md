@@ -1,0 +1,2 @@
+- Added frozen fixture, executable, source, runtime and affinity provenance for paired compaction benchmark outer runs.
+- Added balanced seeded fresh-process AB/BA protocol admission with independent paired log-ratio bootstrap statistics and deterministic synthetic qualification controls.
