@@ -452,10 +452,7 @@ pub fn resolve_config_value_or_throw(config: &str, description: &str) -> Result<
         return Ok(resolved_value);
     }
     if config.starts_with('!') {
-        return Err(format!(
-            "Failed to resolve {description} from shell command: {}",
-            &config[1..]
-        ));
+        return Err(format!("Failed to resolve {description} from shell command"));
     }
     Err(format!("Failed to resolve {description}"))
 }
@@ -616,10 +613,36 @@ Write-Output ($parentId.ToString() + ':' + [CredentialWindowProbe]::GetConsoleWi
     }
 
     #[test]
-    fn shell_command_failures_report_the_command_text() {
-        let error = resolve_config_value_or_throw("!definitely-not-a-real-binary-xyz", "test credential")
+    fn shell_command_failures_do_not_echo_commands_or_inline_secrets() {
+        const CANARY: &str = "prime-test-inline-secret-canary";
+        let command = format!("!definitely-not-a-real-binary-xyz --api-key={CANARY}");
+        let error = resolve_config_value_or_throw(
+            &command,
+            "API key for provider \"synthetic\"",
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            "Failed to resolve API key for provider \"synthetic\" from shell command"
+        );
+        assert!(!error.contains(CANARY));
+        assert!(!error.contains("definitely-not-a-real-binary-xyz"));
+
+        let empty_output = if cfg!(windows) {
+            format!("!rem {CANARY}")
+        } else {
+            format!("!printf '' # {CANARY}")
+        };
+        let mut headers = indexmap::IndexMap::new();
+        headers.insert("authorization".to_string(), empty_output.clone());
+        let error = resolve_headers_or_throw(Some(&headers), "provider \"synthetic\"")
             .unwrap_err();
-        assert!(error.starts_with("Failed to resolve test credential"));
+        assert_eq!(
+            error,
+            "Failed to resolve provider \"synthetic\" header \"authorization\" from shell command"
+        );
+        assert!(!error.contains(CANARY));
+        assert!(!error.contains(empty_output.trim_start_matches('!')));
     }
 
     #[test]

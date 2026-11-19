@@ -199,14 +199,14 @@ fn split_root_and_segments(path: &str) -> (String, Vec<String>) {
                 prefix.push(separator());
                 rest = stripped;
             }
-        } else if rest.starts_with("\\\\") {
-            // UNC root: `\\server\share`.
+        } else if rest.starts_with("\\\\") || rest.starts_with("//") {
+            // UNC root: `\\server\share` (or the forward-slash equivalent).
             let trimmed = rest.trim_start_matches(['\\', '/']);
             let mut pieces = trimmed.splitn(3, ['\\', '/']);
             let server = pieces.next().unwrap_or_default();
             let share = pieces.next().unwrap_or_default();
             let tail = pieces.next().unwrap_or_default();
-            prefix = format!("{s}{s}{server}{s}{share}", s = separator());
+            prefix = format!("{s}{s}{server}{s}{share}{s}", s = separator());
             rest = tail;
         } else if rest.starts_with(['\\', '/']) {
             prefix.push(separator());
@@ -240,6 +240,9 @@ fn split_root_and_segments(path: &str) -> (String, Vec<String>) {
 /// reads `process.env[`=${device}`] || process.cwd()` for that step.
 fn with_current_drive(prefix: String) -> String {
     if !cfg!(windows) {
+        return prefix;
+    }
+    if prefix.starts_with("\\\\") || prefix.starts_with("//") {
         return prefix;
     }
     let drive = current_drive();
@@ -394,6 +397,42 @@ mod tests {
         assert_eq!(resolve_to_cwd("b/c", "/a"), format!("{drive}{sep}a{sep}b{sep}c"));
         assert_eq!(resolve_to_cwd("/abs", "/a"), "/abs");
         assert_eq!(resolve_to_cwd("../b", "/a/c"), format!("{drive}{sep}a{sep}b"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn unc_paths_keep_their_server_share_root() {
+        assert_eq!(
+            resolve_path(r"C:\work", r"\\server\share\folder\file.txt"),
+            r"\\server\share\folder\file.txt"
+        );
+        assert_eq!(
+            resolve_path("C:/work", "//server/share/folder/file.txt"),
+            r"\\server\share\folder\file.txt"
+        );
+        assert_eq!(
+            resolve_to_cwd(r"\\server\share\folder\file.txt", "C:/work"),
+            r"\\server\share\folder\file.txt"
+        );
+        assert_eq!(
+            resolve_to_cwd("//server/share/folder/file.txt", "C:/work"),
+            "//server/share/folder/file.txt"
+        );
+        assert!(!resolve_path("C:/work", "//server/share/folder").starts_with(host_drive().as_str()));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn forward_slash_local_paths_resolve_for_write_and_read() {
+        let directory = tempfile::tempdir().unwrap();
+        let base = directory.path().to_string_lossy().replace('\\', "/");
+        let write_path = resolve_path(&base, "nested/file.txt");
+        std::fs::create_dir_all(Path::new(&write_path).parent().unwrap()).unwrap();
+        std::fs::write(&write_path, "local").unwrap();
+        let read_input = write_path.replace('\\', "/");
+        let read_path = resolve_read_path(&read_input, &base);
+        assert_eq!(std::fs::read_to_string(read_path).unwrap(), "local");
+        assert!(!write_path.starts_with("\\\\"));
     }
 
     #[test]
