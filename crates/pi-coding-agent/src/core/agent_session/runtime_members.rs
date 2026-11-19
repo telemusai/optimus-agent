@@ -426,6 +426,46 @@ fn build_extension_actions(weak: Weak<AgentSession>, runner: ExtensionRunner) ->
 }
 
 /// `_bindExtensionCore` context-action half (agent-session.ts:9921-9943).
+fn finish_extension_compaction(
+    result: Result<crate::core::compaction::compaction::CompactionResult, String>,
+    on_complete: Option<
+        Arc<dyn Fn(crate::core::extensions::types::CompactionResult) + Send + Sync>,
+    >,
+    on_error: Option<Arc<dyn Fn(String) + Send + Sync>>,
+) {
+    let result = result.and_then(|result| {
+        let details = result
+            .details
+            .map(serde_json::to_value)
+            .transpose()
+            .map_err(|error| format!("Could not serialize compaction details: {error}"))?;
+        let usage = result
+            .usage
+            .map(serde_json::to_value)
+            .transpose()
+            .map_err(|error| format!("Could not serialize compaction usage: {error}"))?;
+        Ok(crate::core::extensions::types::CompactionResult {
+            summary: result.summary,
+            first_kept_entry_id: result.first_kept_entry_id,
+            tokens_before: result.tokens_before,
+            details,
+            usage,
+        })
+    });
+    match result {
+        Ok(result) => {
+            if let Some(on_complete) = on_complete {
+                on_complete(result);
+            }
+        }
+        Err(error) => {
+            if let Some(on_error) = on_error {
+                on_error(error);
+            }
+        }
+    }
+}
+
 fn build_extension_context_actions(weak: Weak<AgentSession>) -> ExtensionContextActions {
     let model_weak = weak.clone();
     let get_model =
@@ -471,9 +511,6 @@ fn build_extension_context_actions(weak: Weak<AgentSession>) -> ExtensionContext
     });
     let compact_weak = weak.clone();
     let compact = Arc::new(move |options: Option<CompactOptions>| {
-        let Some(session) = compact_weak.upgrade() else {
-            return;
-        };
         let (custom_instructions, on_complete, on_error) = match options {
             Some(options) => (
                 options.custom_instructions,
@@ -482,27 +519,26 @@ fn build_extension_context_actions(weak: Weak<AgentSession>) -> ExtensionContext
             ),
             None => (None, None, None),
         };
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            handle.spawn(async move {
-                // REPAIR CURSOR: the TypeScript hands the `CompactionResult` to
-                // `options.onComplete` (agent-session.ts:9934). The public Rust
-                // owner `compact_with_options` returns `Result<(), String>`; the
-                // result object is only built by the private
-                // `perform_compaction_unmeasured_full`. Expose that result on the
-                // public path and forward it here.
-                match session
-                    .compact_with_options(custom_instructions.as_deref(), false)
-                    .await
-                {
-                    Ok(()) => {}
-                    Err(error) => {
-                        if let Some(on_error) = on_error {
-                            on_error(error);
-                        }
-                    }
+        let Some(session) = compact_weak.upgrade() else {
+            if let Some(on_error) = on_error {
+                on_error("Cannot compact: the session is no longer available.".to_string());
+            }
+            return;
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(async move {
+                    let result = session
+                        .compact_with_options(custom_instructions.as_deref(), false)
+                        .await;
+                    finish_extension_compaction(result, on_complete, on_error);
+                });
+            }
+            Err(error) => {
+                if let Some(on_error) = on_error {
+                    on_error(format!("Cannot compact without a Tokio runtime: {error}"));
                 }
-                let _ = on_complete;
-            });
+            }
         }
     });
     let prompt_weak = weak.clone();
@@ -610,6 +646,66 @@ impl crate::core::tools::BashOperations for ExtensionBashOperations {
             Ok(crate::core::tools::bash::BashExecResult { exit_code })
         })
     }
+}
+
+/// Fail-loud OCC-3 twin guard for `resolve_rlm_subagent_model`. The selection
+/// is returned unchanged when no authenticated entry shares the model id with
+/// an enabled OCC-3 configuration; otherwise the error names the resolved
+/// selector and the exact OCC-3 selector(s) to use instead.
+fn occ3_twin_guarded_selection(
+    model: Model,
+    target: &str,
+    authenticated: &[Model],
+) -> Result<RlmSubagentModelSelection, String> {
+    if let Some(error) = occ3_twin_error(&model, target, authenticated) {
+        return Err(error);
+    }
+    Ok(RlmSubagentModelSelection { model })
+}
+
+/// The OCC-3 twin refusal for `model`, or `None` when the spawn may proceed.
+fn occ3_twin_error(model: &Model, target: &str, authenticated: &[Model]) -> Option<String> {
+    let twins = crate::core::rlm_runtime::occ3_configured_twin_selectors(model, authenticated);
+    if twins.is_empty() {
+        return None;
+    }
+    let selectors: Vec<String> = twins.iter().map(|twin| format!("\"{twin}\"")).collect();
+    let selector_hint = if twins.len() == 1 {
+        format!("Pass the exact OCC-3 selector {}", selectors[0])
+    } else {
+        format!("Pass one of the exact OCC-3 selectors {}", selectors.join(", "))
+    };
+    Some(format!(
+        "Requested {target} model \"{}/{}\" has no OCC-3 configuration, but an OCC-3-configured entry with the same model id exists. Children on this entry never receive the native occ3_handoff tool. {selector_hint} instead",
+        model.provider,
+        model.id,
+    ))
+}
+
+/// The unavailable-model refusal. A bare model id shared by multiple
+/// providers additionally lists the exact `provider/id` selectors,
+/// OCC-3-configured entries first, so the reference can be disambiguated.
+fn format_unavailable_rlm_model_message(
+    reference: &str,
+    target: &str,
+    authenticated: &[Model],
+) -> String {
+    let mut message = format!(
+        "Requested {target} model \"{reference}\" is unavailable, unauthenticated, or expired"
+    );
+    if !reference.contains('/') {
+        let selectors =
+            crate::core::rlm_runtime::selectors_for_model_id(reference, authenticated);
+        if selectors.len() > 1 {
+            let quoted: Vec<String> =
+                selectors.iter().map(|selector| format!("\"{selector}\"")).collect();
+            message.push_str(&format!(
+                "; the model id \"{reference}\" is available from multiple providers: {}",
+                quoted.join(", ")
+            ));
+        }
+    }
+    message
 }
 
 impl AgentSession {
@@ -3194,6 +3290,12 @@ impl AgentSession {
     }
 
     /// `_resolveRlmSubagentModel(reference, target)` (agent-session.ts:11418-11446).
+    ///
+    /// Fails loud when the resolution lands on a non-OCC-3 entry while an
+    /// OCC-3-configured entry with the same model id is authenticated: latent
+    /// transfer is same-exact-model only, so a child spawned on the ordinary
+    /// entry silently lacks the native `occ3_handoff` tool and the missing
+    /// tool is the only symptom. No fallback, no auto-rewrite.
     pub(super) async fn resolve_rlm_subagent_model(
         self: &Arc<Self>,
         reference: Option<&str>,
@@ -3201,31 +3303,34 @@ impl AgentSession {
     ) -> Result<RlmSubagentModelSelection, String> {
         let parent_model = self.model().ok_or_else(format_no_model_selected_message)?;
         let Some(reference) = reference else {
-            return Ok(RlmSubagentModelSelection {
-                model: parent_model,
-            });
+            let authenticated = self.authenticated_rlm_models().await;
+            return occ3_twin_guarded_selection(parent_model, target, &authenticated);
         };
         let normalized_reference = reference.to_lowercase();
         let parent_selector =
             format!("{}/{}", parent_model.provider, parent_model.id).to_lowercase();
         if parent_selector == normalized_reference {
-            return Ok(RlmSubagentModelSelection {
-                model: parent_model,
-            });
+            let authenticated = self.authenticated_rlm_models().await;
+            return occ3_twin_guarded_selection(parent_model, target, &authenticated);
         }
-        let model = self
-            .authenticated_rlm_models()
-            .await
-            .into_iter()
+        let authenticated = self.authenticated_rlm_models().await;
+        let model = authenticated
+            .iter()
             .find(|candidate| {
                 format!("{}/{}", candidate.provider, candidate.id).to_lowercase()
                     == normalized_reference
-            });
+            })
+            .cloned();
         let Some(model) = model else {
-            return Err(format!(
-                "Requested {target} model \"{reference}\" is unavailable, unauthenticated, or expired"
+            return Err(format_unavailable_rlm_model_message(
+                reference,
+                target,
+                &authenticated,
             ));
         };
+        if let Some(error) = occ3_twin_error(&model, target, &authenticated) {
+            return Err(error);
+        }
         let request_model = model.clone();
         let registry = self.model_registry.clone();
         let auth = crate::core::sdk::with_model_registry(registry, move |registry| {
@@ -3361,6 +3466,7 @@ impl AgentSession {
 
     /// `_isRetryableError(message)` (agent-session.ts:12000-12019).
     pub(super) fn is_retryable_error(&self, message: &AssistantMessage) -> bool {
+        if self.textmas_failure().is_some() { return false; }
         if message.stop_reason != STOP_REASON_ERROR || message.error_message.is_none() {
             return false;
         }
@@ -3769,12 +3875,23 @@ impl AgentSession {
     /// All observers await the same deferred; only the retry owner clears its slot.
     /// A waiter never consumes pending state or resurrects a settled generation.
     pub(super) async fn wait_for_retry(&self) {
-        let promise = { self.retry_promise.lock().unwrap().clone() };
-        let Some(promise) = promise else {
-            return;
-        };
-        let _ = promise.wait().await;
-        self.agent.wait_for_idle().await;
+        if let Some(settled) = self.retry_settled_future() {
+            settled.await;
+        }
+    }
+
+    /// The `wait_for_retry` wait as an owned future, or `None` when no
+    /// retry is pending. It owns only the cloned retry deferred and the
+    /// agent handle, never the session, so a detached waiter can drop its
+    /// session reference before awaiting and the session can be freed
+    /// while the wait is still in progress.
+    pub(super) fn retry_settled_future(&self) -> Option<BoxFuture<()>> {
+        let promise = self.retry_promise.lock().unwrap().clone()?;
+        let agent = Arc::clone(&self.agent);
+        Some(Box::pin(async move {
+            let _ = promise.wait().await;
+            agent.wait_for_idle().await;
+        }))
     }
 
     /// `get isRetrying()`.
@@ -4428,6 +4545,14 @@ impl AgentSession {
                 total_cost += assistant.usage.cost.total;
             }
         }
+        let mut textmas = crate::core::occ::textmas::TextMasUsageLedger::default();
+        for record in entries.iter().filter_map(crate::core::occ::textmas::usage_record) { textmas.observe(record); }
+        let auxiliary = textmas.total();
+        total_input += auxiliary.input;
+        total_output += auxiliary.output;
+        total_cache_read += auxiliary.cache_read;
+        total_cache_write += auxiliary.cache_write;
+        total_cost += auxiliary.cost.total;
         SessionStats {
             session_file: self.session_file(),
             session_id: self.session_id(),
@@ -4444,6 +4569,7 @@ impl AgentSession {
                 total: total_input + total_output + total_cache_read + total_cache_write,
             },
             cost: total_cost,
+            textmas_usage: textmas.summary(),
             context_usage: self.get_context_usage().map(|usage| {
                 crate::core::session_stats::ContextUsage {
                     tokens: usage.tokens,
@@ -4707,5 +4833,109 @@ mod tests {
         .await
         .expect_err("out-of-range exit code must be reported");
         assert!(error.contains("out-of-range exit code"), "{error}");
+    }
+}
+
+#[cfg(test)]
+mod compaction_callback_tests {
+    use super::*;
+    use crate::core::compaction::compaction::{CompactionDetails, CompactionResult};
+    use std::sync::atomic::AtomicUsize;
+
+    fn result_fixture() -> CompactionResult {
+        CompactionResult {
+            summary: "persisted fixture summary".to_string(),
+            first_kept_entry_id: "entry-42".to_string(),
+            tokens_before: 1234.0,
+            details: Some(CompactionDetails {
+                read_files: vec!["src/kept.rs".to_string()],
+                modified_files: vec!["src/changed.rs".to_string()],
+                provider_checkpoint: None,
+                deadline_fallback: None,
+                task_state: None,
+                typed_state: None,
+                typed_verification: None,
+            }),
+            usage: Some(Usage {
+                input: 900.0,
+                output: 12.0,
+                ..Default::default()
+            }),
+        }
+    }
+
+    #[test]
+    fn completion_receives_the_actual_result_and_false_success_does_not_complete() {
+        let expected = result_fixture();
+        let completed = Arc::new(Mutex::new(Vec::new()));
+        let errors = Arc::new(Mutex::new(Vec::new()));
+        let completed_sink = completed.clone();
+        let error_sink = errors.clone();
+        finish_extension_compaction(
+            Ok(expected.clone()),
+            Some(Arc::new(move |result| completed_sink.lock().unwrap().push(result))),
+            Some(Arc::new(move |error| error_sink.lock().unwrap().push(error))),
+        );
+        let completed_results = completed.lock().unwrap();
+        assert_eq!(completed_results.len(), 1);
+        assert_eq!(completed_results[0].summary, expected.summary);
+        assert_eq!(
+            completed_results[0].first_kept_entry_id,
+            expected.first_kept_entry_id
+        );
+        assert_eq!(completed_results[0].tokens_before, expected.tokens_before);
+        assert_eq!(
+            completed_results[0]
+                .details
+                .as_ref()
+                .and_then(|details| details.get("readFiles"))
+                .and_then(serde_json::Value::as_array)
+                .and_then(|files| files.first())
+                .and_then(serde_json::Value::as_str),
+            Some("src/kept.rs")
+        );
+        assert_eq!(
+            completed_results[0]
+                .usage
+                .as_ref()
+                .and_then(|usage| usage.get("input"))
+                .and_then(serde_json::Value::as_f64),
+            Some(900.0)
+        );
+        drop(completed_results);
+        assert!(errors.lock().unwrap().is_empty());
+
+        let completed_sink = completed.clone();
+        let error_sink = errors.clone();
+        finish_extension_compaction(
+            Err("actual persist failure".to_string()),
+            Some(Arc::new(move |result| completed_sink.lock().unwrap().push(result))),
+            Some(Arc::new(move |error| error_sink.lock().unwrap().push(error))),
+        );
+        assert_eq!(completed.lock().unwrap().len(), 1, "an error is never a short-Ok completion");
+        assert_eq!(
+            errors.lock().unwrap().as_slice(),
+            &["actual persist failure".to_string()]
+        );
+    }
+
+    #[test]
+    fn early_weak_session_failure_invokes_only_on_error() {
+        let actions = build_extension_context_actions(Weak::<AgentSession>::new());
+        let completions = Arc::new(AtomicUsize::new(0));
+        let errors = Arc::new(Mutex::new(Vec::new()));
+        let completion_counter = completions.clone();
+        let error_sink = errors.clone();
+        (actions.compact)(Some(CompactOptions {
+            custom_instructions: Some("retain these instructions".to_string()),
+            on_complete: Some(Arc::new(move |_| {
+                completion_counter.fetch_add(1, Ordering::SeqCst);
+            })),
+            on_error: Some(Arc::new(move |error| error_sink.lock().unwrap().push(error))),
+        }));
+        assert_eq!(completions.load(Ordering::SeqCst), 0);
+        let errors = errors.lock().unwrap();
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("no longer available"), "{errors:?}");
     }
 }

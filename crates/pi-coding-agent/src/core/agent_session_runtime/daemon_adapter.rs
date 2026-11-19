@@ -902,21 +902,10 @@ impl DaemonSession for AgentSessionDaemonAdapter {
         }
     }
 
-    /// `await session.compact(command.customInstructions)` (`daemon-mode.ts:5212`).
-    ///
-    /// The forward is real: `compact_with_options`
-    /// (`core/agent_session.rs:11121`) runs the same manual compaction.
-    /// blocked_on: the seam's `Value` is the `CompactionResult`
-    /// `{summary, firstKeptEntryId, tokensBefore, details?, usage?}`
-    /// (`core/compaction/compaction.ts:124-131`); `compact_with_options` returns
-    /// `Result<(), String>`, and the result is only produced by the private
-    /// `AgentSession::compact` (`core/agent_session.rs:13139`) /
-    /// `perform_compaction_unmeasured_full` (:13290). Owner to add:
-    /// `core/agent_session.rs`, a public `async fn compact(...) -> Result<CompactionResult, String>`
-    /// (the `compact` at :12748 minus the `skip_abort` internal, matching
-    /// `agent-session.ts:8077`). `CompactionResult`
-    /// (`core/compaction/compaction.rs:565`) has no serde impls, so the seam also
-    /// needs the serializer. Needs `core/agent_session.rs` edited.
+    /// `await session.compact(command.customInstructions)` uses the same full
+    /// manual lifecycle as queued and extension compaction. The internal result
+    /// carries `CompactionResult` for extension callbacks; this existing RPC
+    /// response remains the unit/null schema.
     fn compact(&self, custom_instructions: Option<&str>) -> BoxFuture<'static, Result<Value, String>> {
         let session = Arc::clone(&self.runtime.session());
         let custom_instructions = custom_instructions.map(|value| value.to_string());
