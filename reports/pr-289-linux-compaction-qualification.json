@@ -1,0 +1,295 @@
+{
+  "pr": 289,
+  "date": "2026-11-20",
+  "decision": "hold",
+  "criterion": {
+    "max_geometric_mean_candidate_over_baseline": 0.97,
+    "upper_paired_ci95_must_be_below": 1.0
+  },
+  "primary_metric": {
+    "case": "restore-branch",
+    "kernel": "process_total_ms"
+  },
+  "results": {
+    "passed": false,
+    "ratio": 1.0148779685730014,
+    "confidence_interval": [
+      0.994774303498748,
+      1.0369503343305704
+    ],
+    "pairs": 30,
+    "baseline_median_ms": 334.902687,
+    "candidate_median_ms": 335.2616865,
+    "secondary_restore_phase_ratio": 0.6597379861982411,
+    "secondary_ci": [
+      0.5896206340356144,
+      0.7385428008045402
+    ]
+  },
+  "preregistered_fixture": {
+    "name": "restore-branch",
+    "sha256": {
+      "manifest": "5ec4397f345eccb9846cb4c8b8696d6dd99086c42b8c9c0e91309c7eb8f61527",
+      "transcript": "da0bb6b5d7833bd4d7d21423138e9e0d0af88e04d550382595c4bfcda1964726"
+    }
+  },
+  "method": {
+    "pairs": 30,
+    "warmup": 10,
+    "inner_iterations_for_warm_kernel": 30,
+    "bootstrap_samples": 10000,
+    "seed": 20261120,
+    "lane": {
+      "kind": "process-cold-replay",
+      "process_state": "process-cold",
+      "cpu_ids": [
+        0,
+        2,
+        4,
+        6,
+        8,
+        10
+      ],
+      "mask": "0x555",
+      "topology": {
+        "source": "Linux sysfs",
+        "smt_siblings": [
+          "0,8",
+          "1,9",
+          "2,10",
+          "3,11",
+          "4,12",
+          "5,13",
+          "6,14",
+          "7,15"
+        ]
+      }
+    },
+    "limitations": [
+      "Shared workstation. Linux CPU frequency in kHz, queue is procs_running, and power policy is the per-CPU scaling governor. Six selected logical CPUs span four physical cores.",
+      "No page-cache-cold claim is made",
+      "Thermal, host scheduling, SMT/cache contention and unavailable counters remain limitations"
+    ]
+  },
+  "arms": {
+    "baseline": {
+      "head": "04d2a75af5c50f8fe74baf42a38568c104e1d315",
+      "exe_sha256": "d78f44b9c387709f779b0f0a1b548329dc1309984398f50b4d560e7a0abc4359",
+      "source_sha256": {
+        "Cargo.lock": "b5a5550043fbe6602d497be475bd69f4e81268f0174028179b651a3a59dc71f4",
+        "crates/pi-coding-agent/examples/compaction_replay.rs": "ff2640cf132ed6679b125715adc85a29bd6c79b3172d7538d75957a1ed79fd13",
+        "crates/pi-coding-agent/src/core/compaction/utils.rs": "24aa008aa50626fdf1712f02e7c053e2c73e163a191e92f5c8907a2826316c4e",
+        "crates/pi-coding-agent/src/core/agent_session.rs": "6ab097169090f7ecaff896430be353d2a3de40f01d139841ebb4b1d5ab92c8d0",
+        "crates/pi-coding-agent/examples/compaction_replay/local_parity.rs": "4d9eb13a6f5ade8bd9368510ca0919e1f4f8d8760926c1dcb969c09902dad046",
+        "crates/pi-coding-agent/build_provenance.rs": "dec9bdcfda355f656ce01b8f8a1f062bbfd2ab3e0f3dd7b59b3cb8ffe79e2562",
+        "scripts/compaction_paired_protocol.py": "784b384f3a17e1fd4e3de494a8b436ee37d3470ec1a3ce8c5be78ce4e415facb",
+        "scripts/compaction_paired_stats.py": "6c44fb3bfd7dc438d55571c4ec0f7ae68f99eae96f6318a79867abbc54400504"
+      }
+    },
+    "candidate": {
+      "head": "8906314e0187240524c48e534c4b6ac3a4563906",
+      "exe_sha256": "d8b3b85b25d2019ac1825ae134cc4ce216e3073bfe3d847a01accaf034116214",
+      "source_sha256": {
+        "Cargo.lock": "b5a5550043fbe6602d497be475bd69f4e81268f0174028179b651a3a59dc71f4",
+        "crates/pi-coding-agent/examples/compaction_replay.rs": "ff2640cf132ed6679b125715adc85a29bd6c79b3172d7538d75957a1ed79fd13",
+        "crates/pi-coding-agent/src/core/compaction/utils.rs": "24aa008aa50626fdf1712f02e7c053e2c73e163a191e92f5c8907a2826316c4e",
+        "crates/pi-coding-agent/src/core/agent_session.rs": "cc1f3f47ffedc25751bc78497afc114a678caa8033d1b3487e18bea232343182",
+        "crates/pi-coding-agent/examples/compaction_replay/local_parity.rs": "4d9eb13a6f5ade8bd9368510ca0919e1f4f8d8760926c1dcb969c09902dad046",
+        "crates/pi-coding-agent/build_provenance.rs": "dec9bdcfda355f656ce01b8f8a1f062bbfd2ab3e0f3dd7b59b3cb8ffe79e2562",
+        "scripts/compaction_paired_protocol.py": "784b384f3a17e1fd4e3de494a8b436ee37d3470ec1a3ce8c5be78ce4e415facb",
+        "scripts/compaction_paired_stats.py": "6c44fb3bfd7dc438d55571c4ec0f7ae68f99eae96f6318a79867abbc54400504"
+      }
+    }
+  },
+  "parity_receipts_sha256": {
+    "baseline": "086863c5d58fdefcf6744125dfc4669b060f113a0738d060481a533c730abe7c",
+    "candidate": "6c47a8a32f53bc5c7a60b723863926a4eb9ca2ba5d451bf04907fd765446273e"
+  },
+  "raw_run_manifest_sha256": "cec08bab22482e5849e6f55b5fbc7c5433318659fbfb59d9b52628fd3f051eba",
+  "paired_primary_observations_ms": [
+    {
+      "baseline": 331.05691,
+      "candidate": 335.356805,
+      "log_ratio": 0.012904760438928239,
+      "pair_id": 0
+    },
+    {
+      "baseline": 330.988609,
+      "candidate": 330.670069,
+      "log_ratio": -0.0009628530092655313,
+      "pair_id": 1
+    },
+    {
+      "baseline": 334.287352,
+      "candidate": 331.074792,
+      "log_ratio": -0.00965665087333882,
+      "pair_id": 2
+    },
+    {
+      "baseline": 331.08513,
+      "candidate": 330.559377,
+      "log_ratio": -0.001589231392669745,
+      "pair_id": 3
+    },
+    {
+      "baseline": 334.896148,
+      "candidate": 335.166568,
+      "log_ratio": 0.0008071483705154309,
+      "pair_id": 4
+    },
+    {
+      "baseline": 333.329294,
+      "candidate": 384.823902,
+      "log_ratio": 0.14365496000648237,
+      "pair_id": 5
+    },
+    {
+      "baseline": 336.027416,
+      "candidate": 388.117548,
+      "log_ratio": 0.14411550063083176,
+      "pair_id": 6
+    },
+    {
+      "baseline": 334.524186,
+      "candidate": 333.322104,
+      "log_ratio": -0.003599880140568869,
+      "pair_id": 7
+    },
+    {
+      "baseline": 340.666386,
+      "candidate": 335.620044,
+      "log_ratio": -0.014923959546788521,
+      "pair_id": 8
+    },
+    {
+      "baseline": 333.83103,
+      "candidate": 333.671166,
+      "log_ratio": -0.0004789916917561405,
+      "pair_id": 9
+    },
+    {
+      "baseline": 344.072753,
+      "candidate": 335.554118,
+      "log_ratio": -0.025069877373781316,
+      "pair_id": 10
+    },
+    {
+      "baseline": 338.407981,
+      "candidate": 389.430264,
+      "log_ratio": 0.14043259751733284,
+      "pair_id": 11
+    },
+    {
+      "baseline": 337.01461,
+      "candidate": 335.152053,
+      "log_ratio": -0.005541964127768254,
+      "pair_id": 12
+    },
+    {
+      "baseline": 335.151566,
+      "candidate": 334.336395,
+      "log_ratio": -0.0024352085484227234,
+      "pair_id": 13
+    },
+    {
+      "baseline": 335.594631,
+      "candidate": 338.441579,
+      "log_ratio": 0.00844751331666537,
+      "pair_id": 14
+    },
+    {
+      "baseline": 335.214145,
+      "candidate": 393.103144,
+      "log_ratio": 0.15930246395578632,
+      "pair_id": 15
+    },
+    {
+      "baseline": 334.909226,
+      "candidate": 333.657417,
+      "log_ratio": -0.0037447589585042317,
+      "pair_id": 16
+    },
+    {
+      "baseline": 336.571483,
+      "candidate": 339.578504,
+      "log_ratio": 0.008894597005223513,
+      "pair_id": 17
+    },
+    {
+      "baseline": 386.999572,
+      "candidate": 338.751604,
+      "log_ratio": -0.13315647984796694,
+      "pair_id": 18
+    },
+    {
+      "baseline": 331.954309,
+      "candidate": 334.161455,
+      "log_ratio": 0.006626938429489832,
+      "pair_id": 19
+    },
+    {
+      "baseline": 334.817462,
+      "candidate": 334.060608,
+      "log_ratio": -0.00226305617409185,
+      "pair_id": 20
+    },
+    {
+      "baseline": 336.338154,
+      "candidate": 334.745807,
+      "log_ratio": -0.004745605858418637,
+      "pair_id": 21
+    },
+    {
+      "baseline": 338.347865,
+      "candidate": 334.149867,
+      "log_ratio": -0.012484956692177062,
+      "pair_id": 22
+    },
+    {
+      "baseline": 334.626035,
+      "candidate": 333.722238,
+      "log_ratio": -0.002704570618130734,
+      "pair_id": 23
+    },
+    {
+      "baseline": 333.932808,
+      "candidate": 337.379469,
+      "log_ratio": 0.010268518552114591,
+      "pair_id": 24
+    },
+    {
+      "baseline": 340.401159,
+      "candidate": 347.330242,
+      "log_ratio": 0.02015123190237285,
+      "pair_id": 25
+    },
+    {
+      "baseline": 334.373219,
+      "candidate": 338.366239,
+      "log_ratio": 0.01187106492564606,
+      "pair_id": 26
+    },
+    {
+      "baseline": 340.375391,
+      "candidate": 334.84017,
+      "log_ratio": -0.016395786229379494,
+      "pair_id": 27
+    },
+    {
+      "baseline": 334.455424,
+      "candidate": 336.084436,
+      "log_ratio": 0.0048588169085790524,
+      "pair_id": 28
+    },
+    {
+      "baseline": 333.290986,
+      "candidate": 336.79855,
+      "log_ratio": 0.010469036889742012,
+      "pair_id": 29
+    }
+  ],
+  "verification": {
+    "full_output_sections_compared": 14,
+    "fresh_process_restore_smoke": true
+  }
+}
