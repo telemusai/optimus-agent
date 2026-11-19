@@ -3,7 +3,8 @@
 use indexmap::IndexMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use crate::compaction::CompactionOptions;
+use crate::compaction::{CompactionOptions, ProviderCompactionResult};
+use crate::providers::openai_compaction::CompactionRequestError;
 use crate::types::{
     Api, BoxFuture, CompactFunction, Context, Model, SimpleStreamOptions, StreamFunction,
     StreamOptions,
@@ -20,6 +21,16 @@ pub type ApiStreamSimpleFunction =
 /// `ApiProvider.streamSimple` is typed as (api-registry.ts:27). `Model<TApi>` is not generic
 /// in this port, so this is the same function type as [`ApiStreamSimpleFunction`].
 pub type SimpleStreamFunction = ApiStreamSimpleFunction;
+
+pub(crate) type FallibleCompactFunction = Arc<
+    dyn Fn(
+            &Model,
+            &Context,
+            Option<&CompactionOptions>,
+        ) -> BoxFuture<Result<Option<ProviderCompactionResult>, CompactionRequestError>>
+        + Send
+        + Sync,
+>;
 
 
 /// `interface ApiProvider<TApi, TOptions>` for callers whose `streamSimple` is the base
@@ -87,6 +98,7 @@ pub struct ApiProviderInternal {
 struct RegisteredApiProvider {
     provider: ApiProviderInternal,
     source_id: Option<String>,
+    fallible_compact: Option<FallibleCompactFunction>,
 }
 
 fn api_provider_registry() -> &'static Mutex<IndexMap<String, RegisteredApiProvider>> {
@@ -144,9 +156,11 @@ fn throw_mismatched_api(model_api: &str, api: &str, prefix: &str) -> ! {
     panic!("{}: {} expected {}", prefix, model_api, api)
 }
 
-/// `registerApiProvider(provider, sourceId?)` (api-registry.ts:71-92), with the faithful
-/// `streamSimple` signature preserved.
-pub fn register_api_provider_simple(provider: ApiProviderSimple, source_id: Option<String>) {
+fn register_api_provider_simple_inner(
+    provider: ApiProviderSimple,
+    fallible_compact: Option<FallibleCompactFunction>,
+    source_id: Option<String>,
+) {
     let api = provider.api.clone();
     let internal = ApiProviderInternal {
         api: provider.api.clone(),
@@ -175,8 +189,25 @@ pub fn register_api_provider_simple(provider: ApiProviderSimple, source_id: Opti
         RegisteredApiProvider {
             provider: internal,
             source_id,
+            fallible_compact,
         },
     );
+}
+
+/// `registerApiProvider(provider, sourceId?)` (api-registry.ts:71-92), with the faithful
+/// `streamSimple` signature preserved.
+pub fn register_api_provider_simple(provider: ApiProviderSimple, source_id: Option<String>) {
+    register_api_provider_simple_inner(provider, None, source_id);
+}
+
+/// Atomically installs both handlers for built-in providers. Custom registrations use the
+/// public entry point above and therefore cannot inherit a built-in fallible handler.
+pub(crate) fn register_api_provider_simple_with_fallible_compaction(
+    provider: ApiProviderSimple,
+    compact: FallibleCompactFunction,
+    source_id: Option<String>,
+) {
+    register_api_provider_simple_inner(provider, Some(compact), source_id);
 }
 
 /// `registerApiProvider(provider, sourceId?)` for the base-shaped [`ApiProvider`].
@@ -209,8 +240,23 @@ pub fn register_api_provider(provider: ApiProvider, source_id: Option<String>) {
         RegisteredApiProvider {
             provider: internal,
             source_id,
+            fallible_compact: None,
         },
     );
+}
+
+
+#[derive(Clone)]
+pub(crate) struct ApiProviderCompactionSnapshot {
+    pub provider: ApiProviderInternal,
+    pub fallible_compact: Option<FallibleCompactFunction>,
+}
+
+pub(crate) fn get_api_provider_compaction_snapshot(api: &str) -> Option<ApiProviderCompactionSnapshot> {
+    lock_registry().get(api).map(|entry| ApiProviderCompactionSnapshot {
+        provider: entry.provider.clone(),
+        fallible_compact: entry.fallible_compact.clone(),
+    })
 }
 
 pub fn get_api_provider(api: &str) -> Option<ApiProviderInternal> {

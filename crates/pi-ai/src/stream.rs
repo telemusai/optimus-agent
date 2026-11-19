@@ -2,8 +2,12 @@
 
 use std::sync::Arc;
 
-use crate::api_registry::{get_api_provider, get_api_providers, ApiProviderInternal};
+use crate::api_registry::{
+    get_api_provider, get_api_provider_compaction_snapshot, get_api_providers, ApiProviderCompactionSnapshot,
+    ApiProviderInternal,
+};
 use crate::compaction::{CompactionOptions, ProviderCompactionResult};
+use crate::providers::openai_compaction::CompactionRequestError;
 use crate::types::{
     AssistantMessage, BoxFuture, Context, Model, ProviderStreamOptions, SimpleStreamOptions,
 };
@@ -36,14 +40,23 @@ fn resolve_api_provider(api: &str) -> ApiProviderInternal {
     }
 }
 
-pub fn supports_compaction(model: &Model) -> bool {
-    let provider = resolve_api_provider(&model.api);
+fn resolve_compaction_provider(api: &str) -> ApiProviderCompactionSnapshot {
+    ensure_builtin_api_providers();
+    get_api_provider_compaction_snapshot(api)
+        .unwrap_or_else(|| panic!("No API provider registered for api: {}", api))
+}
+
+fn provider_supports_compaction(provider: &ApiProviderInternal, model: &Model) -> bool {
     provider.compact.is_some()
         && provider
             .supports_compaction
             .as_ref()
             .map(|supports| supports(model))
             .unwrap_or(true)
+}
+
+pub fn supports_compaction(model: &Model) -> bool {
+    provider_supports_compaction(&resolve_api_provider(&model.api), model)
 }
 
 pub fn compact_simple(
@@ -61,6 +74,35 @@ pub fn compact_simple(
     let context = context.clone();
     let options = options.cloned();
     Box::pin(async move { compact(&model, &context, options.as_ref()).await })
+}
+
+/// Fallible native compaction preserves request failures separately from `None`, which means
+/// that compaction is unsupported. Custom providers retain their existing [`compact_simple`]
+/// contract; built-in providers opt into typed failures through an internal registration slot.
+pub fn try_compact_simple(
+    model: &Model,
+    context: &Context,
+    options: Option<&CompactionOptions>,
+) -> BoxFuture<Result<Option<ProviderCompactionResult>, CompactionRequestError>> {
+    let snapshot = resolve_compaction_provider(&model.api);
+    if !provider_supports_compaction(&snapshot.provider, model) {
+        return Box::pin(async { Ok(None) });
+    }
+    let compact = snapshot
+        .provider
+        .compact
+        .expect("checked by provider_supports_compaction");
+    let fallible_compact = snapshot.fallible_compact;
+    let model = model.clone();
+    let context = context.clone();
+    let options = options.cloned();
+    Box::pin(async move {
+        if let Some(compact) = fallible_compact {
+            compact(&model, &context, options.as_ref()).await
+        } else {
+            Ok(compact(&model, &context, options.as_ref()).await)
+        }
+    })
 }
 
 pub fn stream(
@@ -155,6 +197,66 @@ mod tests {
         register_api_provider(provider("mistral-conversations"), None);
         let model = Model::new("m", "M", "mistral-conversations", "mistral", "https://example.test");
         assert!(!supports_compaction(&model));
+        clear_api_providers();
+    }
+
+    #[test]
+    fn built_in_custom_built_in_compaction_uses_the_current_atomic_snapshot() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use crate::providers::register_builtins::register_built_in_api_providers;
+
+        let _guard = API_REGISTRY_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        clear_api_providers();
+        let model = Model::new(
+            "gpt-5.1-codex",
+            "Synthetic supported Codex",
+            "openai-codex-responses",
+            "openai-codex",
+            "https://unused.invalid",
+        );
+        let mut options = CompactionOptions::default();
+        // Account-ID extraction rejects this synthetic JWT before any network request. The
+        // built-in typed path returns Err; the legacy Option wrapper would erase it to None.
+        options.simple.stream.api_key = Some("synthetic-malformed-jwt".to_string());
+
+        register_built_in_api_providers();
+        assert!(resolve_compaction_provider("openai-codex-responses").fallible_compact.is_some());
+        let before = futures::executor::block_on(try_compact_simple(
+            &model,
+            &Context::default(),
+            Some(&options),
+        ));
+        assert!(matches!(before, Err(ref error) if error.name == "CompactionRequestError" && error.message == "Failed to extract accountId from token"),
+            "the current typed built-in handler must run before the custom override");
+
+        let custom_calls = Arc::new(AtomicUsize::new(0));
+        let observed_calls = custom_calls.clone();
+        let mut custom = provider("openai-codex-responses");
+        custom.supports_compaction = Some(Arc::new(|_| true));
+        custom.compact = Some(Arc::new(move |_, _, _| {
+            observed_calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { None })
+        }));
+        register_api_provider(custom, None);
+        assert!(resolve_compaction_provider("openai-codex-responses").fallible_compact.is_none());
+        let custom_result = futures::executor::block_on(try_compact_simple(
+            &model,
+            &Context::default(),
+            Some(&options),
+        ));
+        assert!(matches!(custom_result, Ok(None)), "custom None must remain unsupported");
+        assert_eq!(custom_calls.load(Ordering::SeqCst), 1);
+
+        register_built_in_api_providers();
+        assert!(resolve_compaction_provider("openai-codex-responses").fallible_compact.is_some());
+        let after = futures::executor::block_on(try_compact_simple(
+            &model,
+            &Context::default(),
+            Some(&options),
+        ));
+        assert!(matches!(after, Err(ref error) if error.name == "CompactionRequestError" && error.message == "Failed to extract accountId from token"),
+            "the current typed built-in handler must run again after the built-in reset");
+        assert_eq!(custom_calls.load(Ordering::SeqCst), 1, "stale custom handler must not run after built-in reset");
         clear_api_providers();
     }
 

@@ -1,0 +1,1 @@
+- Fixed OpenAI and Codex native compaction request failures being mistaken for unsupported compaction: HTTP and transport failures now reach the existing retry and cancellation path, while unsupported routes keep text-summary fallback and existing public provider interfaces retain their behavior.

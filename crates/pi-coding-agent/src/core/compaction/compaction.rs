@@ -25,7 +25,7 @@ use pi_ai::compaction::{
     ProviderCompactionCheckpoint,
 };
 use pi_ai::models::get_model_input_limit;
-use pi_ai::stream::{compact_simple, complete_simple, supports_compaction};
+use pi_ai::stream::{complete_simple, supports_compaction, try_compact_simple};
 use pi_ai::types::{
     Api, AssistantMessage, Context, Message, Model, StopReason, Usage,
     STOP_REASON_ABORTED, STOP_REASON_ERROR,
@@ -423,10 +423,10 @@ fn error_is_transient(error: &ProviderRequestError) -> bool {
         .status
         .map(|status| status == 408 || status == 429 || status >= 500)
         .unwrap_or(false);
-    let network_like = error.is_type_error && {
-        let message = error.message.to_lowercase();
-        message.contains("fetch") || message.contains("network") || message.contains("socket")
-    };
+    // Built-in compaction marks transport failures as TypeError. Other request
+    // failures (including local conversion and malformed checkpoints) do not
+    // set this bit and therefore are not replayed as transient network faults.
+    let network_like = error.is_type_error;
     status_transient || network_like
 }
 
@@ -457,7 +457,7 @@ async fn request_with_provider_retry(
             Ok(result) => return Ok(result),
             Err(error) => {
                 if signal.map(|signal| signal.is_cancelled()).unwrap_or(false) {
-                    return Err(error);
+                    return Err(provider_request_error(abort_error()));
                 }
                 if !error_is_transient(&error) || attempt >= max_retries {
                     return Err(error);
@@ -471,7 +471,7 @@ async fn request_with_provider_retry(
                     .await
                     .is_err()
                 {
-                    return Err(error);
+                    return Err(provider_request_error(abort_error()));
                 }
                 attempt += 1;
             }
@@ -2894,17 +2894,14 @@ pub async fn compact_with_metrics(
                         let model = model_for_request.clone();
                         let context = context_for_request.clone();
                         let options = merged_for_request.clone();
-                        Box::pin(
-                            async move { compact_simple(&model, &context, Some(&options)).await },
-                        )
+                        try_compact_simple(&model, &context, Some(&options))
                     };
-                    // `compactSimple` resolves to the value (or undefined); the
-                    // retry layer owns the error channel, so a provider failure is
-                    // mapped to `ProviderRequestError` here.
-                    // TS `compactSimple` resolving to `undefined` is a NORMAL
-                    // outcome: the caller falls through to the text summarizer
-                    // (compaction.ts:895-925). Only a request failure is an error.
-                    Ok(compact_call().await)
+                    compact_call().await.map_err(|error| ProviderRequestError {
+                        message: error.message,
+                        status: (error.status != 0).then_some(error.status),
+                        retry_after_ms: error.retry_after_ms,
+                        is_type_error: error.name == "TypeError",
+                    })
                 })
                     as pi_ai::types::BoxFuture<
                         Result<
@@ -2933,6 +2930,9 @@ pub async fn compact_with_metrics(
                 Ok(None) => PerformanceMetricOutcome::Unavailable,
                 Err(_) => PerformanceMetricOutcome::Failure,
             });
+            if local_signal.is_cancelled() {
+                return Err(abort_error());
+            }
             let remote = remote_result.map_err(|error| error.message)?;
             if let Some(remote) = remote {
                 if signal.map(|signal| signal.is_cancelled()).unwrap_or(false) {

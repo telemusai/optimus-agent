@@ -7,7 +7,8 @@
 use std::sync::{Arc, OnceLock, RwLock};
 
 use crate::api_registry::{
-	clear_api_providers, get_api_providers, register_api_provider_simple, ApiProviderSimple,
+	clear_api_providers, get_api_providers, register_api_provider_simple,
+	register_api_provider_simple_with_fallible_compaction, ApiProviderSimple, FallibleCompactFunction,
 };
 use crate::compaction::CompactionOptions;
 use crate::types::CompactFunction;
@@ -31,7 +32,8 @@ use super::google_vertex::{
 };
 use super::mistral::{stream_mistral as stream_mistral_provider, stream_simple_mistral, MistralOptions};
 use super::openai_codex_responses::{
-	compact_openai_codex_responses, stream_openai_codex_responses as stream_openai_codex_responses_provider,
+	compact_openai_codex_responses, try_compact_openai_codex_responses_typed,
+	stream_openai_codex_responses as stream_openai_codex_responses_provider,
 	stream_simple_openai_codex_responses, OpenAICodexResponsesOptions,
 };
 use super::openai_compaction::supports_openai_compaction;
@@ -40,7 +42,8 @@ use super::openai_completions::{
 	OpenAICompletionsOptions,
 };
 use super::openai_responses::{
-	compact_openai_responses, stream_openai_responses as stream_openai_responses_provider,
+	compact_openai_responses, try_compact_openai_responses_typed,
+	stream_openai_responses as stream_openai_responses_provider,
 	stream_simple_openai_responses, OpenAIResponsesOptions,
 };
 
@@ -199,6 +202,18 @@ fn compact_openai_responses_guarded() -> CompactFunction {
 	})
 }
 
+fn compact_openai_responses_fallible_guarded() -> FallibleCompactFunction {
+	Arc::new(|model: &Model, context: &Context, options: Option<&CompactionOptions>| {
+		if model.api != "openai-responses" {
+			panic!("Mismatched compaction api: {}", model.api);
+		}
+		let model = model.clone();
+		let context = context.clone();
+		let options = options.cloned();
+		Box::pin(async move { try_compact_openai_responses_typed(&model, &context, options.as_ref()).await })
+	})
+}
+
 fn compact_openai_codex_responses_guarded() -> CompactFunction {
 	Arc::new(|model: &Model, context: &Context, options: Option<&CompactionOptions>| {
 		if model.api != "openai-codex-responses" {
@@ -208,6 +223,18 @@ fn compact_openai_codex_responses_guarded() -> CompactFunction {
 		let context = context.clone();
 		let options = options.cloned();
 		Box::pin(async move { compact_openai_codex_responses(&model, &context, options.as_ref()).await })
+	})
+}
+
+fn compact_openai_codex_responses_fallible_guarded() -> FallibleCompactFunction {
+	Arc::new(|model: &Model, context: &Context, options: Option<&CompactionOptions>| {
+		if model.api != "openai-codex-responses" {
+			panic!("Mismatched compaction api: {}", model.api);
+		}
+		let model = model.clone();
+		let context = context.clone();
+		let options = options.cloned();
+		Box::pin(async move { try_compact_openai_codex_responses_typed(&model, &context, options.as_ref()).await })
 	})
 }
 
@@ -531,13 +558,13 @@ pub fn register_built_in_api_providers() {
 		supports_compaction: None,
 	}, None);
 
-	register_api_provider_simple(ApiProviderSimple {
+	register_api_provider_simple_with_fallible_compaction(ApiProviderSimple {
 		api: "openai-responses".to_string(),
 		supports_compaction: Some(compaction_api_guard("openai-responses", supports_openai_compaction)),
 		stream: stream_openai_responses(),
 		stream_simple: stream_simple_openai_responses_lazy(),
 		compact: Some(compact_openai_responses_guarded()),
-	}, None);
+	}, compact_openai_responses_fallible_guarded(), None);
 
 	register_api_provider_simple(ApiProviderSimple {
 		api: "azure-openai-responses".to_string(),
@@ -547,13 +574,13 @@ pub fn register_built_in_api_providers() {
 		supports_compaction: None,
 	}, None);
 
-	register_api_provider_simple(ApiProviderSimple {
+	register_api_provider_simple_with_fallible_compaction(ApiProviderSimple {
 		api: "openai-codex-responses".to_string(),
 		supports_compaction: Some(compaction_api_guard("openai-codex-responses", supports_openai_compaction)),
 		stream: stream_openai_codex_responses(),
 		stream_simple: stream_simple_openai_codex_responses_lazy(),
 		compact: Some(compact_openai_codex_responses_guarded()),
-	}, None);
+	}, compact_openai_codex_responses_fallible_guarded(), None);
 
 	register_api_provider_simple(ApiProviderSimple {
 		api: "google-generative-ai".to_string(),
