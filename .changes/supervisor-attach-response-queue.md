@@ -1,0 +1,1 @@
+- Fixed supervisor attach and command responses being silently dropped behind worker events by using an independent bounded, ordered control lane. Control-lane saturation is logged and disconnects the affected client. Bounded control priority preserves worker-event delivery, with an explicit causal exception keeping each cached-attach response before its snapshot stream.

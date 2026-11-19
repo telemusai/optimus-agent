@@ -40,7 +40,7 @@ pub(super) struct SupervisorFixture {
     pub root: std::path::PathBuf,
     pub supervisor: Arc<Supervisor>,
     pub client: Arc<PublicClient>,
-    pub outbound: mpsc::Receiver<Vec<u8>>,
+    pub outbound: mpsc::Receiver<PublicFrame>,
 }
 
 impl SupervisorFixture {
@@ -114,7 +114,7 @@ impl SupervisorFixture {
             pending_command_journal_log: Mutex::new(None),
         });
         supervisor.init_roster();
-        let (sender, outbound) = mpsc::channel::<Vec<u8>>(1024);
+        let (sender, outbound) = mpsc::channel::<PublicFrame>(1024);
         let (snapshot_dequeue, _) = tokio::sync::broadcast::channel::<Vec<u8>>(1024);
         let identity = create_active_session_id(None);
         let client = Arc::new(PublicClient {
@@ -124,7 +124,10 @@ impl SupervisorFixture {
             subscriptions: Mutex::new(HashSet::new()),
             supports_extension_ui: AtomicBool::new(false),
             pause_epoch: AtomicU64::new(0),
-            output: sender,
+            output: sender.clone(),
+            response_output: sender,
+            snapshot_responses_pending: AtomicU64::new(0),
+            snapshot_event_gate: AsyncMutex::new(()),
             snapshot_dequeue,
             stopped: CancellationToken::new(),
             roster_subscribed: AtomicBool::new(false),
@@ -139,7 +142,8 @@ impl SupervisorFixture {
         Self { root, supervisor, client, outbound }
     }
 
-    fn parse_output_frame(&self, frame: Vec<u8>) -> Option<Value> {
+    fn parse_output_frame(&self, frame: PublicFrame) -> Option<Value> {
+        let frame = frame.bytes;
         if frame.starts_with(SNAPSHOT_DEQUEUE_MARKER_PREFIX) {
             let _ = self.client.snapshot_dequeue.send(frame);
             return None;

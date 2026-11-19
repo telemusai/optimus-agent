@@ -87,6 +87,7 @@ mod worker_stop_safety_tests;
 const REQUEST_TIMEOUT: u64 = 24 * 60 * 60 * 1000;
 const STOP_CLEANUP_MAX_ATTEMPTS: usize = 3;
 const MAX_PUBLIC_LINE: usize = super::super::daemon_client::DAEMON_MAX_LINE_LENGTH;
+const RESPONSE_BATCH_LIMIT: usize = 8;
 
 /// `ROSTER_WATCHDOG_INTERVAL_MS` / `ROSTER_STALE_AFTER_MS` (daemon-supervisor.ts:194-195).
 const ROSTER_WATCHDOG_INTERVAL_MS: u64 = 15_000;
@@ -110,6 +111,11 @@ const WORKER_RETRY_DELAYS_MS: [u64; 3] = [250, 1000, 5000];
 // Internal queue records only. The writer consumes these markers without socket writes.
 const SNAPSHOT_DEQUEUE_MARKER_PREFIX: &[u8] = b"\x00optimus-snapshot-dequeue:";
 
+struct PublicFrame {
+    bytes: Vec<u8>,
+    before_snapshot: bool,
+}
+
 struct PublicClient {
     connection_id: String,
     id: Mutex<String>,
@@ -117,7 +123,13 @@ struct PublicClient {
     subscriptions: Mutex<HashSet<String>>,
     supports_extension_ui: AtomicBool,
     pause_epoch: AtomicU64,
-    output: mpsc::Sender<Vec<u8>>,
+    output: mpsc::Sender<PublicFrame>,
+    // Worker events are lossy under backpressure; command controls and responses need an ordered independent lane.
+    response_output: mpsc::Sender<PublicFrame>,
+    // Number of queued controls that must precede their snapshot start frames.
+    // This is a causal exception to ordinary response-batch fairness.
+    snapshot_responses_pending: AtomicU64,
+    snapshot_event_gate: AsyncMutex<()>,
     snapshot_dequeue: tokio::sync::broadcast::Sender<Vec<u8>>,
     stopped: CancellationToken,
     /// `client.rosterSubscribed` / `client.rosterResyncPending`.
@@ -166,9 +178,36 @@ impl PublicClient {
     fn write(&self, value: &Value) -> bool {
         let Ok(mut bytes) = serde_json::to_vec(value) else { return false; };
         bytes.push(b'\n');
-        match self.output.try_send(bytes) {
+        match self.output.try_send(PublicFrame { bytes, before_snapshot: false }) {
             Ok(()) => true,
             Err(mpsc::error::TrySendError::Full(_)) => { self.backpressured.store(true, Ordering::SeqCst); false }
+            Err(mpsc::error::TrySendError::Closed(_)) => { self.stopped.cancel(); false }
+        }
+    }
+    fn write_response(&self, value: &Value) -> bool { self.write_control(value, false) }
+    async fn write_snapshot_response(&self, bytes: Vec<u8>) -> bool {
+        let _gate = tokio::select! {
+            _ = self.stopped.cancelled() => return false,
+            gate = self.snapshot_event_gate.lock() => gate,
+        };
+        self.write_control_bytes(bytes, true)
+    }
+    fn write_control(&self, value: &Value, before_snapshot: bool) -> bool {
+        let Ok(bytes) = serde_json::to_vec(value) else { return false; };
+        self.write_control_bytes(bytes, before_snapshot)
+    }
+    fn write_control_bytes(&self, mut bytes: Vec<u8>, before_snapshot: bool) -> bool {
+        if bytes.last() != Some(&b'\n') { bytes.push(b'\n'); }
+        if before_snapshot { self.snapshot_responses_pending.fetch_add(1, Ordering::SeqCst); }
+        let sent = self.response_output.try_send(PublicFrame { bytes, before_snapshot });
+        if sent.is_err() && before_snapshot { self.snapshot_responses_pending.fetch_sub(1, Ordering::SeqCst); }
+        match sent {
+            Ok(()) => true,
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                eprintln!("Daemon client {} response queue is full; closing the connection instead of dropping the response", self.connection_id);
+                self.stopped.cancel();
+                false
+            }
             Err(mpsc::error::TrySendError::Closed(_)) => { self.stopped.cancel(); false }
         }
     }
@@ -3054,7 +3093,7 @@ impl Supervisor {
                                 "total": total,
                             });
                             if let Some(active) = &progress_active { frame["activeSessionId"] = json!(active); }
-                            progress_public.write(&frame);
+                            progress_public.write_response(&frame);
                         })),
                         on_session: Some(Arc::new(move |session: SessionInfo| {
                             let mut frame = json!({
@@ -3064,7 +3103,7 @@ impl Supervisor {
                                 "session": serialize_saved_session_info(&session),
                             });
                             if let Some(active) = &session_active { frame["activeSessionId"] = json!(active); }
-                            session_public.write(&frame);
+                            session_public.write_response(&frame);
                         })),
                     }
                 });
@@ -3086,7 +3125,7 @@ impl Supervisor {
                             "session": serialize_saved_session_info(session),
                         });
                         if let Some(active) = &item_active { frame["activeSessionId"] = json!(active); }
-                        item_public.write(&frame);
+                        item_public.write_response(&frame);
                     }) as Arc<dyn Fn(&SessionInfo) + Send + Sync>
                 });
                 let ledger = self.rlm_spawn_ledger_for(session_dir.as_deref()).await?;
@@ -3175,7 +3214,7 @@ impl Supervisor {
                 // (daemon-supervisor.ts:2418-2420): the reply is written before the deferred
                 // shutdown body runs, and that body writes `daemon_closing` to every client
                 // before it stops any worker (7314-7318).
-                public.write(&json!(reply));
+                public.write_response(&json!(reply));
                 for client in self.clients.lock().unwrap().values() { client.write(&json!({"type":"daemon_closing","reason":"shutdown"})); }
                 let supervisor = Arc::clone(self);
                 tokio::spawn(async move {
@@ -3331,7 +3370,7 @@ impl Supervisor {
             // (`isUnknownDaemonCommandError`, package-manager-cli.ts:1264-1277) fires instead of
             // aborting the update with "Could not prepare daemon sessions for automatic resume".
             "restart" => {
-                public.write(&json!(DaemonResponse::success(id.as_deref(), &kind, None)));
+                public.write_response(&json!(DaemonResponse::success(id.as_deref(), &kind, None)));
                 for client in self.clients.lock().unwrap().values() { client.write(&json!({"type":"daemon_closing","reason":"update"})); }
                 let supervisor = Arc::clone(self);
                 tokio::spawn(async move {
@@ -3532,7 +3571,7 @@ impl Supervisor {
             // settle its pending request instead of waiting out the 30s request timeout.
             Err(error) => {
                 let salvaged = daemon_protocol::salvage_daemon_command_id(&String::from_utf8_lossy(&line));
-                public.write(&json!(DaemonResponse::failure(salvaged.as_deref(), "parse", &error, None)));
+                public.write_response(&json!(DaemonResponse::failure(salvaged.as_deref(), "parse", &error, None)));
                 return;
             }
         };
@@ -3548,7 +3587,7 @@ impl Supervisor {
         if matches!(kind.as_str(), "prompt" | "prompt_and_wait") && body.get("admissionId").is_some() {
             if let Err(error) = self.register_prompt_admission(&public, &body) {
                 let salvaged = daemon_protocol::salvage_daemon_command_id(&String::from_utf8_lossy(&line));
-                public.write(&json!(DaemonResponse::failure(salvaged.as_deref(), &kind, &error, None)));
+                public.write_response(&json!(DaemonResponse::failure(salvaged.as_deref(), &kind, &error, None)));
                 return;
             }
             _prompt_admission_guard = self.get_prompt_admission(
@@ -3577,14 +3616,14 @@ impl Supervisor {
         // (daemon-supervisor.ts:1969-1972): the unlisted-command contract is what lets a client
         // detect a supervisor build that predates a command (`isUnknownDaemonCommandError`).
         if !super::DAEMON_COMMAND_TYPES.contains(&kind.as_str()) {
-            public.write(&json!(DaemonResponse::failure(id.as_deref(), &kind, &format!("Unknown daemon command: {kind}"), None)));
+            public.write_response(&json!(DaemonResponse::failure(id.as_deref(), &kind, &format!("Unknown daemon command: {kind}"), None)));
             return;
         }
         // The negotiated protocol belongs to the envelope, never the command body.
         if kind == "get_session_tree" {
             let min_protocol = daemon_protocol::daemon_command_compatibility("get_session_tree").min_protocol;
             if protocol_version.unwrap_or(0) < u64::from(min_protocol) {
-                public.write(&json!(DaemonResponse::failure(id.as_deref(), &kind, &format!("get_session_tree requires client protocol {min_protocol} or newer"), None)));
+                public.write_response(&json!(DaemonResponse::failure(id.as_deref(), &kind, &format!("get_session_tree requires client protocol {min_protocol} or newer"), None)));
                 return;
             }
         }
@@ -3595,14 +3634,14 @@ impl Supervisor {
         // cannot race the eviction snapshot and graceful worker shutdown.
         let _admission = self.eviction_fence.read().await;
         if let Err(error) = self.ownership.assert_current().await {
-            public.write(&json!(DaemonResponse::failure(id.as_deref(), &kind, &error.to_string(), None))); return;
+            public.write_response(&json!(DaemonResponse::failure(id.as_deref(), &kind, &error.to_string(), None))); return;
         }
         if let Some((client, id)) = &journal_identity {
             match self.journal.lock().unwrap().begin(client, id, &kind) {
-                Ok(CommandJournalBeginResult::Complete(response)) => { public.write(&json!(response)); return; }
-                Ok(CommandJournalBeginResult::Pending) => { public.write(&json!({"type":"response", "command":kind, "id":id, "success":false, "error":"The previous command result is uncertain and was not replayed", "errorInfo":{"code":"command_result_uncertain","clientId":client,"commandId":id}})); return; }
+                Ok(CommandJournalBeginResult::Complete(response)) => { public.write_response(&json!(response)); return; }
+                Ok(CommandJournalBeginResult::Pending) => { public.write_response(&json!({"type":"response", "command":kind, "id":id, "success":false, "error":"The previous command result is uncertain and was not replayed", "errorInfo":{"code":"command_result_uncertain","clientId":client,"commandId":id}})); return; }
                 Ok(CommandJournalBeginResult::New) => {},
-                Err(error) => { public.write(&json!(DaemonResponse::failure(id.as_str().into(), &kind, &error, None))); return; }
+                Err(error) => { public.write_response(&json!(DaemonResponse::failure(id.as_str().into(), &kind, &error, None))); return; }
             }
         }
         let response = match self.dispatch(&public, body).await { Ok(response) => response, Err(error) => Some(DaemonResponse::failure(id.as_deref(), &kind, &error, None)) };
@@ -3612,9 +3651,9 @@ impl Supervisor {
                     Ok(()) => self.journal.lock().unwrap().record_result(&client, &id, response.clone()),
                     Err(error) => Err(error.to_string()),
                 };
-                if let Err(error) = durable { public.write(&json!(DaemonResponse::failure(Some(&id), &kind, &error, None))); return; }
+                if let Err(error) = durable { public.write_response(&json!(DaemonResponse::failure(Some(&id), &kind, &error, None))); return; }
             }
-            public.write(&json!(response));
+            public.write_response(&json!(response));
         }
     }
     /// D-04: append one bounded, content-free delivery record. Telemetry only: a failed
@@ -4128,53 +4167,114 @@ fn parse_command(line: &[u8]) -> Result<(Map<String, Value>, Option<String>, Opt
         Ok((command, Some(object.get("clientId").and_then(Value::as_str).unwrap_or("").to_string()), protocol_version))
     } else { Ok((object.clone(), None, None)) }
 }
-fn spawn_connection<S>(supervisor: Arc<Supervisor>, stream: S) where S: AsyncRead + AsyncWrite + Unpin + Send + 'static {
+fn new_public_client(identity: String) -> (Arc<PublicClient>, mpsc::Receiver<PublicFrame>, mpsc::Receiver<PublicFrame>) {
+    let (sender, receiver) = mpsc::channel::<PublicFrame>(1024);
+    let (response_sender, response_receiver) = mpsc::channel::<PublicFrame>(1024);
+    let (snapshot_dequeue, _) = tokio::sync::broadcast::channel::<Vec<u8>>(1024);
+    let public = Arc::new(PublicClient {
+        connection_id: identity.clone(), id: Mutex::new(identity.clone()), protocol_id: Mutex::new(None),
+        subscriptions: Mutex::new(HashSet::new()), supports_extension_ui: AtomicBool::new(false), pause_epoch: AtomicU64::new(0),
+        output: sender, response_output: response_sender, snapshot_responses_pending: AtomicU64::new(0), snapshot_event_gate: AsyncMutex::new(()), snapshot_dequeue, stopped: CancellationToken::new(), roster_subscribed: AtomicBool::new(false),
+        roster_resync_pending: AtomicBool::new(false), backpressured: AtomicBool::new(false),
+    });
+    (public, receiver, response_receiver)
+}
+async fn write_control_frame<S: AsyncWrite + Unpin>(
+    public: &PublicClient, output: &mut S, cancelled: &CancellationToken, frame: PublicFrame,
+) -> bool {
+    tokio::select! {
+        _ = cancelled.cancelled() => return false,
+        result = output.write_all(&frame.bytes) => if result.is_err() { return false; },
+    }
+    if frame.before_snapshot { public.snapshot_responses_pending.fetch_sub(1, Ordering::SeqCst); }
+    true
+}
+fn spawn_public_writer<S>(
+    supervisor: Arc<Supervisor>, public: Arc<PublicClient>, mut output: S,
+    mut receiver: mpsc::Receiver<PublicFrame>, mut response_receiver: mpsc::Receiver<PublicFrame>,
+) -> tokio::task::JoinHandle<()> where S: AsyncWrite + Unpin + Send + 'static {
+    let cancelled = public.stopped.clone();
     tokio::spawn(async move {
-        let (mut input, mut output) = tokio::io::split(stream);
-        let (sender, mut receiver) = mpsc::channel::<Vec<u8>>(1024);
-        let (snapshot_dequeue, _) = tokio::sync::broadcast::channel::<Vec<u8>>(1024);
-        let identity = create_active_session_id(None);
-        let public = Arc::new(PublicClient {
-            connection_id: identity.clone(), id: Mutex::new(identity.clone()), protocol_id: Mutex::new(None),
-            subscriptions: Mutex::new(HashSet::new()), supports_extension_ui: AtomicBool::new(false), pause_epoch: AtomicU64::new(0),
-            output: sender, snapshot_dequeue, stopped: CancellationToken::new(), roster_subscribed: AtomicBool::new(false),
-            roster_resync_pending: AtomicBool::new(false), backpressured: AtomicBool::new(false),
-        });
-        supervisor.clients.lock().unwrap().insert(identity, public.clone());
-        public.write(&supervisor.hello(&public));
-        let cancelled = public.stopped.clone();
-        let writer_public = Arc::clone(&public);
-        let writer_supervisor = Arc::clone(&supervisor);
-        let writer = tokio::spawn(async move {
-            loop {
+        let mut response_batch = 0usize;
+        'writer: loop {
+            enum Lane { Response(PublicFrame), Event(PublicFrame) }
+            let lane = if response_batch < RESPONSE_BATCH_LIMIT {
                 tokio::select! { biased;
-                    bytes = receiver.recv() => match bytes {
-                        Some(bytes) => {
-                            if bytes.starts_with(SNAPSHOT_DEQUEUE_MARKER_PREFIX) {
-                                // FIFO receipt here is the socket-drain boundary: this
-                                // serial loop already completed the preceding chunk's
-                                // write_all before receiving its private marker.
-                                let _ = writer_public.snapshot_dequeue.send(bytes);
-                                continue;
-                            }
-                            if output.write_all(&bytes).await.is_err() { break; }
-                            // The socket drained: a resync deferred under backpressure
-                            // is written once, covering the whole loss gap.
-                            if writer_public.backpressured.swap(false, Ordering::SeqCst)
-                                && writer_public.roster_subscribed.load(Ordering::SeqCst)
-                                && writer_public.roster_resync_pending.swap(false, Ordering::SeqCst)
-                            {
-                                let changed = writer_supervisor.roster_entries_for_client();
-                                writer_public.write(&roster_update_value(&changed, &[], Some(true)));
-                            }
-                        },
-                        None => break,
-                    },
                     _ = cancelled.cancelled() => break,
+                    frame = response_receiver.recv() => match frame { Some(frame) => Lane::Response(frame), None => break },
+                    bytes = receiver.recv() => match bytes { Some(bytes) => Lane::Event(bytes), None => break },
+                }
+            } else {
+                // Bound response priority so a continuous response refill cannot
+                // starve event delivery, roster resyncs or snapshot acknowledgements.
+                tokio::select! { biased;
+                    _ = cancelled.cancelled() => break,
+                    bytes = receiver.recv() => match bytes { Some(bytes) => Lane::Event(bytes), None => break },
+                    frame = response_receiver.recv() => match frame { Some(frame) => Lane::Response(frame), None => break },
+                }
+            };
+            match lane {
+                Lane::Response(frame) => {
+                    if !write_control_frame(&public, &mut output, &cancelled, frame).await { break; }
+                    response_batch += 1;
+                }
+                Lane::Event(frame) => {
+                    response_batch = 0;
+                    let bytes = frame.bytes;
+                    if bytes.starts_with(SNAPSHOT_DEQUEUE_MARKER_PREFIX) {
+                        // FIFO receipt here is the socket-drain boundary: this
+                        // serial loop already completed the preceding chunk's
+                        // write_all before receiving its private marker.
+                        let _ = public.snapshot_dequeue.send(bytes);
+                        continue;
+                    }
+                    let _event_gate = tokio::select! {
+                        _ = cancelled.cancelled() => break 'writer,
+                        gate = public.snapshot_event_gate.lock() => gate,
+                    };
+                    // Select may have been armed before the producer registered its
+                    // causal response. Hold this dequeued event locally, drain in FIFO
+                    // order to the required responses, then write the retained event.
+                    // The gate makes producer registration and this causal drain mutually exclusive.
+                    while public.snapshot_responses_pending.load(Ordering::SeqCst) > 0 {
+                        let frame = tokio::select! { biased;
+                            _ = cancelled.cancelled() => break 'writer,
+                            frame = response_receiver.recv() => match frame { Some(frame) => frame, None => break 'writer },
+                        };
+                        if !write_control_frame(&public, &mut output, &cancelled, frame).await { break 'writer; }
+                        response_batch += 1;
+                    }
+                    // One writer owns every raw socket write. Once the causal check
+                    // and drain are complete, release the registration gate so an
+                    // unrelated blocked event write cannot stall a new attach enqueue.
+                    drop(_event_gate);
+                    tokio::select! {
+                        _ = cancelled.cancelled() => break,
+                        result = output.write_all(&bytes) => if result.is_err() { break; },
+                    }
+                    // The socket drained: a resync deferred under backpressure
+                    // is written once, covering the whole loss gap.
+                    if public.backpressured.swap(false, Ordering::SeqCst)
+                        && public.roster_subscribed.load(Ordering::SeqCst)
+                        && public.roster_resync_pending.swap(false, Ordering::SeqCst)
+                    {
+                        let changed = supervisor.roster_entries_for_client();
+                        public.write(&roster_update_value(&changed, &[], Some(true)));
+                    }
                 }
             }
-            cancelled.cancel(); let _ = output.shutdown().await;
-        });
+        }
+        cancelled.cancel(); let _ = output.shutdown().await;
+    })
+}
+fn spawn_connection<S>(supervisor: Arc<Supervisor>, stream: S) where S: AsyncRead + AsyncWrite + Unpin + Send + 'static {
+    tokio::spawn(async move {
+        let (mut input, output) = tokio::io::split(stream);
+        let identity = create_active_session_id(None);
+        let (public, receiver, response_receiver) = new_public_client(identity.clone());
+        supervisor.clients.lock().unwrap().insert(identity, public.clone());
+        public.write_response(&supervisor.hello(&public));
+        let writer = spawn_public_writer(supervisor.clone(), public.clone(), output, receiver, response_receiver);
         let mut pending = Vec::new(); let mut buffer = [0u8; 8192];
         loop {
             let read = tokio::select! { _ = supervisor.stopped.cancelled() => break, _ = public.stopped.cancelled() => break, read = input.read(&mut buffer) => read };
@@ -4253,6 +4353,9 @@ async fn commit_gate(mut gate: tokio::process::ChildStdin) -> Result<(), String>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::modes::daemon::daemon_client::DaemonClient;
+    use super::daemon_supervisor_parity_tests::SupervisorFixture;
+    use std::sync::Mutex as StdMutex;
 
 
     fn attach_membership_test_client(subscriptions: &[&str]) -> Arc<PublicClient> {
@@ -4265,13 +4368,556 @@ mod tests {
             subscriptions: Mutex::new(subscriptions.iter().map(|id| (*id).to_string()).collect()),
             supports_extension_ui: AtomicBool::new(false),
             pause_epoch: AtomicU64::new(0),
-            output,
+            output: output.clone(),
+            response_output: output,
             snapshot_dequeue,
             stopped: CancellationToken::new(),
-            roster_subscribed: AtomicBool::new(false),
+            snapshot_responses_pending: AtomicU64::new(0), snapshot_event_gate: AsyncMutex::new(()), roster_subscribed: AtomicBool::new(false),
             roster_resync_pending: AtomicBool::new(false),
             backpressured: AtomicBool::new(false),
         })
+    }
+
+    #[derive(Default)]
+    struct TestWriteGate {
+        open: AtomicBool,
+        entered: AtomicBool,
+        entered_notify: tokio::sync::Notify,
+        write_waker: Mutex<Option<std::task::Waker>>,
+    }
+    impl TestWriteGate {
+        async fn entered(&self) {
+            while !self.entered.load(Ordering::SeqCst) {
+                let notified = self.entered_notify.notified();
+                if self.entered.load(Ordering::SeqCst) { break; }
+                notified.await;
+            }
+        }
+        fn release(&self) {
+            self.open.store(true, Ordering::SeqCst);
+            if let Some(waker) = self.write_waker.lock().unwrap().take() { waker.wake(); }
+        }
+    }
+    struct GatedWriter<S> { inner: S, gate: Arc<TestWriteGate> }
+    impl<S: AsyncWrite + Unpin> AsyncWrite for GatedWriter<S> {
+        fn poll_write(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>, buffer: &[u8]) -> std::task::Poll<std::io::Result<usize>> {
+            if !self.gate.open.load(Ordering::SeqCst) {
+                self.gate.entered.store(true, Ordering::SeqCst);
+                self.gate.entered_notify.notify_waiters();
+                *self.gate.write_waker.lock().unwrap() = Some(cx.waker().clone());
+                return std::task::Poll::Pending;
+            }
+            std::pin::Pin::new(&mut self.inner).poll_write(cx, buffer)
+        }
+        fn poll_flush(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+        }
+        fn poll_shutdown(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+    async fn read_control_ordering<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(server: S, client: Arc<DaemonClient>, fixture: SupervisorFixture) {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        let supervisor = fixture.supervisor.clone();
+        let (public, receiver, response_receiver) = new_public_client("ordered-client".into());
+        public.id.lock().unwrap().clone_from(&public.connection_id);
+        supervisor.clients.lock().unwrap().insert(public.connection_id.clone(), public.clone());
+        public.write_response(&supervisor.hello(&public));
+        let (input, output) = tokio::io::split(server);
+        let writer = spawn_public_writer(supervisor.clone(), public.clone(), output, receiver, response_receiver);
+        client.wait_for_hello(2_000).await.unwrap();
+        let observed = Arc::new(StdMutex::new(Vec::new()));
+        let callback_observed = observed.clone();
+        let request_client = client.clone();
+        let request = tokio::spawn(async move {
+            request_client.request_wire(command("list_saved_sessions"), 2_000, DaemonClientRequestOptions {
+                on_progress: Some(Arc::new(move |frame| {
+                    callback_observed.lock().unwrap().push(frame["type"].as_str().unwrap().to_string());
+                })), signal: None, recoverable: None,
+            }, None, Vec::new()).await
+        });
+        let mut lines = BufReader::new(input).lines();
+        let request_line = tokio::time::timeout(Duration::from_secs(2), lines.next_line()).await.unwrap().unwrap().unwrap();
+        let request_id = serde_json::from_str::<Value>(&request_line).unwrap()["id"].as_str().unwrap().to_string();
+        let progress = |kind: &str, extra: Value| {
+            let mut frame = json!({"type": kind, "command": "list_saved_sessions", "id": request_id});
+            frame.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            frame
+        };
+        public.write_response(&progress("session_list_progress", json!({"loaded": 1, "total": 2})));
+        public.write_response(&progress("session_list_item", json!({"session": {
+            "path": "session.jsonl", "id": "saved", "cwd": "work", "created": "now", "modified": "now",
+            "messageCount": 0, "firstMessage": "", "allMessagesText": ""
+        }})));
+        public.write_response(&progress("session_list_progress", json!({"loaded": 2, "total": 2})));
+        public.write_response(&json!(DaemonResponse::success(Some(&request_id), "list_saved_sessions", Some(json!({"sessions":[]})))));
+        request.await.unwrap().unwrap();
+        assert_eq!(*observed.lock().unwrap(), ["session_list_progress", "session_list_item", "session_list_progress"]);
+        public.stopped.cancel();
+        tokio::time::timeout(Duration::from_secs(2), writer).await.unwrap().unwrap();
+        client.close().await;
+    }
+    #[tokio::test]
+    async fn command_controls_reach_real_client_callbacks_before_settlement() {
+        let fixture = SupervisorFixture::new("socket-control-order").await;
+        #[cfg(windows)]
+        {
+            use tokio::net::windows::named_pipe::ServerOptions;
+            let path = format!(r"\\.\pipe\optimus-control-order-{}", uuid::Uuid::new_v4());
+            let client = DaemonClient::create(&path);
+            let server = ServerOptions::new().create(&path).unwrap();
+            let accept = tokio::spawn(async move { server.connect().await.map(|_| server) });
+            client.connect(2_000).await.unwrap();
+            read_control_ordering(accept.await.unwrap().unwrap(), client, fixture).await;
+        }
+        #[cfg(unix)]
+        {
+            let path = fixture.root.join("control-order.sock");
+            let client = DaemonClient::create(&path.to_string_lossy());
+            let listener = tokio::net::UnixListener::bind(&path).unwrap();
+            let accept = tokio::spawn(async move { listener.accept().await.map(|pair| pair.0) });
+            client.connect(2_000).await.unwrap();
+            read_control_ordering(accept.await.unwrap().unwrap(), client, fixture).await;
+        }
+    }
+    async fn read_chunked_response_priority<S, C>(server: S, client: C, fixture: SupervisorFixture)
+    where S: AsyncRead + AsyncWrite + Unpin + Send + 'static, C: AsyncRead + AsyncWrite + Unpin {
+        use futures::FutureExt;
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        let supervisor = fixture.supervisor.clone();
+        let (public, receiver, response_receiver) = new_public_client("chunked-client".into());
+        let gate = Arc::new(TestWriteGate::default());
+        let (input, output) = tokio::io::split(server);
+        let writer = spawn_public_writer(
+            supervisor.clone(), public.clone(), GatedWriter { inner: output, gate: gate.clone() }, receiver, response_receiver,
+        );
+        public.write_response(&supervisor.hello(&public));
+        gate.entered().await;
+        for sequence in 0..1024 {
+            assert!(public.write(&json!({"type":"session_event","activeSessionId":"background","sequence":sequence})));
+        }
+        assert!(matches!(public.output.try_send(PublicFrame { bytes: b"full\n".to_vec(), before_snapshot: false }), Err(tokio::sync::mpsc::error::TrySendError::Full(_))));
+        let mut response = DaemonResponse::success(Some("chunk-attach".into()), "attach", Some(json!({"snapshot": {
+            "lastEventSequence": 0, "lastEventCursor": Value::Null, "messages": []
+        }})));
+        let mut attach = Box::pin(supervisor.stream_cached_attach(&public, "chunk-active", &mut response));
+        assert!(attach.as_mut().now_or_never().is_none(), "the full event queue must suspend snapshot streaming");
+        gate.release();
+        let frames = async {
+            let mut lines = BufReader::new(client).lines();
+            let mut frames = Vec::new();
+            loop {
+                let line = tokio::time::timeout(Duration::from_secs(5), lines.next_line()).await.unwrap().unwrap().unwrap();
+                let frame: Value = serde_json::from_str(&line).unwrap();
+                let finished = frame["type"] == "session_snapshot_end";
+                frames.push(frame);
+                if finished { break frames; }
+            }
+        };
+        let (attach_result, frames) = tokio::join!(attach, frames);
+        attach_result.unwrap();
+        let response_position = frames.iter().position(|frame| frame["type"] == "response" && frame["id"] == "chunk-attach").unwrap();
+        let event_position = frames.iter().position(|frame| frame["type"] == "session_event").unwrap();
+        assert!(response_position < event_position, "attach response must precede an exactly full event queue: {frames:?}");
+        drop(input);
+        public.stopped.cancel();
+        tokio::time::timeout(Duration::from_secs(2), writer).await.unwrap().unwrap();
+    }
+    #[tokio::test]
+    async fn chunked_attach_response_precedes_an_exactly_full_event_queue_on_a_real_socket() {
+        let fixture = SupervisorFixture::new("socket-chunked-priority").await;
+        #[cfg(windows)]
+        {
+            use tokio::net::windows::named_pipe::{ClientOptions, ServerOptions};
+            let path = format!(r"\\.\pipe\optimus-chunk-priority-{}", uuid::Uuid::new_v4());
+            let server = ServerOptions::new().create(&path).unwrap();
+            let client = ClientOptions::new().open(&path).unwrap();
+            server.connect().await.unwrap();
+            read_chunked_response_priority(server, client, fixture).await;
+        }
+        #[cfg(unix)]
+        {
+            let path = fixture.root.join("chunk-priority.sock");
+            let listener = tokio::net::UnixListener::bind(&path).unwrap();
+            let client = tokio::net::UnixStream::connect(&path).await.unwrap();
+            let (server, _) = listener.accept().await.unwrap();
+            read_chunked_response_priority(server, client, fixture).await;
+        }
+    }
+    async fn read_snapshot_causal_boundary<S, C>(server: S, client: C, fixture: SupervisorFixture)
+    where S: AsyncRead + AsyncWrite + Unpin + Send + 'static, C: AsyncRead + AsyncWrite + Unpin {
+        use futures::FutureExt;
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        let supervisor = fixture.supervisor.clone();
+        let (public, receiver, response_receiver) = new_public_client("causal-client".into());
+        let gate = Arc::new(TestWriteGate::default());
+        for index in 0..RESPONSE_BATCH_LIMIT {
+            public.write_response(&json!({"type":"response","id":format!("preloaded-{index}"),"command":"attach","success":true}));
+        }
+        let (input, output) = tokio::io::split(server);
+        let writer = spawn_public_writer(
+            supervisor.clone(), public.clone(), GatedWriter { inner: output, gate: gate.clone() }, receiver, response_receiver,
+        );
+        gate.entered().await;
+        let mut response = DaemonResponse::success(Some("causal-attach".into()), "attach", Some(json!({"snapshot": {
+            "lastEventSequence": 0, "lastEventCursor": Value::Null, "messages": []
+        }})));
+        // With an unblocked event queue the complete empty snapshot can enqueue.
+        // The first eight controls are still waiting behind the gated socket write.
+        supervisor.stream_cached_attach(&public, "chunk-active", &mut response).now_or_never()
+            .expect("the empty snapshot must enqueue without waiting").unwrap();
+        assert_eq!(public.snapshot_responses_pending.load(Ordering::SeqCst), 1);
+        gate.release();
+        let mut lines = BufReader::new(client).lines();
+        let mut raw_frames = Vec::new();
+        let mut frames = Vec::new();
+        loop {
+            let line = tokio::time::timeout(Duration::from_secs(5), lines.next_line()).await.unwrap().unwrap().unwrap();
+            let frame: Value = serde_json::from_str(&line).unwrap();
+            let finished = frame["type"] == "session_snapshot_end";
+            raw_frames.push(line.into_bytes());
+            frames.push(frame);
+            if finished { break; }
+        }
+        let response_position = frames.iter().position(|frame| frame["type"] == "response" && frame["id"] == "causal-attach").unwrap();
+        assert_eq!(raw_frames[response_position], serde_json::to_vec(&response).unwrap(), "the socket must preserve the original direct DaemonResponse serialization bytes");
+        let begin_position = frames.iter().position(|frame| frame["type"] == "session_snapshot_begin").unwrap();
+        assert_eq!(response_position, RESPONSE_BATCH_LIMIT, "the cached response must follow exactly eight preloaded controls");
+        assert!(response_position < begin_position, "the snapshot must not overtake its causal response: {frames:?}");
+        // The socket reader applies the attach response before its following begin,
+        // so apply_attach_result sets the active identity before session filtering.
+        assert_eq!(frames[response_position]["data"]["snapshotStream"]["id"], frames[begin_position]["snapshotId"]);
+        assert_eq!(frames[begin_position]["activeSessionId"], "chunk-active");
+        assert_eq!(public.snapshot_responses_pending.load(Ordering::SeqCst), 0);
+        drop(input);
+        public.stopped.cancel();
+        tokio::time::timeout(Duration::from_secs(2), writer).await.unwrap().unwrap();
+    }
+    #[tokio::test]
+    async fn cached_attach_response_precedes_snapshot_after_a_preloaded_control_batch() {
+        let fixture = SupervisorFixture::new("socket-causal-boundary").await;
+        #[cfg(windows)]
+        {
+            use tokio::net::windows::named_pipe::{ClientOptions, ServerOptions};
+            let path = format!(r"\\.\pipe\optimus-causal-boundary-{}", uuid::Uuid::new_v4());
+            let server = ServerOptions::new().create(&path).unwrap();
+            let client = ClientOptions::new().open(&path).unwrap();
+            server.connect().await.unwrap();
+            read_snapshot_causal_boundary(server, client, fixture).await;
+        }
+        #[cfg(unix)]
+        {
+            let path = fixture.root.join("causal-boundary.sock");
+            let listener = tokio::net::UnixListener::bind(&path).unwrap();
+            let client = tokio::net::UnixStream::connect(&path).await.unwrap();
+            let (server, _) = listener.accept().await.unwrap();
+            read_snapshot_causal_boundary(server, client, fixture).await;
+        }
+    }
+
+    async fn read_armed_select_response_order<S, C>(server: S, client: C, fixture: SupervisorFixture)
+    where S: AsyncRead + AsyncWrite + Unpin + Send + 'static, C: AsyncRead + AsyncWrite + Unpin {
+        use futures::FutureExt;
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        let supervisor = fixture.supervisor.clone();
+        let (public, receiver, response_receiver) = new_public_client("armed-client".into());
+        let (input, output) = tokio::io::split(server);
+        let writer = spawn_public_writer(supervisor.clone(), public.clone(), output, receiver, response_receiver);
+        let mut lines = BufReader::new(client).lines();
+        for index in 0..RESPONSE_BATCH_LIMIT {
+            public.write_response(&json!({"type":"response","id":format!("armed-preload-{index}"),"command":"attach","success":true}));
+        }
+        for _ in 0..RESPONSE_BATCH_LIMIT {
+            tokio::time::timeout(Duration::from_secs(2), lines.next_line()).await.unwrap().unwrap().unwrap();
+        }
+        // The queues are empty and the writer has completed exactly one full
+        // response batch. Current-thread yield lets it park in event-first select.
+        tokio::task::yield_now().await;
+        let mut response = DaemonResponse::success(Some("armed-select-attach".into()), "attach", Some(json!({"snapshot": {
+            "lastEventSequence": 0, "lastEventCursor": Value::Null, "messages": []
+        }})));
+        supervisor.stream_cached_attach(&public, "chunk-active", &mut response).now_or_never()
+            .expect("empty attach queues response, begin and end synchronously").unwrap();
+        let mut frames = Vec::new();
+        loop {
+            let line = tokio::time::timeout(Duration::from_secs(5), lines.next_line()).await.unwrap().unwrap().unwrap();
+            let frame: Value = serde_json::from_str(&line).unwrap();
+            let finished = frame["type"] == "session_snapshot_end";
+            frames.push(frame);
+            if finished { break; }
+        }
+        let response_position = frames.iter().position(|frame| frame["type"] == "response" && frame["id"] == "armed-select-attach").unwrap();
+        let begin_position = frames.iter().position(|frame| frame["type"] == "session_snapshot_begin").unwrap();
+        assert_eq!(response_position, 0, "the eight preloaded controls were consumed before recording");
+        assert_eq!(begin_position, 1, "an armed fairness select must not overtake the attach response: {frames:?}");
+        assert_eq!(frames[response_position]["data"]["snapshotStream"]["id"], frames[begin_position]["snapshotId"]);
+        assert_eq!(frames[begin_position]["activeSessionId"], "chunk-active");
+        drop(input);
+        public.stopped.cancel();
+        tokio::time::timeout(Duration::from_secs(2), writer).await.unwrap().unwrap();
+    }
+    #[tokio::test]
+    async fn cached_attach_wins_a_race_with_an_already_armed_fairness_select() {
+        let fixture = SupervisorFixture::new("socket-armed-select").await;
+        #[cfg(windows)]
+        {
+            use tokio::net::windows::named_pipe::{ClientOptions, ServerOptions};
+            let path = format!(r"\\.\pipe\optimus-armed-select-{}", uuid::Uuid::new_v4());
+            let server = ServerOptions::new().create(&path).unwrap();
+            let client = ClientOptions::new().open(&path).unwrap();
+            server.connect().await.unwrap();
+            read_armed_select_response_order(server, client, fixture).await;
+        }
+        #[cfg(unix)]
+        {
+            let path = fixture.root.join("armed-select.sock");
+            let listener = tokio::net::UnixListener::bind(&path).unwrap();
+            let client = tokio::net::UnixStream::connect(&path).await.unwrap();
+            let (server, _) = listener.accept().await.unwrap();
+            read_armed_select_response_order(server, client, fixture).await;
+        }
+    }
+
+    async fn read_sustained_causal_fairness<S, C>(server: S, client: C, fixture: SupervisorFixture)
+    where S: AsyncRead + AsyncWrite + Unpin + Send + 'static, C: AsyncRead + AsyncWrite + Unpin {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        let supervisor = fixture.supervisor.clone();
+        let (public, receiver, response_receiver) = new_public_client("sustained-causal-client".into());
+        let gate = Arc::new(TestWriteGate::default());
+        for index in 0..RESPONSE_BATCH_LIMIT {
+            public.write_response(&json!({"type":"response","id":format!("sustained-preload-{index}"),"command":"attach","success":true}));
+        }
+        let (input, output) = tokio::io::split(server);
+        let writer = spawn_public_writer(
+            supervisor.clone(), public.clone(), GatedWriter { inner: output, gate: gate.clone() }, receiver, response_receiver,
+        );
+        gate.entered().await;
+        let mut marker = SNAPSHOT_DEQUEUE_MARKER_PREFIX.to_vec();
+        marker.extend_from_slice(b"sustained-causal-fairness");
+        let mut dequeued = public.snapshot_dequeue.subscribe();
+        public.output.try_send(PublicFrame { bytes: marker.clone(), before_snapshot: false }).unwrap();
+        for index in 0..65 {
+            let mut response = DaemonResponse::success(Some(&format!("sustained-attach-{index}")), "attach", Some(json!({"snapshot": {
+                "lastEventSequence": 0, "lastEventCursor": Value::Null, "messages": []
+            }})));
+            tokio::time::timeout(Duration::from_secs(1), supervisor.stream_cached_attach(&public, "chunk-active", &mut response))
+                .await.expect("cached attach registration must remain bounded").unwrap();
+        }
+        let marker_seen = Arc::new(AtomicBool::new(false));
+        let producer_seen = Arc::clone(&marker_seen);
+        let producer_public = Arc::clone(&public);
+        let producer = tokio::spawn(async move {
+            let mut produced = 0;
+            while !producer_seen.load(Ordering::SeqCst) {
+                assert!(produced < 1024, "marker acknowledgement must stop continued cached-attach production");
+                let index = produced + 65;
+                let mut response = DaemonResponse::success(Some(&format!("sustained-attach-{index}")), "attach", Some(json!({"snapshot": {
+                    "lastEventSequence": 0, "lastEventCursor": Value::Null, "messages": []
+                }})));
+                tokio::time::timeout(Duration::from_secs(1), supervisor.stream_cached_attach(&producer_public, "chunk-active", &mut response))
+                    .await.expect("continued cached-attach registration must remain bounded").unwrap();
+                produced += 1;
+                tokio::task::yield_now().await;
+            }
+            produced
+        });
+        // Continue production after the eight-control prelude is already blocked,
+        // then release the real socket. A response-only causal branch never reaches
+        // the marker and cannot stop this producer; fair writer arbitration can.
+        tokio::task::yield_now().await;
+        gate.release();
+        let acknowledgement_seen = Arc::clone(&marker_seen);
+        let acknowledgement = async {
+            let bytes = tokio::time::timeout(Duration::from_secs(2), dequeued.recv()).await.unwrap().unwrap();
+            acknowledgement_seen.store(true, Ordering::SeqCst);
+            bytes
+        };
+        let (acknowledged, produced) = tokio::join!(acknowledgement, producer);
+        let produced = produced.unwrap();
+        assert_eq!(acknowledged, marker);
+        let mut lines = BufReader::new(client).lines();
+        let mut snapshot_ends = 0;
+        while snapshot_ends < 65 + produced {
+            let line = tokio::time::timeout(Duration::from_secs(5), lines.next_line()).await.unwrap().unwrap().unwrap();
+            let frame: Value = serde_json::from_str(&line).unwrap();
+            if frame["type"] == "session_snapshot_end" { snapshot_ends += 1; }
+        }
+        assert_eq!(public.snapshot_responses_pending.load(Ordering::SeqCst), 0);
+        drop(input);
+        public.stopped.cancel();
+        tokio::time::timeout(Duration::from_secs(2), writer).await.unwrap().unwrap();
+    }
+    #[tokio::test]
+    async fn snapshot_dequeue_marker_gets_a_fairness_turn_during_sustained_cached_attaches() {
+        let fixture = SupervisorFixture::new("socket-sustained-causal-fairness").await;
+        #[cfg(windows)]
+        {
+            use tokio::net::windows::named_pipe::{ClientOptions, ServerOptions};
+            let path = format!(r"\\.\pipe\optimus-sustained-causal-{}", uuid::Uuid::new_v4());
+            let server = ServerOptions::new().create(&path).unwrap();
+            let client = ClientOptions::new().open(&path).unwrap();
+            server.connect().await.unwrap();
+            read_sustained_causal_fairness(server, client, fixture).await;
+        }
+        #[cfg(unix)]
+        {
+            let path = fixture.root.join("sustained-causal.sock");
+            let listener = tokio::net::UnixListener::bind(&path).unwrap();
+            let client = tokio::net::UnixStream::connect(&path).await.unwrap();
+            let (server, _) = listener.accept().await.unwrap();
+            read_sustained_causal_fairness(server, client, fixture).await;
+        }
+    }
+    async fn read_blocked_event_attach_registration<S, C>(server: S, client: C, fixture: SupervisorFixture)
+    where S: AsyncRead + AsyncWrite + Unpin + Send + 'static, C: AsyncRead + AsyncWrite + Unpin {
+        use futures::FutureExt;
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        let supervisor = fixture.supervisor.clone();
+        let (public, receiver, response_receiver) = new_public_client("blocked-event-client".into());
+        let gate = Arc::new(TestWriteGate::default());
+        assert!(public.write(&json!({"type":"session_event","activeSessionId":"background"})));
+        let (input, output) = tokio::io::split(server);
+        let writer = spawn_public_writer(
+            supervisor.clone(), public.clone(), GatedWriter { inner: output, gate: gate.clone() }, receiver, response_receiver,
+        );
+        gate.entered().await;
+        let mut response = DaemonResponse::success(Some("blocked-event-attach".into()), "attach", Some(json!({"snapshot": {
+            "lastEventSequence": 0, "lastEventCursor": Value::Null, "messages": []
+        }})));
+        // No wire progress is claimed here. Only registration/enqueue must complete
+        // while the ordinary event is stalled in its real socket write.
+        supervisor.stream_cached_attach(&public, "chunk-active", &mut response).now_or_never()
+            .expect("registration must not wait for an unrelated event socket write").unwrap();
+        assert_eq!(public.snapshot_responses_pending.load(Ordering::SeqCst), 1);
+        gate.release();
+        let mut lines = BufReader::new(client).lines();
+        let mut frames = Vec::new();
+        loop {
+            let line = tokio::time::timeout(Duration::from_secs(2), lines.next_line()).await.unwrap().unwrap().unwrap();
+            let frame: Value = serde_json::from_str(&line).unwrap();
+            let finished = frame["type"] == "session_snapshot_end";
+            frames.push(frame);
+            if finished { break; }
+        }
+        let response_position = frames.iter().position(|frame| frame["type"] == "response" && frame["id"] == "blocked-event-attach").unwrap();
+        let begin_position = frames.iter().position(|frame| frame["type"] == "session_snapshot_begin").unwrap();
+        assert!(response_position < begin_position);
+        drop(input);
+        public.stopped.cancel();
+        tokio::time::timeout(Duration::from_secs(2), writer).await.unwrap().unwrap();
+    }
+    #[tokio::test]
+    async fn cached_attach_enqueues_while_an_unrelated_event_socket_write_is_blocked() {
+        let fixture = SupervisorFixture::new("socket-blocked-event-enqueue").await;
+        #[cfg(windows)]
+        {
+            use tokio::net::windows::named_pipe::{ClientOptions, ServerOptions};
+            let path = format!(r"\\.\pipe\optimus-blocked-event-{}", uuid::Uuid::new_v4());
+            let server = ServerOptions::new().create(&path).unwrap();
+            let client = ClientOptions::new().open(&path).unwrap();
+            server.connect().await.unwrap();
+            read_blocked_event_attach_registration(server, client, fixture).await;
+        }
+        #[cfg(unix)]
+        {
+            let path = fixture.root.join("blocked-event.sock");
+            let listener = tokio::net::UnixListener::bind(&path).unwrap();
+            let client = tokio::net::UnixStream::connect(&path).await.unwrap();
+            let (server, _) = listener.accept().await.unwrap();
+            read_blocked_event_attach_registration(server, client, fixture).await;
+        }
+    }
+
+    async fn read_response_fairness<S, C>(server: S, client: C, fixture: SupervisorFixture)
+    where S: AsyncRead + AsyncWrite + Unpin + Send + 'static, C: AsyncRead + AsyncWrite + Unpin {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        let (public, receiver, response_receiver) = new_public_client("fair-client".into());
+        let gate = Arc::new(TestWriteGate::default());
+        assert!(public.write(&json!({"type":"session_event","activeSessionId":"fair"})));
+        for index in 0..=64 {
+            public.write_response(&json!({"type":"response","id":format!("response-{index}"),"command":"attach","success":true}));
+        }
+        let (input, output) = tokio::io::split(server);
+        let writer = spawn_public_writer(
+            fixture.supervisor.clone(), public.clone(), GatedWriter { inner: output, gate: gate.clone() }, receiver, response_receiver,
+        );
+        gate.entered().await;
+        gate.release();
+        let mut lines = BufReader::new(client).lines();
+        let mut response_count = 0;
+        loop {
+            let line = tokio::time::timeout(Duration::from_secs(2), lines.next_line()).await.unwrap().unwrap().unwrap();
+            let frame: Value = serde_json::from_str(&line).unwrap();
+            if frame["type"] == "session_event" { break; }
+            assert_eq!(frame["type"], "response");
+            response_count += 1;
+        }
+        assert_eq!(response_count, RESPONSE_BATCH_LIMIT, "a queued event must follow one bounded response burst");
+        drop(input);
+        public.stopped.cancel();
+        tokio::time::timeout(Duration::from_secs(2), writer).await.unwrap().unwrap();
+    }
+    #[tokio::test]
+    async fn bounded_response_burst_delivers_a_pending_event_on_a_real_socket() {
+        let fixture = SupervisorFixture::new("socket-response-fairness").await;
+        #[cfg(windows)]
+        {
+            use tokio::net::windows::named_pipe::{ClientOptions, ServerOptions};
+            let path = format!(r"\\.\pipe\optimus-response-fairness-{}", uuid::Uuid::new_v4());
+            let server = ServerOptions::new().create(&path).unwrap();
+            let client = ClientOptions::new().open(&path).unwrap();
+            server.connect().await.unwrap();
+            read_response_fairness(server, client, fixture).await;
+        }
+        #[cfg(unix)]
+        {
+            let path = fixture.root.join("response-fairness.sock");
+            let listener = tokio::net::UnixListener::bind(&path).unwrap();
+            let client = tokio::net::UnixStream::connect(&path).await.unwrap();
+            let (server, _) = listener.accept().await.unwrap();
+            read_response_fairness(server, client, fixture).await;
+        }
+    }
+    async fn read_response_overflow_eof<S, C>(server: S, mut client: C, fixture: SupervisorFixture)
+    where S: AsyncRead + AsyncWrite + Unpin + Send + 'static, C: AsyncRead + AsyncWrite + Unpin {
+        let (public, receiver, response_receiver) = new_public_client("overflow-client".into());
+        let gate = Arc::new(TestWriteGate::default());
+        let (input, output) = tokio::io::split(server);
+        let writer = spawn_public_writer(
+            fixture.supervisor.clone(), public.clone(), GatedWriter { inner: output, gate: gate.clone() }, receiver, response_receiver,
+        );
+        public.write_response(&fixture.supervisor.hello(&public));
+        gate.entered().await;
+        for index in 0..1024 {
+            assert!(public.write_response(&json!({"id":index,"type":"response","command":"attach","success":true})));
+        }
+        assert!(!public.write_response(&json!({"type":"response","command":"attach","success":true})));
+        drop(input);
+        tokio::time::timeout(Duration::from_secs(2), writer).await.unwrap().unwrap();
+        let mut received = Vec::new();
+        tokio::time::timeout(Duration::from_secs(2), client.read_to_end(&mut received)).await.unwrap().unwrap();
+        assert!(received.is_empty(), "the gated client must observe an orderly EOF, not a late response");
+    }
+    #[tokio::test]
+    async fn response_queue_overflow_closes_a_real_socket() {
+        let fixture = SupervisorFixture::new("socket-response-overflow").await;
+        #[cfg(windows)]
+        {
+            use tokio::net::windows::named_pipe::{ClientOptions, ServerOptions};
+            let path = format!(r"\\.\pipe\optimus-response-overflow-{}", uuid::Uuid::new_v4());
+            let server = ServerOptions::new().create(&path).unwrap();
+            let client = ClientOptions::new().open(&path).unwrap();
+            server.connect().await.unwrap();
+            read_response_overflow_eof(server, client, fixture).await;
+        }
+        #[cfg(unix)]
+        {
+            let path = fixture.root.join("response-overflow.sock");
+            let listener = tokio::net::UnixListener::bind(&path).unwrap();
+            let client = tokio::net::UnixStream::connect(&path).await.unwrap();
+            let (server, _) = listener.accept().await.unwrap();
+            read_response_overflow_eof(server, client, fixture).await;
+        }
     }
 
     #[test]
