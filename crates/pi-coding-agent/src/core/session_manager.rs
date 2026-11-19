@@ -2273,6 +2273,7 @@ struct SessionScanAccumulator {
     assistant_usage_by_id: BTreeMap<String, Usage>,
     attributed_child_usage: Usage,
     summarization_usage: Usage,
+    textmas_usage: crate::core::occ::textmas::TextMasUsageLedger,
 }
 
 struct SessionScanState {
@@ -2345,7 +2346,7 @@ fn drop_session_scan_state(file_path: &str) {
 /// Refresh LRU recency and enforce the retained-usage bound.
 fn store_session_scan_state(file_path: &str, mut state: SessionScanState) {
     drop_session_scan_state(file_path);
-    state.accounted_usage_entries = state.acc.assistant_usage_by_id.len();
+    state.accounted_usage_entries = state.acc.assistant_usage_by_id.len().saturating_add(state.acc.textmas_usage.len());
     let accounted = state.accounted_usage_entries;
     let mut store = session_scan_store()
         .lock()
@@ -2379,6 +2380,7 @@ fn create_session_scan_accumulator() -> SessionScanAccumulator {
         assistant_usage_by_id: BTreeMap::new(),
         attributed_child_usage: empty_usage(),
         summarization_usage: empty_usage(),
+        textmas_usage: Default::default(),
     }
 }
 
@@ -2444,6 +2446,7 @@ async fn scan_session_info(file_path: &str, retry_on_replacement: bool) -> Optio
                 assistant_usage_by_id: state.acc.assistant_usage_by_id.clone(),
                 attributed_child_usage: state.acc.attributed_child_usage.clone(),
                 summarization_usage: state.acc.summarization_usage.clone(),
+                textmas_usage: state.acc.textmas_usage.clone(),
             },
             info: state.info.clone(),
             accounted_usage_entries: state.accounted_usage_entries,
@@ -2535,6 +2538,7 @@ fn clone_scan_state(state: &SessionScanState) -> SessionScanState {
             assistant_usage_by_id: state.acc.assistant_usage_by_id.clone(),
             attributed_child_usage: state.acc.attributed_child_usage.clone(),
             summarization_usage: state.acc.summarization_usage.clone(),
+            textmas_usage: state.acc.textmas_usage.clone(),
         },
         info: state.info.clone(),
         accounted_usage_entries: state.accounted_usage_entries,
@@ -2661,6 +2665,9 @@ fn fold_session_scan_line(acc: &mut SessionScanAccumulator, line_buffer: &[u8]) 
         _ => return,
     };
 
+    if let Some(record) = crate::core::occ::textmas::usage_record(&entry) {
+        acc.textmas_usage.observe(record);
+    }
     if entry_type(&entry) == "session_info" {
         let name = entry
             .get("name")
@@ -2783,6 +2790,7 @@ fn snapshot_session_info(
         add_assistant_usage(&mut usage_total, usage);
     }
     add_assistant_usage(&mut usage_total, &acc.summarization_usage);
+    add_assistant_usage(&mut usage_total, &acc.textmas_usage.total());
     subtract_assistant_usage(&mut usage_total, &acc.attributed_child_usage);
     let cwd = header
         .get("cwd")
@@ -2838,6 +2846,7 @@ fn clone_accumulator(acc: &SessionScanAccumulator) -> SessionScanAccumulator {
         assistant_usage_by_id: acc.assistant_usage_by_id.clone(),
         attributed_child_usage: acc.attributed_child_usage.clone(),
         summarization_usage: acc.summarization_usage.clone(),
+        textmas_usage: acc.textmas_usage.clone(),
     }
 }
 
@@ -3609,6 +3618,47 @@ impl SessionWriteBuffer {
             .bytes
             .is_empty()
     }
+
+    /// Serialize the file publish with timed flushes, then retarget without a
+    /// second drain. The manager has already drained accepted bytes while it
+    /// excluded new appends. Holding `inner` and `path` across the rename means
+    /// a timed flush cannot observe the staged path after its inode moves.
+    fn import_handoff<T>(
+        &self,
+        new_path: &str,
+        publish: impl FnOnce() -> Result<T, String>,
+    ) -> Result<T, String> {
+        let inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut path = self
+            .path
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !inner.timed.bytes.is_empty() {
+            return Err("Import handoff found undrained candidate bytes".to_string());
+        }
+        let published = publish()?;
+        *path = new_path.to_string();
+        Ok(published)
+    }
+
+    /// Retarget after a partially completed rollback. The caller holds the
+    /// manager lock and the import handoff has already drained this buffer.
+    /// Never drain here: the inode previously named by `path` may have moved.
+    fn retarget_after_import_handoff(&self, new_path: &str) {
+        let inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        debug_assert!(inner.timed.bytes.is_empty());
+        let mut path = self
+            .path
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *path = new_path.to_string();
+    }
 }
 
 impl TimedFlush for SessionWriteBuffer {
@@ -3664,6 +3714,31 @@ pub struct SessionManager {
 }
 
 impl SessionManager {
+    /// Snapshot an in-memory manager before a fallible replacement build. The
+    /// candidate owns its mutations and listener list; failure leaves the live
+    /// manager and its observers byte-for-byte untouched.
+    pub fn clone_for_nonpersisted_replacement(&self) -> Self {
+        assert!(!self.persist, "only non-persisted managers can be cloned transactionally");
+        Self {
+            session_id: self.session_id.clone(),
+            session_file: self.session_file.clone(),
+            session_dir: self.session_dir.clone(),
+            cwd: self.cwd.clone(),
+            persist: self.persist,
+            flushed: self.flushed,
+            file_entries: self.file_entries.clone(),
+            by_id: self.by_id.clone(),
+            labels_by_id: self.labels_by_id.clone(),
+            label_timestamps_by_id: self.label_timestamps_by_id.clone(),
+            leaf_id: self.leaf_id.clone(),
+            persist_listeners: Arc::new(Mutex::new(Vec::new())),
+            load_observation: self.load_observation,
+            persist_write_epoch: self.persist_write_epoch,
+            rlm_delivery_synced_epoch: self.rlm_delivery_synced_epoch,
+            write_buffer: None,
+        }
+    }
+
     fn new_internal(
         cwd: String,
         session_dir: String,
@@ -4000,6 +4075,18 @@ impl SessionManager {
         }
     }
 
+    /// Keep accepted entries buffered for adapter visibility regressions without
+    /// changing the process-wide flush environment used by parallel tests.
+    #[cfg(test)]
+    pub(crate) fn hold_write_buffer_for_test(&mut self) {
+        let Some(path) = self.session_file.clone() else { return; };
+        let _ = self.drain_write_buffer();
+        self.write_buffer = Some(Arc::new(SessionWriteBuffer::new(
+            &path,
+            std::time::Duration::from_secs(3600),
+        )));
+    }
+
     /// Point the write buffer at a new target file. Pending bytes belong to
     /// the previous file and are flushed to it best-effort first; a failed
     /// flush drops them (bounded by one flush period of lines) rather than
@@ -4206,6 +4293,44 @@ impl SessionManager {
         self.rewrite_file()?;
         self.flushed = true;
         Ok(self.session_file.clone().unwrap_or_default())
+    }
+
+    /// Drain this manager at its current path and serialize a caller-owned
+    /// import publish with its buffer. On success both the manager and buffer
+    /// target `session_file`; on error both retain their exact old targets.
+    /// No old-path drain is permitted after the staged inode has moved.
+    pub(crate) fn import_handoff<T>(
+        &mut self,
+        session_file: &str,
+        publish: impl FnOnce() -> Result<T, String>,
+    ) -> Result<T, String> {
+        self.flush_now()?;
+        let session_file = resolve_path(session_file);
+        let published = match &self.write_buffer {
+            Some(buffer) => buffer.import_handoff(&session_file, publish)?,
+            None => publish()?,
+        };
+        self.session_file = Some(session_file);
+        Ok(published)
+    }
+
+    /// Repair candidate targeting after a rollback moved its published file
+    /// back to staging but a later restore failed. There is no drain here: the
+    /// candidate was drained before the rollback and its old path is expired.
+    pub(crate) fn retarget_imported_session_file(&mut self, session_file: &str) {
+        let session_file = resolve_path(session_file);
+        if let Some(buffer) = &self.write_buffer {
+            buffer.retarget_after_import_handoff(&session_file);
+        }
+        self.session_file = Some(session_file);
+    }
+
+    /// A disposed, replaced manager must not recreate a retired backup when a
+    /// retained handle or timed callback runs after import cleanup.
+    pub(crate) fn retire_import_replaced_session(&mut self) {
+        self.persist = false;
+        self.session_file = None;
+        self.write_buffer = None;
     }
 
     pub fn get_session_artifact_dir(&self) -> Option<String> {
@@ -4858,6 +4983,22 @@ impl SessionManager {
 
     pub fn get_entry(&self, id: &str) -> Option<SessionEntry> {
         self.by_id.get(id).cloned()
+    }
+
+    /// True when a custom_message entry of this type carrying this
+    /// `noticeId` (in its details) already exists. Full-history scan with
+    /// no window and no clones: delivery dedup must be exact, not
+    /// probabilistic. Read-only.
+    pub fn has_custom_message_notice(&self, custom_type: &str, notice_id: &str) -> bool {
+        self.by_id.values().any(|entry| {
+            entry_type(entry) == "custom_message"
+                && entry.get("customType").and_then(Value::as_str) == Some(custom_type)
+                && entry
+                    .get("details")
+                    .and_then(|details| details.get("noticeId"))
+                    .and_then(Value::as_str)
+                    == Some(notice_id)
+        })
     }
 
     pub fn get_children(&self, parent_id: &str) -> Vec<SessionEntry> {

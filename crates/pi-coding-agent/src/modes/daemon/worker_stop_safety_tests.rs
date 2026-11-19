@@ -10,6 +10,7 @@ enum Reply {
     Timeout,
     Disconnect,
     Reject,
+    Success,
     ReplaceRegistration,
 }
 
@@ -44,7 +45,7 @@ fn descriptor_path(fixture: &SupervisorFixture, worker: &Worker) -> PathBuf {
     fixture.supervisor.descriptor_dir.join(format!("{}.json", worker.descriptor.lock().unwrap().worker_id))
 }
 
-async fn scripted_client(worker: &Arc<Worker>, reply: Reply) -> tokio::task::JoinHandle<()> {
+async fn scripted_client(worker: &Arc<Worker>, reply: Reply) -> (tokio::task::JoinHandle<()>, Arc<DaemonWorkerClient>) {
     let socket = worker.descriptor.lock().unwrap().socket_path.clone();
     let mut pipe = tokio::net::windows::named_pipe::ServerOptions::new()
         .first_pipe_instance(true).create(&socket).expect("private named pipe");
@@ -67,32 +68,47 @@ async fn scripted_client(worker: &Arc<Worker>, reply: Reply) -> tokio::task::Joi
             Reply::Timeout => std::future::pending::<()>().await,
             Reply::ReplaceRegistration => {
                 server_worker.descriptor.lock().unwrap().worker_instance_id = Some("replacement-generation".into());
+                let replacement = Arc::new(DaemonWorkerClient::new("unused-stop-replacement"));
+                *server_worker.client.lock().unwrap() = Some(Arc::clone(&replacement));
+                *server_worker.subscribed_client.lock().unwrap() = Some(replacement);
             }
-            Reply::Reject => {}
+            Reply::Reject | Reply::Success => {}
         }
+        let success = matches!(reply, Reply::Success);
         let response = json!({
             "type": "response", "id": request.header["requestId"],
-            "command": request.header["commandType"], "success": false,
-            "error": "synthetic shutdown rejection"
+            "command": request.header["commandType"], "success": success,
+            "error": if success { Value::Null } else { json!("synthetic shutdown rejection") },
+            "data": if success { json!({"ok":true}) } else { Value::Null }
         });
         let header = json!({"kind": "outbound", "outboundType": "response", "requestId": request.header["requestId"]});
         let frame = encode_private_frame(&header, &serde_json::to_vec(&response).unwrap()).unwrap();
-        pipe.write_all(&frame).await.expect("negative acknowledgement");
+        pipe.write_all(&frame).await.expect("scripted acknowledgement");
         std::future::pending::<()>().await;
     });
     client.connect(2_000).await.expect("private worker client");
-    *worker.client.lock().unwrap() = Some(client);
-    server
+    *worker.client.lock().unwrap() = Some(Arc::clone(&client));
+    (server, client)
 }
 
-async fn forced_transport_failure(case: &str, reply: Reply, archive: bool) {
+async fn forced_transport_outcome(case: &str, reply: Reply, archive: bool) {
     let fixture = SupervisorFixture::new(case).await;
     let (mut child, worker) = child_worker(&fixture).await;
-    let server = scripted_client(&worker, reply).await;
+    let (server, client) = scripted_client(&worker, reply).await;
+    let stale = if matches!(reply, Reply::Success) {
+        Arc::clone(&client)
+    } else {
+        Arc::new(DaemonWorkerClient::new("stale-ready-stop-transport"))
+    };
+    *worker.subscribed_client.lock().unwrap() = Some(Arc::clone(&stale));
     let result = tokio::time::timeout(Duration::from_secs(8), fixture.supervisor.stop_worker(&worker, archive, true)).await;
     server.abort();
     let _ = server.await;
-    assert!(matches!(result, Ok(Ok(()))), "force shutdown must continue beyond a failed RPC: {result:?}");
+    assert!(matches!(result, Ok(Ok(()))), "force shutdown must continue beyond the RPC outcome: {result:?}");
+    assert!(worker.client.lock().unwrap().is_none());
+    assert!(worker.subscribed_client.lock().unwrap().is_none());
+    assert_eq!(client.close_call_count(), 1, "request transport closes exactly once");
+    assert_eq!(stale.close_call_count(), 1, "a shared transport is deduplicated; a stale ready transport closes once");
     tokio::time::timeout(Duration::from_secs(2), child.wait()).await.expect("test-owned worker exited").unwrap();
     assert!(fixture.supervisor.workers.lock().unwrap().is_empty());
     assert!(!descriptor_path(&fixture, &worker).exists(), "completed stop removes its tombstone");
@@ -100,17 +116,22 @@ async fn forced_transport_failure(case: &str, reply: Reply, archive: bool) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cr03_force_stops_after_rpc_timeout() {
-    forced_transport_failure("cr03-timeout", Reply::Timeout, false).await;
+    forced_transport_outcome("cr03-timeout", Reply::Timeout, false).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cr03_force_stops_after_rpc_disconnect() {
-    forced_transport_failure("cr03-disconnect", Reply::Disconnect, false).await;
+    forced_transport_outcome("cr03-disconnect", Reply::Disconnect, false).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cr03_force_stops_after_negative_archive_acknowledgement() {
-    forced_transport_failure("cr03-rejected", Reply::Reject, true).await;
+    forced_transport_outcome("cr03-rejected", Reply::Reject, true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cr03_graceful_stop_closes_shared_transport_and_clears_both_caches_once() {
+    forced_transport_outcome("cr03-graceful-cache-cleanup", Reply::Success, false).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -129,8 +150,16 @@ async fn cr03_force_keeps_unknown_identity_tombstoned() {
     let fixture = SupervisorFixture::new("cr03-unknown-pid").await;
     let (mut child, worker) = child_worker(&fixture).await;
     worker.descriptor.lock().unwrap().process_start_id = None;
+    let current = Arc::new(DaemonWorkerClient::new("retained-current-stop-transport"));
+    let stale = Arc::new(DaemonWorkerClient::new("retained-stale-ready-stop-transport"));
+    *worker.client.lock().unwrap() = Some(Arc::clone(&current));
+    *worker.subscribed_client.lock().unwrap() = Some(Arc::clone(&stale));
     let result = fixture.supervisor.stop_worker(&worker, false, true).await;
     assert!(result.as_ref().is_err_and(|error| error.contains("did not stop")), "unknown identity must not be reported dead: {result:?}");
+    assert!(worker.client.lock().unwrap().is_none(), "retained stop clears the current cache");
+    assert!(worker.subscribed_client.lock().unwrap().is_none(), "retained stop clears the stale ready cache");
+    assert_eq!(current.close_call_count(), 1);
+    assert_eq!(stale.close_call_count(), 1);
     // Leave the finalizer running past its escalation deadline: it must also
     // preserve a live process whose generation could not be authenticated.
     tokio::time::sleep(Duration::from_millis(super::super::STOP_FINALIZATION_SIGKILL_GRACE_MS + 250)).await;
@@ -145,11 +174,19 @@ async fn cr03_force_keeps_unknown_identity_tombstoned() {
 async fn cr03_stop_does_not_follow_relaunched_registration() {
     let fixture = SupervisorFixture::new("cr03-relaunched").await;
     let (mut child, worker) = child_worker(&fixture).await;
-    let server = scripted_client(&worker, Reply::ReplaceRegistration).await;
+    let (server, failed) = scripted_client(&worker, Reply::ReplaceRegistration).await;
+    let stale = Arc::new(DaemonWorkerClient::new("old-ready-before-stop-replacement"));
+    *worker.subscribed_client.lock().unwrap() = Some(Arc::clone(&stale));
     let result = fixture.supervisor.stop_worker(&worker, false, true).await;
     server.abort();
     let _ = server.await;
     assert!(result.as_ref().is_err_and(|error| error.contains("replaced during stop")), "stale stop must abort: {result:?}");
+    let current = worker.client.lock().unwrap().clone().expect("newer current client survives old stop cleanup");
+    let ready = worker.subscribed_client.lock().unwrap().clone().expect("newer ready client survives old stop cleanup");
+    assert!(Arc::ptr_eq(&current, &ready));
+    assert_eq!(current.close_call_count(), 0, "old stop cleanup never closes the replacement");
+    assert_eq!(failed.close_call_count(), 1, "old request transport closes once");
+    assert_eq!(stale.close_call_count(), 1, "old stale ready transport closes once");
     assert!(child.try_wait().unwrap().is_none(), "a replacement registration must not be followed");
     assert!(descriptor_path(&fixture, &worker).exists());
     child.kill().await.unwrap();
@@ -191,12 +228,18 @@ async fn cr03_delayed_finalizer_keeps_its_original_registration() {
 async fn cr03_ordinary_shutdown_does_not_force_on_negative_acknowledgement() {
     let fixture = SupervisorFixture::new("cr03-ordinary").await;
     let (mut child, worker) = child_worker(&fixture).await;
-    let server = scripted_client(&worker, Reply::Reject).await;
+    let (server, client) = scripted_client(&worker, Reply::Reject).await;
+    let stale = Arc::new(DaemonWorkerClient::new("ordinary-stale-ready-stop-transport"));
+    *worker.subscribed_client.lock().unwrap() = Some(Arc::clone(&stale));
     let result = fixture.supervisor.stop_worker(&worker, false, false).await;
     fixture.supervisor.stopped.cancel();
     server.abort();
     let _ = server.await;
     assert!(result.as_ref().is_err_and(|error| error.contains("did not stop")), "ordinary shutdown must report its timeout: {result:?}");
+    assert!(worker.client.lock().unwrap().is_none());
+    assert!(worker.subscribed_client.lock().unwrap().is_none());
+    assert_eq!(client.close_call_count(), 1);
+    assert_eq!(stale.close_call_count(), 1);
     assert!(child.try_wait().unwrap().is_none(), "ordinary shutdown must not force termination before finalization");
     assert!(descriptor_path(&fixture, &worker).exists());
     child.kill().await.unwrap();

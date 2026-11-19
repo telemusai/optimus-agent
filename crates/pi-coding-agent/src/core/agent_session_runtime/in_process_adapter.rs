@@ -495,6 +495,7 @@ impl InProcessRuntimeHost for InProcessRuntimeHostAdapter {
             let persisted_recap = manager.get_latest_agent_status().map(|status| status.summary);
             (manager.get_cwd(), manager.get_session_dir(), manager.get_leaf_id(), compaction_count, persisted_recap)
         };
+        let occ3_global_opt_in = session.settings_manager.lock().unwrap().get_agent_communication_occ3_opt_in();
         AgentSessionRuntimeSnapshotSource {
             session: crate::modes::agent_connection::snapshot::AgentSessionSnapshotSource {
                 session_id: session.session_id(),
@@ -530,6 +531,12 @@ impl InProcessRuntimeHost for InProcessRuntimeHostAdapter {
                 scoped_models: session.scoped_models().into_iter().map(|entry| AgentConnectionScopedModel { model: entry.model, thinking_level: entry.thinking_level }).collect(),
                 // `activeToolNames: session.getActiveToolNames()` (snapshot.ts:55).
                 active_tool_names: session.get_active_tool_names(),
+                // A dead native OCC-3 enrollment keeps the handoff tool on
+                // the list until the next turn removes it; the panel must
+                // not present that boundary turn as a live enrollment.
+                occ3_native_dead: session.experimental_native_occ3().map(|native| native.is_dead()).unwrap_or(false),
+                occ3_global_opt_in,
+                textmas_active: session.is_textmas_active(),
                 // `contextUsage: session.getContextUsage()` (snapshot.ts:56).
                 context_usage: serde_json::to_value(session.get_context_usage()).unwrap(),
                 persisted_recap,
@@ -710,12 +717,18 @@ impl InProcessRuntimeHost for InProcessRuntimeHostAdapter {
     }
 
     fn session_export_to_html(&self, output_path: Option<&str>) -> BoxFuture<Result<String, String>> {
-        let session_file = self.session().session_file();
+        let session = self.session();
+        let session_file = session.session_file();
         let output_path = output_path.map(|path| path.to_string());
         Box::pin(async move {
             let Some(session_file) = session_file else {
                 return Err("Cannot export in-memory session to HTML".to_string());
             };
+            session
+                .session_manager
+                .lock()
+                .expect("session manager poisoned")
+                .flush_now()?;
             let options = crate::core::export_html::ExportOptions {
                 output_path,
                 ..Default::default()
@@ -959,6 +972,35 @@ impl InProcessRuntimeHost for InProcessRuntimeHostAdapter {
 
     fn session_system_prompt(&self) -> String {
         self.session().system_prompt()
+    }
+
+    fn session_resolve_occ_queue_entry(&self, queue_id: &str, reemit: bool) -> Result<Value, String> {
+        // Same process: the session itself owns the native OCC-3 queue, so
+        // the resolve executes directly against it. The resolve API
+        // refuses any non-uncertain state, and the journaling goes through
+        // the same notice drain the session's own listener uses, so the
+        // transcript records and the roster projection observe the
+        // resolution within one drain cycle.
+        let native = self
+            .session()
+            .experimental_native_occ3()
+            .ok_or_else(|| "This chat has no active OCC-3 native session".to_string())?;
+        let notice = native
+            .sender_queue_resolve_uncertain(queue_id, reemit)
+            .map_err(|error| format!("Queue resolution refused: {error}"))?;
+        // The wrapper journals the outcome into the durable outbox
+        // atomically with the resolution itself (one lock, one persist).
+        Ok(match &notice {
+            Some(notice) => serde_json::json!({
+                "queueId": notice.queue_id,
+                "messageId": notice.message_id.clone().unwrap_or_default(),
+                "state": notice.state,
+                "reason": notice.reason.clone().unwrap_or_else(|| {
+                    if reemit { "manual_reemit".to_string() } else { "manual_cancel".to_string() }
+                }),
+            }),
+            None => serde_json::json!({ "queueId": queue_id, "state": "unchanged" }),
+        })
     }
 
     fn session_tool_definition(&self, name: &str) -> Option<ConnectionToolDefinition> {

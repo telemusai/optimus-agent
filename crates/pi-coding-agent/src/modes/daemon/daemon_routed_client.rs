@@ -241,7 +241,17 @@ impl DaemonRoutedClient {
         let direct = self.direct_client();
         if let Some(direct) = direct {
             if direct.is_connected() && self.serves_direct(&direct, &command) {
-                return direct.request(command, timeout_ms, options).await;
+                let attach_retry = (command.get("type").and_then(Value::as_str) == Some("attach")).then(|| command.clone());
+                match direct.request(command, timeout_ms, options.clone()).await {
+                    Err(DaemonClientError::SocketClosed(_)) if attach_retry.is_some() && self.is_control_plane_ready() => {
+                        // An attach that lost its direct write/response is safe to
+                        // retry through the supervisor. Detach first so this direct
+                        // client cannot service a duplicate fast-path attempt.
+                        self.fallback_to_supervisor();
+                        return self.request_control_plane(attach_retry.expect("attach command"), timeout_ms, options).await;
+                    }
+                    result => return result,
+                }
             }
         }
         self.request_control_plane(command, timeout_ms, options).await
@@ -430,7 +440,7 @@ fn routed_server_capability_supported(
     direct_supported: bool,
 ) -> bool {
     // Roster metadata comes from the control plane, never the direct worker.
-    if capability == "streaming_throughput" {
+    if capability == "streaming_throughput" || capability == "agent_communication_queue" {
         supervisor_connected && supervisor_supported
     } else {
         supervisor_supported || direct_supported
@@ -715,6 +725,16 @@ mod tests {
     }
 
     #[test]
+    fn communication_queue_metadata_never_uses_the_direct_worker_capability() {
+        // Queue metadata is roster metadata from the control plane, exactly
+        // like streaming throughput: a newer direct worker cannot satisfy
+        // an older supervisor, and a connected supervisor must advertise it.
+        assert!(!routed_server_capability_supported("agent_communication_queue", true, false, true));
+        assert!(!routed_server_capability_supported("agent_communication_queue", false, true, true));
+        assert!(routed_server_capability_supported("agent_communication_queue", true, true, false));
+    }
+
+    #[test]
     fn streaming_throughput_never_uses_new_worker_capability_for_old_supervisor() {
         assert!(!routed_server_capability_supported("streaming_throughput", true, false, true));
         assert!(!routed_server_capability_supported("streaming_throughput", false, true, true));
@@ -763,6 +783,64 @@ mod tests {
         );
         routed.close();
         assert_eq!(supervisor.closed.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn attach_write_first_broken_pipe_falls_back_exactly_once() {
+        let supervisor = FakeSupervisor::new(true, true);
+        *supervisor.response.lock().expect("response poisoned") = Some(serde_json::from_value::<DaemonResponse>(serde_json::json!({
+            "type":"response", "command":"attach", "success":true, "data":{"attached":true}
+        })).expect("response"));
+        let direct = Arc::new(DaemonWorkerClient::new("/definitely/missing/worker.sock"));
+        direct.install_test_write_failure(supervisor.hello().expect("hello"), std::io::ErrorKind::BrokenPipe);
+        let routed = DaemonRoutedClient::new(supervisor.clone(), direct);
+        let response = routed.request(command("attach"), 1000, DaemonClientRequestOptions::default()).await.expect("supervisor fallback");
+        assert!(response.success);
+        assert!(routed.direct_client().is_none(), "failed direct transport is detached");
+        assert_eq!(supervisor.requests.lock().expect("requests poisoned").len(), 1, "one supervisor attach, no duplicate reply");
+        // A later call uses the supervisor directly; it cannot replay the failed direct write.
+        routed.request(command("attach"), 1000, DaemonClientRequestOptions::default()).await.expect("second call");
+        assert_eq!(supervisor.requests.lock().expect("requests poisoned").len(), 2);
+        routed.close();
+    }
+
+    #[tokio::test]
+    async fn attach_close_first_uses_supervisor_without_a_direct_retry() {
+        let supervisor = FakeSupervisor::new(true, true);
+        *supervisor.response.lock().expect("response poisoned") = Some(serde_json::from_value::<DaemonResponse>(serde_json::json!({
+            "type":"response", "command":"attach", "success":true
+        })).expect("response"));
+        let direct = Arc::new(DaemonWorkerClient::new("/definitely/missing/worker.sock"));
+        direct.install_test_write_failure(supervisor.hello().expect("hello"), std::io::ErrorKind::BrokenPipe);
+        let routed = DaemonRoutedClient::new(supervisor.clone(), direct.clone());
+        direct.close_now();
+        let response = routed.request(command("attach"), 1000, DaemonClientRequestOptions::default()).await.expect("close-first supervisor route");
+        assert!(response.success);
+        assert_eq!(supervisor.requests.lock().expect("requests poisoned").len(), 1);
+        routed.close();
+    }
+
+    #[tokio::test]
+    async fn non_attach_write_failure_is_not_replayed() {
+        let supervisor = FakeSupervisor::new(true, true);
+        let direct = Arc::new(DaemonWorkerClient::new("/definitely/missing/worker.sock"));
+        let mut direct_hello = supervisor.hello().expect("hello");
+        direct_hello.server_capabilities.push("session_input_admission".into());
+        direct.install_test_write_failure(direct_hello, std::io::ErrorKind::BrokenPipe);
+        let routed = DaemonRoutedClient::new(supervisor.clone(), direct);
+        let error = routed.request(command("prompt"), 1000, DaemonClientRequestOptions::default()).await.expect_err("direct prompt write fails");
+        let DaemonClientError::SocketClosed(closed) = &error else {
+            panic!("direct prompt write must return SocketClosed: {error:?}");
+        };
+        assert_eq!(closed.socket_path, "/definitely/missing/worker.sock");
+        assert_eq!(closed.daemon_closing_reason, None);
+        let cause = closed.cause.as_deref().expect("direct transport cause");
+        assert!(cause.contains("write"), "{cause}");
+        assert!(cause.contains("BrokenPipe"), "{cause}");
+        assert!(cause.contains("injected transport failure"), "{cause}");
+        assert!(routed.direct_client().is_none(), "failed direct transport is detached");
+        assert!(supervisor.requests.lock().expect("requests poisoned").is_empty(), "non-attach write is never replayed");
+        routed.close();
     }
 
     #[tokio::test]

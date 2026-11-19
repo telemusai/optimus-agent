@@ -1,6 +1,174 @@
 //! Isolated startup recovery probes; no worker processes or provider calls.
 use super::*;
 use super::daemon_supervisor_parity_tests::{SupervisorFixture, add_descriptor_only_worker};
+use crate::modes::daemon::daemon_worker_client::{encode_private_frame, PrivateFrameDecoder};
+
+struct AdoptionListFailure {
+    socket: String,
+    observed: Arc<Mutex<Option<Arc<DaemonWorkerClient>>>>,
+    replacement: Arc<DaemonWorkerClient>,
+    task: tokio::task::JoinHandle<()>,
+    _socket_root: Option<tempfile::TempDir>,
+}
+
+async fn serve_adoption_list_failure<S>(
+    mut socket: S,
+    hello: Value,
+    supervisor: Arc<Supervisor>,
+    worker_id: String,
+    observed: Arc<Mutex<Option<Arc<DaemonWorkerClient>>>>,
+    replacement: Arc<DaemonWorkerClient>,
+    replace_during_list: bool,
+) where S: AsyncRead + AsyncWrite + Unpin {
+    let frame = encode_private_frame(
+        &json!({"kind":"outbound","outboundType":"daemon_hello","payloadEncoding":"jsonl"}),
+        hello.to_string().as_bytes(),
+    ).unwrap();
+    socket.write_all(&frame).await.unwrap();
+    let mut decoder = PrivateFrameDecoder::new();
+    let mut bytes = [0; 8192];
+    loop {
+        let count = socket.read(&mut bytes).await.unwrap();
+        if count == 0 { break; }
+        for frame in decoder.push(&bytes[..count]).unwrap() {
+            let command: Value = serde_json::from_slice(&frame.payload).unwrap();
+            let kind = command["type"].as_str().unwrap().to_string();
+            assert!(["worker_auth", "worker_subscribe", "list"].contains(&kind.as_str()));
+            if kind == "list" {
+                // This is the real adoption sequence: authentication and subscribe
+                // have published readiness before the failing list request.
+                let worker = supervisor.workers.lock().unwrap().get(&worker_id).cloned().expect("adopting worker");
+                let client = worker.client.lock().unwrap().clone().expect("authenticated client");
+                let ready = worker.subscribed_client.lock().unwrap().clone().expect("subscribe published readiness");
+                assert!(Arc::ptr_eq(&client, &ready));
+                *observed.lock().unwrap() = Some(Arc::clone(&client));
+                if replace_during_list {
+                    *worker.client.lock().unwrap() = Some(Arc::clone(&replacement));
+                    *worker.subscribed_client.lock().unwrap() = Some(Arc::clone(&replacement));
+                    let mut descriptor = worker.descriptor.lock().unwrap();
+                    descriptor.lifecycle = DAEMON_WORKER_LIFECYCLE_READY.into();
+                    descriptor.last_error = None;
+                }
+            }
+            let success = kind != "list";
+            let data = if kind == "worker_auth" {
+                json!({"capabilities":[DAEMON_WORKER_ROSTER_CAPABILITY]})
+            } else if kind == "list" {
+                json!({"sessions":[]})
+            } else {
+                json!({"ok":true})
+            };
+            let response = json!({
+                "type":"response", "id":command["id"], "command":kind,
+                "success":success,
+                "error":if success {Value::Null} else {json!("synthetic list failure")},
+                "data":data,
+            });
+            let response = encode_private_frame(
+                &json!({"kind":"outbound","outboundType":"response","requestId":command["id"],"payloadEncoding":"jsonl"}),
+                response.to_string().as_bytes(),
+            ).unwrap();
+            socket.write_all(&response).await.unwrap();
+        }
+    }
+}
+
+fn adoption_list_failure(
+    fixture: &SupervisorFixture,
+    worker_id: &str,
+    replace_during_list: bool,
+) -> AdoptionListFailure {
+    let hello = fixture.supervisor.hello(&fixture.client);
+    let observed = Arc::new(Mutex::new(None));
+    let replacement = Arc::new(DaemonWorkerClient::new("unused-adoption-replacement"));
+    #[cfg(unix)]
+    let (socket, task, socket_root) = {
+        let socket_root = tempfile::Builder::new().prefix("oa-").tempdir_in("/tmp").unwrap();
+        let socket = socket_root.path().join("adoption-list.sock").to_string_lossy().into_owned();
+        let server = tokio::net::UnixListener::bind(&socket).unwrap();
+        let supervisor = Arc::clone(&fixture.supervisor);
+        let worker_id = worker_id.to_string();
+        let observed_server = Arc::clone(&observed);
+        let replacement_server = Arc::clone(&replacement);
+        let task = tokio::spawn(async move {
+            let (socket, _) = server.accept().await.unwrap();
+            serve_adoption_list_failure(
+                socket, hello, supervisor, worker_id, observed_server,
+                replacement_server, replace_during_list,
+            ).await;
+        });
+        (socket, task, Some(socket_root))
+    };
+    #[cfg(windows)]
+    let (socket, task, socket_root) = {
+        let socket = format!(r"\\.\pipe\optimus-adoption-list-{}", uuid::Uuid::new_v4());
+        let server = tokio::net::windows::named_pipe::ServerOptions::new()
+            .first_pipe_instance(true).create(&socket).unwrap();
+        let supervisor = Arc::clone(&fixture.supervisor);
+        let worker_id = worker_id.to_string();
+        let observed_server = Arc::clone(&observed);
+        let replacement_server = Arc::clone(&replacement);
+        let task = tokio::spawn(async move {
+            server.connect().await.unwrap();
+            serve_adoption_list_failure(
+                server, hello, supervisor, worker_id, observed_server,
+                replacement_server, replace_during_list,
+            ).await;
+        });
+        (socket, task, None)
+    };
+    AdoptionListFailure { socket, observed, replacement, task, _socket_root: socket_root }
+}
+
+#[tokio::test]
+async fn adoption_list_failure_clears_both_caches_and_closes_failed_client() {
+    let fixture = SupervisorFixture::new("adoption-list-failure-cache-cleanup").await;
+    let worker = add_descriptor_only_worker(&fixture, "adopt-list", "root", "synthetic", DAEMON_WORKER_LIFECYCLE_READY);
+    let scripted = adoption_list_failure(&fixture, "adopt-list", false);
+    worker.descriptor.lock().unwrap().socket_path = scripted.socket.clone();
+    fixture.supervisor.persist_worker(&worker.descriptor.lock().unwrap()).unwrap();
+
+    fixture.supervisor.adopt_workers().await.unwrap();
+
+    let worker = fixture.supervisor.workers.lock().unwrap()["adopt-list"].clone();
+    let failed = scripted.observed.lock().unwrap().clone().expect("list observed the subscribed client");
+    assert!(worker.client.lock().unwrap().is_none(), "failed current client is detached");
+    assert!(worker.subscribed_client.lock().unwrap().is_none(), "failed ready client is detached");
+    assert!(Supervisor::ready_connected_client(&worker).is_none(), "the discarded transport cannot be resurrected by the ready fast path");
+    assert_eq!(failed.close_call_count(), 1, "the failed transport is closed exactly once");
+    assert_eq!(worker.descriptor.lock().unwrap().lifecycle, DAEMON_WORKER_LIFECYCLE_RECOVERING);
+    assert!(worker.deferred_recovery.load(Ordering::SeqCst));
+    fixture.supervisor.stopped.cancel();
+    tokio::time::timeout(Duration::from_secs(2), scripted.task).await.expect("failed client closes its socket").unwrap();
+    fixture.supervisor.ownership.release().await.unwrap();
+}
+
+#[tokio::test]
+async fn adoption_list_failure_preserves_replacement_and_still_closes_failed_client() {
+    let fixture = SupervisorFixture::new("adoption-list-failure-replacement").await;
+    let worker = add_descriptor_only_worker(&fixture, "adopt-race", "root", "synthetic", DAEMON_WORKER_LIFECYCLE_READY);
+    let scripted = adoption_list_failure(&fixture, "adopt-race", true);
+    worker.descriptor.lock().unwrap().socket_path = scripted.socket.clone();
+    fixture.supervisor.persist_worker(&worker.descriptor.lock().unwrap()).unwrap();
+
+    fixture.supervisor.adopt_workers().await.unwrap();
+
+    let worker = fixture.supervisor.workers.lock().unwrap()["adopt-race"].clone();
+    let failed = scripted.observed.lock().unwrap().clone().expect("list observed the subscribed client");
+    let current = worker.client.lock().unwrap().clone().expect("replacement remains current");
+    let ready = worker.subscribed_client.lock().unwrap().clone().expect("replacement remains ready");
+    assert!(Arc::ptr_eq(&current, &scripted.replacement));
+    assert!(Arc::ptr_eq(&ready, &scripted.replacement));
+    assert!(!Arc::ptr_eq(&ready, &failed), "the discarded client is not restored as readiness");
+    assert_eq!(failed.close_call_count(), 1, "stale failure closes only its own transport");
+    assert_eq!(scripted.replacement.close_call_count(), 0, "replacement is never closed");
+    assert_eq!(worker.descriptor.lock().unwrap().lifecycle, DAEMON_WORKER_LIFECYCLE_READY);
+    assert!(worker.descriptor.lock().unwrap().last_error.is_none());
+    assert!(!worker.deferred_recovery.load(Ordering::SeqCst));
+    fixture.supervisor.stopped.cancel();
+    tokio::time::timeout(Duration::from_secs(2), scripted.task).await.expect("failed client closes its socket").unwrap();
+    fixture.supervisor.ownership.release().await.unwrap();
+}
 
 #[test]
 fn adoption_identity_observation_distinguishes_unknown_from_replaced_and_dead() {
@@ -109,6 +277,94 @@ async fn adoption_failed_first_probe_reconnects_without_replay_or_identity_chang
     assert_eq!(seen.lock().unwrap().iter().filter(|kind| kind.as_str() == "worker_auth").count(), 2);
     fixture.supervisor.stopped.cancel();
     if let Some(client) = worker.client.lock().unwrap().take() { client.close_now(); }
+    task.abort();
+    fixture.supervisor.ownership.release().await.unwrap();
+}
+
+async fn connected_client_subscribe_attempt<S>(
+    mut socket: S,
+    attempt: usize,
+    hello: Value,
+    captured: Arc<Mutex<Vec<String>>>,
+) where S: AsyncRead + AsyncWrite + Unpin {
+    let frame = encode_private_frame(&json!({"kind":"outbound","outboundType":"daemon_hello","payloadEncoding":"jsonl"}), hello.to_string().as_bytes()).unwrap();
+    socket.write_all(&frame).await.unwrap();
+    let mut decoder = PrivateFrameDecoder::new();
+    let mut bytes = [0; 8192];
+    loop {
+        let count = socket.read(&mut bytes).await.unwrap();
+        if count == 0 { break; }
+        for frame in decoder.push(&bytes[..count]).unwrap() {
+            let command: Value = serde_json::from_slice(&frame.payload).unwrap();
+            let kind = command["type"].as_str().unwrap().to_string();
+            captured.lock().unwrap().push(kind.clone());
+            let success = attempt != 0 || kind != "worker_subscribe";
+            let data = if kind == "worker_auth" { json!({"capabilities":[DAEMON_WORKER_ROSTER_CAPABILITY]}) } else { json!({"ok":true}) };
+            let response = json!({"type":"response","id":command["id"],"command":kind.clone(),"success":success,"error":if success {Value::Null} else {json!("first subscribe failed")},"data":data});
+            let response = encode_private_frame(&json!({"kind":"outbound","outboundType":"response","requestId":command["id"],"payloadEncoding":"jsonl"}), response.to_string().as_bytes()).unwrap();
+            socket.write_all(&response).await.unwrap();
+            if attempt == 1 && kind == "worker_subscribe" {
+                // Prove readiness by reaching the real worker listener and
+                // public event forwarding path, not a subscription helper mock.
+                let event = json!({"type":"session_event","activeSessionId":"root","marker":"delivered-after-retry"});
+                let event = encode_private_frame(&json!({"kind":"outbound","outboundType":"session_event","activeSessionId":"root","payloadEncoding":"jsonl"}), event.to_string().as_bytes()).unwrap();
+                socket.write_all(&event).await.unwrap();
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn connected_client_retries_failed_subscribe_and_delivers_events() {
+    let mut fixture = SupervisorFixture::new("connected-client-subscribe-transaction").await;
+    let worker = add_descriptor_only_worker(&fixture, "live", "root", "synthetic", DAEMON_WORKER_LIFECYCLE_READY);
+    fixture.client.subscriptions.lock().unwrap().insert("root".into());
+    let hello = fixture.supervisor.hello(&fixture.client);
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    #[cfg(unix)]
+    let (_socket_root, socket, task) = {
+        // Unix socket paths must stay below SUN_LEN even under a long harness TMPDIR.
+        let socket_root = tempfile::Builder::new().prefix("oa-").tempdir_in("/tmp").unwrap();
+        let socket = socket_root.path().join("subscribe.sock").to_string_lossy().into_owned();
+        let server = tokio::net::UnixListener::bind(&socket).unwrap();
+        let captured = seen.clone();
+        let task = tokio::spawn(async move {
+            for attempt in 0..2 {
+                let (socket, _) = server.accept().await.unwrap();
+                connected_client_subscribe_attempt(socket, attempt, hello.clone(), captured.clone()).await;
+            }
+        });
+        (socket_root, socket, task)
+    };
+    #[cfg(windows)]
+    let (socket, task) = {
+        let socket = format!(r"\\.\pipe\optimus-connected-client-{}", uuid::Uuid::new_v4());
+        let captured = seen.clone();
+        let server_socket = socket.clone();
+        let task = tokio::spawn(async move {
+            for attempt in 0..2 {
+                let server = tokio::net::windows::named_pipe::ServerOptions::new()
+                    .first_pipe_instance(attempt == 0).create(&server_socket).unwrap();
+                server.connect().await.unwrap();
+                connected_client_subscribe_attempt(server, attempt, hello.clone(), captured.clone()).await;
+            }
+        });
+        (socket, task)
+    };
+    worker.descriptor.lock().unwrap().socket_path = socket;
+    let first = tokio::time::timeout(Duration::from_secs(5), fixture.supervisor.connected_client(&worker)).await.unwrap();
+    let first_error = match first { Ok(_) => panic!("first subscribe unexpectedly succeeded"), Err(error) => error };
+    assert!(first_error.contains("first subscribe failed"));
+    assert!(worker.client.lock().unwrap().is_none(), "failed client is not cached");
+    assert!(worker.subscribed_client.lock().unwrap().is_none());
+    let client = tokio::time::timeout(Duration::from_secs(5), fixture.supervisor.connected_client(&worker)).await.unwrap().expect("retry resubscribes");
+    assert!(client.is_connected());
+    let event = fixture.next_frame(Duration::from_secs(2)).await.expect("event after successful resubscribe");
+    assert_eq!(event["marker"], "delivered-after-retry");
+    assert_eq!(seen.lock().unwrap().iter().filter(|kind| kind.as_str() == "worker_subscribe").count(), 2);
+    assert!(Arc::ptr_eq(worker.subscribed_client.lock().unwrap().as_ref().unwrap(), &client));
+    fixture.supervisor.stopped.cancel();
+    client.close_now();
     task.abort();
     fixture.supervisor.ownership.release().await.unwrap();
 }

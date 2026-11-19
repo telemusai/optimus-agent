@@ -546,6 +546,13 @@ impl AgentSessionRuntime {
         reason: &str,
         target_session_file: Option<String>,
     ) -> Result<(), String> {
+        #[cfg(test)]
+        if target_session_file
+            .as_deref()
+            .is_some_and(import_teardown_fault)
+        {
+            return Err("synthetic import teardown fault before old-session disposal".to_string());
+        }
         let child_dispose_error = self.dispose_hosted_subagent_runtimes().await.err();
 
         let runner = self.session_extension_runner();
@@ -1334,6 +1341,13 @@ impl AgentSessionRuntime {
             }
 
             let target_leaf_id = target_leaf_id.expect("target leaf checked above");
+            // The selected entry came from the live manager, so its accepted
+            // buffered bytes must reach disk before the fork re-opens the file.
+            self.session()
+                .session_manager
+                .lock()
+                .expect("session manager poisoned")
+                .flush_now()?;
             let source_manager = Self::open_session_manager(
                 &current_session_file,
                 Some(&session_dir),
@@ -1341,7 +1355,14 @@ impl AgentSessionRuntime {
             )?;
             let forked_session_path = {
                 let mut manager = source_manager.lock().expect("session manager poisoned");
-                manager.create_branched_session(&target_leaf_id)?
+                let forked = manager.create_branched_session(&target_leaf_id)?;
+                if forked.is_some() {
+                    // A user-only branch otherwise follows the lazy first-
+                    // assistant rule and names a file that does not exist yet.
+                    // Persist the accepted source entries before reopening it.
+                    manager.flush_now()?;
+                }
+                forked
             };
             let Some(forked_session_path) = forked_session_path else {
                 return Err("Failed to create forked session".to_string());
@@ -1517,14 +1538,22 @@ impl AgentSessionRuntime {
 
         let previous_session_file = self.session().session_file();
         let lease = self.acquire_replacement_lease(Some(&destination_path))?;
-        if resolve_path(&destination_path) != resolved_path {
-            if let Err(error) = std::fs::copy(&resolved_path, &destination_path) {
-                self.release_uncommitted_lease(lease);
-                return Err(error.to_string());
-            }
+
+        // Always validate and build against a side file. In particular, an
+        // import whose basename names the live (or another existing) session
+        // must not truncate that destination before every fallible check wins.
+        let staged_path = format!(
+            "{destination_path}.import-{}.{}.tmp",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        );
+        let mut staged = StagedImportFile { path: staged_path, published: false };
+        if let Err(error) = std::fs::copy(&resolved_path, &staged.path) {
+            self.release_uncommitted_lease(lease);
+            return Err(error.to_string());
         }
         let session_manager = match Self::open_session_manager(
-            &destination_path,
+            &staged.path,
             Some(&session_dir),
             cwd_override,
         ) {
@@ -1535,57 +1564,198 @@ impl AgentSessionRuntime {
             }
         };
         let cwd_ok = assert_session_cwd_exists(
-            &SessionManagerCwdSource { session_manager: &session_manager },
+            &ImportSessionCwdSource {
+                session_manager: &session_manager,
+                destination_path: &destination_path,
+            },
             &self.cwd(),
         );
         if let Err(error) = cwd_ok {
             self.release_uncommitted_lease(lease);
             return Err(error.to_string());
         }
-        let file = session_manager
-            .lock()
-            .expect("session manager poisoned")
-            .get_session_file();
+
         let agent_dir = self.services().agent_dir.clone();
         let session_config = self.session_config.clone();
         let cwd = session_manager.lock().expect("session manager poisoned").get_cwd();
-        let deferred_cleanup_error = self.build_and_apply_replacement(
-            {
-                let this = Arc::clone(self);
-                move || {
-                    let this = Arc::clone(&this);
-                    let session_manager = Arc::clone(&session_manager);
-                    async move {
-                        this.clone().scoped_build(move || {
-                            let create_runtime = Arc::clone(&this.create_runtime);
-                            let session_manager = Arc::clone(&session_manager);
-                            async move {
-                                create_runtime(CreateAgentSessionRuntimeInput {
-                                    cwd,
-                                    agent_dir,
-                                    session_manager,
-                                    session_start_event: Some(serde_json::json!({
-                                        "type": "session_start",
-                                        "reason": "resume",
-                                        "previousSessionFile": previous_session_file,
-                                    })),
-                                    session_config,
-                                    session_options: None,
-                                    runtime_metadata: None,
-                                    session_lease: None,
-                                })
-                                .await
+        let previous_for_event = previous_session_file.clone();
+        let create_runtime = Arc::clone(&self.create_runtime);
+        let candidate_manager = Arc::clone(&session_manager);
+        let built = self
+            .scoped_build(move || async move {
+                create_runtime(CreateAgentSessionRuntimeInput {
+                    cwd,
+                    agent_dir,
+                    session_manager: candidate_manager,
+                    session_start_event: Some(serde_json::json!({
+                        "type": "session_start",
+                        "reason": "resume",
+                        "previousSessionFile": previous_for_event,
+                    })),
+                    session_config,
+                    session_options: None,
+                    runtime_metadata: None,
+                    session_lease: None,
+                })
+                .await
+            })
+            .await;
+        let result = match built {
+            Ok(result) => result,
+            Err(error) => {
+                self.release_uncommitted_lease(lease);
+                return Err(error);
+            }
+        };
+
+        // Publish before any irreversible old-session teardown. Candidate and
+        // old-live buffers drain at their current paths, then the rename and
+        // retarget run under the same manager/buffer locks. Candidate appends
+        // accepted after this handoff can only target the destination.
+        let replaces_live_file = self
+            .session()
+            .session_file()
+            .as_deref()
+            .map(resolve_path)
+            == Some(resolve_path(&destination_path));
+        let old_manager = replaces_live_file
+            .then(|| Arc::clone(&self.session().session_manager));
+        let backup_path = (replaces_live_file || std::path::Path::new(&destination_path).exists())
+            .then(|| import_backup_path(&destination_path));
+        let handoff = {
+            // Lock order is candidate -> optional old-live manager. No guard or
+            // buffer lock crosses the teardown await below.
+            let mut candidate = session_manager.lock().expect("session manager poisoned");
+            if let Some(old_manager) = &old_manager {
+                let mut old = old_manager.lock().expect("session manager poisoned");
+                candidate.import_handoff(&destination_path, || {
+                    old.import_handoff(
+                        backup_path
+                            .as_deref()
+                            .expect("a live import destination always has a backup target"),
+                        || {
+                            publish_staged_import(
+                                &staged.path,
+                                &destination_path,
+                                backup_path.as_deref(),
+                            )
+                        },
+                    )
+                })
+            } else {
+                candidate.import_handoff(&destination_path, || {
+                    publish_staged_import(&staged.path, &destination_path, backup_path.as_deref())
+                })
+            }
+        };
+        let published_backup = match handoff {
+            Ok(backup) => backup,
+            Err(error) => {
+                // A failed handoff leaves candidate targeting staged and the
+                // old live runtime targeting its original destination.
+                result.result.session.dispose_async(None).await;
+                self.release_uncommitted_lease(lease);
+                return Err(error);
+            }
+        };
+        staged.published = true;
+
+        let teardown_error = self
+            .teardown_for_replacement("resume", Some(destination_path.clone()))
+            .await
+            .err();
+        #[cfg(test)]
+        let rollback_safe_error = teardown_error
+            .as_ref()
+            .filter(|error| {
+                error.as_str() == "synthetic import teardown fault before old-session disposal"
+            })
+            .cloned();
+        #[cfg(not(test))]
+        let rollback_safe_error: Option<String> = None;
+        if let Some(error) = rollback_safe_error {
+            // Only the synthetic pre-disposal fault is rollback-safe. Production
+            // child-cleanup errors arrive after irreversible disposal and must
+            // commit the candidate, matching the other replacement operations.
+            let mut rollback_failure = None;
+            let rollback_error = {
+                let mut candidate = session_manager.lock().expect("session manager poisoned");
+                let rollback = if let Some(old_manager) = &old_manager {
+                    let mut old = old_manager.lock().expect("session manager poisoned");
+                    candidate.import_handoff(&staged.path, || {
+                        old.import_handoff(&destination_path, || {
+                            match rollback_published_import(
+                                &staged.path,
+                                &destination_path,
+                                published_backup.as_deref(),
+                            ) {
+                                Ok(()) => Ok(()),
+                                Err(failure) => {
+                                    let message = failure.message.clone();
+                                    rollback_failure = Some(failure);
+                                    Err(message)
+                                }
                             }
                         })
-                        .await
+                    })
+                } else {
+                    candidate.import_handoff(&staged.path, || {
+                        match rollback_published_import(
+                            &staged.path,
+                            &destination_path,
+                            published_backup.as_deref(),
+                        ) {
+                            Ok(()) => Ok(()),
+                            Err(failure) => {
+                                let message = failure.message.clone();
+                                rollback_failure = Some(failure);
+                                Err(message)
+                            }
+                        }
+                    })
+                };
+                match rollback {
+                    Ok(()) => {
+                        staged.published = false;
+                        None
+                    }
+                    Err(error) => {
+                        if rollback_failure
+                            .as_ref()
+                            .is_some_and(|failure| failure.staged_reclaimed)
+                        {
+                            candidate.retarget_imported_session_file(&staged.path);
+                            staged.published = false;
+                        }
+                        Some(error)
                     }
                 }
-            },
-            lease,
-            "resume",
-            file,
-        )
-        .await?;
+            };
+            result.result.session.dispose_async(None).await;
+            self.release_uncommitted_lease(lease);
+            return match rollback_error {
+                Some(rollback_error) => Err(format!(
+                    "{error}; import rollback also failed: {rollback_error}"
+                )),
+                None => Err(error),
+            };
+        }
+
+        let deferred_cleanup_error = teardown_error;
+        if let Some(old_manager) = &old_manager {
+            // All old dispose writes belong to the backup inode. Draining is
+            // best-effort here because the old runtime is already disposed;
+            // reporting an Err now would falsely promise a live-session rollback.
+            let mut old = old_manager.lock().expect("session manager poisoned");
+            let _ = old.flush_now();
+            old.retire_import_replaced_session();
+        }
+        if let Some(backup) = published_backup {
+            let _ = std::fs::remove_file(backup);
+        }
+
+        self.apply(result);
+        self.commit_replacement_lease(lease);
         // `finishSessionReplacement()` with no `withSession`.
         self.finish_session_replacement(None).await?;
         if let Some(error) = deferred_cleanup_error {
@@ -1694,6 +1864,26 @@ impl crate::core::session_cwd::SessionCwdSource for SessionManagerCwdSource<'_> 
     }
 }
 
+/// CWD validation reads the staged manager but reports the public destination
+/// in errors, not a random staging filename.
+struct ImportSessionCwdSource<'a> {
+    session_manager: &'a Arc<Mutex<SessionManager>>,
+    destination_path: &'a str,
+}
+
+impl crate::core::session_cwd::SessionCwdSource for ImportSessionCwdSource<'_> {
+    fn get_cwd(&self) -> String {
+        self.session_manager
+            .lock()
+            .expect("session manager poisoned")
+            .get_cwd()
+    }
+
+    fn get_session_file(&self) -> Option<String> {
+        Some(self.destination_path.to_string())
+    }
+}
+
 /// `switchSession` options (`{ cwdOverride?, withSession? }`).
 #[derive(Clone, Default)]
 pub struct SwitchSessionOptions {
@@ -1741,6 +1931,209 @@ fn resolve_path(value: &str) -> String {
     std::fs::canonicalize(cwd.join(value))
         .map(|path| path.to_string_lossy().to_string())
         .unwrap_or_else(|_| cwd.join(value).to_string_lossy().to_string())
+}
+
+/// Removes an unpublished staged import on every early-return path.
+struct StagedImportFile {
+    path: String,
+    published: bool,
+}
+
+impl Drop for StagedImportFile {
+    fn drop(&mut self) {
+        if !self.published {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ImportRenameStage {
+    DestinationBackup,
+    StagedPublish,
+    BackupRestore,
+    RollbackCandidate,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct ImportFaultState {
+    missing_directory: String,
+    failures: Vec<ImportRenameStage>,
+    attempts: Vec<ImportRenameStage>,
+    injected: Vec<ImportRenameStage>,
+    staged_path: Option<String>,
+    fail_teardown: bool,
+}
+
+#[cfg(test)]
+fn import_fault_registry(
+) -> &'static Mutex<HashMap<String, Arc<Mutex<ImportFaultState>>>> {
+    static REGISTRY: std::sync::OnceLock<Mutex<HashMap<String, Arc<Mutex<ImportFaultState>>>>> =
+        std::sync::OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[cfg(test)]
+fn import_fault_for(destination_path: &str) -> Option<Arc<Mutex<ImportFaultState>>> {
+    import_fault_registry()
+        .lock()
+        .expect("import fault registry poisoned")
+        .get(&resolve_path(destination_path))
+        .cloned()
+}
+
+#[cfg(test)]
+fn inject_import_rename_fault(source: &str, destination: &str) -> Option<std::io::Result<()>> {
+    let (destination_path, stage) = if destination.contains(".import-backup-") {
+        (source, ImportRenameStage::DestinationBackup)
+    } else if source.contains(".import-backup-") {
+        (destination, ImportRenameStage::BackupRestore)
+    } else if source.contains(".import-") {
+        (destination, ImportRenameStage::StagedPublish)
+    } else if destination.contains(".import-") {
+        (source, ImportRenameStage::RollbackCandidate)
+    } else {
+        return None;
+    };
+    let fault = import_fault_for(destination_path)?;
+    let missing_directory = {
+        let mut state = fault.lock().expect("import fault state poisoned");
+        state.attempts.push(stage);
+        match stage {
+            ImportRenameStage::StagedPublish => state.staged_path = Some(source.to_string()),
+            _ => {}
+        }
+        if !state.failures.contains(&stage) {
+            return None;
+        }
+        state.missing_directory.clone()
+    };
+    // The injected error comes from the operating system, not a fabricated
+    // string. The missing parent also guarantees that `source` is not moved.
+    let blocked = std::path::Path::new(&missing_directory).join("rename-target");
+    let result = std::fs::rename(source, blocked.to_string_lossy().as_ref());
+    assert!(result.is_err(), "the missing rename parent must produce a real OS fault");
+    fault.lock().expect("import fault state poisoned").injected.push(stage);
+    Some(result)
+}
+
+#[cfg(test)]
+fn import_teardown_fault(target_session_file: &str) -> bool {
+    let Some(fault) = import_fault_for(target_session_file) else {
+        return false;
+    };
+    let mut state = fault.lock().expect("import fault state poisoned");
+    let fail = state.fail_teardown;
+    state.fail_teardown = false;
+    fail
+}
+
+fn import_backup_path(destination_path: &str) -> String {
+    format!(
+        "{destination_path}.import-backup-{}.{}.tmp",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    )
+}
+
+/// One indirection keeps production on the real Windows/Unix rename while
+/// deterministic tests can inject an actual failing filesystem operation.
+fn rename_import_file(source: &str, destination: &str) -> std::io::Result<()> {
+    #[cfg(test)]
+    if let Some(result) = inject_import_rename_fault(source, destination) {
+        return result;
+    }
+    std::fs::rename(source, destination)
+}
+
+/// Restore the original inode when possible. If a rename rollback itself is
+/// obstructed, a same-filesystem copy is a second recovery path for the exact
+/// bytes; the backup is retained and named in the error if both methods fail.
+fn restore_import_backup(backup: &str, destination_path: &str) -> Result<(), String> {
+    match rename_import_file(backup, destination_path) {
+        Ok(()) => Ok(()),
+        Err(rename_error) => match std::fs::copy(backup, destination_path) {
+            Ok(_) => {
+                std::fs::remove_file(backup).map_err(|remove_error| {
+                    format!(
+                        "restore rename failed ({rename_error}); copied the original bytes to {destination_path}, but retained backup {backup} could not be removed: {remove_error}"
+                    )
+                })?;
+                Ok(())
+            }
+            Err(copy_error) => Err(format!(
+                "restore rename failed ({rename_error}); restore copy failed ({copy_error}); original bytes remain recoverable at {backup}"
+            )),
+        },
+    }
+}
+
+/// Publish beside the destination. An existing destination is moved aside so
+/// the same rename protocol works on Windows as on Unix; a failed publish puts
+/// those exact old bytes back before reporting the error.
+fn publish_staged_import(
+    staged_path: &str,
+    destination_path: &str,
+    backup: Option<&str>,
+) -> Result<Option<String>, String> {
+    let destination_exists = std::path::Path::new(destination_path).exists();
+    if destination_exists {
+        let backup = backup.ok_or_else(|| "Existing import destination has no backup path".to_string())?;
+        rename_import_file(destination_path, backup).map_err(|error| error.to_string())?;
+    }
+    if let Err(error) = rename_import_file(staged_path, destination_path) {
+        let restore = if destination_exists {
+            backup.map(|backup| restore_import_backup(backup, destination_path))
+        } else {
+            None
+        };
+        return match restore {
+            Some(Err(restore_error)) => Err(format!(
+                "{error}; additionally failed to restore the existing session: {restore_error}"
+            )),
+            _ => Err(error.to_string()),
+        };
+    }
+    Ok(if destination_exists {
+        backup.map(str::to_string)
+    } else {
+        None
+    })
+}
+
+struct ImportRollbackError {
+    message: String,
+    staged_reclaimed: bool,
+}
+
+/// Undo a successful handoff when old-runtime teardown still fails. Original
+/// bytes stay in the backup and the old manager remains targeted there on an
+/// obstructed restore, keeping that runtime operable and recovery explicit.
+fn rollback_published_import(
+    staged_path: &str,
+    destination_path: &str,
+    backup: Option<&str>,
+) -> Result<(), ImportRollbackError> {
+    if let Err(error) = rename_import_file(destination_path, staged_path) {
+        return Err(ImportRollbackError {
+            message: format!(
+                "could not reclaim the imported destination: {error}; original bytes remain at {}",
+                backup.unwrap_or("their original current-session path")
+            ),
+            staged_reclaimed: false,
+        });
+    }
+    if let Some(backup) = backup {
+        if let Err(error) = restore_import_backup(backup, destination_path) {
+            return Err(ImportRollbackError {
+                message: error,
+                staged_reclaimed: true,
+            });
+        }
+    }
+    Ok(())
 }
 
 /// `join(agentDir, name)`.
@@ -1940,4 +2333,905 @@ mod tests {
     fn session_before_event_result_default_is_not_cancelled() {
         assert!(!SessionBeforeEventResult::default().cancelled);
     }
+
+    struct PersistenceFixture {
+        _temp: tempfile::TempDir,
+        cwd: String,
+        session_dir: String,
+        runtime: Arc<AgentSessionRuntime>,
+        fail_build: Arc<std::sync::atomic::AtomicBool>,
+        prepare_candidate: Arc<std::sync::atomic::AtomicBool>,
+        candidate_managers: Arc<Mutex<Vec<Arc<Mutex<SessionManager>>>>>,
+        candidate_disposals: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    async fn build_persistence_candidate(
+        input: CreateAgentSessionRuntimeInput,
+        settings_manager: Arc<Mutex<crate::core::settings_manager::SettingsManager>>,
+        model_registry: Arc<Mutex<crate::core::model_registry::ModelRegistry>>,
+        model: pi_ai::types::Model,
+        fail_build: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<CreateAgentSessionRuntimeResult, String> {
+        if fail_build.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err("synthetic import candidate failure".to_string());
+        }
+        let services = crate::core::agent_session_services::create_agent_session_services(
+            crate::core::agent_session_services::CreateAgentSessionServicesOptions {
+                cwd: input.cwd.clone(),
+                agent_dir: Some(input.agent_dir.clone()),
+                auth_storage: None,
+                settings_manager: Some(Arc::clone(&settings_manager)),
+                model_registry: Some(Arc::clone(&model_registry)),
+                extension_flag_values: None,
+                no_builtin_herdr_reporter: Some(true),
+                telemetry_disabled: Some(true),
+                resource_loader_options: Some(
+                    crate::core::resource_loader::DefaultResourceLoaderOptions {
+                        cwd: input.cwd.clone(),
+                        agent_dir: input.agent_dir.clone(),
+                        settings_manager: Some(settings_manager),
+                        no_extensions: true,
+                        no_skills: true,
+                        no_prompt_templates: true,
+                        no_themes: true,
+                        no_context_files: true,
+                        bundled_skills_dir: Some(None),
+                        ..Default::default()
+                    },
+                ),
+            },
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        let services = Arc::new(services);
+        let result = crate::core::agent_session_services::create_agent_session_from_services(
+            crate::core::agent_session_services::CreateAgentSessionFromServicesOptions {
+                services: Arc::clone(&services),
+                session_manager: input.session_manager,
+                session_start_event: input.session_start_event,
+                creation: AgentSessionCreationOptions {
+                    model: Some(model),
+                    no_tools: Some("all".to_string()),
+                    prewarm_ipython_kernel: Some(false),
+                    telemetry_disabled: Some(true),
+                    rlm_depth: Some(0),
+                    serialized_refine: Some(false),
+                    ..Default::default()
+                },
+            },
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        Ok(CreateAgentSessionRuntimeResult {
+            result,
+            services,
+            diagnostics: Vec::new(),
+        })
+    }
+
+    impl PersistenceFixture {
+        async fn new(case: &str) -> Self {
+            let temp = tempfile::tempdir().unwrap();
+            let cwd_path = temp.path().join("workspace");
+            let session_path = temp.path().join("sessions");
+            let agent_path = temp.path().join(case);
+            std::fs::create_dir_all(&cwd_path).unwrap();
+            std::fs::create_dir_all(&session_path).unwrap();
+            std::fs::create_dir_all(&agent_path).unwrap();
+            let cwd = cwd_path.to_string_lossy().into_owned();
+            let session_dir = session_path.to_string_lossy().into_owned();
+            let agent_dir = agent_path.to_string_lossy().into_owned();
+
+            let provider = pi_ai::providers::faux::register_faux_provider(Some(
+                pi_ai::providers::faux::RegisterFauxProviderOptions {
+                    provider: Some(format!("persistence-{}", uuid::Uuid::new_v4())),
+                    tokens_per_second: Some(0.0),
+                    ..Default::default()
+                },
+            ));
+            let model = provider.get_model();
+            let settings_manager = Arc::new(Mutex::new(
+                crate::core::settings_manager::SettingsManager::in_memory(
+                    serde_json::json!({
+                        "autoRefine": {"enabled": false},
+                        "retry": {"enabled": false},
+                        "compaction": {"enabled": false},
+                        "telemetryEnabled": false,
+                        "agentTracesEnabled": false,
+                    })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+                ),
+            ));
+            let model_registry = Arc::new(Mutex::new(
+                crate::core::model_registry::ModelRegistry::in_memory(
+                    crate::core::auth_storage::AuthStorage::in_memory(Default::default(), None),
+                ),
+            ));
+            let current_file = session_path.join("current.jsonl").to_string_lossy().into_owned();
+            let mut manager = SessionManager::create(&cwd, Some(&session_dir)).unwrap();
+            manager.set_session_file(&current_file, None, None).unwrap();
+            manager.flush_now().unwrap();
+            let session_manager = Arc::new(Mutex::new(manager));
+            let fail_build = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let prepare_candidate = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let candidate_managers = Arc::new(Mutex::new(Vec::new()));
+            let candidate_disposals = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let factory: CreateAgentSessionRuntimeFactory = {
+                let settings_manager = Arc::clone(&settings_manager);
+                let model_registry = Arc::clone(&model_registry);
+                let model = model.clone();
+                let fail_build = Arc::clone(&fail_build);
+                let prepare_candidate = Arc::clone(&prepare_candidate);
+                let candidate_managers = Arc::clone(&candidate_managers);
+                let candidate_disposals = Arc::clone(&candidate_disposals);
+                Arc::new(move |input| {
+                    let settings_manager = Arc::clone(&settings_manager);
+                    let model_registry = Arc::clone(&model_registry);
+                    let model = model.clone();
+                    let fail_build = Arc::clone(&fail_build);
+                    let prepare_candidate = Arc::clone(&prepare_candidate);
+                    let candidate_managers = Arc::clone(&candidate_managers);
+                    let candidate_disposals = Arc::clone(&candidate_disposals);
+                    let candidate_manager = Arc::clone(&input.session_manager);
+                    Box::pin(async move {
+                        let built = build_persistence_candidate(
+                            input,
+                            settings_manager,
+                            model_registry,
+                            model,
+                            fail_build,
+                        )
+                        .await?;
+                        if prepare_candidate.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                            candidate_manager.lock().unwrap().hold_write_buffer_for_test();
+                            candidate_manager
+                                .lock()
+                                .unwrap()
+                                .append_message(pi_agent_core::types::AgentMessage::Message(
+                                    pi_ai::types::Message::User(pi_ai::types::UserMessage::new(
+                                        pi_ai::types::UserContent::Text(
+                                            "candidate-pre-publish-entry".to_string(),
+                                        ),
+                                        31,
+                                    )),
+                                ))
+                                .unwrap();
+                            let callback_manager = Arc::clone(&candidate_manager);
+                            let candidate_disposals = Arc::clone(&candidate_disposals);
+                            built.result.session.register_dispose_callback(Arc::new(move || {
+                                let callback_manager = Arc::clone(&callback_manager);
+                                let candidate_disposals = Arc::clone(&candidate_disposals);
+                                Box::pin(async move {
+                                    candidate_disposals.fetch_add(
+                                        1,
+                                        std::sync::atomic::Ordering::SeqCst,
+                                    );
+                                    callback_manager
+                                        .lock()
+                                        .unwrap()
+                                        .append_message(pi_agent_core::types::AgentMessage::Message(
+                                            pi_ai::types::Message::User(
+                                                pi_ai::types::UserMessage::new(
+                                                    pi_ai::types::UserContent::Text(
+                                                        "candidate-dispose-callback-entry".to_string(),
+                                                    ),
+                                                    32,
+                                                ),
+                                            ),
+                                        ))
+                                        .unwrap();
+                                })
+                            }));
+                            candidate_managers.lock().unwrap().push(candidate_manager);
+                        }
+                        Ok(built)
+                    })
+                })
+            };
+            let runtime = create_agent_session_runtime(
+                factory,
+                CreateAgentSessionRuntimeInput {
+                    cwd: cwd.clone(),
+                    agent_dir: agent_dir.clone(),
+                    session_manager,
+                    session_start_event: None,
+                    session_config: None,
+                    session_options: None,
+                    runtime_metadata: None,
+                    session_lease: None,
+                },
+            )
+            .await
+            .unwrap();
+            Self {
+                _temp: temp,
+                cwd,
+                session_dir,
+                runtime,
+                fail_build,
+                prepare_candidate,
+                candidate_managers,
+                candidate_disposals,
+            }
+        }
+
+        fn path(&self, name: &str) -> String {
+            std::path::Path::new(&self.session_dir)
+                .join(name)
+                .to_string_lossy()
+                .into_owned()
+        }
+
+        fn input_path(&self, name: &str) -> String {
+            let directory = self._temp.path().join("external");
+            std::fs::create_dir_all(&directory).unwrap();
+            directory.join(name).to_string_lossy().into_owned()
+        }
+
+        fn collision_destination(
+            &self,
+            current: bool,
+            name: &str,
+        ) -> (String, Arc<Mutex<SessionManager>>) {
+            let destination = self.path(name);
+            let manager = if current {
+                let manager = Arc::clone(&self.runtime.session().session_manager);
+                let live_file = self.runtime.session().session_file().unwrap();
+                std::fs::rename(&live_file, &destination).unwrap();
+                manager
+                    .lock()
+                    .unwrap()
+                    .set_session_file(&destination, None, None)
+                    .unwrap();
+                self.runtime.release_session_lease();
+                let lease = self.runtime.acquire_replacement_lease(Some(&destination)).unwrap();
+                self.runtime.commit_replacement_lease(lease);
+                manager
+            } else {
+                let mut manager = SessionManager::create(&self.cwd, Some(&self.session_dir)).unwrap();
+                manager.set_session_file(&destination, None, None).unwrap();
+                manager.flush_now().unwrap();
+                Arc::new(Mutex::new(manager))
+            };
+            (destination, manager)
+        }
+
+        fn candidate_manager(&self) -> Arc<Mutex<SessionManager>> {
+            self.candidate_managers
+                .lock()
+                .unwrap()
+                .last()
+                .cloned()
+                .expect("the prepared candidate retained its real session manager")
+        }
+
+        fn prepare_import_candidate(&self) {
+            self.prepare_candidate
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    fn install_import_fault(
+        fixture: &PersistenceFixture,
+        destination: &str,
+        failures: Vec<ImportRenameStage>,
+        fail_teardown: bool,
+    ) -> Arc<Mutex<ImportFaultState>> {
+        let state = Arc::new(Mutex::new(ImportFaultState {
+            missing_directory: fixture
+                ._temp
+                .path()
+                .join("missing-rename-parent")
+                .to_string_lossy()
+                .into_owned(),
+            failures,
+            fail_teardown,
+            ..Default::default()
+        }));
+        import_fault_registry()
+            .lock()
+            .unwrap()
+            .insert(resolve_path(destination), Arc::clone(&state));
+        state
+    }
+
+    fn clear_import_fault(destination: &str) {
+        import_fault_registry().lock().unwrap().remove(&resolve_path(destination));
+    }
+
+    fn import_leftovers(destination: &str) -> Vec<String> {
+        let destination = std::path::Path::new(destination);
+        let prefix = format!(
+            "{}.import-",
+            destination.file_name().unwrap().to_string_lossy()
+        );
+        std::fs::read_dir(destination.parent().unwrap())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(&prefix))
+            .collect()
+    }
+
+    fn append_buffered_user(
+        manager: &Arc<Mutex<SessionManager>>,
+        text: &str,
+    ) -> (String, Vec<u8>) {
+        let file = manager.lock().unwrap().get_session_file().unwrap();
+        manager.lock().unwrap().hold_write_buffer_for_test();
+        let before = std::fs::read(&file).unwrap();
+        let id = manager
+            .lock()
+            .unwrap()
+            .append_message(pi_agent_core::types::AgentMessage::Message(
+                pi_ai::types::Message::User(pi_ai::types::UserMessage::new(
+                    pi_ai::types::UserContent::Text(text.to_string()),
+                    1,
+                )),
+            ))
+            .unwrap();
+        assert_eq!(std::fs::read(&file).unwrap(), before, "fixture must hold the append");
+        (id, before)
+    }
+
+    fn write_import(path: &str, id: &str, cwd: &str) {
+        std::fs::write(
+            path,
+            format!(
+                "{{\"type\":\"session\",\"version\":3,\"id\":{},\"timestamp\":\"2026-01-01T00:00:00.000Z\",\"cwd\":{}}}\n",
+                serde_json::to_string(id).unwrap(),
+                serde_json::to_string(cwd).unwrap(),
+            ),
+        )
+        .unwrap();
+    }
+
+    fn assert_html_includes_pending(
+        fixture: &PersistenceFixture,
+        output: &str,
+        newest_id: &str,
+        export: Result<String, String>,
+    ) {
+        let output_path = export.unwrap();
+        assert_eq!(output_path, output);
+        let html = std::fs::read_to_string(output).unwrap();
+        const DATA_OPEN: &str = r#"<script id="session-data" type="application/json">"#;
+        let data_start = html.find(DATA_OPEN).expect("embedded session-data start") + DATA_OPEN.len();
+        let data_end = html[data_start..]
+            .find("</script>")
+            .map(|offset| data_start + offset)
+            .expect("embedded session-data end");
+        use base64::Engine;
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(&html[data_start..data_end])
+            .expect("session-data base64");
+        let session_data: Value = serde_json::from_slice(&decoded).expect("session-data JSON");
+        assert!(session_data
+            .get("entries")
+            .and_then(Value::as_array)
+            .is_some_and(|entries| entries.iter().any(|entry| {
+                entry.get("id").and_then(Value::as_str) == Some(newest_id)
+                    && serde_json::to_string(entry)
+                        .is_ok_and(|entry| entry.contains("pending-html-export-visibility"))
+            })), "pending user entry missing from exported session data");
+        let source = std::fs::read_to_string(fixture.runtime.session().session_file().unwrap()).unwrap();
+        assert!(source.contains(&format!("\"id\":\"{newest_id}\"")), "export must drain the pending id");
+    }
+
+    fn assert_fork_contains_every_source_entry(
+        source_entries: Vec<serde_json::Map<String, Value>>,
+        forked_file: String,
+        newest_id: &str,
+    ) {
+        let forked = std::fs::read_to_string(forked_file).unwrap();
+        assert!(forked.contains(&format!("\"id\":\"{newest_id}\"")), "newest pending id missing from fork");
+        for source in source_entries {
+            let id = source.get("id").and_then(Value::as_str).unwrap();
+            assert!(forked.contains(&format!("\"id\":\"{id}\"")), "source entry {id} missing from fork");
+        }
+    }
+
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn daemon_html_export_drains_live_pending_entries() {
+        let fixture = PersistenceFixture::new("daemon-html").await;
+        let (id, _) = append_buffered_user(
+            &fixture.runtime.session().session_manager,
+            "pending-html-export-visibility",
+        );
+        let output = fixture._temp.path().join("daemon.html").to_string_lossy().into_owned();
+        let adapter = AgentSessionDaemonAdapter::new(Arc::clone(&fixture.runtime));
+        use crate::modes::daemon::daemon_mode::DaemonSession;
+        let exported = adapter.export_to_html(Some(&output)).await;
+        assert_html_includes_pending(&fixture, &output, &id, exported);
+        fixture.runtime.dispose(Some(Default::default())).await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn in_process_html_export_drains_live_pending_entries() {
+        let fixture = PersistenceFixture::new("in-process-html").await;
+        let (id, _) = append_buffered_user(
+            &fixture.runtime.session().session_manager,
+            "pending-html-export-visibility",
+        );
+        let output = fixture._temp.path().join("in-process.html").to_string_lossy().into_owned();
+        let adapter = InProcessRuntimeHostAdapter::new(Arc::clone(&fixture.runtime));
+        use crate::modes::agent_connection::in_process_agent_connection::InProcessRuntimeHost;
+        let exported = adapter.session_export_to_html(Some(&output)).await;
+        assert_html_includes_pending(&fixture, &output, &id, exported);
+        fixture.runtime.dispose(Some(Default::default())).await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn daemon_persisted_fork_drains_every_live_pending_entry() {
+        let fixture = PersistenceFixture::new("daemon-fork").await;
+        let manager = Arc::clone(&fixture.runtime.session().session_manager);
+        let (id, _) = append_buffered_user(&manager, "pending-daemon-fork-entry");
+        let source_entries = manager.lock().unwrap().get_entries();
+        let adapter = AgentSessionDaemonAdapter::new(Arc::clone(&fixture.runtime));
+        use crate::modes::daemon::daemon_mode::{DaemonSession, ForkOptions};
+        adapter
+            .fork(&id, ForkOptions { position: Some("at".to_string()) })
+            .await
+            .unwrap();
+        let forked_file = fixture.runtime.session().session_file().unwrap();
+        assert_fork_contains_every_source_entry(source_entries, forked_file, &id);
+        fixture.runtime.dispose(Some(Default::default())).await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn in_process_persisted_fork_drains_every_live_pending_entry() {
+        let fixture = PersistenceFixture::new("in-process-fork").await;
+        let manager = Arc::clone(&fixture.runtime.session().session_manager);
+        let (id, _) = append_buffered_user(&manager, "pending-in-process-fork-entry");
+        let source_entries = manager.lock().unwrap().get_entries();
+        let adapter = InProcessRuntimeHostAdapter::new(Arc::clone(&fixture.runtime));
+        use crate::modes::agent_connection::in_process_agent_connection::InProcessRuntimeHost;
+        use crate::modes::agent_connection::types::AgentConnectionForkOptions;
+        adapter
+            .runtime_fork(&id, Some(AgentConnectionForkOptions { position: Some("at".to_string()) }))
+            .await
+            .unwrap();
+        let forked_file = fixture.runtime.session().session_file().unwrap();
+        assert_fork_contains_every_source_entry(source_entries, forked_file, &id);
+        fixture.runtime.dispose(Some(Default::default())).await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn successful_current_path_import_excludes_old_pending_and_teardown_entries() {
+        let fixture = PersistenceFixture::new("success-current-import").await;
+        let old_manager = Arc::clone(&fixture.runtime.session().session_manager);
+        let destination = fixture.runtime.session().session_file().unwrap();
+        let (old_pending_id, _) = append_buffered_user(
+            &old_manager,
+            "old-entry-that-must-not-cross-import-commit",
+        );
+        let old_session = fixture.runtime.session();
+        let teardown_entry_id = Arc::new(Mutex::new(None::<String>));
+        let callback_manager = Arc::clone(&old_manager);
+        let callback_entry_id = Arc::clone(&teardown_entry_id);
+        old_session.register_dispose_callback(Arc::new(move || {
+            let callback_manager = Arc::clone(&callback_manager);
+            let callback_entry_id = Arc::clone(&callback_entry_id);
+            Box::pin(async move {
+                let id = callback_manager
+                    .lock()
+                    .unwrap()
+                    .append_message(pi_agent_core::types::AgentMessage::Message(
+                        pi_ai::types::Message::User(pi_ai::types::UserMessage::new(
+                            pi_ai::types::UserContent::Text(
+                                "old-dispose-callback-entry".to_string(),
+                            ),
+                            2,
+                        )),
+                    ))
+                    .unwrap();
+                *callback_entry_id.lock().unwrap() = Some(id);
+            })
+        }));
+        let input = fixture.input_path("current.jsonl");
+        write_import(&input, "successful-current-import", &fixture.cwd);
+
+        fixture.runtime.import_from_jsonl(&input, None).await.unwrap();
+        let teardown_entry_id = teardown_entry_id
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("dispose callback must append the teardown entry");
+        assert!(!Arc::ptr_eq(&fixture.runtime.session().session_manager, &old_manager));
+        assert_eq!(fixture.runtime.session().session_file().as_deref(), Some(destination.as_str()));
+        let imported = std::fs::read_to_string(&destination).unwrap();
+        assert!(imported.contains("successful-current-import"));
+        assert!(
+            !imported.contains(&format!("\"id\":\"{old_pending_id}\"")),
+            "old pre-import bytes crossed into the imported inode"
+        );
+        assert!(
+            !imported.contains(&format!("\"id\":\"{teardown_entry_id}\"")),
+            "old teardown bytes crossed into the imported inode"
+        );
+
+        // Simulate a late timed flush from the retained old manager. Backup
+        // retargeting, the post-teardown drain and manager retirement make it
+        // a no-op: old entries cannot contaminate the imported destination or
+        // recreate an expired backup after cleanup.
+        old_manager.lock().unwrap().flush_now().unwrap();
+        let after_old_flush = std::fs::read_to_string(&destination).unwrap();
+        for old_id in [&old_pending_id, &teardown_entry_id] {
+            assert!(
+                !after_old_flush.contains(&format!("\"id\":\"{old_id}\"")),
+                "late old-manager drain contaminated the imported path with {old_id}"
+            );
+        }
+
+        fixture
+            .runtime
+            .session()
+            .session_manager
+            .lock()
+            .unwrap()
+            .flush_now()
+            .unwrap();
+        let after_new_flush = std::fs::read_to_string(&destination).unwrap();
+        assert!(after_new_flush.contains("successful-current-import"));
+        for old_id in [&old_pending_id, &teardown_entry_id] {
+            assert!(
+                !after_new_flush.contains(&format!("\"id\":\"{old_id}\"")),
+                "old manager appended after the new manager took over the path: {old_id}"
+            );
+        }
+        fixture.runtime.dispose(Some(Default::default())).await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn import_faults_preserve_current_and_inactive_destinations_with_pending_entries() {
+        for current_destination in [true, false] {
+            for fault in ["header", "cwd", "candidate"] {
+                let fixture = PersistenceFixture::new(&format!("import-{fault}-{current_destination}")).await;
+                let destination = fixture.path("collision.jsonl");
+                let old_manager = if current_destination {
+                    let manager = Arc::clone(&fixture.runtime.session().session_manager);
+                    let live_file = fixture.runtime.session().session_file().unwrap();
+                    std::fs::rename(&live_file, &destination).unwrap();
+                    manager
+                        .lock()
+                        .unwrap()
+                        .set_session_file(&destination, None, None)
+                        .unwrap();
+                    manager
+                } else {
+                    let mut manager = SessionManager::create(&fixture.cwd, Some(&fixture.session_dir)).unwrap();
+                    manager.set_session_file(&destination, None, None).unwrap();
+                    manager.flush_now().unwrap();
+                    Arc::new(Mutex::new(manager))
+                };
+                let (old_pending_id, old_bytes) = append_buffered_user(
+                    &old_manager,
+                    &format!("old-pending-{fault}-{current_destination}"),
+                );
+                let input = fixture.input_path("collision.jsonl");
+                match fault {
+                    "header" => write_import(&input, "../header-fault", &fixture.cwd),
+                    "cwd" => write_import(
+                        &input,
+                        "cwd-fault",
+                        &fixture._temp.path().join("missing-cwd").to_string_lossy(),
+                    ),
+                    "candidate" => {
+                        write_import(&input, "candidate-fault", &fixture.cwd);
+                        fixture.fail_build.store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    _ => unreachable!(),
+                }
+                let error = fixture.runtime.import_from_jsonl(&input, None).await.unwrap_err();
+                assert!(!error.is_empty());
+                assert_eq!(std::fs::read(&destination).unwrap(), old_bytes, "{fault} changed {current_destination} destination bytes");
+                assert!(old_manager.lock().unwrap().get_entry(&old_pending_id).is_some(), "old pending entry was lost");
+                old_manager.lock().unwrap().flush_now().unwrap();
+                let recovered = std::fs::read_to_string(&destination).unwrap();
+                assert!(recovered.contains(&format!("\"id\":\"{old_pending_id}\"")), "old pending entry did not drain");
+                assert!(!recovered.contains("candidate-fault"), "imported candidate contaminated old bytes");
+                assert!(!recovered.contains("cwd-fault"), "imported cwd candidate contaminated old bytes");
+                assert!(!recovered.contains("header-fault"), "invalid import contaminated old bytes");
+                if current_destination {
+                    assert!(Arc::ptr_eq(&fixture.runtime.session().session_manager, &old_manager));
+                }
+                drop(old_manager);
+                fixture.runtime.dispose(Some(Default::default())).await.unwrap();
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn import_rename_faults_preserve_current_and_inactive_runtime_and_bytes() {
+        for current_destination in [true, false] {
+            for (label, failures) in [
+                ("backup", vec![ImportRenameStage::DestinationBackup]),
+                ("staged", vec![ImportRenameStage::StagedPublish]),
+                (
+                    "restore",
+                    vec![ImportRenameStage::StagedPublish, ImportRenameStage::BackupRestore],
+                ),
+            ] {
+                let fixture = PersistenceFixture::new(&format!(
+                    "rename-fault-{label}-{current_destination}"
+                ))
+                .await;
+                let (destination, collision_manager) = fixture
+                    .collision_destination(current_destination, &format!("{label}.jsonl"));
+                let (old_entry_id, _) = append_buffered_user(
+                    &collision_manager,
+                    &format!("old-before-{label}-{current_destination}"),
+                );
+                collision_manager.lock().unwrap().flush_now().unwrap();
+                let old_bytes = std::fs::read(&destination).unwrap();
+                let current_session = fixture.runtime.session();
+                let current_manager = Arc::clone(&current_session.session_manager);
+                let current_lease = fixture
+                    .runtime
+                    .session_lease
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .expect("fixture owns its current-session lease");
+                let old_disposals = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let callback_disposals = Arc::clone(&old_disposals);
+                current_session.register_dispose_callback(Arc::new(move || {
+                    let callback_disposals = Arc::clone(&callback_disposals);
+                    Box::pin(async move {
+                        callback_disposals.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    })
+                }));
+                fixture.prepare_import_candidate();
+                let fault = install_import_fault(&fixture, &destination, failures, false);
+                let input = fixture.input_path(&format!("{label}.jsonl"));
+                write_import(&input, &format!("imported-{label}"), &fixture.cwd);
+
+                let error = fixture.runtime.import_from_jsonl(&input, None).await.unwrap_err();
+                assert!(!error.is_empty());
+                let (attempts, injected, fault_staged_path) = {
+                    let state = fault.lock().unwrap();
+                    (
+                        state.attempts.clone(),
+                        state.injected.clone(),
+                        state.staged_path.clone(),
+                    )
+                };
+                clear_import_fault(&destination);
+                assert!(attempts.contains(&match label {
+                    "backup" => ImportRenameStage::DestinationBackup,
+                    _ => ImportRenameStage::StagedPublish,
+                }));
+                let expected_fault = match label {
+                    "backup" => ImportRenameStage::DestinationBackup,
+                    _ => ImportRenameStage::StagedPublish,
+                };
+                assert!(injected.contains(&expected_fault));
+                if label == "restore" {
+                    assert!(attempts.contains(&ImportRenameStage::BackupRestore));
+                    assert!(injected.contains(&ImportRenameStage::BackupRestore));
+                }
+
+                assert_eq!(std::fs::read(&destination).unwrap(), old_bytes);
+                assert!(Arc::ptr_eq(&fixture.runtime.session(), &current_session));
+                assert!(Arc::ptr_eq(
+                    &fixture.runtime.session().session_manager,
+                    &current_manager
+                ));
+                let after_lease = fixture.runtime.session_lease.lock().unwrap().clone().unwrap();
+                assert!(Arc::ptr_eq(&after_lease, &current_lease));
+                assert_eq!(old_disposals.load(std::sync::atomic::Ordering::SeqCst), 0);
+                let candidate_manager = fixture.candidate_manager();
+                let candidate_target = candidate_manager
+                    .lock()
+                    .unwrap()
+                    .get_session_file()
+                    .unwrap();
+                assert!(candidate_target.contains(&format!("{label}.jsonl.import-")));
+                if let Some(fault_staged_path) = fault_staged_path {
+                    assert_eq!(candidate_target, fault_staged_path);
+                }
+                assert_eq!(
+                    fixture
+                        .candidate_disposals
+                        .load(std::sync::atomic::Ordering::SeqCst),
+                    1,
+                    "candidate must be disposed exactly once"
+                );
+                assert!(import_leftovers(&destination).is_empty());
+
+                // The retained old runtime still accepts and persists a real entry.
+                let operable_id = current_manager
+                    .lock()
+                    .unwrap()
+                    .append_message(pi_agent_core::types::AgentMessage::Message(
+                        pi_ai::types::Message::User(pi_ai::types::UserMessage::new(
+                            pi_ai::types::UserContent::Text(
+                                "old-runtime-operable-after-import-fault".to_string(),
+                            ),
+                            41,
+                        )),
+                    ))
+                    .unwrap();
+                current_manager.lock().unwrap().flush_now().unwrap();
+                assert!(collision_manager.lock().unwrap().get_entry(&old_entry_id).is_some());
+                assert!(current_manager.lock().unwrap().get_entry(&operable_id).is_some());
+                let current_file = current_manager.lock().unwrap().get_session_file().unwrap();
+                let current_bytes = std::fs::read_to_string(current_file).unwrap();
+                assert!(current_bytes.contains("old-runtime-operable-after-import-fault"));
+                assert!(!current_bytes.contains(&format!("imported-{label}")));
+
+                fixture.runtime.dispose(Some(Default::default())).await.unwrap();
+                assert_eq!(old_disposals.load(std::sync::atomic::Ordering::SeqCst), 1);
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn import_teardown_fault_rolls_back_publish_and_restore_faults() {
+        for current_destination in [true, false] {
+            for inject_restore_fault in [false, true] {
+                let fixture = PersistenceFixture::new(&format!(
+                    "teardown-rollback-{current_destination}-{inject_restore_fault}"
+                ))
+                .await;
+                let (destination, collision_manager) = fixture.collision_destination(
+                    current_destination,
+                    &format!("teardown-{inject_restore_fault}.jsonl"),
+                );
+                collision_manager.lock().unwrap().flush_now().unwrap();
+                let old_bytes = std::fs::read(&destination).unwrap();
+                let current_session = fixture.runtime.session();
+                let current_manager = Arc::clone(&current_session.session_manager);
+                let current_lease = fixture
+                    .runtime
+                    .session_lease
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .unwrap();
+                let old_disposals = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let callback_disposals = Arc::clone(&old_disposals);
+                current_session.register_dispose_callback(Arc::new(move || {
+                    let callback_disposals = Arc::clone(&callback_disposals);
+                    Box::pin(async move {
+                        callback_disposals.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    })
+                }));
+                fixture.prepare_import_candidate();
+                let failures = if inject_restore_fault {
+                    vec![ImportRenameStage::BackupRestore]
+                } else {
+                    Vec::new()
+                };
+                let fault = install_import_fault(&fixture, &destination, failures, true);
+                let input = fixture.input_path(&format!(
+                    "teardown-{inject_restore_fault}.jsonl"
+                ));
+                write_import(&input, "must-not-survive-teardown-rollback", &fixture.cwd);
+
+                let error = fixture.runtime.import_from_jsonl(&input, None).await.unwrap_err();
+                assert!(error.contains("synthetic import teardown fault"));
+                let (attempts, injected) = {
+                    let state = fault.lock().unwrap();
+                    (state.attempts.clone(), state.injected.clone())
+                };
+                clear_import_fault(&destination);
+                assert!(attempts.contains(&ImportRenameStage::RollbackCandidate));
+                assert!(attempts.contains(&ImportRenameStage::BackupRestore));
+                if inject_restore_fault {
+                    assert!(injected.contains(&ImportRenameStage::BackupRestore));
+                }
+                assert_eq!(std::fs::read(&destination).unwrap(), old_bytes);
+                assert!(Arc::ptr_eq(&fixture.runtime.session(), &current_session));
+                assert!(Arc::ptr_eq(
+                    &fixture.runtime.session().session_manager,
+                    &current_manager
+                ));
+                let after_lease = fixture.runtime.session_lease.lock().unwrap().clone().unwrap();
+                assert!(Arc::ptr_eq(&after_lease, &current_lease));
+                assert_eq!(old_disposals.load(std::sync::atomic::Ordering::SeqCst), 0);
+                assert_eq!(
+                    fixture
+                        .candidate_disposals
+                        .load(std::sync::atomic::Ordering::SeqCst),
+                    1
+                );
+                assert!(import_leftovers(&destination).is_empty());
+                assert!(!std::fs::read_to_string(&destination)
+                    .unwrap()
+                    .contains("must-not-survive-teardown-rollback"));
+                fixture.runtime.dispose(Some(Default::default())).await.unwrap();
+                assert_eq!(old_disposals.load(std::sync::atomic::Ordering::SeqCst), 1);
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn candidate_late_append_and_dispose_callback_use_destination_without_staging_files() {
+        for target in ["current", "inactive", "unique"] {
+            let fixture = PersistenceFixture::new(&format!("candidate-handoff-{target}")).await;
+            let destination = if target == "unique" {
+                fixture.path("candidate-unique.jsonl")
+            } else {
+                let (destination, old_manager) = fixture
+                    .collision_destination(target == "current", "candidate-collision.jsonl");
+                if target == "current" {
+                    old_manager.lock().unwrap().flush_now().unwrap();
+                }
+                destination
+            };
+            fixture.prepare_import_candidate();
+            let input = fixture.input_path(std::path::Path::new(&destination)
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .as_ref());
+            write_import(&input, &format!("candidate-success-{target}"), &fixture.cwd);
+
+            fixture.runtime.import_from_jsonl(&input, None).await.unwrap();
+            let candidate_manager = fixture.candidate_manager();
+            assert_eq!(
+                candidate_manager.lock().unwrap().get_session_file().as_deref(),
+                Some(destination.as_str())
+            );
+            assert!(Arc::ptr_eq(
+                &fixture.runtime.session().session_manager,
+                &candidate_manager
+            ));
+            candidate_manager
+                .lock()
+                .unwrap()
+                .append_message(pi_agent_core::types::AgentMessage::Message(
+                    pi_ai::types::Message::User(pi_ai::types::UserMessage::new(
+                        pi_ai::types::UserContent::Text(
+                            "candidate-late-append-after-publish".to_string(),
+                        ),
+                        51,
+                    )),
+                ))
+                .unwrap();
+            candidate_manager.lock().unwrap().flush_now().unwrap();
+            let published = std::fs::read_to_string(&destination).unwrap();
+            assert!(published.contains("candidate-pre-publish-entry"));
+            assert!(published.contains("candidate-late-append-after-publish"));
+            assert!(import_leftovers(&destination).is_empty());
+
+            fixture.runtime.dispose(Some(Default::default())).await.unwrap();
+            candidate_manager.lock().unwrap().flush_now().unwrap();
+            let disposed = std::fs::read_to_string(&destination).unwrap();
+            assert!(disposed.contains("candidate-dispose-callback-entry"));
+            assert_eq!(
+                fixture
+                    .candidate_disposals
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                1
+            );
+            assert!(import_leftovers(&destination).is_empty());
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn import_still_publishes_a_valid_unique_candidate() {
+        let fixture = PersistenceFixture::new("unique-import").await;
+        let input = fixture.input_path("unique.jsonl");
+        write_import(&input, "unique-imported-session", &fixture.cwd);
+        let destination = fixture.path("unique.jsonl");
+        assert!(!std::path::Path::new(&destination).exists());
+        let result = fixture.runtime.import_from_jsonl(&input, None).await.unwrap();
+        assert!(!result.cancelled);
+        assert_eq!(fixture.runtime.session().session_file().as_deref(), Some(destination.as_str()));
+        let imported = std::fs::read_to_string(&destination).unwrap();
+        assert!(imported.contains("unique-imported-session"));
+        let leftovers = std::fs::read_dir(&fixture.session_dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_name().to_string_lossy().contains("unique.jsonl.import-"))
+            .count();
+        assert_eq!(leftovers, 0, "staged and backup files must be cleaned up");
+        fixture.runtime.dispose(Some(Default::default())).await.unwrap();
+    }
+
 }

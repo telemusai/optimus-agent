@@ -1,0 +1,6 @@
+- Fixed staged session imports replacing live state before the imported session was validated and safely committed.
+- Fixed stopped worker descriptors losing their persisted state across daemon restarts.
+- Fixed daemon attach failing to recover session membership and event subscriptions.
+- Fixed structured worker writes lacking a safe transport-close fallback after write failures.
+- Fixed export and fork reading stale session state before live changes were flushed.
+- Fixed RPC connection output events remaining buffered after prompt completion or disappearing at stdin EOF.

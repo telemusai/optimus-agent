@@ -149,6 +149,35 @@ impl std::fmt::Display for DaemonWorkerProbeTimeoutError {
 
 impl std::error::Error for DaemonWorkerProbeTimeoutError {}
 
+/// A direct transport closed or rejected a write. Preserve the originating I/O
+/// class so routing can distinguish a socket close from a worker-level error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DaemonWorkerTransportError {
+    pub operation: &'static str,
+    pub kind: std::io::ErrorKind,
+    pub source: String,
+}
+
+impl DaemonWorkerTransportError {
+    fn write(error: std::io::Error) -> Self {
+        Self { operation: "write", kind: error.kind(), source: error.to_string() }
+    }
+
+    pub fn message(&self) -> String {
+        format!("Daemon worker socket {} failed ({:?}): {}", self.operation, self.kind, self.source)
+    }
+
+    fn to_client_error(&self, socket_path: &str) -> DaemonClientError {
+        DaemonClientError::SocketClosed(DaemonSocketClosedError::new(socket_path, None, Some(&self.message())))
+    }
+}
+
+impl std::fmt::Display for DaemonWorkerTransportError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str(&self.message()) }
+}
+
+impl std::error::Error for DaemonWorkerTransportError {}
+
 struct PendingWorkerRequest {
     result: Arc<StdMutex<Option<DaemonClientResult<DaemonResponse>>>>,
     wake: Arc<tokio::sync::Notify>,
@@ -186,6 +215,8 @@ pub struct DaemonWorkerClient {
     direct_peer: AtomicBool,
     direct_closing_reason: StdMutex<Option<String>>,
     reader_task: StdMutex<Option<tokio::task::JoinHandle<()>>>,
+    #[cfg(test)]
+    close_calls: AtomicU64,
 }
 
 fn worker_socket_connect_error(socket_path: &str, error: std::io::Error) -> DaemonClientError {
@@ -211,6 +242,8 @@ impl DaemonWorkerClient {
             direct_peer: AtomicBool::new(false),
             direct_closing_reason: StdMutex::new(None),
             reader_task: StdMutex::new(None),
+            #[cfg(test)]
+            close_calls: AtomicU64::new(0),
         }
     }
 
@@ -220,6 +253,19 @@ impl DaemonWorkerClient {
 
     pub fn is_connected(&self) -> bool {
         self.connected.load(Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn close_call_count(&self) -> u64 {
+        self.close_calls.load(Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_test_write_failure(&self, hello: DaemonHello, kind: std::io::ErrorKind) {
+        *self.hello_message.lock().expect("worker hello slot poisoned") = Some(hello);
+        self.direct_peer.store(true, Ordering::SeqCst);
+        self.connected.store(true, Ordering::SeqCst);
+        *self.writer.try_lock().expect("test writer lock") = Some(WorkerWriteHalf::Failing(kind));
     }
 
     pub fn supports_server_capability(&self, capability: &str) -> bool {
@@ -452,46 +498,49 @@ impl DaemonWorkerClient {
         Ok(())
     }
 
-    pub async fn close(&self) {
-        self.close_now();
+    pub async fn close(self: &Arc<Self>) {
+        #[cfg(test)]
+        self.close_calls.fetch_add(1, Ordering::SeqCst);
+        self.transition_closed();
+        self.abort_reader();
+        self.finish_close(DaemonClientError::Message("Daemon worker client closed".to_string())).await;
     }
 
-    /// Synchronous close: `fallbackToSupervisor()` calls `direct.close()` from a
-    /// sync context, so the socket teardown must not require an await.
-    pub fn close_now(&self) {
-        {
-            let mut pending = self.pending.try_lock();
-            if let Ok(pending) = pending.as_mut() {
-                let keys: Vec<String> = pending.keys().cloned().collect();
-                let entries: Vec<PendingWorkerRequest> = keys
-                    .into_iter()
-                    .filter_map(|key| pending.remove(&key))
-                    .collect();
-                for entry in entries {
-                    entry.settle(Err(DaemonClientError::Message(
-                        "Daemon worker client closed".to_string(),
-                    )));
-                }
-            }
+    /// Synchronous close performs the visible state transition immediately and
+    /// schedules the lock-owned teardown. Unlike `try_lock`, no cleanup phase is
+    /// skipped when a request or writer is busy.
+    pub fn close_now(self: &Arc<Self>) {
+        #[cfg(test)]
+        self.close_calls.fetch_add(1, Ordering::SeqCst);
+        self.transition_closed();
+        self.abort_reader();
+        let this = Arc::clone(self);
+        let close = async move {
+            this.finish_close(DaemonClientError::Message("Daemon worker client closed".to_string())).await;
+        };
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(close);
+        } else {
+            futures::executor::block_on(close);
         }
-        if let Ok(mut waiters) = self.hello_waiters.try_lock() {
-            let entries: Vec<WorkerHelloWaiter> = std::mem::take(&mut *waiters);
-            for waiter in entries {
-                let _ = waiter.sender.send(Err(DaemonClientError::Message(
-                    "Daemon worker client closed".to_string(),
-                )));
-            }
-        }
-        if let Ok(mut writer) = self.writer.try_lock() {
-            *writer = None;
-        }
-        let task = self.reader_task.lock().expect("worker reader slot poisoned").take();
-        if let Some(task) = task {
-            task.abort();
-        }
-        self.connected.store(false, Ordering::SeqCst);
+    }
+
+    fn transition_closed(&self) -> bool {
+        let was_connected = self.connected.swap(false, Ordering::SeqCst);
         self.direct_peer.store(false, Ordering::SeqCst);
         *self.direct_closing_reason.lock().expect("closing reason poisoned") = None;
+        was_connected
+    }
+
+    fn abort_reader(&self) {
+        if let Some(task) = self.reader_task.lock().expect("worker reader slot poisoned").take() {
+            task.abort();
+        }
+    }
+
+    async fn finish_close(&self, error: DaemonClientError) {
+        *self.writer.lock().await = None;
+        self.reject_all(error).await;
     }
 
     async fn request_wire(&self, command: DaemonCommandBody, timeout_ms: u64) -> DaemonClientResult<DaemonResponse> {
@@ -527,10 +576,16 @@ impl DaemonWorkerClient {
             }
         };
         if let Err(error) = self.write_frame(&frame).await {
+            let error = DaemonWorkerTransportError::write(error).to_client_error(&self.socket_path);
+            // A failed raw write is a transport close, not an ordinary worker
+            // error. Settle this request once and close every other pending waiter
+            // with the same routable SocketClosed class.
+            let was_connected = self.transition_closed();
+            self.abort_reader();
             let pending = self.pending.lock().await.remove(&id);
-            if let Some(pending) = pending {
-                pending.settle(Err(DaemonClientError::Message(error.to_string())));
-            }
+            if let Some(pending) = pending { pending.settle(Err(error.clone())); }
+            self.finish_close(error.clone()).await;
+            if was_connected { self.notify_close_listeners(&error); }
         }
         let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
         tokio::select! {
@@ -572,6 +627,8 @@ impl DaemonWorkerClient {
                     writer.write_all(frame).await?;
                     writer.flush().await
                 }
+                #[cfg(test)]
+                WorkerWriteHalf::Failing(kind) => Err(std::io::Error::new(*kind, "injected transport failure")),
             },
             None => Err(std::io::Error::new(std::io::ErrorKind::NotConnected, "socket closed")),
         }
@@ -717,21 +774,18 @@ impl DaemonWorkerClient {
         }
     }
 
-    async fn close_with_error(self: &Arc<Self>, error: DaemonClientError) {
-        if !self.connected.swap(false, Ordering::SeqCst) {
-            return;
-        }
-        *self.writer.lock().await = None;
-        self.direct_peer.store(false, Ordering::SeqCst);
-        *self.direct_closing_reason.lock().expect("closing reason poisoned") = None;
-        self.reject_all(error.clone()).await;
+    fn notify_close_listeners(&self, error: &DaemonClientError) {
         let listeners: Vec<DaemonWorkerCloseListener> = {
             let registry = self.close_listeners.lock().expect("close listeners poisoned");
             registry.values().cloned().collect()
         };
-        for listener in listeners {
-            listener(&error);
-        }
+        for listener in listeners { listener(error); }
+    }
+
+    async fn close_with_error(self: &Arc<Self>, error: DaemonClientError) {
+        let was_connected = self.transition_closed();
+        self.finish_close(error.clone()).await;
+        if was_connected { self.notify_close_listeners(&error); }
     }
 }
 
@@ -748,11 +802,15 @@ enum WorkerStream {
 #[cfg(unix)]
 enum WorkerWriteHalf {
     Unix(tokio::net::unix::OwnedWriteHalf),
+    #[cfg(test)]
+    Failing(std::io::ErrorKind),
 }
 
 #[cfg(windows)]
 enum WorkerWriteHalf {
     Pipe(tokio::io::WriteHalf<tokio::net::windows::named_pipe::NamedPipeClient>),
+    #[cfg(test)]
+    Failing(std::io::ErrorKind),
 }
 
 #[cfg(unix)]
@@ -781,6 +839,63 @@ impl WorkerReadHalf {
 mod tests {
     use super::*;
 
+    fn close_waiters(client: &DaemonWorkerClient) -> (
+        Arc<StdMutex<Option<DaemonClientResult<DaemonResponse>>>>,
+        oneshot::Receiver<DaemonClientResult<DaemonHello>>,
+    ) {
+        let result = Arc::new(StdMutex::new(None));
+        let wake = Arc::new(tokio::sync::Notify::new());
+        client.pending.try_lock().unwrap().insert(
+            "request".into(),
+            PendingWorkerRequest { result: Arc::clone(&result), wake },
+        );
+        let (sender, receiver) = oneshot::channel();
+        client.hello_waiters.try_lock().unwrap().push(WorkerHelloWaiter { sender });
+        (result, receiver)
+    }
+
+    #[tokio::test]
+    async fn async_close_waits_for_pending_and_hello_cleanup() {
+        let client = Arc::new(DaemonWorkerClient::new("unused"));
+        client.connected.store(true, Ordering::SeqCst);
+        let (result, receiver) = close_waiters(&client);
+        let pending = client.pending.lock().await;
+        let hello = client.hello_waiters.lock().await;
+        let closing = tokio::spawn({
+            let client = Arc::clone(&client);
+            async move { client.close().await }
+        });
+        tokio::task::yield_now().await;
+        assert!(!closing.is_finished());
+        drop(pending);
+        drop(hello);
+        tokio::time::timeout(Duration::from_secs(1), closing).await.expect("close must finish").unwrap();
+        assert!(result.lock().unwrap().take().unwrap().is_err());
+        assert!(receiver.await.unwrap().is_err());
+        assert!(client.pending.lock().await.is_empty());
+        assert!(client.hello_waiters.lock().await.is_empty());
+        assert!(client.writer.lock().await.is_none());
+        assert!(!client.is_connected());
+    }
+
+    #[tokio::test]
+    async fn synchronous_close_completes_deferred_pending_and_hello_cleanup() {
+        let client = Arc::new(DaemonWorkerClient::new("unused"));
+        client.connected.store(true, Ordering::SeqCst);
+        let (result, receiver) = close_waiters(&client);
+        let pending = client.pending.lock().await;
+        let hello = client.hello_waiters.lock().await;
+        client.close_now();
+        assert!(!client.is_connected());
+        drop(pending);
+        drop(hello);
+        tokio::time::timeout(Duration::from_secs(1), receiver).await.expect("deferred close must finish").unwrap().unwrap_err();
+        assert!(result.lock().unwrap().take().unwrap().is_err());
+        assert!(client.pending.lock().await.is_empty());
+        assert!(client.hello_waiters.lock().await.is_empty());
+        assert!(client.writer.lock().await.is_none());
+    }
+
     #[tokio::test]
     async fn a_response_before_waiting_keeps_its_notification() {
         let request = PendingWorkerRequest {
@@ -792,6 +907,40 @@ mod tests {
             .await.expect("the response notification is retained");
         request.settle(Err(DaemonClientError::Message("second response".to_string())));
         assert_eq!(request.result.lock().unwrap().as_ref().unwrap().as_ref().unwrap_err().to_string(), "first response");
+    }
+
+    #[tokio::test]
+    async fn raw_broken_pipe_is_a_structured_socket_closed_error() {
+        let client = Arc::new(DaemonWorkerClient::new("/tmp/direct-worker.sock"));
+        let hello = DaemonHello::from_value(&serde_json::json!({
+            "type":"daemon_hello", "protocol":{"name":"test", "version":1}
+        })).expect("hello");
+        client.install_test_write_failure(hello, std::io::ErrorKind::BrokenPipe);
+        let close_count = Arc::new(AtomicU64::new(0));
+        let close_errors = Arc::new(StdMutex::new(Vec::new()));
+        let _unsubscribe = client.on_close({
+            let close_count = Arc::clone(&close_count);
+            let close_errors = Arc::clone(&close_errors);
+            Arc::new(move |error| {
+                close_count.fetch_add(1, Ordering::SeqCst);
+                close_errors.lock().expect("captured close errors").push(error.clone());
+            })
+        });
+        let error = client.request_worker(serde_json::Map::from_iter([
+            ("type".into(), Value::String("attach".into())),
+        ]), 1000).await.expect_err("write fails");
+        let DaemonClientError::SocketClosed(closed) = &error else {
+            panic!("raw transport failure must be SocketClosed: {error:?}");
+        };
+        let cause = closed.cause.as_deref().expect("transport cause");
+        assert!(cause.contains("BrokenPipe"), "{cause}");
+        assert!(cause.contains("write"), "{cause}");
+        assert!(!client.is_connected());
+        assert!(client.pending.lock().await.is_empty());
+        assert!(client.writer.lock().await.is_none());
+        assert_eq!(close_count.load(Ordering::SeqCst), 1, "raw write close notifies exactly once");
+        let notified = close_errors.lock().expect("captured close errors").clone();
+        assert_eq!(notified, vec![error.clone()], "listener receives the same SocketClosed BrokenPipe error");
     }
 
     #[test]
