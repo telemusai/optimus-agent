@@ -280,7 +280,7 @@ async fn codex_compaction_cancel_drops_pending_sse_or_error_body_without_checkpo
         signal.cancel();
         let result = tokio::time::timeout(Duration::from_secs(2), task).await
             .expect("native compaction abort must not wait for another body chunk").unwrap();
-        assert!(result.unwrap_err().message.contains("aborted"), "cancel cannot commit a partial checkpoint or fall back");
+        assert!(result.unwrap_err().contains("aborted"), "cancel cannot commit a partial checkpoint or fall back");
         server.await.unwrap();
     }
 }

@@ -123,7 +123,7 @@ async fn graph_uses_only_authoritative_session_activity_and_hiding_cancels_its_e
     .unwrap()])));
     let mut bar = Bar::new(h.mode.clone());
     *bar.roster.lock().unwrap() = Some(roster.clone());
-    let (send, _receive) = mpsc::channel();
+    let (send, _receive) = host_event_channel(256);
     *bar.render_send.borrow_mut() = Some(send);
     let frame = bar.graph_rows(24, 6);
     let plain = strip_ansi(&frame.join("\n"));

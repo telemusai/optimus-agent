@@ -1596,7 +1596,7 @@ mod tests {
         options.simple.stream.api_key = Some("fake-test-key".into());
         tokio::time::timeout(
             Duration::from_secs(5),
-            compact_openai_responses(&model, &Context::default(), Some(&options)),
+            try_compact_openai_responses_typed(&model, &Context::default(), Some(&options)),
         ).await.expect("native compaction fixture must settle")
     }
 
@@ -1633,7 +1633,7 @@ mod tests {
             let mut options = CompactionOptions::default();
             options.simple.stream.api_key = Some("fake-test-key".into());
             let error = tokio::time::timeout(Duration::from_secs(5),
-                compact_openai_responses(&model, &Context::default(), Some(&options)))
+                try_compact_openai_responses_typed(&model, &Context::default(), Some(&options)))
                 .await.expect("validated gateway failure must settle").unwrap_err();
             assert_eq!(error.status, i64::from(status), "validated gateway {status} is not unsupported");
             server.await.unwrap();

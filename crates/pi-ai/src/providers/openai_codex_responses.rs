@@ -2959,7 +2959,7 @@ mod tests {
         let mut options = CompactionOptions::default();
         options.simple.stream.api_key = Some(token("native-compaction-account"));
         let result = tokio::time::timeout(std::time::Duration::from_secs(5),
-            compact_openai_codex_responses(&model, &Context::default(), Some(&options)))
+            try_compact_openai_codex_responses_typed(&model, &Context::default(), Some(&options)))
             .await.expect("Codex native fixture must settle");
         server.await.unwrap();
         result
@@ -2976,7 +2976,7 @@ mod tests {
         let unsupported = Model::new(
             "gpt-4o", "GPT-4o", "openai-responses", "openai", "https://example.invalid",
         );
-        assert!(compact_openai_codex_responses(&unsupported, &Context::default(), None)
+        assert!(try_compact_openai_codex_responses_typed(&unsupported, &Context::default(), None)
             .await.unwrap().is_none());
 
         let checkpoint = native_checkpoint_event();

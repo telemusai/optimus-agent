@@ -6010,7 +6010,7 @@ mod tests {
             0o700,
             "existing session directory must be tightened"
         );
-        let session_file = manager.session_file().unwrap();
+        let session_file = manager.get_session_file().unwrap();
         manager
             .append_message(user_message("prompt-canary", 1))
             .unwrap();
