@@ -2410,6 +2410,14 @@ mod tests {
     }
 
     impl PersistenceFixture {
+        fn lease(path: &str, agent_dir: &str) -> Arc<Mutex<SessionLease>> {
+            let environment = [(crate::core::session_lease::SESSION_LEASES_ENABLED_ENV.to_string(), "1".to_string())];
+            let lease = acquire_session_lease(Some(path), agent_dir, Some(&environment))
+                .expect("acquire fixture session lease")
+                .expect("fixture explicitly enables session leases");
+            Arc::new(Mutex::new(lease))
+        }
+
         async fn new(case: &str) -> Self {
             let temp = tempfile::tempdir().unwrap();
             let cwd_path = temp.path().join("workspace");
@@ -2540,7 +2548,7 @@ mod tests {
                     session_config: None,
                     session_options: None,
                     runtime_metadata: None,
-                    session_lease: None,
+                    session_lease: Some(Self::lease(&current_file, &agent_dir)),
                 },
             )
             .await
@@ -2586,8 +2594,8 @@ mod tests {
                     .set_session_file(&destination, None, None)
                     .unwrap();
                 self.runtime.release_session_lease();
-                let lease = self.runtime.acquire_replacement_lease(Some(&destination)).unwrap();
-                self.runtime.commit_replacement_lease(lease);
+                let lease = Self::lease(&destination, &self.runtime.services().agent_dir);
+                self.runtime.commit_replacement_lease(Some(lease));
                 manager
             } else {
                 let mut manager = SessionManager::create(&self.cwd, Some(&self.session_dir)).unwrap();

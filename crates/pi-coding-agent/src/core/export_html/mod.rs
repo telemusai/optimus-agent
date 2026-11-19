@@ -21,29 +21,6 @@ use crate::modes::interactive::theme::theme::{
 /// blocked_on: needs crate::config::APP_NAME
 const APP_NAME: &str = "prime-agent";
 
-/// `getExportTemplateDir()` from config.ts.
-/// blocked_on: needs crate::config::get_export_template_dir
-fn get_export_template_dir() -> String {
-    let package_dir = match std::env::var("PI_PACKAGE_DIR") {
-        Ok(dir) if !dir.is_empty() => dir,
-        _ => std::env::current_exe()
-            .ok()
-            .and_then(|path| path.parent().map(|parent| parent.to_string_lossy().to_string()))
-            .unwrap_or_default(),
-    };
-    let src_or_dist = if Path::new(&package_dir).join("src").exists() {
-        "src"
-    } else {
-        "dist"
-    };
-    Path::new(&package_dir)
-        .join(src_or_dist)
-        .join("core")
-        .join("export-html")
-        .to_string_lossy()
-        .to_string()
-}
-
 /// Pre-rendered HTML for a custom tool call and result.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -233,7 +210,7 @@ pub struct ExportToolSummary {
 
 /// Core HTML generation logic shared by both export functions.
 fn generate_html(session_data: &SessionData, theme_name: Option<&str>) -> Result<String, String> {
-    let template_dir = get_export_template_dir();
+    let template_dir = crate::config::get_export_template_dir();
     let template = read_template(&template_dir, "template.html")?;
     let template_css = read_template(&template_dir, "template.css")?;
     let template_js = read_template(&template_dir, "template.js")?;
