@@ -1,0 +1,1 @@
+- Added benchmark-only R4 lane separation for fresh external wall runs, real allocation counters, local replay phases, and a deterministic minimal provider, with strict schemas and non-timing qualification controls.
