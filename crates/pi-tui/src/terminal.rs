@@ -109,15 +109,47 @@ fn drain_pending_handoff_input() -> std::io::Result<HandoffDrain> {
     drain_pending_handoff_input_from(pending, read_available_input)
 }
 
-pub(crate) fn stdout_write(data: &str) {
+#[derive(Debug)]
+struct TerminalOutputError {
+    operation: &'static str,
+    kind: std::io::ErrorKind,
+    raw_os_error: Option<i32>,
+}
+
+impl TerminalOutputError {
+    fn new(operation: &'static str, error: std::io::Error) -> std::io::Error {
+        let kind = error.kind();
+        std::io::Error::new(kind, Self { operation, kind, raw_os_error: error.raw_os_error() })
+    }
+}
+
+impl std::fmt::Display for TerminalOutputError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Deliberately exclude the original message and every byte of terminal output.
+        write!(
+            formatter,
+            "terminal stdout {} failed: kind={:?}, raw_os_error={:?}",
+            self.operation, self.kind, self.raw_os_error,
+        )
+    }
+}
+
+impl std::error::Error for TerminalOutputError {}
+
+fn write_and_flush_terminal_output(writer: &mut impl Write, data: &str, conpty: bool) -> std::io::Result<()> {
+    write_terminal_output(writer, data, conpty)
+        .map_err(|error| TerminalOutputError::new("write", error))?;
+    writer.flush().map_err(|error| TerminalOutputError::new("flush", error))
+}
+
+pub(crate) fn stdout_write(data: &str) -> std::io::Result<()> {
     #[cfg(windows)]
     let _windows_console = WindowsConsoleOutputGuard::new();
     let stdout = std::io::stdout();
     let mut lock = stdout.lock();
     let conpty = cfg!(windows) || std::env::var_os("WSL_INTEROP").is_some()
         || std::env::var_os("WSL_DISTRO_NAME").is_some();
-    let _ = write_terminal_output(&mut lock, data, conpty);
-    let _ = lock.flush();
+    write_and_flush_terminal_output(&mut lock, data, conpty)
 }
 
 fn write_terminal_output(writer: &mut impl Write, mut data: &str, conpty: bool) -> std::io::Result<()> {
@@ -573,6 +605,12 @@ struct Shared {
     modify_other_keys_active: bool,
     keyboard_protocol_fallback_timer: Option<u64>,
     default_color_probe: Option<DefaultColorProbe>,
+    /// The first output failure is returned once through `poll_input`, whose
+    /// existing owner error arm stops the UI instead of continuing stale output.
+    output_error: Option<std::io::Error>,
+    /// Stays set after `take_output_error`, so teardown cannot emit a second
+    /// failure transition or retry an output path that already failed.
+    output_failed: bool,
 }
 
 /// Real terminal using process stdin/stdout
@@ -659,7 +697,40 @@ pub fn title_osc_sequence(title: &str) -> String {
     format!("\x1b]0;{}\x07", sanitize_title_text(title))
 }
 
+fn remember_output_result(shared: &Rc<RefCell<Shared>>, result: std::io::Result<()>) -> bool {
+    let Err(error) = result else { return false; };
+    let mut state = shared.borrow_mut();
+    if state.output_failed { return false; }
+
+    // One bounded, content-free report per admitted failure. Never include the
+    // source Display message: it is not needed to diagnose the output operation.
+    if let Some(error) = error.get_ref().and_then(|error| error.downcast_ref::<TerminalOutputError>()) {
+        tracing::warn!(operation = error.operation, error_kind = ?error.kind, raw_os_error = error.raw_os_error, "terminal output failed");
+    } else {
+        tracing::warn!(error_kind = ?error.kind(), raw_os_error = error.raw_os_error(), "terminal output failed");
+    }
+    state.output_failed = true;
+    state.output_error = Some(error);
+    true
+}
+
+fn write_shared_output_with(
+    shared: &Rc<RefCell<Shared>>,
+    write: impl FnOnce() -> std::io::Result<()>,
+) -> bool {
+    if shared.borrow().output_failed { return false; }
+    remember_output_result(shared, write())
+}
+
+fn write_shared_output(shared: &Rc<RefCell<Shared>>, data: &str) {
+    write_shared_output_with(shared, || stdout_write(data));
+}
+
 impl ProcessTerminal {
+    fn take_output_error(&mut self) -> Option<std::io::Error> {
+        self.shared.borrow_mut().output_error.take()
+    }
+
     pub fn new() -> Self {
         Self {
             shared: Rc::new(RefCell::new(Shared {
@@ -670,6 +741,8 @@ impl ProcessTerminal {
                 modify_other_keys_active: false,
                 keyboard_protocol_fallback_timer: None,
                 default_color_probe: None,
+                output_error: None,
+                output_failed: false,
             })),
             was_raw: false,
             started: false,
@@ -704,14 +777,14 @@ impl ProcessTerminal {
         let shared = self.shared.clone();
         let dispatcher = Rc::new(move |sequence: String| {
             let result = shared.borrow_mut().image_probe.filter(&sequence, std::time::Instant::now());
-            if result.query_cells { stdout_write(CELL_QUERY); }
+            if result.query_cells { write_shared_output(&shared, CELL_QUERY); }
             if result.changed {
                 if let Some(handler) = &shared.borrow().resize_handler { handler(); }
             }
             let sequence = result.input;
             if sequence.is_empty() { return; }
             // Check for Kitty protocol response (only if not already enabled).
-            {
+            let enable_kitty = {
                 let mut s = shared.borrow_mut();
                 if handle_default_color_probe_response(&mut s, &sequence) {
                     return;
@@ -720,14 +793,18 @@ impl ProcessTerminal {
                     s.keyboard_protocol_fallback_timer = None;
                     s.kitty_protocol_active = true;
                     set_kitty_protocol_active(true);
-
-                    // Enable Kitty keyboard protocol (push flags)
-                    // Flag 1 = disambiguate escape codes
-                    // Flag 2 = report event types (press/repeat/release)
-                    // Flag 4 = report alternate keys (shifted key, base layout key)
-                    stdout_write("\x1b[>7u");
-                    return;
+                    true
+                } else {
+                    false
                 }
+            };
+            if enable_kitty {
+                // Enable Kitty keyboard protocol (push flags)
+                // Flag 1 = disambiguate escape codes
+                // Flag 2 = report event types (press/repeat/release)
+                // Flag 4 = report alternate keys (shifted key, base layout key)
+                write_shared_output(&shared, "\x1b[>7u");
+                return;
             }
             let handler = shared.borrow_mut().input_handler.take();
             if let Some(handler) = handler {
@@ -745,7 +822,7 @@ impl ProcessTerminal {
         // Win32 supplies key/modifier records directly; VT reply parsing and
         // keyboard protocol negotiation belong only to the byte reader.
         if cfg!(windows) { return; }
-        stdout_write("\x1b[?u");
+        self.write("\x1b[?u");
         self.clear_keyboard_protocol_fallback_timer();
         self.shared.borrow_mut().keyboard_protocol_fallback_timer = Some(150);
     }
@@ -756,15 +833,20 @@ impl ProcessTerminal {
 
     /// Fallback timer body: enable xterm modifyOtherKeys mode 2 when Kitty never answers.
     pub fn apply_keyboard_protocol_fallback(&mut self) {
-        let mut s = self.shared.borrow_mut();
-        if s.keyboard_protocol_fallback_timer.is_none() {
-            return;
-        }
-        s.keyboard_protocol_fallback_timer = None;
-        if !s.kitty_protocol_active && !s.modify_other_keys_active {
-            stdout_write("\x1b[>4;2m");
-            s.modify_other_keys_active = true;
-        }
+        let enable_modify_other_keys = {
+            let mut s = self.shared.borrow_mut();
+            if s.keyboard_protocol_fallback_timer.is_none() {
+                return;
+            }
+            s.keyboard_protocol_fallback_timer = None;
+            if !s.kitty_protocol_active && !s.modify_other_keys_active {
+                s.modify_other_keys_active = true;
+                true
+            } else {
+                false
+            }
+        };
+        if enable_modify_other_keys { self.write("\x1b[>4;2m"); }
     }
 
     fn query_default_terminal_colors(&mut self) {
@@ -801,8 +883,8 @@ impl ProcessTerminal {
             foreground: None,
             background: None,
         });
-        stdout_write(QUERY_DEFAULT_FOREGROUND);
-        stdout_write(QUERY_DEFAULT_BACKGROUND);
+        self.write(QUERY_DEFAULT_FOREGROUND);
+        self.write(QUERY_DEFAULT_BACKGROUND);
         }
     }
 
@@ -980,7 +1062,7 @@ impl ProcessTerminal {
         }
         self.progress_keepalive_at =
             Some(std::time::Instant::now() + std::time::Duration::from_millis(TERMINAL_PROGRESS_KEEPALIVE_MS));
-        stdout_write(TERMINAL_PROGRESS_ACTIVE_SEQUENCE);
+        self.write(TERMINAL_PROGRESS_ACTIVE_SEQUENCE);
     }
 
     fn release_alt_screen(&mut self) {
@@ -1068,6 +1150,7 @@ fn handle_default_color_probe_response(shared: &mut Shared, sequence: &str) -> b
 
 impl Terminal for ProcessTerminal {
     fn poll_input(&mut self) -> std::io::Result<bool> {
+        if let Some(error) = self.take_output_error() { return Err(error); }
         if !self.started {
             // The preserved-fullscreen handoff gap: `beginInputHandoff()` keeps
             // stdin attached to a discard handler (terminal.ts:48-51) so gap keys
@@ -1081,9 +1164,9 @@ impl Terminal for ProcessTerminal {
                 }
             }
         }
-        if !self.poll_input_from(read_available_input, cfg!(windows))? {
-            return Ok(false);
-        }
+        let input_open = self.poll_input_from(read_available_input, cfg!(windows))?;
+        if let Some(error) = self.take_output_error() { return Err(error); }
+        if !input_open { return Ok(false); }
         if self.pending_native_input.is_empty()
             && self.last_input_at.is_some_and(|last| last.elapsed().as_millis() >= 10)
         {
@@ -1101,6 +1184,7 @@ impl Terminal for ProcessTerminal {
             let shared = self.shared.borrow();
             if let Some(handler) = &shared.resize_handler { handler(); }
         }
+        if let Some(error) = self.take_output_error() { return Err(error); }
         Ok(true)
     }
 
@@ -1127,7 +1211,7 @@ impl Terminal for ProcessTerminal {
         let _ = set_raw_mode(true);
 
         // Enable bracketed paste mode - terminal will wrap pastes in \x1b[200~ ... \x1b[201~
-        stdout_write("\x1b[?2004h");
+        self.write("\x1b[?2004h");
 
         self.configure_windows_event_input();
 
@@ -1144,7 +1228,7 @@ impl Terminal for ProcessTerminal {
             self.shared.borrow_mut().image_probe.start(
                 std::time::Instant::now(), std::env::var_os("WT_SESSION").is_some(),
             );
-            stdout_write(IMAGE_QUERY);
+            self.write(IMAGE_QUERY);
         }
     }
 
@@ -1156,11 +1240,11 @@ impl Terminal for ProcessTerminal {
         self.clear_keyboard_protocol_fallback_timer();
 
         if self.clear_progress_interval() {
-            stdout_write(TERMINAL_PROGRESS_CLEAR_SEQUENCE);
+            self.write(TERMINAL_PROGRESS_CLEAR_SEQUENCE);
         }
 
         if self.mouse_tracking_active {
-            stdout_write("\x1b[?1006l\x1b[?1002l");
+            self.write("\x1b[?1006l\x1b[?1002l");
             self.mouse_tracking_active = false;
         }
         if self.alt_screen_active {
@@ -1175,23 +1259,24 @@ impl Terminal for ProcessTerminal {
         }
 
         // Disable bracketed paste mode
-        stdout_write("\x1b[?2004l");
+        self.write("\x1b[?2004l");
 
         // Disable Kitty keyboard protocol if not already done by drainInput()
-        {
+        let (disable_kitty, disable_modify_other_keys) = {
             let mut s = self.shared.borrow_mut();
-            if s.kitty_protocol_active {
-                stdout_write("\x1b[<u");
-                s.kitty_protocol_active = false;
-                set_kitty_protocol_active(false);
-            }
-            if s.modify_other_keys_active {
-                stdout_write("\x1b[>4;0m");
-                s.modify_other_keys_active = false;
-            }
+            let disable_kitty = s.kitty_protocol_active;
+            let disable_modify_other_keys = s.modify_other_keys_active;
+            s.kitty_protocol_active = false;
+            s.modify_other_keys_active = false;
             s.input_handler = None;
             s.resize_handler = None;
+            (disable_kitty, disable_modify_other_keys)
+        };
+        if disable_kitty {
+            self.write("\x1b[<u");
+            set_kitty_protocol_active(false);
         }
+        if disable_modify_other_keys { self.write("\x1b[>4;0m"); }
 
         // Clean up StdinBuffer
         self.stdin_buffer = None;
@@ -1218,21 +1303,22 @@ impl Terminal for ProcessTerminal {
     }
 
     fn drain_input(&mut self, max_ms: u64, idle_ms: u64) {
-        {
+        let (disable_kitty, disable_modify_other_keys) = {
             let mut s = self.shared.borrow_mut();
-            if s.kitty_protocol_active {
-                // Disable Kitty keyboard protocol first so any late key releases
-                // do not generate new Kitty escape sequences.
-                stdout_write("\x1b[<u");
-                s.kitty_protocol_active = false;
-                set_kitty_protocol_active(false);
-            }
-            if s.modify_other_keys_active {
-                stdout_write("\x1b[>4;0m");
-                s.modify_other_keys_active = false;
-            }
+            let disable_kitty = s.kitty_protocol_active;
+            let disable_modify_other_keys = s.modify_other_keys_active;
+            s.kitty_protocol_active = false;
+            s.modify_other_keys_active = false;
             s.input_handler = None;
+            (disable_kitty, disable_modify_other_keys)
+        };
+        if disable_kitty {
+            // Disable Kitty keyboard protocol first so any late key releases
+            // do not generate new Kitty escape sequences.
+            self.write("\x1b[<u");
+            set_kitty_protocol_active(false);
         }
+        if disable_modify_other_keys { self.write("\x1b[>4;0m"); }
 
         let start = std::time::Instant::now();
         let mut last_data_time = std::time::Instant::now();
@@ -1257,7 +1343,7 @@ impl Terminal for ProcessTerminal {
     }
 
     fn write(&mut self, data: &str) {
-        stdout_write(data);
+        write_shared_output(&self.shared, data);
         if !self.write_log_path.is_empty() {
             if let Ok(mut file) = std::fs::OpenOptions::new()
                 .create(true)
@@ -1364,7 +1450,7 @@ impl Terminal for ProcessTerminal {
     fn set_progress(&mut self, active: bool) {
         if active {
             // OSC 9;4;3 - indeterminate progress
-            stdout_write(TERMINAL_PROGRESS_ACTIVE_SEQUENCE);
+            self.write(TERMINAL_PROGRESS_ACTIVE_SEQUENCE);
             if self.progress_interval.is_none() {
                 self.progress_interval = Some(TERMINAL_PROGRESS_KEEPALIVE_MS);
             }
@@ -1373,7 +1459,7 @@ impl Terminal for ProcessTerminal {
         } else {
             self.clear_progress_interval();
             // OSC 9;4;0 - clear progress
-            stdout_write(TERMINAL_PROGRESS_CLEAR_SEQUENCE);
+            self.write(TERMINAL_PROGRESS_CLEAR_SEQUENCE);
         }
     }
 }
@@ -1420,10 +1506,10 @@ mod tests {
             let plain_mode = ENABLE_PROCESSED_OUTPUT | ENABLE_WRAP_AT_EOL_OUTPUT;
             assert_ne!(SetConsoleMode(buffer, plain_mode), 0);
             assert_ne!(SetStdHandle(STD_OUTPUT_HANDLE, buffer), 0);
-            stdout_write("\x1b[2J\x1b[Hfirst\x1b[2;1Hsecond");
+            stdout_write("\x1b[2J\x1b[Hfirst\x1b[2;1Hsecond").unwrap();
             // Shared-console children can reset the mode between frames.
             assert_ne!(SetConsoleMode(buffer, ENABLE_WRAP_AT_EOL_OUTPUT), 0);
-            stdout_write("\x1b[1;1Hfixed\x1b[K");
+            stdout_write("\x1b[1;1Hfixed\x1b[K").unwrap();
             let mut mode = 0;
             let mode_ok = GetConsoleMode(buffer, &mut mode);
             let mut first = [0u16; 6];
@@ -1548,25 +1634,128 @@ mod tests {
         assert_eq!(ownership.token, None);
     }
 
+    const OUTPUT_SOURCE_MARKER: &str = "SYNTHETIC_OUTPUT_PAYLOAD_NEVER_DIAGNOSE";
+
+    #[derive(Default)]
+    struct OutputWriter {
+        chunks: Vec<Vec<u8>>,
+        fail_at: Option<usize>,
+        flush_calls: usize,
+        fail_flush: bool,
+    }
+
+    impl Write for OutputWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if self.fail_at == Some(self.chunks.len()) {
+                return Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, OUTPUT_SOURCE_MARKER));
+            }
+            self.chunks.push(bytes.to_vec());
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.flush_calls += 1;
+            if self.fail_flush {
+                return Err(std::io::Error::new(std::io::ErrorKind::WriteZero, OUTPUT_SOURCE_MARKER));
+            }
+            Ok(())
+        }
+    }
+
+    fn output_error_parts(error: &std::io::Error) -> (&TerminalOutputError, String) {
+        let output = error.get_ref().and_then(|inner| inner.downcast_ref::<TerminalOutputError>()).unwrap();
+        (output, error.to_string())
+    }
+
     #[test]
     fn conpty_image_writes_are_utf8_safe_bounded_and_stop_on_error() {
-        #[derive(Default)]
-        struct Writer { chunks: Vec<Vec<u8>>, fail_at: Option<usize> }
-        impl Write for Writer {
-            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-                if self.fail_at == Some(self.chunks.len()) { return Err(std::io::ErrorKind::BrokenPipe.into()); }
-                self.chunks.push(bytes.to_vec()); Ok(bytes.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
-        }
-        let data = format!("{}\n\x1bP0;1;0q{}\x1b\\", "界😀".repeat(5000), "~".repeat(50000));
-        let mut writer = Writer::default();
+        let data = format!("{}
+\x1bP0;1;0q{}\x1b\\", "界😀".repeat(5000), "~".repeat(50000));
+        let mut writer = OutputWriter::default();
         write_terminal_output(&mut writer, &data, true).unwrap();
         assert_eq!(writer.chunks.concat(), data.as_bytes());
         assert!(writer.chunks.iter().all(|chunk| chunk.len() <= 16 * 1024 && std::str::from_utf8(chunk).is_ok()));
-        writer = Writer { fail_at: Some(1), ..Default::default() };
+        writer = OutputWriter { fail_at: Some(1), ..Default::default() };
         assert!(write_terminal_output(&mut writer, &data, true).is_err());
         assert_eq!(writer.chunks.len(), 1);
+    }
+
+    #[test]
+    fn terminal_output_success_preserves_data_chunks_and_flushes() {
+        let data = format!("{}
+\x1bP0;1;0q{}\x1b\\", "界😀".repeat(5000), "~".repeat(50000));
+        let mut writer = OutputWriter::default();
+        write_and_flush_terminal_output(&mut writer, &data, true).unwrap();
+        assert_eq!(writer.chunks.concat(), data.as_bytes());
+        assert!(writer.chunks.iter().all(|chunk| chunk.len() <= 16 * 1024 && std::str::from_utf8(chunk).is_ok()));
+        assert_eq!(writer.flush_calls, 1);
+    }
+
+    #[test]
+    fn terminal_output_write_failure_preempts_flush_and_hides_source_text() {
+        let mut writer = OutputWriter { fail_at: Some(1), fail_flush: true, ..Default::default() };
+        let error = write_and_flush_terminal_output(&mut writer, &"界😀".repeat(10000), true).unwrap_err();
+        let (output, diagnostic) = output_error_parts(&error);
+        assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+        assert_eq!(output.operation, "write");
+        assert_eq!(output.kind, std::io::ErrorKind::BrokenPipe);
+        assert_eq!(writer.flush_calls, 0, "a write error must not be replaced by a flush result");
+        assert!(diagnostic.contains("write") && diagnostic.contains("BrokenPipe"));
+        assert!(!diagnostic.contains(OUTPUT_SOURCE_MARKER));
+        assert!(!diagnostic.contains("界") && !diagnostic.contains("😀"));
+    }
+
+    #[test]
+    fn terminal_output_flush_failure_retains_identity_and_hides_source_text() {
+        let mut writer = OutputWriter { fail_flush: true, ..Default::default() };
+        let error = write_and_flush_terminal_output(&mut writer, "complete payload", false).unwrap_err();
+        let (output, diagnostic) = output_error_parts(&error);
+        assert_eq!(error.kind(), std::io::ErrorKind::WriteZero);
+        assert_eq!(output.operation, "flush");
+        assert_eq!(writer.chunks.concat(), b"complete payload");
+        assert_eq!(writer.flush_calls, 1);
+        assert!(diagnostic.contains("flush") && diagnostic.contains("WriteZero"));
+        assert!(!diagnostic.contains(OUTPUT_SOURCE_MARKER));
+        assert!(!diagnostic.contains("complete payload"));
+    }
+
+    #[test]
+    fn terminal_output_raw_os_error_is_retained_without_source_text() {
+        let error = TerminalOutputError::new("write", std::io::Error::from_raw_os_error(12345));
+        let (output, diagnostic) = output_error_parts(&error);
+        assert_eq!(output.raw_os_error, Some(12345));
+        assert!(diagnostic.contains("12345"));
+        assert!(!diagnostic.contains(OUTPUT_SOURCE_MARKER));
+    }
+
+    #[test]
+    fn process_terminal_returns_first_output_failure_once_through_existing_poll_boundary() {
+        let mut terminal = ProcessTerminal::new();
+        let mut first = OutputWriter { fail_at: Some(0), ..Default::default() };
+        let first_admitted = write_shared_output_with(&terminal.shared, || {
+            write_and_flush_terminal_output(&mut first, OUTPUT_SOURCE_MARKER, false)
+        });
+        assert!(first_admitted);
+
+        let mut second = OutputWriter { fail_flush: true, ..Default::default() };
+        let second_admitted = write_shared_output_with(&terminal.shared, || {
+            write_and_flush_terminal_output(&mut second, "second failure", false)
+        });
+        assert!(!second_admitted, "only one failure transition is logged and admitted");
+        assert_eq!(second.flush_calls, 0, "later output is withheld after the first failure");
+
+        let error = terminal.poll_input().unwrap_err();
+        let (output, diagnostic) = output_error_parts(&error);
+        assert_eq!(output.operation, "write");
+        assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+        assert!(!diagnostic.contains(OUTPUT_SOURCE_MARKER));
+        assert!(terminal.shared.borrow().output_error.is_none(), "poll delivers the retained failure exactly once");
+        assert!(terminal.shared.borrow().output_failed, "teardown cannot log or retry the same failed output path");
+        let cleanup_admitted = write_shared_output_with(&terminal.shared, || {
+            write_and_flush_terminal_output(&mut second, "teardown retry", false)
+        });
+        assert!(!cleanup_admitted);
+        assert_eq!(second.flush_calls, 0);
     }
 
     #[test]
