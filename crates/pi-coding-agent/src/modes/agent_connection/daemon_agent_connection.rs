@@ -4617,9 +4617,6 @@ mod daemon_backlog_tests;
 #[path = "daemon_restart_tests.rs"]
 mod daemon_restart_tests;
 #[cfg(test)]
-#[path = "daemon_dispose_tests.rs"]
-mod daemon_dispose_tests;
-#[cfg(test)]
 #[path = "daemon_initial_attach_tests.rs"]
 mod daemon_initial_attach_tests;
 
@@ -4914,3 +4911,7 @@ mod tests {
         assert_eq!(thinking_level_from_str("bogus"), None);
     }
 }
+
+#[cfg(test)]
+#[path = "daemon_dispose_tests.rs"]
+mod daemon_dispose_tests;
