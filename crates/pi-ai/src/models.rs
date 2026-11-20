@@ -43,6 +43,8 @@ pub const GPT_5_6_PREFIX: &str = "gpt-5.6-";
 pub const GPT_6_ASTRA: &str = "gpt-6-astra";
 pub const GPT_6_SOL: &str = "gpt-6-sol";
 pub const GPT_6_1_SOL: &str = "gpt-6.1-sol";
+pub const GPT_6_2_ASTRA: &str = "gpt-6.2-astra";
+pub const GPT_6_2_SOL: &str = "gpt-6.2-sol";
 
 /// `supportsFastMode(model)`.
 pub fn supports_fast_mode(model: &Model) -> bool {
@@ -51,20 +53,15 @@ pub fn supports_fast_mode(model: &Model) -> bool {
         || model.id == GPT_5_6
         || model.id.starts_with(GPT_5_6_PREFIX)
         || model.id == GPT_6_ASTRA;
-    let codex_sol_id = model.id == GPT_6_SOL || model.id == GPT_6_1_SOL;
+    let codex_only_id = matches!(model.id.as_str(), GPT_6_SOL | GPT_6_1_SOL | GPT_6_2_ASTRA | GPT_6_2_SOL);
     let codex_route = model.provider == "openai-codex" && model.api == "openai-codex-responses";
     let openai_route = model.provider == "openai" && model.api == "openai-responses";
-    (codex_route && (eligible_id || codex_sol_id)) || (openai_route && eligible_id)
+    (codex_route && (eligible_id || codex_only_id)) || (openai_route && eligible_id)
 }
 
-/// `supportsUltrafastMode(model)` — OpenAI's Ultrafast service tier ("the fastest
-/// available responses", 8x Standard speed against subscription allowance) is offered
-/// for exactly two models, both on the ChatGPT subscription route
-/// (`openai-codex-responses`): GPT-6 Astra and GPT-6.1 Sol. Fast (`priority`) remains
-/// available to the wider set above; a persisted Ultrafast preference on any other
-/// model is demoted by the session clamp, not rejected here.
+/// Models that support the Ultrafast tier on the Codex subscription route.
 pub fn supports_ultrafast_mode(model: &Model) -> bool {
-    let ultrafast_id = model.id == GPT_6_ASTRA || model.id == GPT_6_1_SOL;
+    let ultrafast_id = matches!(model.id.as_str(), GPT_6_ASTRA | GPT_6_1_SOL | GPT_6_2_ASTRA | GPT_6_2_SOL);
     let codex_route = model.provider == "openai-codex" && model.api == "openai-codex-responses";
     codex_route && ultrafast_id
 }
@@ -307,7 +304,7 @@ mod tests {
     fn fast_mode_requires_eligible_id_and_route() {
         for id in [
             GPT_5_4, GPT_5_5, GPT_5_6, "gpt-5.6-astra", "gpt-5.6-anything",
-            GPT_6_ASTRA, GPT_6_SOL, GPT_6_1_SOL,
+            GPT_6_ASTRA, GPT_6_SOL, GPT_6_1_SOL, GPT_6_2_ASTRA, GPT_6_2_SOL,
         ] {
             for provider in [
                 "openai", "openai-codex", "github-copilot", "openrouter", "custom",
@@ -320,7 +317,7 @@ mod tests {
                     let model = Model::new(id, id, api, provider, "https://fixture.invalid");
                     let codex = provider == "openai-codex" && api == "openai-codex-responses";
                     let openai = provider == "openai" && api == "openai-responses"
-                        && id != GPT_6_SOL && id != GPT_6_1_SOL;
+                        && !matches!(id, GPT_6_SOL | GPT_6_1_SOL | GPT_6_2_ASTRA | GPT_6_2_SOL);
                     assert_eq!(supports_fast_mode(&model), codex || openai, "{provider}/{id} via {api}");
                 }
             }
@@ -331,7 +328,7 @@ mod tests {
     fn fast_mode_rejects_unreviewed_model_ids() {
         for id in [
             "gpt-4o", "gpt-5.60", "gpt-6", "gpt-6.1", "gpt-6-luna", "gpt-6.1-luna",
-            "gpt-6-terra", "gpt-6.2-sol", "gpt-6.1-astra", "gpt-6-astra-preview",
+            "gpt-6-terra", "gpt-6.2-sol-preview", "gpt-6.2-astra-preview", "gpt-6.1-astra", "gpt-6-astra-preview",
             "gpt-6-sol-preview", "gpt-6.1-sol-preview", "gpt-6-sol-2026-09-30",
             "gpt-6.1-sol-2026-09-30", "gpt-6-solx", "gpt-6.1-solx", "GPT-6-SOL",
             " gpt-6-sol", "gpt-6-sol ", "openai-codex/gpt-6-sol", "",
@@ -348,7 +345,7 @@ mod tests {
 
     #[test]
     fn ultrafast_mode_requires_eligible_id_and_codex_route() {
-        for id in [GPT_6_ASTRA, GPT_6_1_SOL] {
+        for id in [GPT_6_ASTRA, GPT_6_1_SOL, GPT_6_2_ASTRA, GPT_6_2_SOL] {
             for provider in ["openai", "openai-codex", "github-copilot", "OpenAI-Codex", ""] {
                 for api in [
                     "openai-responses", "openai-codex-responses", "openai-completions",
@@ -365,7 +362,7 @@ mod tests {
     #[test]
     fn ultrafast_mode_rejects_unreviewed_model_ids() {
         for id in [
-            GPT_6_SOL, "gpt-6.2-sol", "gpt-6.1-astra", "gpt-6-astra-preview",
+            GPT_6_SOL, "gpt-6.2-sol-preview", "gpt-6.2-astra-preview", "gpt-6.1-astra", "gpt-6-astra-preview",
             "gpt-6.1-sol-preview", "gpt-6-astra-2026-09-30", "gpt-6.1-sol-2026-09-30",
             "gpt-6-astrax", "gpt-6.1-solx", "GPT-6-ASTRA", " gpt-6-astra", "gpt-6-astra ",
             "openai-codex/gpt-6-astra", "",

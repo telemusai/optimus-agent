@@ -8,17 +8,18 @@ use serde_json::json;
 
 #[test]
 fn codex_sol_luna_catalog_preserves_reviewed_metadata() {
-    for (id, input_cost, output_cost) in [
-        ("gpt-6.1-sol", 2.0, 10.0),
-        ("gpt-6-sol", 2.0, 10.0),
-        ("gpt-6-luna", 0.1, 0.5),
+    for (id, context_window, input_cost, output_cost) in [
+        ("gpt-6.2-sol", 500_000.0, 2.0, 10.0),
+        ("gpt-6.1-sol", 272_000.0, 2.0, 10.0),
+        ("gpt-6-sol", 272_000.0, 2.0, 10.0),
+        ("gpt-6-luna", 272_000.0, 0.1, 0.5),
     ] {
         let model = get_model("openai-codex", id).expect("reviewed subscription model");
         assert_eq!(model.id, id);
         assert_eq!(model.provider, "openai-codex");
         assert_eq!(model.api, "openai-codex-responses");
         assert_eq!(model.base_url, "https://chatgpt.com/backend-api");
-        assert_eq!(model.context_window, 272_000.0);
+        assert_eq!(model.context_window, context_window);
         assert_eq!(model.max_tokens, 128_000.0);
         assert_eq!(model.input, vec![InputModality::Text, InputModality::Image]);
         assert_eq!(model.cost.input, input_cost);
@@ -35,7 +36,7 @@ fn codex_sol_luna_catalog_preserves_reviewed_metadata() {
 
 #[test]
 fn codex_subscription_requests_keep_ids_reasoning_and_existing_auth_shape() {
-    for id in ["gpt-6.2-astra", "gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna"] {
+    for id in ["gpt-6.2-astra", "gpt-6.2-sol", "gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna"] {
         let model = get_model("openai-codex", id).unwrap();
         let efforts = ["low", "medium", "high", "xhigh", "max"];
         assert_eq!(get_supported_thinking_levels(model), efforts);
@@ -61,15 +62,19 @@ fn codex_subscription_requests_keep_ids_reasoning_and_existing_auth_shape() {
 
 #[test]
 fn codex_gpt6_fast_requests_preserve_nullable_service_tier() {
-    for id in ["gpt-6-astra", "gpt-6-sol", "gpt-6.1-sol"] {
+    for id in ["gpt-6-astra", "gpt-6-sol", "gpt-6.1-sol", "gpt-6.2-astra", "gpt-6.2-sol"] {
         let model = get_model("openai-codex", id).expect("requested Codex model");
         assert!(supports_fast_mode(model), "openai-codex/{id}");
-        for service_tier in [
+        let mut tiers = vec![
             None,
             Some(Some("priority".to_string())),
             Some(Some("default".to_string())),
             Some(None),
-        ] {
+        ];
+        if pi_ai::models::supports_ultrafast_mode(model) {
+            tiers.push(Some(Some("ultrafast".to_string())));
+        }
+        for service_tier in tiers {
             let base = StreamOptions {
                 service_tier: service_tier.clone(),
                 api_key: Some("synthetic-token".to_string()),

@@ -4655,7 +4655,7 @@ async fn run_builtin_command(
             let unavailable = concat!(
                 "Fast mode requires GPT-5.4, GPT-5.5, GPT-5.6, or GPT-6 Astra ",
                 "with ChatGPT or OpenAI API key authentication; ",
-                "GPT-6 Sol and GPT-6.1 Sol require ChatGPT authentication (openai-codex)",
+                "GPT-6 Sol, GPT-6.1 Sol, GPT-6.2 Astra and GPT-6.2 Sol require ChatGPT authentication (openai-codex)",
             );
             let state = connection.get_state().await?;
             let supports = state
@@ -4681,14 +4681,12 @@ async fn run_builtin_command(
                 if on { "on" } else { "off" }
             )))
         }
-        // `commandName === "ultrafast"` — Ultrafast service tier (GPT-6 Astra and
-        // GPT-6.1 Sol, ChatGPT/Codex subscription route only).
         "ultrafast" => {
             if !args.is_empty() {
                 return Ok(CommandOutput::Error("Usage: /ultrafast".to_string()));
             }
             let unavailable = concat!(
-                "Ultrafast requires GPT-6 Astra or GPT-6.1 Sol with ChatGPT ",
+                "Ultrafast requires GPT-6 Astra, GPT-6.1 Sol, GPT-6.2 Astra or GPT-6.2 Sol with ChatGPT ",
                 "authentication (openai-codex).",
             );
             let state = connection.get_state().await?;
@@ -7480,7 +7478,7 @@ fn apply_event_legacy_for_speed(
 
     #[tokio::test]
     async fn fast_command_toggles_requested_codex_models_without_prompting() {
-        for id in ["gpt-6-astra", "gpt-6-sol", "gpt-6.1-sol"] {
+        for id in ["gpt-6-astra", "gpt-6-sol", "gpt-6.1-sol", "gpt-6.2-astra", "gpt-6.2-sol"] {
             let model = pi_ai::models::get_model("openai-codex", id).unwrap().clone();
             for initial_tier in [
                 None,
@@ -7531,9 +7529,25 @@ fn apply_event_legacy_for_speed(
     }
 
     #[tokio::test]
+    async fn ultrafast_command_toggles_both_codex_6_2_models() {
+        for id in ["gpt-6.2-astra", "gpt-6.2-sol"] {
+            let recorder = Arc::new(RecordingConnection::new());
+            let model = pi_ai::models::get_model("openai-codex", id).unwrap().clone();
+            recorder.state.lock().unwrap().model = Some(model);
+            let connection: Arc<dyn wire::AgentConnection> = recorder.clone();
+            let (send, receive) = host_event_channel(8);
+            for (tier, status) in [("ultrafast", "Ultrafast mode: on"), ("default", "Ultrafast mode: off")] {
+                dispatch_submission(&connection, &send, "/ultrafast", false, None).await.unwrap();
+                assert!(matches!(receive.try_recv(), Ok(HostEvent::Status(message)) if message == status), "{id}");
+                assert_eq!(recorder.state.lock().unwrap().service_tier, Some(Some(tier.to_string())), "{id}");
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn fast_command_reports_updated_requirements_for_unsupported_models_and_routes() {
         let mut models = vec![None];
-        for id in ["gpt-6-astra", "gpt-6-sol", "gpt-6.1-sol"] {
+        for id in ["gpt-6-astra", "gpt-6-sol", "gpt-6.1-sol", "gpt-6.2-astra", "gpt-6.2-sol"] {
             let codex = pi_ai::models::get_model("openai-codex", id).unwrap();
             for (provider, api) in [
                 ("openai-codex", "openai-responses"),
@@ -7557,7 +7571,7 @@ fn apply_event_legacy_for_speed(
         }
         for id in [
             "gpt-6-luna", "gpt-6.1-luna", "gpt-6-astra-preview", "gpt-6-sol-preview",
-            "gpt-6.1-sol-preview", "gpt-6.2-sol", "gpt-6-terra",
+            "gpt-6.1-sol-preview", "gpt-6.2-sol-preview", "gpt-6-terra",
         ] {
             let mut model = pi_ai::models::get_model("openai-codex", "gpt-6-sol").unwrap().clone();
             model.id = id.to_string();
@@ -7566,7 +7580,7 @@ fn apply_event_legacy_for_speed(
         let expected = concat!(
             "Fast mode requires GPT-5.4, GPT-5.5, GPT-5.6, or GPT-6 Astra ",
             "with ChatGPT or OpenAI API key authentication; ",
-            "GPT-6 Sol and GPT-6.1 Sol require ChatGPT authentication (openai-codex)",
+            "GPT-6 Sol, GPT-6.1 Sol, GPT-6.2 Astra and GPT-6.2 Sol require ChatGPT authentication (openai-codex)",
         );
         for model in models {
             let label = model.as_ref().map(|model| format!("{}/{} via {}", model.provider, model.id, model.api))

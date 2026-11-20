@@ -18,6 +18,17 @@ text/image input. Optimus exposes the supported levels from `low` through
 `max`. The output limit and standard cost estimates come from the
 [OpenAI model card](https://developers.openai.com/api/docs/models/gpt-6.2-astra).
 
+## GPT-6.2 Sol and Codex speed commands
+
+Select **GPT-6.2 Sol** under `openai-codex`, or start with
+`optimus-agent --provider openai-codex --model gpt-6.2-sol`.
+The Codex 0.171.0 catalog listed a 500,000-token default context window
+and text and image input for Sol. The output limit and standard cost
+estimates follow the [OpenAI model card](https://developers.openai.com/api/docs/models/gpt-6.2-sol).
+
+Both GPT-6.2 Astra and GPT-6.2 Sol support `/fast` and `/ultrafast` on the Codex
+subscription route. Running the active speed command again returns to standard speed.
+
 ## GPT-6.1 Sol
 
 Selectors: `openai-codex/gpt-6.1-sol` with your existing Codex sign-in, or
