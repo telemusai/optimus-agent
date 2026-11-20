@@ -305,8 +305,6 @@ async fn t09_capabilities_match_service() {
 
     // Every default the supervisor genuinely serves must still be advertised.
     let withheld_by_the_port = [
-        "slim_attach",
-        "history_ranges",
         "heartbeat_catalog",
         "authoritative_child_roster",
         "owned_session_recovery_context",
@@ -331,6 +329,15 @@ async fn t09_capabilities_match_service() {
         advertised.contains(&"heartbeat_catalog".to_string()),
         "heartbeat_catalog must be advertised while the generic forward serves heartbeats_list: {advertised:?}"
     );
+
+    // Modern peers agree on the smaller inline payload. A legacy peer on either
+    // side still receives the complete history in its original representation.
+    let offered = serde_json::json!(["slim_attach", "history_ranges", "chunked_snapshot"]);
+    let offered = offered.as_array().unwrap();
+    assert_eq!(worker_attach_capabilities(offered, |_| true), ["attach_snapshot", "event_sequence", "slim_attach", "history_ranges"]);
+    assert_eq!(worker_attach_capabilities(offered, |_| false), ["attach_snapshot", "event_sequence"]);
+    assert_eq!(worker_attach_capabilities(&[], |_| true), ["attach_snapshot", "event_sequence"]);
+    assert_eq!(worker_attach_capabilities(offered, |name| name == "slim_attach"), ["attach_snapshot", "event_sequence", "slim_attach"]);
 
     // C-05 (b): an unlisted command type must get the unknown-command error.
     let response = fixture

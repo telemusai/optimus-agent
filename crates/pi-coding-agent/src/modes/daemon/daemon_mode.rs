@@ -120,7 +120,7 @@ use crate::core::session_lease::{
 };
 use crate::core::session_manager::SessionManager;
 use crate::core::session_manager::{
-    get_session_artifact_path_for_file, order_session_context_for_transcript, read_session_info,
+    get_session_artifact_path_for_file, order_transcript_messages, read_session_info,
     resolve_session_rlm_depth, SessionHistorySnapshot, SessionInfo,
 };
 use crate::core::session_resolver::{resolve_session_path, ResolvedSession};
@@ -9496,12 +9496,10 @@ impl AgentDaemon {
         // Slim clients read summary/messages from the snapshot; duplicating them at
         // the top level would serialize the full history twice more per attach.
         let slim = capabilities.contains("slim_attach");
-        let snapshot_summary = snapshot.get("summary").cloned().unwrap_or(Value::Null);
-        let snapshot_messages = snapshot
-            .get("messages")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
+        let snapshot_summary = (!slim).then(|| snapshot.get("summary").cloned().unwrap_or(Value::Null));
+        let snapshot_messages = (!slim).then(|| {
+            snapshot.get("messages").and_then(Value::as_array).cloned().unwrap_or_default()
+        });
         Ok(DaemonAttachResult {
             protocol: Some(
                 serde_json::to_value(
@@ -9510,8 +9508,8 @@ impl AgentDaemon {
                 .unwrap_or(Value::Null),
             ),
             active_session_id: state_active_session_id,
-            state: (!slim).then_some(snapshot_summary),
-            messages: (!slim).then_some(snapshot_messages),
+            state: snapshot_summary,
+            messages: snapshot_messages,
             snapshot,
             replay,
             last_event_sequence,
@@ -9589,14 +9587,13 @@ impl AgentDaemon {
         // Runtime hydration still parses the complete JSONL once. This capability
         // only avoids serializing/transferring/rendering the complete resident
         // transcript on attach.
-        let mut history: Option<SessionHistorySnapshot> = None;
-        if recent_first_history {
-            let persisted_context = entry
-                .session
-                .session_manager()
-                .lock()
-                .expect("session manager poisoned")
-                .build_session_context_with_entry_ids(None);
+        let initial_history = if recent_first_history {
+            let target_model = entry.session.model_identity();
+            let (persisted_context, tip_entry_id) = {
+                let manager = entry.session.session_manager();
+                let manager = manager.lock().expect("session manager poisoned");
+                (manager.build_session_context_with_entry_ids(target_model.as_ref()), manager.get_leaf_id())
+            };
             let live_messages = published_messages.as_ref();
             let aligns = persisted_context.messages.len() == live_messages.len()
                 && persisted_context
@@ -9608,49 +9605,29 @@ impl AgentDaemon {
                             && message_timestamp_of(left) == message_timestamp_of(right)
                     });
             if aligns {
-                // Keep the exact public messages (including in-memory detail
-                // augmentation), while using persisted entry ids to present the same
-                // context chronologically. `{ ...persistedContext, messages: liveMessages }`
-                // (daemon-mode.ts:5503) replaces the message list, keeping the entry ids.
-                let live_context = crate::core::session_manager::SessionContextWithEntryIds {
-                    messages: live_messages.clone(),
-                    ..persisted_context.clone()
-                };
-                let ordered = order_session_context_for_transcript(&live_context);
-                history = Some(SessionHistorySnapshot {
-                    messages: ordered.messages,
-                    entry_ids: ordered.entry_ids,
-                    tip_entry_id: entry
-                        .session
-                        .session_manager()
-                        .lock()
-                        .expect("session manager poisoned")
-                        .get_leaf_id(),
-                });
+                let mut ordered = order_transcript_messages(live_messages, &persisted_context.entry_ids);
+                ordered.tip_entry_id = tip_entry_id;
+                Some(slice_pinned_session_history(
+                    &ordered,
+                    &SlicePinnedSessionHistoryOptions {
+                        generation: event_generation.clone(),
+                        representation: session_history_representation(target_model.as_ref()),
+                        limit: Some(INITIAL_HISTORY_WINDOW_MESSAGES),
+                        before_entry_id: None,
+                    },
+                )?)
+            } else {
+                // An unpersisted outcome has no stable entry id for paging.
+                None
             }
-            // Unpersisted outcome insertion can temporarily break index alignment. In
-            // that case retain the full legacy snapshot rather than dropping it.
-        }
-        let initial_history = match &history {
-            Some(history) => Some(slice_pinned_session_history(
-                history,
-                &SlicePinnedSessionHistoryOptions {
-                    generation: event_generation.clone(),
-                    representation: session_history_representation(
-                        entry.session.model_identity().as_ref(),
-                    ),
-                    limit: Some(INITIAL_HISTORY_WINDOW_MESSAGES),
-                    before_entry_id: None,
-                },
-            )?),
-            None => None,
+        } else {
+            None
         };
-        let messages = match &initial_history {
-            Some(history) => history.messages.clone(),
-            None => published_messages.as_ref().clone(),
-        };
+        let messages = initial_history.as_ref()
+            .map(|history| history.messages.as_slice())
+            .unwrap_or(published_messages.as_slice());
         let messages = messages
-            .into_iter()
+            .iter()
             .map(|message| serde_json::to_value(message).unwrap_or(Value::Null))
             .collect::<Vec<_>>();
         let mut snapshot = Map::new();

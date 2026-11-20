@@ -117,7 +117,7 @@ fn occ31_schema47_is_optional_and_keeps_old_startup_and_occ2_contracts() {
         DaemonCompatibilityHello, daemon_outbound_compatibility, meets_daemon_command_compatibility,
     };
     use pi_coding_agent::modes::daemon::daemon_supervisor;
-    assert_eq!(DAEMON_SCHEMA_REVISION, 48);
+    assert_eq!(DAEMON_SCHEMA_REVISION, 49);
     assert!(DAEMON_DEFAULT_SERVER_CAPABILITIES.contains(&DaemonServerCapability::Occ31Textmas));
     let current = DaemonCompatibilityHello {
         protocol: daemon_protocol_info(), schema_revision: Some(DAEMON_SCHEMA_REVISION),

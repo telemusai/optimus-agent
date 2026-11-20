@@ -2313,8 +2313,8 @@ impl Supervisor {
         let cancelled_roots = self.settle_ephemeral_cancel_intents().await;
         let ledger = match self.rlm_spawn_ledger().await { Ok(ledger) => ledger, Err(_) => return Vec::new() };
         let infos = ledger.family().await;
-        let info_by_path: HashMap<String, SessionInfo> = infos.iter()
-            .map(|info| (canonical_session_path(&info.path), info.clone()))
+        let info_by_path: HashMap<String, &SessionInfo> = infos.iter()
+            .map(|info| (canonical_session_path(&info.path), info))
             .collect();
         let mut results: Vec<(String, Value)> = Vec::new();
         let parent_map: HashMap<String, String> = infos.iter().filter_map(|info| info.parent_session_path.as_ref().map(|parent| (canonical_session_path(&info.path), canonical_session_path(parent)))).collect();
@@ -2333,14 +2333,14 @@ impl Supervisor {
                 if !include_inactive && job.status != crate::core::cron_jobs::STATUS_ACTIVE && job.status != crate::core::cron_jobs::STATUS_PAUSED { continue; }
                 // `uncoveredRootFor(info)`: walk up while no worker holds the current path.
                 let root = {
-                    let mut cursor = info.clone();
+                    let mut cursor = info;
                     let mut visited: HashSet<String> = HashSet::from([canonical_session_path(&cursor.path)]);
                     loop {
                         if self.find_worker_by_session_file(&cursor.path, None).is_some() { break; }
-                        let Some(parent_path) = cursor.parent_session_path.clone() else { break; };
-                        let Some(parent) = info_by_path.get(&canonical_session_path(&parent_path)) else { break; };
+                        let Some(parent_path) = cursor.parent_session_path.as_deref() else { break; };
+                        let Some(&parent) = info_by_path.get(&canonical_session_path(parent_path)) else { break; };
                         if !visited.insert(canonical_session_path(&parent.path)) { break; }
-                        cursor = parent.clone();
+                        cursor = parent;
                     }
                     cursor
                 };
@@ -3618,12 +3618,6 @@ impl Supervisor {
             // supervisor, not by the worker: TS re-asks the worker through `subscribeWorker`
             // with the real flag (3660-3669).
             body.insert("supportsExtensionUi".into(), json!(false));
-            // `slim_attach` / `chunked_snapshot` / `history_ranges` stay out of the list
-            // although TS:5451-5457 can add them: this port pins full snapshots (see
-            // `subscribe`, "Full snapshots avoid a private chunk cache at the public
-            // boundary") and reads `response.data.snapshot` directly, so a slim or chunked
-            // reply would be a snapshot the supervisor cannot consume.
-            body.insert("capabilities".into(), json!(["attach_snapshot", "event_sequence"]));
             if let Some(client_id) = body.get("clientId").and_then(Value::as_str) { *public.id.lock().unwrap() = client_id.to_string(); }
             body.remove("clientId");
             public.subscriptions.lock().unwrap().insert(active.clone());
@@ -3631,6 +3625,13 @@ impl Supervisor {
         // `command.promoteOwnedSession` (:2586, :2640) must be read before `body` is forwarded.
         let promote_owned_session = body.get("promoteOwnedSession").and_then(Value::as_bool) == Some(true);
         let client = self.connected_client(&worker).await?;
+        if attaching {
+            let offered = body.get("capabilities").and_then(Value::as_array);
+            let capabilities = worker_attach_capabilities(offered.map(Vec::as_slice).unwrap_or_default(), |name| {
+                client.supports_server_capability(name)
+            });
+            body.insert("capabilities".into(), json!(capabilities));
+        }
         let mut response = client.request(body, REQUEST_TIMEOUT, DaemonClientRequestOptions::default()).await.map_err(|error| error.to_string())?;
         response.id = id; response.command = kind.clone();
         if response.success {
@@ -3887,34 +3888,22 @@ fn recovery_command(descriptor: &DaemonWorkerDescriptor) -> Result<Map<String, V
     command.insert("config".into(), json!({"sessionDir":descriptor.session_dir, "telemetryDisabled":descriptor.telemetry_disabled}));
     Ok(command)
 }
+// The supervisor consumes one inline worker snapshot, then supplies its own public chunks.
+fn worker_attach_capabilities(offered: &[Value], worker_supports: impl Fn(&str) -> bool) -> Vec<&'static str> {
+    let mut capabilities = vec!["attach_snapshot", "event_sequence"];
+    for name in ["slim_attach", "history_ranges"] {
+        if offered.iter().any(|value| value.as_str() == Some(name)) && worker_supports(name) {
+            capabilities.push(name);
+        }
+    }
+    capabilities
+}
+
 fn server_capabilities() -> Vec<String> {
-    // Capability honesty: advertise every default the supervisor really serves, and withhold
-    // only the ones it does not. `heartbeat_catalog` and `authoritative_child_roster` are
-    // withheld by the filter below in the ported slice even though both paths ARE served:
-    //   - `heartbeat_catalog` gates `heartbeats_list` on the CLIENT side
-    //     (heartbeat_catalog.rs:34, daemon-agent-connection.ts), so withholding it made
-    //     supervisor clients never ask for a command this supervisor forwards.
-    //   - `authoritative_child_roster` gates `get_rlm_children` on the client side
-    //     (daemon_agent_connection.rs:2499-2501), which the supervisor's generic forward
-    //     already routes; withholding it made RLM children invisible to those clients.
-    // Still withheld, because the path is genuinely absent here:
-    //   - `slim_attach` - private worker snapshots still arrive in full. Public
-    //     `chunked_snapshot` attaches are served through the disk-backed cache,
-    //     but that is not a bound on the initial decoded worker response.
-    //   - `history_ranges` - the attach branch pins `capabilities` to
-    //     `["attach_snapshot", "event_sequence"]`, so the snapshot never carries the `history`
-    //     field the capability promises.
-    //   - `owned_session_recovery_context` - needs `command.recoveryConfig` handling in the
-    //     owned-worker attach branch (daemon-supervisor.ts:5385-5396), which the port lacks.
     let mut capabilities: Vec<String> = daemon_protocol::DAEMON_DEFAULT_SERVER_CAPABILITIES
         .iter()
         .map(super::super::daemon_client::capability_name)
-        .filter(|capability| {
-            !matches!(
-                capability.as_str(),
-                "slim_attach" | "history_ranges" | "owned_session_recovery_context"
-            )
-        })
+        .filter(|capability| capability != "owned_session_recovery_context")
         .collect();
     capabilities.push("agent_roster".to_string());
     capabilities

@@ -1,0 +1,2 @@
+- Fixed duplicate transcript transfers when opening active chats through the daemon supervisor. Compatible terminals open the recent history first and can load earlier messages.
+- Changed saved-session lookups to reuse cached summaries without copying the full scan state for unchanged files.
