@@ -14446,10 +14446,7 @@ async fn sender_queue_idle_tick(
         let current_model = self.model();
         if let Some(current_model) = current_model.as_ref() {
             if supports_fast_mode(current_model) {
-                // Ultrafast serves a narrower model set (GPT-6 Astra and GPT-6.1
-                // Sol on the Codex subscription route). Switching models keeps the
-                // speed preference at the best tier the model serves instead of
-                // sending a tier it would reject.
+                // Keep the speed preference at the fastest tier the new model supports.
                 if service_tier.as_ref().and_then(|tier| tier.as_deref()) == Some("ultrafast")
                     && !supports_ultrafast_mode(current_model)
                 {

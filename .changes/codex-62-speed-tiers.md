@@ -1,0 +1,1 @@
+- Added GPT-6.2 Sol to the Codex model picker and enabled Fast and Ultrafast for GPT-6.2 Astra and Sol on Codex subscriptions.

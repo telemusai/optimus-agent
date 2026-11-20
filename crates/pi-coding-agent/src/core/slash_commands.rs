@@ -217,7 +217,7 @@ fn canonical_builtin_slash_commands() -> Vec<BuiltinSlashCommand> {
     push("fast", "Toggle OpenAI Fast mode".to_string(), None, None);
     push(
         "ultrafast",
-        "Toggle OpenAI Ultrafast mode (GPT-6 Astra / GPT-6.1 Sol)".to_string(),
+        "Toggle OpenAI Ultrafast mode on supported Codex models".to_string(),
         None,
         None,
     );
