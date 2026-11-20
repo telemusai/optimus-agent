@@ -1,0 +1,1 @@
+- Fixed a terminal freeze when leaving a busy chat. Closing the view releases waiting updates, and repeated repaint requests no longer fill the UI queue.

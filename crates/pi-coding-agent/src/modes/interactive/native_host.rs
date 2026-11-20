@@ -45,12 +45,13 @@ use std::time::{Duration, Instant};
 
 const MAX_HOST_EVENTS_PER_FRAME: usize = 64;
 const MAX_HOST_EVENT_TIME_PER_FRAME: Duration = Duration::from_millis(8);
-/// Raw events waiting for the UI owner. Producers block at this explicit
-/// bound; adjacent streaming snapshots are folded by `HostEventBudget`.
+/// Raw events waiting for the UI owner. Connection delivery awaits capacity;
+/// adjacent streaming snapshots are folded by `HostEventBudget`.
 const MAX_PENDING_HOST_EVENTS: usize = 256;
 
 struct HostEventChannelState {
     receive: std::sync::Mutex<mpsc::Receiver<HostEvent>>,
+    repaint_pending: std::sync::atomic::AtomicBool,
     /// Oldest events moved aside by a UI-owner send when the raw channel was
     /// full. The receiver always drains these before the raw channel.
     owner_backlog: std::sync::Mutex<std::collections::VecDeque<HostEvent>>,
@@ -60,17 +61,21 @@ struct HostEventChannelState {
 pub(super) struct HostEventSender {
     send: mpsc::SyncSender<HostEvent>,
     owner: std::thread::ThreadId,
-    state: std::sync::Arc<HostEventChannelState>,
+    state: std::sync::Weak<HostEventChannelState>,
+    capacity: tokio::sync::watch::Receiver<()>,
 }
 
 pub(super) struct HostEventReceiver {
+    capacity_changed: tokio::sync::watch::Sender<()>,
     state: std::sync::Arc<HostEventChannelState>,
 }
 
 pub(super) fn host_event_channel(capacity: usize) -> (HostEventSender, HostEventReceiver) {
     let (send, receive) = mpsc::sync_channel(capacity);
+    let (capacity_changed, capacity_updates) = tokio::sync::watch::channel(());
     let state = std::sync::Arc::new(HostEventChannelState {
         receive: std::sync::Mutex::new(receive),
+        repaint_pending: std::sync::atomic::AtomicBool::new(false),
         owner_backlog: std::sync::Mutex::new(std::collections::VecDeque::with_capacity(
             MAX_PENDING_HOST_EVENTS,
         )),
@@ -79,9 +84,10 @@ pub(super) fn host_event_channel(capacity: usize) -> (HostEventSender, HostEvent
         HostEventSender {
             send,
             owner: std::thread::current().id(),
-            state: state.clone(),
+            state: std::sync::Arc::downgrade(&state),
+            capacity: capacity_updates,
         },
-        HostEventReceiver { state },
+        HostEventReceiver { state, capacity_changed },
     )
 }
 
@@ -90,9 +96,32 @@ impl HostEventSender {
     /// on its own receiver: it moves the oldest full-channel event into an
     /// ordered bounded backlog, then nonblockingly requeues its new event.
     fn send(&self, mut event: HostEvent) -> Result<(), mpsc::SendError<HostEvent>> {
+        if matches!(event, HostEvent::Render) {
+            if self.capacity.has_changed().is_err() {
+                return Err(mpsc::SendError(event));
+            }
+            let Some(state) = self.state.upgrade() else {
+                return Err(mpsc::SendError(event));
+            };
+            if state.repaint_pending.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                return Ok(());
+            }
+            return match self.try_send(event) {
+                Ok(()) => Ok(()),
+                Err(mpsc::TrySendError::Full(_)) => {
+                    // Every event drained by the owner already requests a repaint.
+                    state.repaint_pending.store(false, std::sync::atomic::Ordering::Release);
+                    Ok(())
+                }
+                Err(mpsc::TrySendError::Disconnected(event)) => Err(mpsc::SendError(event)),
+            };
+        }
         if std::thread::current().id() != self.owner {
             return self.send.send(event);
         }
+        let Some(state) = self.state.upgrade() else {
+            return Err(mpsc::SendError(event));
+        };
         loop {
             match self.send.try_send(event) {
                 Ok(()) => return Ok(()),
@@ -101,12 +130,12 @@ impl HostEventSender {
                 }
                 Err(mpsc::TrySendError::Full(returned)) => event = returned,
             }
-            let oldest = match self.state.receive.lock().expect("host receiver").try_recv() {
+            let oldest = match state.receive.lock().expect("host receiver").try_recv() {
                 Ok(oldest) => oldest,
                 Err(mpsc::TryRecvError::Empty) => continue,
                 Err(mpsc::TryRecvError::Disconnected) => return Err(mpsc::SendError(event)),
             };
-            let mut backlog = self.state.owner_backlog.lock().expect("host owner backlog");
+            let mut backlog = state.owner_backlog.lock().expect("host owner backlog");
             // Owner actions emit a small finite batch and the loop drains this
             // queue before any more input. Fail loudly, never silently discard,
             // if a broken action exceeds that batch invariant.
@@ -122,17 +151,47 @@ impl HostEventSender {
         self.send.try_send(event)
     }
 
+    async fn send_connection_event(&self, event: wire::AgentConnectionEvent, received_at: Instant) {
+        let event = HostEvent::TimedConnection(event, received_at);
+        if std::thread::current().id() == self.owner {
+            let _ = self.send(event);
+            return;
+        }
+        let mut pending = match self.try_send(event) {
+            Err(mpsc::TrySendError::Full(event)) => event,
+            _ => return,
+        };
+        // Observe capacity before retrying so a concurrent drain cannot be missed.
+        // Only the UI receiver owns the watch sender, so detach wakes every waiter.
+        let mut capacity = self.capacity.clone();
+        capacity.mark_unchanged();
+        loop {
+            match self.try_send(pending) {
+                Err(mpsc::TrySendError::Full(event)) => pending = event,
+                _ => return,
+            }
+            if capacity.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+
     fn owner_backlog_pending(&self) -> bool {
-        !self
-            .state
-            .owner_backlog
-            .lock()
-            .expect("host owner backlog")
-            .is_empty()
+        self.state.upgrade().is_some_and(|state| {
+            !state.owner_backlog.lock().expect("host owner backlog").is_empty()
+        })
     }
 }
 
 impl HostEventReceiver {
+    fn received(&self, event: HostEvent) -> HostEvent {
+        if matches!(event, HostEvent::Render) {
+            self.state.repaint_pending.store(false, std::sync::atomic::Ordering::Release);
+        }
+        let _ = self.capacity_changed.send(());
+        event
+    }
+
     fn try_recv(&self) -> Result<HostEvent, mpsc::TryRecvError> {
         if let Some(event) = self
             .state
@@ -141,9 +200,14 @@ impl HostEventReceiver {
             .expect("host owner backlog")
             .pop_front()
         {
-            return Ok(event);
+            return Ok(self.received(event));
         }
-        self.state.receive.lock().expect("host receiver").try_recv()
+        self.state
+            .receive
+            .lock()
+            .expect("host receiver")
+            .try_recv()
+            .map(|event| self.received(event))
     }
 
     fn try_iter(&self) -> impl Iterator<Item = HostEvent> + '_ {
@@ -158,13 +222,14 @@ impl HostEventReceiver {
             .expect("host owner backlog")
             .pop_front()
         {
-            return Ok(event);
+            return Ok(self.received(event));
         }
         self.state
             .receive
             .lock()
             .expect("host receiver")
             .recv_timeout(timeout)
+            .map(|event| self.received(event))
     }
 }
 
@@ -2113,8 +2178,9 @@ async fn run_terminal(
     let mut pending_relaunch = None;
     let event_send = send.clone();
     let unsubscribe = connection.subscribe(Arc::new(move |event| {
-        let _ = event_send.send(HostEvent::TimedConnection(event, Instant::now()));
-        Box::pin(async {})
+        let send = event_send.clone();
+        let received_at = Instant::now();
+        Box::pin(async move { send.send_connection_event(event, received_at).await })
     }));
     if let Some(message) = initial_message {
         submit(&connection, &send, message, false, initial_images);
@@ -3642,6 +3708,7 @@ async fn run_terminal(
         }
         tokio::time::sleep(Duration::from_millis(16)).await;
     }
+    drop(receive);
     unsubscribe();
     ui_metrics.reset_attachment();
     ui_metrics.flush_render();
@@ -7096,6 +7163,94 @@ fn apply_event_legacy_for_speed(
             assert!(matches!(event, HostEvent::Status(status) if status == expected));
         }
         worker.join().expect("synchronous producer finishes after the UI drains");
+    }
+
+    #[test]
+    fn host_queue_closes_for_all_senders_when_the_view_leaves() {
+        let (send, receive) = host_event_channel(1);
+        send.send(HostEvent::Status("queued".into())).unwrap();
+        let (started, ready) = mpsc::channel();
+        let (finished, replies) = mpsc::channel();
+        let mut workers = Vec::new();
+        for _ in 0..23 {
+            let (send, started, finished) = (send.clone(), started.clone(), finished.clone());
+            workers.push(std::thread::spawn(move || {
+                started.send(()).unwrap();
+                let closed = send.send(HostEvent::CloseCommandDialog).is_err();
+                let _ = finished.send(closed);
+            }));
+        }
+        for _ in &workers {
+            ready.recv_timeout(Duration::from_secs(5)).unwrap();
+        }
+        drop(receive);
+        for _ in &workers {
+            assert_eq!(replies.recv_timeout(Duration::from_secs(5)), Ok(true));
+        }
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        assert!(send.send(HostEvent::Render).is_err());
+        assert!(send.send(HostEvent::Shutdown).is_err());
+    }
+
+    #[test]
+    fn host_queue_repaint_bursts_leave_room_for_ordered_controls() {
+        let (send, receive) = host_event_channel(2);
+        for _ in 0..256 {
+            send.send(HostEvent::Render).unwrap();
+        }
+        send.try_send(HostEvent::Shutdown).expect("repaints use at most one slot");
+        assert!(matches!(receive.try_recv(), Ok(HostEvent::Render)));
+        assert!(matches!(receive.try_recv(), Ok(HostEvent::Shutdown)));
+        send.send(HostEvent::Render).unwrap();
+        assert!(matches!(receive.try_recv(), Ok(HostEvent::Render)));
+        assert!(receive.try_recv().is_err());
+    }
+
+    #[test]
+    fn host_queue_full_of_controls_does_not_block_background_repaints() {
+        let (send, receive) = host_event_channel(1);
+        send.send(HostEvent::Shutdown).unwrap();
+        let repaint = send.clone();
+        let (done, result) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            for _ in 0..256 {
+                repaint.send(HostEvent::Render).unwrap();
+            }
+            let _ = done.send(());
+        });
+        result.recv_timeout(Duration::from_secs(5)).unwrap();
+        let input = Rc::new(RefCell::new(vec!["\x1b[A".to_owned(), "\x1b[B".to_owned()]));
+        let mut handled = Vec::new();
+        drain_input_batch(&input, &send, |key| handled.push(key));
+        assert_eq!(handled, ["\x1b[A", "\x1b[B"]);
+        assert!(matches!(receive.try_recv(), Ok(HostEvent::Shutdown)));
+        assert!(receive.try_recv().is_err());
+        worker.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn host_queue_connection_wait_yields_and_wakes_on_drain_or_detach() {
+        // The connection callback runs off the UI owner on a single-thread runtime.
+        let (send, receive) = std::thread::spawn(|| host_event_channel(1)).join().unwrap();
+        send.send(HostEvent::Status("older".into())).unwrap();
+        let at = Instant::now();
+        let pending = send.send_connection_event(wire::AgentConnectionEvent::HeartbeatsChanged, at);
+        tokio::pin!(pending);
+        assert!(futures::poll!(&mut pending).is_pending());
+        assert!(matches!(receive.try_recv(), Ok(HostEvent::Status(text)) if text == "older"));
+        tokio::time::timeout(Duration::from_secs(5), pending).await.unwrap();
+        assert!(matches!(
+            receive.try_recv(),
+            Ok(HostEvent::TimedConnection(wire::AgentConnectionEvent::HeartbeatsChanged, time)) if time == at
+        ));
+        send.send(HostEvent::Shutdown).unwrap();
+        let pending = send.send_connection_event(wire::AgentConnectionEvent::HeartbeatsChanged, at);
+        tokio::pin!(pending);
+        assert!(futures::poll!(&mut pending).is_pending());
+        drop(receive);
+        tokio::time::timeout(Duration::from_secs(5), pending).await.unwrap();
     }
 
     #[tokio::test]
