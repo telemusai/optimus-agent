@@ -387,6 +387,82 @@ fn wait_for_daemon(daemon: &mut OwnedDaemon) {
 }
 
 #[test]
+fn busy_chat_attach_pages_history_through_the_real_supervisor() {
+    use pi_coding_agent::main_entry::{create_daemon_client_connection, CreateDaemonClientConnectionOptions};
+    use pi_coding_agent::modes::agent_connection::types::{AgentConnection, AgentConnectionHistoryRangeRequest};
+    use pi_coding_agent::modes::daemon::daemon_mode::INITIAL_HISTORY_WINDOW_MESSAGES;
+
+    let model = LocalModel::start();
+    let fixture = PrivateCli::new(&format!("http://{}/v1", model.address));
+    let file = fixture.root.path().join("sessions/busy-chat.jsonl");
+    let window = INITIAL_HISTORY_WINDOW_MESSAGES;
+    let total = window + 25;
+    let stamp = "2026-11-01T00:00:00Z";
+    {
+        let mut transcript = std::io::BufWriter::new(File::create(&file).unwrap());
+        writeln!(transcript, "{}", json!({"type":"session", "version":3, "id":"busy-chat", "timestamp":stamp, "cwd":fixture.workspace})).unwrap();
+        for index in 0..total {
+            let parent = index.checked_sub(1).map(|previous| format!("msg-{previous}"));
+            writeln!(transcript, "{}", json!({
+                "type":"message", "id":format!("msg-{index}"), "parentId":parent, "timestamp":stamp,
+                "message":{"role":"user","content":format!("line {index}"),"timestamp":index}
+            })).unwrap();
+        }
+        transcript.flush().unwrap();
+    }
+
+    let mut daemon = OwnedDaemon {
+        process: fixture.spawn("history-daemon", &["--mode", "daemon", "--offline"]),
+        socket: fixture.socket.clone(),
+    };
+    wait_for_daemon(&mut daemon);
+    let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+    runtime.block_on(async {
+        let config = json!({
+            "cwd":fixture.workspace, "agentDir":fixture.agent_dir, "sessionDir":fixture.root.path().join("sessions"),
+            "provider":"local-cli-fixture", "model":"fixture-model", "noSkills":true, "noExtensions":true
+        });
+        let control = DaemonClient::create(&fixture.socket);
+        control.connect(3000).await.unwrap();
+        let created = control.request(json!({"type":"create","config":config,"sessionPath":file})
+            .as_object().unwrap().clone(), Some(30_000), Default::default()).await.unwrap();
+        assert!(created.success, "{:?}", created.error);
+        let data = created.data.unwrap();
+        let active = data["activeSessionId"].as_str().or_else(|| data["id"].as_str()).unwrap();
+        let started = Instant::now();
+        let (viewer, _) = create_daemon_client_connection(CreateDaemonClientConnectionOptions {
+            socket_path: fixture.socket.clone(), config: serde_json::from_value(config).unwrap(),
+            active_session_id: Some(active.into()), session_path: None, continue_recent: None,
+            client_owned: Some(false), no_session: None, supports_extension_ui: Some(true), defer_session_events: true,
+        }).await.unwrap();
+        let snapshot = viewer.get_initial_snapshot().await.unwrap();
+        let elapsed = started.elapsed();
+        let history = snapshot.history.expect("the supervisor must preserve recent-first history through the chunk stream");
+        assert_eq!(snapshot.messages.len(), window);
+        assert_eq!(history.entry_ids.first().unwrap(), "msg-25");
+        assert_eq!(history.entry_ids.last().unwrap(), &format!("msg-{}", total - 1));
+        let range = viewer.get_history_range(AgentConnectionHistoryRangeRequest {
+            generation: history.generation, representation: history.representation, tip_entry_id: history.tip_entry_id,
+            before_entry_id: history.entry_ids.first().cloned(), limit: Some(25.0),
+        }).await.unwrap();
+        assert_eq!(range.messages.len(), 25);
+        assert_eq!(range.window.entry_ids, (0..25).map(|index| format!("msg-{index}")).collect::<Vec<_>>());
+        viewer.dispose().await.unwrap();
+
+        let legacy = control.request(json!({"type":"attach","activeSessionId":active,"capabilities":["attach_snapshot","event_sequence"]})
+            .as_object().unwrap().clone(), Some(30_000), Default::default()).await.unwrap();
+        assert!(legacy.success, "{:?}", legacy.error);
+        let data = legacy.data.unwrap();
+        assert_eq!(data["messages"].as_array().unwrap().len(), total);
+        assert_eq!(data["snapshot"]["messages"], data["messages"]);
+        assert!(data["snapshot"]["history"].is_null());
+        eprintln!("supervised chat opened in {elapsed:?}: {window} recent messages and 25 older messages verified");
+        control.close().await;
+    });
+    assert!(model.requests.lock().unwrap().is_empty());
+}
+
+#[test]
 fn actual_print_cli_streams_local_http_through_the_daemon_worker() {
     let mut model = LocalModel::start();
     let fixture = PrivateCli::new(&format!("http://{}/v1", model.address));

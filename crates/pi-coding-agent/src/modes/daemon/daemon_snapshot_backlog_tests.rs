@@ -114,7 +114,7 @@ fn register_resident_child(fixture: &ScriptedDaemonFixture, root_file: &str, ind
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn backlog_resident_children_skip_passive_display_and_transcript_stats() {
     let child_snapshots: Vec<Value> = (0..21).map(|index| json!({"id":format!("resident-{index}"),"sessionName":format!(" Resident {index} "),"label":format!("resident-{index}"),"status":"running"})).collect();
-    let fixture = fixture_with_children("backlog-resident-fast-path", child_snapshots);
+    let mut fixture = fixture_with_children("backlog-resident-fast-path", child_snapshots);
     let root_file = fixture.daemon.session_of(&fixture.state).session_file().unwrap();
     let mut resident_display_paths = Vec::new();
     for index in 0..21 {
@@ -163,6 +163,21 @@ async fn backlog_resident_children_skip_passive_display_and_transcript_stats() {
         assert!(!walked.input_stats.contains_key(&resolve_path(&display_path)), "resident display was read: {display_path}");
     }
     assert!(walked.input_stats.contains_key(&resolve_path(&rlm_subagent_display_path(&passive_dir))), "nonresident display stat is required for memo invalidation");
+
+    let id = "open-with-resident-children";
+    fixture.send(json!({
+        "type":"attach", "id":id, "activeSessionId":fixture.active_session_id,
+        "capabilities":["attach_snapshot", "event_sequence", "slim_attach", "history_ranges"]
+    })).await;
+    let response = fixture.wait_response(id, Duration::from_secs(5)).await.unwrap();
+    assert_eq!(response["success"], true, "{response}");
+    let data = &response["data"];
+    assert!(data.get("messages").is_none());
+    let children = data["snapshot"]["children"].as_array().unwrap();
+    assert_eq!(children.len(), 22);
+    for child in expected_ids.iter().map(String::as_str).chain(["passive"]) {
+        assert!(children.iter().any(|entry| entry["id"] == child), "{child}");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

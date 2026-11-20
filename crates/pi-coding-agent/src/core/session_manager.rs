@@ -1426,24 +1426,17 @@ pub fn build_session_context(
 pub fn order_session_context_for_transcript(
     context: &SessionContextWithEntryIds,
 ) -> SessionHistorySnapshot {
-    let mut pairs: Vec<(AgentMessage, String)> = context
-        .messages
-        .iter()
-        .cloned()
-        .zip(context.entry_ids.iter().cloned())
-        .collect();
+    order_transcript_messages(&context.messages, &context.entry_ids)
+}
+
+pub(crate) fn order_transcript_messages(messages: &[AgentMessage], entry_ids: &[String]) -> SessionHistorySnapshot {
+    let mut pairs: Vec<_> = messages.iter().zip(entry_ids).collect();
     let summary_index = pairs
         .iter()
         .position(|(message, _)| message.role() == "compactionSummary");
     if let Some(summary_index) = summary_index {
-        let summary_pair = pairs[summary_index].clone();
-        let mut remaining: Vec<(AgentMessage, String)> = pairs
-            .iter()
-            .enumerate()
-            .filter(|(index, _)| *index != summary_index)
-            .map(|(_, pair)| pair.clone())
-            .collect();
-        let (summary_message, _) = &summary_pair;
+        let summary_pair = pairs.remove(summary_index);
+        let (summary_message, _) = summary_pair;
         let boundary = match summary_message {
             AgentMessage::Custom(CustomAgentMessage::CompactionSummary {
                 retained_message_count,
@@ -1451,26 +1444,21 @@ pub fn order_session_context_for_transcript(
                 ..
             }) => match retained_message_count {
                 Some(count) if *count >= 0.0 && count.fract() == 0.0 => {
-                    (*count as usize).min(remaining.len())
+                    (*count as usize).min(pairs.len())
                 }
-                _ => remaining
+                _ => pairs
                     .iter()
                     .filter(|(message, _)| message_timestamp(message) < *timestamp)
                     .count(),
             },
             _ => 0,
         };
-        let mut ordered: Vec<(AgentMessage, String)> = Vec::with_capacity(pairs.len());
-        ordered.extend(remaining.drain(..boundary.min(remaining.len())));
-        ordered.push(summary_pair);
-        ordered.extend(remaining);
-        pairs = ordered;
+        pairs.insert(boundary, summary_pair);
     }
-    SessionHistorySnapshot {
-        messages: pairs.iter().map(|(message, _)| message.clone()).collect(),
-        entry_ids: pairs.iter().map(|(_, entry_id)| entry_id.clone()).collect(),
-        tip_entry_id: None,
-    }
+    let (messages, entry_ids) = pairs.into_iter()
+        .map(|(message, entry_id)| (message.clone(), entry_id.clone()))
+        .unzip();
+    SessionHistorySnapshot { messages, entry_ids, tip_entry_id: None }
 }
 
 /// `message.timestamp` for every AgentMessage shape.
@@ -2485,54 +2473,19 @@ async fn scan_session_info(file_path: &str, retry_on_replacement: bool) -> Optio
         let store = session_scan_store()
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        store.states.get(file_path).map(|state| SessionScanState {
-            file_size: state.file_size,
-            mtime: state.mtime,
-            dev: state.dev,
-            ino: state.ino,
-            offset: state.offset,
-            tail: state.tail.clone(),
-            acc: SessionScanAccumulator {
-                header: state.acc.header.clone(),
-                invalid: state.acc.invalid,
-                message_count: state.acc.message_count,
-                first_message: state.acc.first_message.clone(),
-                all_messages_text: state.acc.all_messages_text.clone(),
-                name: state.acc.name.clone(),
-                state: state.acc.state.clone(),
-                agent_status: state.acc.agent_status.clone(),
-                last_activity_time: state.acc.last_activity_time,
-                assistant_usage_by_id: state.acc.assistant_usage_by_id.clone(),
-                attributed_child_usage: state.acc.attributed_child_usage.clone(),
-                summarization_usage: state.acc.summarization_usage.clone(),
-                textmas_usage: state.acc.textmas_usage.clone(),
-            },
-            info: state.info.clone(),
-            accounted_usage_entries: state.accounted_usage_entries,
-        })
+        let cached = store.states.get(file_path)
+            .filter(|state| same_file_identity(state.dev, state.ino, dev, ino));
+        if let Some(state) = cached {
+            if state.file_size == size && state.mtime == mtime {
+                return state.info.clone();
+            }
+        }
+        cached.filter(|state| size > state.file_size).map(clone_scan_state)
     };
 
-    // Match TS scanSessionInfo: unchanged identity/size/mtime reuses the
-    // snapshot, and append-only growth resumes from the scanned prefix.
-    let same_file = previous
-        .as_ref()
-        .map(|previous| same_file_identity(previous.dev, previous.ino, dev, ino))
-        .unwrap_or(false);
-    if let Some(previous) = previous.as_ref() {
-        if same_file && previous.file_size == size && previous.mtime == mtime {
-            store_session_scan_state(file_path, clone_scan_state(previous));
-            return previous.info.clone();
-        }
-    }
-    let resume = same_file
-        && previous
-            .as_ref()
-            .map(|previous| size > previous.file_size && scanned_prefix_intact(file_path, previous))
-            .unwrap_or(false);
-    let mut state = if resume {
-        clone_scan_state(previous.as_ref().unwrap())
-    } else {
-        SessionScanState {
+    let mut state = previous
+        .filter(|previous| scanned_prefix_intact(file_path, previous))
+        .unwrap_or_else(|| SessionScanState {
             file_size: 0,
             mtime: None,
             dev,
@@ -2542,8 +2495,7 @@ async fn scan_session_info(file_path: &str, retry_on_replacement: bool) -> Optio
             acc: create_session_scan_accumulator(),
             info: None,
             accounted_usage_entries: 0,
-        }
-    };
+        });
 
     let torn_tail = match scan_session_lines(file_path, &mut state, size) {
         Ok(torn_tail) => torn_tail,

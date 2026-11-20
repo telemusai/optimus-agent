@@ -105,8 +105,10 @@ pub const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION: u32 = 7;
 // Revision 48 adds optional content-free TextMAS activity on connection state
 // and its typed, client-capability-gated session event. No new command or startup
 // requirement is introduced; old clients never receive the new event.
-pub const DAEMON_SCHEMA_REVISION: u32 = 48;
-pub const DAEMON_SCHEMA_ID: &str = "protocol-7-schema-48-occ31-textmas-activity";
+// Revision 49 exposes the existing slim attach and pinned history range capabilities
+// through the supervisor. The revision 29 history command gate still applies.
+pub const DAEMON_SCHEMA_REVISION: u32 = 49;
+pub const DAEMON_SCHEMA_ID: &str = "protocol-7-schema-49-supervisor-history-ranges";
 
 pub type DaemonProtocolName = String;
 pub type DaemonProtocolVersion = u32;
@@ -3186,7 +3188,7 @@ mod tests {
 
     #[test]
     fn keeps_the_advertised_schema_identity() {
-        assert_eq!(DAEMON_SCHEMA_ID, format!("protocol-{DAEMON_PROTOCOL_VERSION}-schema-{DAEMON_SCHEMA_REVISION}-occ31-textmas-activity"));
+        assert_eq!(DAEMON_SCHEMA_ID, format!("protocol-{DAEMON_PROTOCOL_VERSION}-schema-{DAEMON_SCHEMA_REVISION}-supervisor-history-ranges"));
     }
 
     #[test]
