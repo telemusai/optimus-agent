@@ -3671,12 +3671,12 @@ async fn run_terminal(
         // Detach acknowledges are not a prerequisite for drawing the browser.
         // This only disposes the UI's connection, never aborts the agent.
         tokio::spawn(async move {
-            if let Err(error) = cleanup.await {
+            finish_detached_session_view_cleanup(cleanup.await, |error| {
                 crate::modes::agents_view::agents_view_mode::log_client_error("Failed to detach session view", &error);
-            }
+            });
         });
     } else {
-        cleanup.await?;
+        finish_session_view_cleanup(&exit_error, cleanup.await)?;
     }
     if let Some(args) = pending_relaunch {
         let status = std::process::Command::new(std::env::current_exe().map_err(|e| e.to_string())?)
@@ -3692,6 +3692,25 @@ async fn run_terminal(
     match exit_error {
         Some(error) => Err(error),
         None => Ok(result),
+    }
+}
+
+fn finish_session_view_cleanup(
+    exit_error: &Option<String>,
+    cleanup_result: Result<(), String>,
+) -> Result<(), String> {
+    match cleanup_result {
+        Ok(()) => Ok(()),
+        Err(cleanup_error) => Err(exit_error.clone().unwrap_or(cleanup_error)),
+    }
+}
+
+fn finish_detached_session_view_cleanup(
+    cleanup_result: Result<(), String>,
+    report: impl FnOnce(String),
+) {
+    if let Err(error) = cleanup_result {
+        report(error);
     }
 }
 
@@ -7084,6 +7103,34 @@ fn apply_event_legacy_for_speed(
         let recorder = Arc::new(RecordingConnection::new());
         close_session_view(recorder.clone(), Vec::new()).await.unwrap();
         assert_eq!(recorder.calls().iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>(), vec!["dispose"]);
+    }
+
+    #[test]
+    fn session_view_cleanup_preserves_primary_then_surfaces_secondary_error() {
+        let primary = Some("synthetic terminal failure".to_string());
+        let cleanup_error = Err("synthetic detach failure".to_string());
+        assert_eq!(
+            finish_session_view_cleanup(&primary, cleanup_error).unwrap_err(),
+            "synthetic terminal failure"
+        );
+        assert_eq!(
+            finish_session_view_cleanup(&None, Err("synthetic detach failure".to_string())).unwrap_err(),
+            "synthetic detach failure"
+        );
+        finish_session_view_cleanup(&primary, Ok(())).unwrap();
+        finish_session_view_cleanup(&None, Ok(())).unwrap();
+    }
+
+    #[test]
+    fn detached_session_view_cleanup_consumes_secondary_error_and_preserves_primary() {
+        let primary = Some("synthetic attach failure".to_string());
+        let mut reported = Vec::new();
+        finish_detached_session_view_cleanup(Err("synthetic detached cleanup failure".to_string()), |error| {
+            reported.push(error);
+        });
+        assert_eq!(reported, vec!["synthetic detached cleanup failure"]);
+        assert_eq!(primary.as_deref(), Some("synthetic attach failure"));
+        finish_detached_session_view_cleanup(Ok(()), |_| panic!("successful detach must not log an error"));
     }
 
     #[test]
