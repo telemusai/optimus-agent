@@ -468,7 +468,7 @@ impl Drop for AttachScope {
     fn drop(&mut self) {
         if let Some(connection) = self.0.take() {
             // Cancelling navigation must release only this viewer, never its session.
-            tokio::spawn(async move { connection.dispose_inner().await; });
+            tokio::spawn(async move { let _ = connection.dispose_inner().await; });
         }
     }
 }
@@ -1350,7 +1350,7 @@ impl DaemonAgentConnection {
             let initial_close = connection.initial_control_plane_close.lock().unwrap().take();
             if let Some(initial_close) = initial_close {
                 if get_daemon_socket_close_reason(&initial_close) == Some(DaemonClosingReason::Shutdown) {
-                    connection.dispose_inner().await;
+                    let _ = connection.dispose_inner().await;
                     return Err(initial_close);
                 }
                 connection.handle_transport_close(initial_close).await;
@@ -2586,8 +2586,14 @@ impl DaemonAgentConnection {
     }
 
     async fn dispose_inner(&self) {
+        // Attach failure and best-effort test teardown have their own primary outcome.
+        // The public AgentConnection boundary below retains the real disposal error.
+        let _ = self.dispose_inner_result().await;
+    }
+
+    async fn dispose_inner_result(&self) -> Result<(), String> {
         if *self.disposed.lock().unwrap() || *self.disposing.lock().unwrap() {
-            return;
+            return Ok(());
         }
         *self.disposing.lock().unwrap() = true;
         self.fail_replacement_snapshot("Daemon connection disposed during session switch".to_string());
@@ -2619,9 +2625,14 @@ impl DaemonAgentConnection {
         }
         *self.disposed.lock().unwrap() = true;
         *self.update_restart_pending.lock().unwrap() = false;
+        let mut first_error = None;
         let side_questions: Vec<String> = self.active_side_question_ids.lock().unwrap().iter().cloned().collect();
         for id in side_questions {
-            let _ = self.abort_side_question_inner(&id).await;
+            if self.abort_side_question_inner(&id).await.is_err() {
+                if first_error.is_none() {
+                    first_error = Some("Daemon session view side-question cleanup failed.".to_string());
+                }
+            }
         }
         let roster = self.roster_store.lock().unwrap().take();
         if let Some(store) = roster {
@@ -2634,20 +2645,20 @@ impl DaemonAgentConnection {
             unsubscribe();
         }
         let active_session_id = self.active_session_id();
-        if self.options.lock().unwrap().owned_session {
-            let _ = self
-                .request_ok(command_body(
-                    "complete_owned_session",
-                    vec![("activeSessionId", Value::String(active_session_id))],
-                ))
-                .await;
+        let owned_session = self.options.lock().unwrap().owned_session;
+        let (operation, lifecycle_command) = if owned_session {
+            ("Daemon owned session completion", "complete_owned_session")
         } else {
-            let _ = self
-                .request_ok(command_body(
-                    "detach",
-                    vec![("activeSessionId", Value::String(active_session_id))],
-                ))
-                .await;
+            ("Daemon session view detach", "detach")
+        };
+        let lifecycle_result = self
+            .request_ok(command_body(
+                lifecycle_command,
+                vec![("activeSessionId", Value::String(active_session_id))],
+            ))
+            .await;
+        if lifecycle_result.is_err() && first_error.is_none() {
+            first_error = Some(format!("{operation} failed."));
         }
         if self.options.lock().unwrap().close_client_on_dispose {
             self.client.close();
@@ -2657,6 +2668,10 @@ impl DaemonAgentConnection {
             .lock()
             .unwrap()
             .retain(|_, connection| connection.client_id != self.client_id);
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
     async fn drain_deferred_session_events(&self) -> Result<(), String> {
@@ -4517,10 +4532,7 @@ impl AgentConnection for DaemonAgentConnection {
 
     fn dispose(&self) -> BoxFuture<Result<(), String>> {
         let this = self.clone();
-        Box::pin(async move {
-            this.dispose_inner().await;
-            Ok(())
-        })
+        Box::pin(async move { this.dispose_inner_result().await })
     }
 }
 
@@ -4604,6 +4616,12 @@ mod daemon_backlog_tests;
 #[cfg(test)]
 #[path = "daemon_restart_tests.rs"]
 mod daemon_restart_tests;
+#[cfg(test)]
+#[path = "daemon_dispose_tests.rs"]
+mod daemon_dispose_tests;
+#[cfg(test)]
+#[path = "daemon_initial_attach_tests.rs"]
+mod daemon_initial_attach_tests;
 
 #[cfg(test)]
 #[path = "jev_status_tests.rs"]
