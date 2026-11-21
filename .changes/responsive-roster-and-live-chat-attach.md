@@ -1,0 +1,1 @@
+Keep the session list responsive while scheduled tasks and saved chats load. Open a selected live chat over one connection, avoid duplicate subagent catalog scans, and give busy workers more time to prepare the first snapshot.

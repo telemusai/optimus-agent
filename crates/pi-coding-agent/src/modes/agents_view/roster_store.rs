@@ -109,6 +109,7 @@ pub type ProgressListener = Box<dyn Fn(&serde_json::Value) + Send + Sync>;
 /// `DaemonClientRequestOptions` (modes/daemon/daemon-client.ts).
 #[derive(Default)]
 pub struct DaemonClientRequestOptions {
+    pub signal: Option<tokio_util::sync::CancellationToken>,
     pub on_progress: Option<ProgressListener>,
     /// False opts out of reconnect parking: a close rejects so the caller's own
     /// retry loop stays live. Any caller that owns its own bounded retry MUST
@@ -138,6 +139,8 @@ impl DaemonClientRequestOptions {
 pub trait DaemonTransport: Send + Sync {
     /// A separate connection for one-shot operations that close their socket.
     fn fresh_transport(&self) -> Option<Arc<dyn DaemonTransport>> { None }
+    /// Adapt this connected socket for the session viewer without dialing again.
+    fn session_transport(&self) -> Option<Arc<dyn crate::modes::agent_connection::daemon_agent_connection::DaemonTransportClient>> { None }
     fn hello(&self) -> Option<DaemonHello>;
     fn is_connected(&self) -> bool;
     fn supports_server_capability(&self, capability: &str) -> bool;
@@ -163,6 +166,10 @@ pub struct DaemonTransportClient {
 }
 
 impl DaemonTransportClient {
+    pub(super) fn session_transport(&self) -> Option<Arc<dyn crate::modes::agent_connection::daemon_agent_connection::DaemonTransportClient>> {
+        self.inner.session_transport()
+    }
+
     pub fn new(inner: Arc<dyn DaemonTransport>) -> Self {
         Self { inner }
     }

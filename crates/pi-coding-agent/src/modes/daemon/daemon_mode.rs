@@ -2408,7 +2408,7 @@ pub struct AgentDaemon {
     pub pending_rlm_spawn_appends:
         StdMutex<HashMap<String, tokio::task::JoinHandle<Result<(), String>>>>,
     /// `passiveRlmSubagentWalks`: same-shape walks waiting on the in-flight one.
-    pub passive_rlm_subagent_walks: StdMutex<HashMap<String, Arc<Notify>>>,
+    passive_rlm_subagent_walks: StdMutex<HashMap<String, Weak<TokioMutex<()>>>>,
     pub passive_rlm_subagent_memo: StdMutex<HashMap<String, PassiveRlmMemoEntry>>,
     /// `state.inFlightBash` per active session.
     pub in_flight_bash: StdMutex<HashMap<String, Arc<Notify>>>,
@@ -2422,7 +2422,6 @@ pub struct PassiveRlmMemoEntry {
     pub fingerprint: String,
     pub result: Vec<PassiveRlmSubagent>,
     pub input_stats: HashMap<String, String>,
-    pub in_flight: Option<Arc<Notify>>,
 }
 
 /// `...session.rlmDiagnostics` (`daemon-mode.ts:3516`).
@@ -12273,56 +12272,22 @@ impl AgentDaemon {
         root_paths.sort();
         let key = format!("{include_resident}|{}", root_paths.join(","));
         // Same-shape walks run one at a time; a caller never joins an earlier walk.
-        let previous = self
-            .passive_rlm_subagent_memo
-            .lock()
-            .expect("passive rlm memo poisoned")
-            .get(&key)
-            .and_then(|memo| memo.in_flight.clone());
-        let waiters = match previous {
-            Some(waiters) => waiters,
-            None => {
-                let waiters = Arc::new(Notify::new());
-                self.passive_rlm_subagent_memo
-                    .lock()
-                    .expect("passive rlm memo poisoned")
-                    .entry(key.clone())
-                    .or_insert_with(|| PassiveRlmMemoEntry {
-                        fingerprint: String::new(),
-                        result: Vec::new(),
-                        input_stats: HashMap::new(),
-                        in_flight: None,
-                    })
-                    .in_flight = Some(Arc::clone(&waiters));
-                waiters
-            }
-        };
-        let result = self
-            .passive_rlm_walk_run(&key, &saved_root_infos, include_resident)
-            .await;
-        {
-            let mut memo = self
-                .passive_rlm_subagent_memo
-                .lock()
-                .expect("passive rlm memo poisoned");
-            if let Some(entry) = memo.get_mut(&key) {
-                if entry
-                    .in_flight
-                    .as_ref()
-                    .map(|current| Arc::ptr_eq(current, &waiters))
-                    .unwrap_or(false)
-                {
-                    entry.in_flight = None;
-                }
-            }
-            memo.retain(|_, entry| {
-                entry.in_flight.is_some()
-                    || !entry.fingerprint.is_empty()
-                    || entry.result.is_empty()
-            });
+        let gate = self.passive_walk_gate(&key);
+        let _walking = gate.lock().await;
+        self.passive_rlm_walk_run(&key, &saved_root_infos, include_resident).await
+    }
+
+    // Waiters revalidate the memo after the previous walk completes. A dropped
+    // caller releases its guard, and idle keys retain neither a lock nor results.
+    fn passive_walk_gate(&self, key: &str) -> Arc<TokioMutex<()>> {
+        let mut walks = self.passive_rlm_subagent_walks.lock().expect("passive walks poisoned");
+        walks.retain(|_, gate| gate.strong_count() > 0);
+        if let Some(gate) = walks.get(key).and_then(Weak::upgrade) {
+            return gate;
         }
-        waiters.notify_waiters();
-        result
+        let gate = Arc::new(TokioMutex::new(()));
+        walks.insert(key.to_owned(), Arc::downgrade(&gate));
+        gate
     }
 
     /// The body of one passive walk, including the memo check and the write-back.
@@ -12369,14 +12334,12 @@ impl AgentDaemon {
                 .passive_rlm_subagent_memo
                 .lock()
                 .expect("passive rlm memo poisoned");
-            let in_flight = memo.get(key).and_then(|entry| entry.in_flight.clone());
             memo.insert(
                 key.to_string(),
                 PassiveRlmMemoEntry {
                     fingerprint: after,
                     result: walked.result.clone(),
                     input_stats: walked.input_stats.clone(),
-                    in_flight,
                 },
             );
             while memo

@@ -2248,6 +2248,7 @@ pub async fn create_daemon_client_connection(
                     recover_daemon: true,
                     reconnect_timeout_ms: None,
                     snapshot_timeout_ms: None,
+                    attach_timeout_ms: None,
                     send_client_env: true,
                     owned_session: client_owned,
                     owned_session_recovery_config: if client_owned {

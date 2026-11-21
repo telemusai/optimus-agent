@@ -500,6 +500,9 @@ pub struct DaemonAgentConnectionOptions {
     pub recover_daemon: bool,
     /// Bound supervisor recovery before surfacing a fatal connection error.
     pub reconnect_timeout_ms: Option<u64>,
+    /// Time allowed for the worker to prepare the attach response, before a
+    /// streamed snapshot begins. Other requests keep their transport deadline.
+    pub attach_timeout_ms: Option<u64>,
     /// Bound an incomplete streamed snapshot before failing the attach or resync.
     pub snapshot_timeout_ms: Option<u64>,
     /// Send this client's allowlisted env with attach.
@@ -1461,7 +1464,8 @@ impl DaemonAgentConnection {
             ));
         }
         let command = command_body("attach", fields);
-        let result = match self.request_data_with_recovery(command, None, recoverable).await {
+        let timeout_ms = self.options.lock().unwrap().attach_timeout_ms;
+        let result = match self.request_data_with_recovery(command, timeout_ms, recoverable).await {
             Ok(data) => self.apply_attach_result(&data).await,
             Err(error) => Err(error),
         };

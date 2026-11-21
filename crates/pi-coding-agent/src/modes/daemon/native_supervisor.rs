@@ -2945,14 +2945,17 @@ impl Supervisor {
             // Refresh connected workers; a temporarily unreachable worker may use a
             // snapshot only while no change notification has invalidated it.
             "heartbeats_list" if body.get("activeSessionId").and_then(Value::as_str).is_none() => {
+                use futures::StreamExt;
                 let workers: Vec<Arc<Worker>> = self.workers.lock().unwrap().values().cloned().collect();
                 let mut heartbeats: Vec<Value> = Vec::new();
                 let mut seen: HashSet<String> = HashSet::new();
                 let mut failure: Option<DaemonResponse> = None;
-                for worker in workers {
-                    if !self.is_live_worker(&worker) { continue; }
+                // Independent worker timeouts used to add up on every catalog refresh.
+                // Buffer in input order to retain duplicate-job and first-error precedence.
+                let mut replies = futures::stream::iter(workers).map(|worker| async move {
+                    if !self.is_live_worker(&worker) { return Ok(Vec::new()); }
                     let lifecycle = worker.descriptor.lock().unwrap().lifecycle.clone();
-                    if lifecycle == DAEMON_WORKER_LIFECYCLE_FAILED { continue; }
+                    if lifecycle == DAEMON_WORKER_LIFECYCLE_FAILED { return Ok(Vec::new()); }
                     // `if (worker.client && worker.descriptor.lifecycle === "ready")` (:2493):
                     // only an already-connected ready worker is asked; this path never dials.
                     let client = { worker.client.lock().unwrap().as_ref().cloned() };
@@ -2969,13 +2972,17 @@ impl Supervisor {
                         },
                         None => None,
                     };
-                    let rows = forwarded.or_else(|| worker.heartbeat_snapshot.lock().unwrap().fresh());
-                    let Some(rows) = rows else {
-                        if failure.is_none() {
-                            let state = if lifecycle == DAEMON_WORKER_LIFECYCLE_READY { "disconnected".to_string() } else { lifecycle.clone() };
-                            failure = Some(DaemonResponse::failure(id.as_deref(), &kind, &format!("Cannot list heartbeats while session worker is {state}"), None));
+                    forwarded.or_else(|| worker.heartbeat_snapshot.lock().unwrap().fresh()).ok_or_else(|| {
+                        if lifecycle == DAEMON_WORKER_LIFECYCLE_READY { "disconnected".to_string() } else { lifecycle }
+                    })
+                }).buffered(8);
+                while let Some(reply) = replies.next().await {
+                    let rows = match reply {
+                        Ok(rows) => rows,
+                        Err(state) => {
+                            failure.get_or_insert_with(|| DaemonResponse::failure(id.as_deref(), &kind, &format!("Cannot list heartbeats while session worker is {state}"), None));
+                            continue;
                         }
-                        continue;
                     };
                     for heartbeat in rows {
                         let job_id = heartbeat.get("job").and_then(|job| job.get("id")).and_then(Value::as_str).unwrap_or_default().to_string();

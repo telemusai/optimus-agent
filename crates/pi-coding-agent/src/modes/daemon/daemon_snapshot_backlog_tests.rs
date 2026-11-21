@@ -8,6 +8,22 @@ fn fixture(case: &str) -> ScriptedDaemonFixture {
     ScriptedDaemonFixture::new(case, ReportingSession::arc("active", "saved", &file, None, None))
 }
 
+#[tokio::test]
+async fn attach_passive_child_walk_waits_for_its_key_and_releases_cancelled_waiters() {
+    let fixture = fixture("attach-passive-child-walk");
+    let gate = fixture.daemon.passive_walk_gate("false|");
+    let walking = gate.lock().await;
+    let mut waiter = Box::pin(fixture.daemon.list_passive_rlm_subagents(Vec::new(), false));
+    assert!(futures::poll!(&mut waiter).is_pending());
+    assert_eq!(Arc::strong_count(&gate), 2, "same-key request must wait on the current walk");
+    drop(waiter);
+    assert_eq!(Arc::strong_count(&gate), 1);
+    let other = fixture.daemon.passive_walk_gate("true|");
+    assert!(other.try_lock().is_ok(), "different catalog queries remain independent");
+    drop(walking);
+    assert!(fixture.daemon.list_passive_rlm_subagents(Vec::new(), false).await.is_empty());
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn backlog_snapshot_capture_and_stream_keep_the_published_cursor() {
     let mut fixture = fixture("backlog-snapshot-capture");

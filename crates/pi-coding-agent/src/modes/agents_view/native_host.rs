@@ -16,6 +16,7 @@ use super::roster_store as roster;
 use crate::core::settings_manager::SettingsManager;
 use crate::main_entry::{AgentsViewSeamOptions, InteractiveModeSeamOptions};
 use crate::modes::agent_connection::types as wire;
+use crate::modes::agent_connection::daemon_agent_connection::{DaemonAgentConnection, DaemonAgentConnectionOptions, DaemonTransportClient as SessionTransport};
 use crate::modes::daemon::daemon_client::{self, DaemonClient};
 use crate::modes::interactive::components::custom_editor::{CustomEditor, CustomEditorOptions};
 use crate::modes::interactive::theme::theme::{self as palette, theme};
@@ -337,6 +338,9 @@ fn outbound(value: &Value) -> roster::DaemonOutbound {
 }
 
 impl roster::DaemonTransport for NativeTransport {
+    fn session_transport(&self) -> Option<Arc<dyn SessionTransport>> {
+        Some(Arc::new(crate::main_entry::MainEntryDaemonTransport::new(self.0.clone())))
+    }
     fn fresh_transport(&self) -> Option<Arc<dyn roster::DaemonTransport>> {
         Some(Arc::new(Self::new(self.0.socket_path())))
     }
@@ -381,7 +385,7 @@ impl roster::DaemonTransport for NativeTransport {
                     daemon_client::DaemonClientRequestOptions {
                         on_progress: options.on_progress.map(Arc::from),
                         recoverable: options.recoverable,
-                        signal: None,
+                        signal: options.signal,
                     },
                 )
                 .await
@@ -432,9 +436,11 @@ impl roster::DaemonTransport for NativeTransport {
 }
 
 type Attached = Arc<Mutex<Option<Arc<dyn wire::AgentConnection>>>>;
+// The opening panel can be cancelled while a busy worker prepares its snapshot.
+const VIEWER_ATTACH_TIMEOUT_MS: u64 = 120_000;
+
 struct ConnectionFactory {
-    socket: String,
-    config: crate::core::agent_session_config::AgentSessionRuntimeConfig,
+    telemetry_disabled: Option<bool>,
     attached: Attached,
 }
 struct ConnectionHandle(Arc<dyn wire::AgentConnection>);
@@ -471,28 +477,29 @@ impl view::DaemonAgentConnectionFactory for ConnectionFactory {
         active: &str,
         options: view::AttachOptions,
     ) -> view::TransportFuture<Result<Arc<dyn view::DaemonAgentConnectionHandle>, String>> {
-        let socket = self.socket.clone();
-        let mut config = self.config.clone();
+        let telemetry_disabled = options.telemetry_disabled.or(self.telemetry_disabled).unwrap_or(false);
         let active = active.to_string();
         let attached = self.attached.clone();
-        config.telemetry_disabled = options.telemetry_disabled.or(config.telemetry_disabled);
         Box::pin(async move {
-            let result = crate::main_entry::create_daemon_client_connection(
-                crate::main_entry::CreateDaemonClientConnectionOptions {
-                    socket_path: socket,
-                    config,
-                    session_path: None,
-                    continue_recent: None,
-                    active_session_id: Some(active),
-                    client_owned: Some(false),
-                    no_session: None,
-                    supports_extension_ui: options.supports_extension_ui,
+            // The selected row already provides the active ID. Attach validates
+            // it and supplies the authoritative snapshot on this socket.
+            let transport = client.session_transport().ok_or("Session viewer transport is unavailable")?;
+            let connection = DaemonAgentConnection::attach(
+                transport,
+                active,
+                DaemonAgentConnectionOptions {
+                    close_client_on_dispose: options.close_client_on_dispose.unwrap_or(true),
+                    supports_extension_ui: options.supports_extension_ui.unwrap_or(false),
+                    reconnect_timeout_ms: options.reconnect_timeout_ms,
+                    attach_timeout_ms: Some(VIEWER_ATTACH_TIMEOUT_MS),
+                    recover_daemon: true,
+                    send_client_env: true,
                     defer_session_events: true,
+                    telemetry_disabled,
+                    ..Default::default()
                 },
             )
-            .await;
-            client.close();
-            let (connection, _) = result?;
+            .await?;
             let connection: Arc<dyn wire::AgentConnection> = connection;
             *attached.lock().expect("attached connection poisoned") = Some(connection.clone());
             Ok(Arc::new(ConnectionHandle(connection))
@@ -631,8 +638,7 @@ async fn run_on_owner_thread(options: AgentsViewSeamOptions) -> Result<(), Strin
     let _guard = UiGuard;
     let attached = Arc::new(Mutex::new(None));
     let factory = ConnectionFactory {
-        socket: options.socket_path.clone(),
-        config: options.config.clone(),
+        telemetry_disabled: options.config.telemetry_disabled,
         attached: attached.clone(),
     };
     let interactive: view::InteractiveModeFactory = Box::new(move |options| {
@@ -728,6 +734,68 @@ pub(super) fn capture_for_test(name: &str, mode: &mut view::AgentsViewMode<'_>, 
 mod tests {
     use super::*;
     use view::AgentsViewEditor;
+
+    #[tokio::test]
+    async fn native_viewer_attaches_to_the_selected_id_on_the_existing_socket() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use view::DaemonAgentConnectionFactory;
+
+        async fn serve(stream: impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin) {
+            let (input, mut output) = tokio::io::split(stream);
+            let mut lines = BufReader::new(input).lines();
+            let hello = serde_json::json!({"type":"daemon_hello",
+                "protocol":crate::modes::daemon::daemon_protocol::daemon_protocol_info(),
+                "schemaRevision":crate::modes::daemon::daemon_protocol::DAEMON_SCHEMA_REVISION,
+                "serverCapabilities":[]});
+            output.write_all(format!("{hello}\n").as_bytes()).await.unwrap();
+            let mut expected = ["attach", "detach"].into_iter();
+            while let Some(line) = lines.next_line().await.unwrap() {
+                if line.trim().is_empty() { continue; }
+                let envelope: Value = serde_json::from_str(&line).unwrap();
+                let request = &envelope["command"];
+                if request["type"] == "ack_result" { continue; }
+                let command = expected.next().expect("unexpected viewer request");
+                assert_eq!(request["type"], command);
+                assert_eq!(request["activeSessionId"], "active");
+                let data = if command == "attach" {
+                    assert_eq!(request["supportsExtensionUi"], true);
+                    serde_json::json!({"activeSessionId":"active","snapshot":{
+                        "summary":{"sessionId":"saved","activeSessionId":"active"},
+                        "state":{"sessionId":"saved","activeSessionId":"active"},
+                        "messages":[], "lastEventSequence":0
+                    }})
+                } else { serde_json::json!({}) };
+                let reply = serde_json::json!({"type":"response","command":command,"id":envelope["id"],"success":true,"data":data});
+                output.write_all(format!("{reply}\n").as_bytes()).await.unwrap();
+            }
+            assert!(expected.next().is_none(), "viewer must attach and detach on one socket");
+        }
+
+        #[cfg(windows)]
+        let (socket, server) = {
+            let socket = format!(r"\\.\pipe\optimus-selected-view-{}", uuid::Uuid::new_v4());
+            let listener = tokio::net::windows::named_pipe::ServerOptions::new().first_pipe_instance(true).create(&socket).unwrap();
+            (socket, tokio::spawn(async move { listener.connect().await.unwrap(); serve(listener).await }))
+        };
+        #[cfg(unix)]
+        let directory = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        let (socket, server) = {
+            let path = directory.path().join("viewer.sock");
+            let listener = tokio::net::UnixListener::bind(&path).unwrap();
+            (path.to_string_lossy().into_owned(), tokio::spawn(async move { serve(listener.accept().await.unwrap().0).await }))
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let client = view::connect_agents_view_daemon_client(&socket, Arc::new(NativeTransport::new(&socket))).await.unwrap();
+            let factory = ConnectionFactory { telemetry_disabled: Some(true), attached: Arc::new(Mutex::new(None)) };
+            let connection = factory.attach(client, "active", view::AttachOptions {
+                close_client_on_dispose: Some(true), supports_extension_ui: Some(true),
+                reconnect_timeout_ms: None, telemetry_disabled: Some(true),
+            }).await.unwrap();
+            connection.dispose().await.unwrap();
+            server.await.unwrap();
+        }).await.expect("one socket must serve the complete view lifecycle");
+    }
 
     #[test]
     fn editor_accepts_terminal_bytes_and_submits_the_edited_text() {
