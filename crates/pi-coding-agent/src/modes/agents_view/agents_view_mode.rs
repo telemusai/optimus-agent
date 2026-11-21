@@ -1045,6 +1045,14 @@ pub async fn list_daemon_heartbeats(
     client: &DaemonTransportClient,
     active_session_id: Option<&str>,
 ) -> Result<Vec<AgentConnectionHeartbeat>, String> {
+    list_daemon_heartbeats_with_options(client, active_session_id, DaemonClientRequestOptions::default()).await
+}
+
+async fn list_daemon_heartbeats_with_options(
+    client: &DaemonTransportClient,
+    active_session_id: Option<&str>,
+    options: DaemonClientRequestOptions,
+) -> Result<Vec<AgentConnectionHeartbeat>, String> {
     if client.hello().is_none() {
         let _ = client.wait_for_hello(3000).await;
     }
@@ -1055,7 +1063,7 @@ pub async fn list_daemon_heartbeats(
     if let Some(active_session_id) = active_session_id {
         command["activeSessionId"] = Value::String(active_session_id.to_string());
     }
-    match client.request(command, 30000).await {
+    match client.request_with_options(command, 30000, options).await {
         Ok(response) => {
             if !response.success {
                 return Err(deserialize_daemon_error(&response));
@@ -1876,6 +1884,7 @@ pub struct AgentsViewMode<'a> {
     saved_catalog_ready: bool,
     saved_catalog_generation: i64,
     heartbeat_catalog_generation: i64,
+    heartbeat_request: Option<TransportFuture<(i64, Result<Vec<AgentConnectionHeartbeat>, String>)>>,
     saved_catalog_refresh_pending: bool,
     saved_catalog_progress: i64,
     expanded_subagent_parents: HashSet<String>,
@@ -2029,6 +2038,7 @@ impl<'a> AgentsViewMode<'a> {
             saved_catalog_ready,
             saved_catalog_generation,
             heartbeat_catalog_generation: 0,
+            heartbeat_request: None,
             saved_catalog_refresh_pending: false,
             saved_catalog_progress: 0,
             expanded_subagent_parents,
@@ -2368,7 +2378,7 @@ impl<'a> AgentsViewMode<'a> {
         self.apply_session_list(summaries, true);
         self.arm_saved_search_fetch(false);
         self.resolve_missing_selection_anchor();
-        let _ = self.refresh_heartbeats(false).await;
+        self.schedule_heartbeat_refresh();
         self.terminal.request_render(true);
         let width = self.terminal.columns();
         let lines = self.render(width);
@@ -2376,6 +2386,7 @@ impl<'a> AgentsViewMode<'a> {
 
         let mut heartbeat_ticker =
             tokio::time::interval(std::time::Duration::from_millis(HEARTBEAT_POLL_INTERVAL_MS));
+        heartbeat_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         heartbeat_ticker.tick().await;
         let mut animation_ticker =
             tokio::time::interval(std::time::Duration::from_millis(WORKING_ICON_INTERVAL_MS));
@@ -2393,8 +2404,15 @@ impl<'a> AgentsViewMode<'a> {
                     return result.map_err(|_| "agents view run loop ended unexpectedly".to_string());
                 }
                 _ = heartbeat_ticker.tick() => {
-                    let _ = heartbeats_changed.swap(false, std::sync::atomic::Ordering::SeqCst);
-                    let _ = self.refresh_heartbeats(false).await;
+                    if self.heartbeat_request.is_none() {
+                        heartbeats_changed.swap(false, std::sync::atomic::Ordering::SeqCst);
+                        self.schedule_heartbeat_refresh();
+                    }
+                }
+                (generation, result) = async { self.heartbeat_request.as_mut().expect("guarded heartbeat request").await },
+                    if self.heartbeat_request.is_some() => {
+                    self.heartbeat_request = None;
+                    self.apply_heartbeat_result(generation, result);
                 }
                 _ = animation_ticker.tick() => {
                     self.tick_animation();
@@ -2415,8 +2433,8 @@ impl<'a> AgentsViewMode<'a> {
                     if roster_changed.swap(false, std::sync::atomic::Ordering::SeqCst) {
                         self.on_roster_update().await;
                     }
-                    if heartbeats_changed.swap(false, std::sync::atomic::Ordering::SeqCst) {
-                        let _ = self.refresh_heartbeats(false).await;
+                    if self.heartbeat_request.is_none() && heartbeats_changed.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                        self.schedule_heartbeat_refresh();
                     }
                     let close_reason = self.last_close_reason.lock().expect("close reason poisoned").take();
                     if let Some(reason) = close_reason {
@@ -2468,6 +2486,12 @@ impl<'a> AgentsViewMode<'a> {
                         },
                     }
                     if self.stopped { return Ok(None); }
+                    // The saved-session stream is optional too. Ctrl+N opens a
+                    // fresh connection and can run while that stream is pending.
+                    if progress.is_some() && std::mem::take(&mut self.create_session_requested) {
+                        self.create_new_session().await;
+                        if self.stopped { return Ok(None); }
+                    }
                     if animation_at.elapsed().as_millis() >= WORKING_ICON_INTERVAL_MS as u128 {
                         self.tick_animation();
                         animation_at = tokio::time::Instant::now();
@@ -2513,6 +2537,7 @@ impl<'a> AgentsViewMode<'a> {
         self.stopped = true;
         self.saved_catalog_generation += 1;
         self.heartbeat_catalog_generation += 1;
+        self.heartbeat_request = None;
         // The `select!` loop in run() owns the timers; finish() only stops the view.
         self.clear_ctrl_c_exit_hint(false);
         self.clear_delete_confirmation(false);
@@ -2564,6 +2589,7 @@ impl<'a> AgentsViewMode<'a> {
             return;
         }
         self.daemon_shutdown_received = true;
+        self.heartbeat_request = None;
         self.reconnect_timed_out = false;
         self.set_status_message(
             Some(&format!(
@@ -2585,6 +2611,7 @@ impl<'a> AgentsViewMode<'a> {
             self.set_status_message(Some("Daemon connection lost; reconnecting…"), false, Some(StatusTone::Warning), true);
         }
         self.reconnect_started = true;
+        self.heartbeat_request = None;
         self.reconnect_last_error = Some(error.to_string());
     }
 
@@ -2635,19 +2662,15 @@ impl<'a> AgentsViewMode<'a> {
         if !attached? {
             return Err("Daemon lost the agent_roster capability during reconnect".to_string());
         }
-        let heartbeats_refreshed = self.refresh_heartbeats(true).await;
-        if !heartbeats_refreshed && !client.is_connected() {
-            return Err("Heartbeat catalog did not refresh during reconnect".to_string());
+        if !client.is_connected() {
+            return Err("Daemon disconnected during roster reconnect".to_string());
         }
         let sessions = self.roster_store.summaries().await;
         self.daemon_shutdown_received = false;
         self.reconnect_timed_out = false;
         self.reconnect_started = false;
-        if heartbeats_refreshed {
-            self.set_status_message(Some("Daemon reconnected"), false, None, false);
-        } else {
-            self.set_status_message(Some("Daemon reconnected; scheduled-task coverage is incomplete, retrying"), false, Some(StatusTone::Warning), false);
-        }
+        self.set_status_message(Some("Daemon reconnected"), false, None, false);
+        self.schedule_heartbeat_refresh();
         self.apply_session_list(sessions, true);
         self.arm_saved_search_fetch(true);
         Ok(())
@@ -2760,6 +2783,28 @@ impl<'a> AgentsViewMode<'a> {
         filter_unified_sessions(&self.scoped_records, &|text| matches_search_text(text, &query))
     }
 
+    // Cancel through the transport so a dropped view cannot leave a parked
+    // request or interrupt a write on the reusable roster socket.
+    fn schedule_heartbeat_refresh(&mut self) {
+        if self.heartbeat_request.is_some() || self.stopped || self.reconnect_started || self.daemon_shutdown_received {
+            return;
+        }
+        if let Some(client) = self.client.clone() {
+            self.heartbeat_catalog_generation += 1;
+            let generation = self.heartbeat_catalog_generation;
+            let signal = tokio_util::sync::CancellationToken::new();
+            let cancel_on_drop = signal.clone().drop_guard();
+            let task = tokio::spawn(async move {
+                let options = DaemonClientRequestOptions { signal: Some(signal), recoverable: Some(false), ..Default::default() };
+                list_daemon_heartbeats_with_options(&client, None, options).await
+            });
+            self.heartbeat_request = Some(Box::pin(async move {
+                let _cancel_on_drop = cancel_on_drop;
+                (generation, task.await.unwrap_or_else(|error| Err(error.to_string())))
+            }));
+        }
+    }
+
     /// `refreshHeartbeats(options)`.
     pub async fn refresh_heartbeats(&mut self, during_reconnect: bool) -> bool {
         if (!during_reconnect && self.reconnect_started) || self.daemon_shutdown_received {
@@ -2777,6 +2822,10 @@ impl<'a> AgentsViewMode<'a> {
             Ok(None) => return false,
             Err(error) => Err(error),
         };
+        self.apply_heartbeat_result(generation, result)
+    }
+
+    fn apply_heartbeat_result(&mut self, generation: i64, result: Result<Vec<AgentConnectionHeartbeat>, String>) -> bool {
         match result {
             Ok(heartbeats) => {
                 if generation != self.heartbeat_catalog_generation {
@@ -2801,7 +2850,9 @@ impl<'a> AgentsViewMode<'a> {
                     } else if !self.status_message_sticky {
                         let pending = error == "Cannot list heartbeats while session worker is starting"
                             || error == "Cannot list heartbeats while session worker is recovering";
-                        let message = if pending {
+                        let message = if pending && self.status_message.as_deref() == Some("Daemon reconnected") {
+                            "Daemon reconnected; scheduled-task coverage is incomplete, retrying".to_string()
+                        } else if pending {
                             "Scheduled tasks are still loading; coverage is incomplete, retrying".to_string()
                         } else {
                             format_error("Failed to refresh heartbeats", &error)
@@ -3552,7 +3603,7 @@ impl<'a> AgentsViewMode<'a> {
             self.create_new_session().await;
         }
         if let Some(during_reconnect) = self.saved_search_fetch_pending.take() {
-            if self.persistent_state.saved_catalog_loaded != Some(true) {
+            if !self.stopped && self.persistent_state.saved_catalog_loaded != Some(true) {
                 let _ = self.refresh_saved_sessions(during_reconnect, true).await;
             }
         }
@@ -5252,6 +5303,7 @@ mod tests {
         connected: AtomicBool,
         requests: StdMutex<Vec<Value>>,
         responses: StdMutex<Vec<Result<DaemonResponse, String>>>,
+        stall_heartbeats: AtomicBool,
     }
 
     impl FakeTransport {
@@ -5266,6 +5318,7 @@ mod tests {
                 connected: AtomicBool::new(true),
                 requests: StdMutex::new(Vec::new()),
                 responses: StdMutex::new(Vec::new()),
+                stall_heartbeats: AtomicBool::new(false),
             })
         }
 
@@ -5301,9 +5354,16 @@ mod tests {
             &self,
             command: Value,
             _timeout_ms: u64,
-            _options: DaemonClientRequestOptions,
+            options: DaemonClientRequestOptions,
         ) -> TransportFuture<Result<DaemonResponse, String>> {
+            let stalled = self.stall_heartbeats.load(Ordering::SeqCst) && command["type"] == "heartbeats_list";
             self.requests.lock().unwrap().push(command);
+            if stalled {
+                return Box::pin(async move {
+                    options.signal.expect("background heartbeat must be cancellable").cancelled().await;
+                    Err("cancelled".into())
+                });
+            }
             let mut queue = self.responses.lock().unwrap();
             let response = if queue.is_empty() {
                 Err("no scripted response".to_string())
@@ -6152,7 +6212,55 @@ mod tests {
         mode.finish_reconnect_attempt(&client).await.unwrap();
         assert!(!mode.reconnect_started);
         assert!(mode.rows().iter().any(|row| row.title.contains("Alpha")));
+        assert_eq!(mode.status_message(), Some("Daemon reconnected"));
+        let (generation, result) = mode.heartbeat_request.take().unwrap().await;
+        mode.apply_heartbeat_result(generation, result);
         assert_eq!(mode.status_message(), Some("Daemon reconnected; scheduled-task coverage is incomplete, retrying"));
+    }
+
+    #[tokio::test]
+    async fn ctrl_n_opens_a_chat_while_the_initial_heartbeat_request_is_stalled() {
+        struct CreateAfterHeartbeat(Arc<FakeTransport>);
+        impl AgentsViewTerminal for CreateAfterHeartbeat {
+            fn present(&self, _: Vec<String>, _: Vec<String>) -> Result<(), String> { Ok(()) }
+            fn rows(&self) -> usize { 30 }
+            fn columns(&self) -> usize { 80 }
+            fn request_render(&self, _: bool) {}
+            fn set_title(&self, _: &str) {}
+            fn poll_input(&self) -> Result<Option<Vec<String>>, String> {
+                let waiting = self.0.requests().iter().any(|request| request["type"] == "heartbeats_list");
+                Ok(Some(if waiting { vec!["\x0e".into()] } else { Vec::new() }))
+            }
+        }
+        let mut mode = build_mode(Vec::new()).await;
+        mode.persistent_state.saved_catalog_loaded = Some(true);
+        mode.persistent_state.roster_client = mode.client.clone();
+        let transport = mode.scripted_transport.clone().unwrap();
+        transport.stall_heartbeats.store(true, Ordering::SeqCst);
+        mode.terminal = Arc::new(CreateAfterHeartbeat(transport.clone()));
+        mode.push_response(ok_response(serde_json::to_value(summary("fresh", "Fresh")).unwrap()));
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), mode.run()).await.unwrap().unwrap();
+        assert!(matches!(result, AgentsViewRunResult::Open { .. }));
+        assert!(mode.heartbeat_request.is_none());
+        for command in ["heartbeats_list", "create"] {
+            assert_eq!(transport.requests().iter().filter(|request| request["type"] == command).count(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn ctrl_n_opens_a_chat_while_the_saved_catalog_is_stalled() {
+        let mut mode = build_mode(Vec::new()).await;
+        mode.terminal = Arc::new(InputDriver {
+            input: StdMutex::new([vec!["\x0e".into()]].into()),
+            frames: StdMutex::new(Vec::new()),
+        });
+        mode.push_response(ok_response(serde_json::to_value(summary("fresh", "Fresh")).unwrap()));
+        let pending = std::future::pending::<()>();
+        let progress = Arc::new(std::sync::atomic::AtomicI64::new(0));
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2),
+            mode.wait_with_input_progress(pending, Some(progress))).await.unwrap().unwrap();
+        assert!(result.is_none() && mode.is_stopped());
+        assert!(mode.recorded_requests().iter().any(|request| request["type"] == "create"));
     }
 
     #[tokio::test]

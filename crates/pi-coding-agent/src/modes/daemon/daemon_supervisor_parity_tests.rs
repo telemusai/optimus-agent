@@ -973,14 +973,15 @@ async fn sidebar_followup_failed_catalog_delete_keeps_saved_file_and_roster() {
 }
 
 
-async fn sidebar_owner_reply<S: AsyncRead + AsyncWrite + Unpin>(mut socket: S, captured: tokio::sync::oneshot::Sender<Value>) {
+async fn scripted_worker_reply<S: AsyncRead + AsyncWrite + Unpin>(mut socket: S, data: Value, barrier: Option<Arc<tokio::sync::Barrier>>, captured: tokio::sync::oneshot::Sender<Value>) {
     use crate::modes::daemon::daemon_worker_client::{encode_private_frame, PrivateFrameDecoder};
     let mut decoder = PrivateFrameDecoder::new(); let mut buffer = [0; 8192];
     loop {
         let count = socket.read(&mut buffer).await.unwrap(); if count == 0 { return; }
         if let Some(frame) = decoder.push(&buffer[..count]).unwrap().into_iter().next() {
             let command: Value = serde_json::from_slice(&frame.payload).unwrap();
-            let reply = json!({"type":"response","id":command["id"],"command":command["type"],"success":true,"data":{"ok":true,"ownerHandled":true}});
+            if let Some(barrier) = barrier { barrier.wait().await; }
+            let reply = json!({"type":"response","id":command["id"],"command":command["type"],"success":true,"data":data});
             let frame = encode_private_frame(&json!({"kind":"outbound","outboundType":"response","requestId":command["id"],"payloadEncoding":"jsonl"}), reply.to_string().as_bytes()).unwrap();
             socket.write_all(&frame).await.unwrap(); let _ = captured.send(command);
             // Keep the peer alive until the test explicitly drops it.
@@ -990,29 +991,60 @@ async fn sidebar_owner_reply<S: AsyncRead + AsyncWrite + Unpin>(mut socket: S, c
     }
 }
 
+async fn connect_scripted_worker(worker: &Arc<Worker>, data: Value, barrier: Option<Arc<tokio::sync::Barrier>>)
+    -> (Arc<DaemonWorkerClient>, tokio::task::JoinHandle<()>, tokio::sync::oneshot::Receiver<Value>) {
+    let (send, received) = tokio::sync::oneshot::channel();
+    #[cfg(windows)]
+    let (socket, task) = {
+        let socket = format!(r"\\.\pipe\optimus-sidebar-owner-{}", uuid::Uuid::new_v4());
+        let server = tokio::net::windows::named_pipe::ServerOptions::new().first_pipe_instance(true).create(&socket).unwrap();
+        let task = tokio::spawn(async move { server.connect().await.unwrap(); scripted_worker_reply(server, data, barrier, send).await; });
+        (socket, task)
+    };
+    #[cfg(unix)]
+    let (socket, task) = {
+        let socket = std::env::temp_dir().join(format!("optimus-test-{}.sock", uuid::Uuid::new_v4())).to_string_lossy().into_owned();
+        let server = tokio::net::UnixListener::bind(&socket).unwrap();
+        let cleanup = socket.clone();
+        let task = tokio::spawn(async move {
+            let (stream, _) = server.accept().await.unwrap();
+            let _ = std::fs::remove_file(cleanup);
+            scripted_worker_reply(stream, data, barrier, send).await;
+        });
+        (socket, task)
+    };
+    let client = Arc::new(DaemonWorkerClient::new(&socket)); client.connect(1000).await.unwrap();
+    worker.descriptor.lock().unwrap().socket_path = socket; *worker.client.lock().unwrap() = Some(client.clone());
+    (client, task, received)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn heartbeat_refresh_contacts_independent_workers_concurrently() {
+    let mut fixture = SupervisorFixture::new("heartbeat-parallel-workers").await;
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+    let mut peers = Vec::new();
+    for id in ["first", "second"] {
+        let worker = add_descriptor_only_worker(&fixture, id, id, "synthetic-token", DAEMON_WORKER_LIFECYCLE_READY);
+        peers.push(connect_scripted_worker(&worker, json!({"heartbeats":[{"job":{"id":id}}]}), Some(barrier.clone())).await);
+    }
+    let result = tokio::time::timeout(Duration::from_secs(3), fixture.send(json!({"type":"heartbeats_list","id":"both"})))
+        .await.expect("both workers must receive their request before either replies");
+    assert_eq!(result["success"], true, "{result}");
+    assert_eq!(result["data"]["heartbeats"].as_array().unwrap().len(), 2);
+    for (client, task, received) in peers {
+        assert_eq!(received.await.unwrap()["type"], "heartbeats_list");
+        client.close_now();
+        task.abort();
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sidebar_followup_saved_delete_forwards_live_owner_then_reclaims_only_dead_failed_owner() {
     let mut fixture = SupervisorFixture::new("sidebar-delete-owner-route").await;
     let target = sidebar_saved_fixture(&fixture, "selected", false);
     let worker = add_descriptor_only_worker(&fixture, "owner", "owner-active", "synthetic-token", DAEMON_WORKER_LIFECYCLE_READY);
     worker.descriptor.lock().unwrap().session_file = target.session_file.clone();
-    let (send, received) = tokio::sync::oneshot::channel();
-    #[cfg(windows)]
-    let (socket, task) = {
-        let socket = format!(r"\\.\pipe\optimus-sidebar-owner-{}", uuid::Uuid::new_v4());
-        let server = tokio::net::windows::named_pipe::ServerOptions::new().first_pipe_instance(true).create(&socket).unwrap();
-        let task = tokio::spawn(async move { server.connect().await.unwrap(); sidebar_owner_reply(server, send).await; });
-        (socket, task)
-    };
-    #[cfg(unix)]
-    let (socket, task) = {
-        let socket = fixture.root.join("owner.sock").to_string_lossy().into_owned();
-        let server = tokio::net::UnixListener::bind(&socket).unwrap();
-        let task = tokio::spawn(async move { let (stream, _) = server.accept().await.unwrap(); sidebar_owner_reply(stream, send).await; });
-        (socket, task)
-    };
-    let client = Arc::new(DaemonWorkerClient::new(&socket)); client.connect(1000).await.unwrap();
-    worker.descriptor.lock().unwrap().socket_path = socket; *worker.client.lock().unwrap() = Some(client.clone());
+    let (client, task, received) = connect_scripted_worker(&worker, json!({"ok":true,"ownerHandled":true}), None).await;
     let command = json!({"type":"delete_saved_session","id":"owner-forward","sessionPath":target.session_file});
     let response = fixture.send(command.clone()).await;
     assert_eq!(response["id"], "owner-forward"); assert_eq!(response["data"]["ownerHandled"], true, "{response}");

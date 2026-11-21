@@ -6,6 +6,7 @@ struct InitialAttachTransport {
     direct: AtomicBool,
     error: Option<String>,
     fall_back_on_error: bool,
+    preparation_delay: Duration,
 }
 
 impl InitialAttachTransport {
@@ -15,6 +16,7 @@ impl InitialAttachTransport {
             direct: AtomicBool::new(direct),
             error: error.map(str::to_string),
             fall_back_on_error,
+            preparation_delay: Duration::ZERO,
         }
     }
 }
@@ -31,7 +33,7 @@ impl DaemonTransportClient for InitialAttachTransport {
     fn request_with_recoverable(
         &self,
         command: Value,
-        _timeout_ms: Option<u64>,
+        timeout_ms: Option<u64>,
         recoverable: bool,
     ) -> BoxFuture<Result<DaemonResponse, String>> {
         let attempt = if command["type"] == "attach" {
@@ -41,12 +43,17 @@ impl DaemonTransportClient for InitialAttachTransport {
         };
         let first_error = self.error.clone();
         let fall_back = self.fall_back_on_error;
+        let delay = self.preparation_delay;
         if attempt == 1 && fall_back {
             self.direct.store(false, Ordering::SeqCst);
         }
         Box::pin(async move {
             match command["type"].as_str().unwrap() {
                 "attach" => {
+                    if !delay.is_zero() {
+                        tokio::time::timeout(Duration::from_millis(timeout_ms.unwrap_or(30_000)), tokio::time::sleep(delay))
+                            .await.map_err(|_| "attach request timed out".to_string())?;
+                    }
                     assert_eq!(recoverable, attempt == 1);
                     if attempt == 1 {
                         if let Some(error) = first_error {
@@ -121,6 +128,26 @@ impl DaemonTransportClient for InitialAttachTransport {
 
 fn socket_error() -> String {
     "Connection to the Optimus Agent daemon closed. Socket: direct-worker".into()
+}
+
+#[tokio::test(start_paused = true)]
+async fn configured_viewer_waits_for_a_slow_initial_attach_without_retrying() {
+    let mut transport = InitialAttachTransport::new(None, false, false);
+    transport.preparation_delay = Duration::from_secs(35);
+    let transport = Arc::new(transport);
+    let original = DaemonAgentConnection::attach(transport.clone(), "active".into(), Default::default()).await;
+    assert_eq!(original.err().unwrap(), "attach request timed out");
+    assert_eq!(transport.attach_requests.load(Ordering::SeqCst), 1);
+
+    let mut transport = InitialAttachTransport::new(None, false, false);
+    transport.preparation_delay = Duration::from_secs(35);
+    let transport = Arc::new(transport);
+    let options = DaemonAgentConnectionOptions {
+        attach_timeout_ms: Some(120_000), ..Default::default()
+    };
+    let connection = DaemonAgentConnection::attach(transport.clone(), "active".into(), options).await.unwrap();
+    assert_eq!(transport.attach_requests.load(Ordering::SeqCst), 1);
+    connection.dispose_inner().await;
 }
 
 #[tokio::test]
