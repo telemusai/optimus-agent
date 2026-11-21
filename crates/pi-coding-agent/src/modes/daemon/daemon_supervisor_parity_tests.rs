@@ -1014,7 +1014,9 @@ async fn connect_scripted_worker(worker: &Arc<Worker>, data: Value, barrier: Opt
         (socket, task)
     };
     let client = Arc::new(DaemonWorkerClient::new(&socket)); client.connect(1000).await.unwrap();
-    worker.descriptor.lock().unwrap().socket_path = socket; *worker.client.lock().unwrap() = Some(client.clone());
+    worker.descriptor.lock().unwrap().socket_path = socket;
+    *worker.client.lock().unwrap() = Some(client.clone());
+    *worker.subscribed_client.lock().unwrap() = Some(client.clone());
     (client, task, received)
 }
 
