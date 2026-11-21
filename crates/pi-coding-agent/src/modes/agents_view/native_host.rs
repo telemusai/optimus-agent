@@ -748,13 +748,16 @@ mod tests {
                 "schemaRevision":crate::modes::daemon::daemon_protocol::DAEMON_SCHEMA_REVISION,
                 "serverCapabilities":[]});
             output.write_all(format!("{hello}\n").as_bytes()).await.unwrap();
-            for expected in ["attach", "detach"] {
-                let line = lines.next_line().await.unwrap().unwrap();
+            let mut expected = ["attach", "detach"].into_iter();
+            while let Some(line) = lines.next_line().await.unwrap() {
+                if line.trim().is_empty() { continue; }
                 let envelope: Value = serde_json::from_str(&line).unwrap();
                 let request = &envelope["command"];
-                assert_eq!(request["type"], expected);
+                if request["type"] == "ack_result" { continue; }
+                let command = expected.next().expect("unexpected viewer request");
+                assert_eq!(request["type"], command);
                 assert_eq!(request["activeSessionId"], "active");
-                let data = if expected == "attach" {
+                let data = if command == "attach" {
                     assert_eq!(request["supportsExtensionUi"], true);
                     serde_json::json!({"activeSessionId":"active","snapshot":{
                         "summary":{"sessionId":"saved","activeSessionId":"active"},
@@ -762,13 +765,10 @@ mod tests {
                         "messages":[], "lastEventSequence":0
                     }})
                 } else { serde_json::json!({}) };
-                let reply = serde_json::json!({"type":"response","command":expected,"id":envelope["id"],"success":true,"data":data});
+                let reply = serde_json::json!({"type":"response","command":command,"id":envelope["id"],"success":true,"data":data});
                 output.write_all(format!("{reply}\n").as_bytes()).await.unwrap();
             }
-            while let Some(line) = lines.next_line().await.unwrap() {
-                let envelope: Value = serde_json::from_str(&line).unwrap();
-                assert_eq!(envelope["command"]["type"], "ack_result");
-            }
+            assert!(expected.next().is_none(), "viewer must attach and detach on one socket");
         }
 
         #[cfg(windows)]
