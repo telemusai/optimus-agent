@@ -2536,8 +2536,21 @@ async fn generate_bounded_summary(
             && (response.stop_reason_raw.as_deref().is_some_and(is_filtered_provider_status)
                 || matches!(provider_stream_failure_kind(&response).as_deref(), Some("refusal" | "safety")))
         {
+            // Name the provider's raw filter status when it reported one, in
+            // the same `validate_summary` wording, so the error and its
+            // classification identify the terminal (for example
+            // `provider_status=content_filter`) instead of a generic refusal.
+            let detail = match response
+                .stop_reason_raw
+                .as_deref()
+                .map(str::trim)
+                .filter(|raw| is_filtered_provider_status(raw))
+            {
+                Some(raw) => format!("the provider refused or filtered the summary (provider_status={raw})"),
+                None => "provider refused or filtered the summary".to_string(),
+            };
             return Err(format!(
-                "Summarization returned an unusable handoff (provider refused or filtered the summary); existing conversation preserved. {}",
+                "Summarization returned an unusable handoff ({detail}); existing conversation preserved. {}",
                 response.error_message.as_deref().unwrap_or("Retry compaction or select another summarization model.")
             ));
         }
