@@ -32,7 +32,7 @@ use pi_agent_core::types::AgentMessage;
 use pi_ai::types::Tool;
 use serde::Serialize;
 
-use crate::core::compaction::charcount::count_chars;
+use crate::core::compaction::charcount::{count_chars, count_json_chars};
 use crate::core::compaction::compaction::estimate_tokens;
 
 /// Char cost of one image block under the shared estimator convention (D16).
@@ -80,9 +80,8 @@ pub fn tool_schema_tokens<T: Serialize>(tool_definitions: &[T]) -> f64 {
     tool_definitions
         .iter()
         .map(|tool| {
-            serde_json::to_string(tool)
-                .map(|json| ceil_div4(count_chars(&json)))
-                .unwrap_or(0.0)
+            // Streamed count of `serde_json::to_string(tool)`; 0 on failure.
+            count_json_chars(tool).map(ceil_div4).unwrap_or(0.0)
         })
         .sum()
 }

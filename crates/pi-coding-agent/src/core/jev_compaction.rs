@@ -20,7 +20,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 
-use crate::core::compaction::charcount::count_noncontinuation;
+use crate::core::compaction::charcount::{count_chars, count_noncontinuation, scan_chars_forward};
 use crate::core::extensions::types::ExtensionContext;
 
 const MAX_MESSAGES: usize = 4096;
@@ -295,10 +295,10 @@ fn excerpt_from_blocks<'a>(texts: impl Iterator<Item = &'a str>) -> String {
             excerpt.push('\n');
             remaining -= 1;
         }
-        for ch in text.chars().take(remaining) {
-            excerpt.push(ch);
-            remaining -= 1;
-        }
+        // The first `remaining` chars, copied as one slice.
+        let (end, seen) = scan_chars_forward(text.as_bytes(), 0, remaining);
+        excerpt.push_str(&text[..end]);
+        remaining -= seen;
     }
     pi_jev::redact::bounded_excerpt(&excerpt, 400)
 }
@@ -461,7 +461,7 @@ pub fn prepare_context(
             .content
             .iter()
             .filter_map(|block| match block {
-                ImageOrTextContent::Text(text) => Some(text.text.chars().count()),
+                ImageOrTextContent::Text(text) => Some(count_chars(&text.text)),
                 _ => None,
             })
             .sum();
@@ -569,7 +569,7 @@ pub fn apply_context(
                     .content
                     .iter()
                     .filter_map(|block| match block {
-                        ImageOrTextContent::Text(text) => Some(text.text.chars().count()),
+                        ImageOrTextContent::Text(text) => Some(count_chars(&text.text)),
                         _ => None,
                     })
                     .sum();
@@ -577,9 +577,9 @@ pub fn apply_context(
                 let mut head = String::new();
                 for block in &result.content {
                     if let ImageOrTextContent::Text(text) = block {
-                        let prefix: String = text.text.chars().take(remaining).collect();
-                        remaining -= prefix.chars().count();
-                        head.push_str(&prefix);
+                        let (end, seen) = scan_chars_forward(text.text.as_bytes(), 0, remaining);
+                        remaining -= seen;
+                        head.push_str(&text.text[..end]);
                     }
                 }
                 let omitted = count.saturating_sub(prepared.config.truncate_head_chars);

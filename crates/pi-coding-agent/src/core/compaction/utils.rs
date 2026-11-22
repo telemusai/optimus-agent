@@ -8,6 +8,8 @@ use pi_agent_core::types::{AgentMessage, CustomAgentMessage};
 use pi_ai::types::Message;
 use serde_json::Value;
 
+use crate::core::compaction::charcount::{count_chars, prefix_end, suffix_start};
+
 /// `FileOperations`; `Set<string>` becomes `BTreeSet<String>` (the TypeScript
 /// sorts every consumer of these sets before it renders them).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -112,13 +114,13 @@ const FILE_LIST_MAX_CHARS: usize = 6000;
 fn budget_file_section(tag: &str, files: &[String], remaining: &mut usize) -> String {
     if files.is_empty() { return String::new(); }
     let omitted = "[additional paths omitted; see structured compaction details]";
-    let overhead = format!("\n\n<{tag}>\n\n</{tag}>").chars().count();
+    let overhead = count_chars(&format!("\n\n<{tag}>\n\n</{tag}>"));
     if *remaining < overhead + omitted.len() { return String::new(); }
     let mut body = String::new();
     for (index, path) in files.iter().enumerate() {
         let separator = usize::from(!body.is_empty());
         let reserve = if index + 1 < files.len() { omitted.len() + 1 } else { 0 };
-        if overhead + body.chars().count() + separator + path.chars().count() + reserve > *remaining {
+        if overhead + count_chars(&body) + separator + count_chars(path) + reserve > *remaining {
             if !body.is_empty() { body.push('\n'); }
             body.push_str(omitted);
             break;
@@ -127,7 +129,7 @@ fn budget_file_section(tag: &str, files: &[String], remaining: &mut usize) -> St
         body.push_str(path);
     }
     let section = format!("\n\n<{tag}>\n{body}\n</{tag}>");
-    *remaining -= section.chars().count();
+    *remaining -= count_chars(&section);
     section
 }
 
@@ -178,7 +180,7 @@ fn truncate_for_summary(text: &str, max_chars: usize) -> String {
     if text.len() <= max_chars {
         return text.to_string();
     }
-    let total_chars = text.chars().count();
+    let total_chars = count_chars(text);
     if total_chars <= max_chars {
         return text.to_string();
     }
@@ -243,7 +245,7 @@ fn truncate_for_summary(text: &str, max_chars: usize) -> String {
     let mut used = 0usize;
     let mut kept = 0usize;
     for line in &evidence {
-        let line_chars = line.chars().count() + 1;
+        let line_chars = count_chars(line) + 1;
         if used + line_chars > evidence_budget {
             break;
         }
@@ -266,25 +268,18 @@ fn truncate_for_summary(text: &str, max_chars: usize) -> String {
         "{head}\n\n[... {elided_now} characters truncated; {kept} evidence line(s) from the omitted middle kept{more} ...]\n\n{block}\n[... end of evidence excerpt ...]\n\n{tail}"
     )
 }
-/// Byte offset where the first `count` chars end.
+/// Byte offset where the first `count` chars end (`text.len()` when `text`
+/// is shorter). Routed through the dispatched forward scan kernel; identical
+/// to the former `char_indices().nth(count - 1)` walk.
 fn char_boundary_after(text: &str, count: usize) -> usize {
-    if count == 0 {
-        return 0;
-    }
-    text.char_indices()
-        .nth(count - 1)
-        .map_or(text.len(), |(byte, ch)| byte + ch.len_utf8())
+    prefix_end(text, count)
 }
 
-/// Byte offset where the last `count` chars start.
+/// Byte offset where the last `count` chars start (0 when `text` is shorter).
+/// Routed through the dispatched backward scan kernel; identical to the
+/// former `char_indices().rev().nth(count - 1)` walk.
 fn char_boundary_before(text: &str, count: usize) -> usize {
-    if count == 0 {
-        return text.len();
-    }
-    text.char_indices()
-        .rev()
-        .nth(count - 1)
-        .map_or(0, |(byte, _)| byte)
+    suffix_start(text, count)
 }
 
 /// Serialize LLM messages to text for summarization.

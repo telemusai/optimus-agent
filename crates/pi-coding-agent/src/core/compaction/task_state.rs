@@ -25,6 +25,7 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use super::charcount::{count_chars, take_chars};
 use super::compaction::CompactionSessionEntry;
 use pi_agent_core::types::AgentMessage;
 
@@ -303,10 +304,10 @@ const STOPWORDS: &[&str] = &[
 
 fn clip(text: &str, limit: usize) -> String {
     let squeezed = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    if squeezed.chars().count() <= limit {
+    if count_chars(&squeezed) <= limit {
         return squeezed;
     }
-    let mut out: String = squeezed.chars().take(limit.saturating_sub(1)).collect();
+    let mut out = take_chars(&squeezed, limit.saturating_sub(1)).to_string();
     out.push('\u{2026}');
     out
 }
@@ -327,7 +328,7 @@ fn short_id(entry_id: &str) -> String {
     if entry_id.is_empty() {
         "summary".to_string()
     } else {
-        entry_id.chars().take(8).collect()
+        take_chars(entry_id, 8).to_string()
     }
 }
 
@@ -340,7 +341,7 @@ fn split_clauses(sentence: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     if let Some(head) = parts.first() {
         let head = head.trim();
-        if head.chars().count() > 8 {
+        if count_chars(head) > 8 {
             out.push(head.to_string());
         }
     }
@@ -414,7 +415,7 @@ pub fn build_ledger(
                     if !(capture_wide || CONSTRAINT_RE.is_match(&clause)) {
                         continue;
                     }
-                    if clause.chars().count() < 12 {
+                    if count_chars(&clause) < 12 {
                         continue;
                     }
                     let key = dedupe_key(&clause);
@@ -559,7 +560,7 @@ pub fn build_ledger(
                         && (token.contains('_')
                             || token.contains('/')
                             || token.chars().any(|c| c.is_ascii_digit())
-                            || token.chars().count() > 8)
+                            || count_chars(token) > 8)
                 })
                 .count();
             let score = (specific as i32) * 3 + anchors as i32;
@@ -671,7 +672,7 @@ fn anchor_weight(token: &str) -> i32 {
     if token.chars().any(|c| c.is_ascii_digit()) {
         weight += 2;
     }
-    if token.chars().count() >= 8 {
+    if count_chars(token) >= 8 {
         weight += 1;
     }
     weight
@@ -680,7 +681,7 @@ fn anchor_weight(token: &str) -> i32 {
 fn evidence_key(line: &str) -> String {
     let squeezed = line.split_whitespace().collect::<Vec<_>>().join(" ");
     let replaced = DIGITS_RE.replace_all(&squeezed, "#");
-    replaced.chars().take(160).collect()
+    take_chars(&replaced, 160).to_string()
 }
 
 /// Extract a named section body from a structured summary (`## Next Steps`).

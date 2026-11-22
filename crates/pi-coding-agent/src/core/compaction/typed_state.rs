@@ -150,6 +150,7 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use super::charcount::{count_chars, take_chars};
 use super::compaction::CompactionSessionEntry;
 use pi_agent_core::types::AgentMessage;
 
@@ -606,7 +607,7 @@ fn split_clauses(sentence: &str) -> Vec<String> {
         if part.is_empty() {
             continue;
         }
-        if index == 0 && part.chars().count() <= 8 {
+        if index == 0 && count_chars(part) <= 8 {
             continue;
         }
         out.push(part.to_string());
@@ -623,7 +624,7 @@ fn user_units(text: &str) -> Vec<String> {
     sentences(text)
         .into_iter()
         .flat_map(|sentence| split_clauses(&sentence))
-        .filter(|unit| unit.chars().count() >= MIN_UNIT_CHARS)
+        .filter(|unit| count_chars(unit) >= MIN_UNIT_CHARS)
         .collect()
 }
 
@@ -632,7 +633,7 @@ fn user_units(text: &str) -> Vec<String> {
 fn assistant_units(text: &str) -> Vec<String> {
     sentences(text)
         .into_iter()
-        .filter(|unit| unit.chars().count() >= MIN_UNIT_CHARS)
+        .filter(|unit| count_chars(unit) >= MIN_UNIT_CHARS)
         .collect()
 }
 
@@ -727,7 +728,7 @@ fn classify_user_unit(unit: &str, first_user_unit: bool) -> Option<TypedInformat
     if DECISION_RE.is_match(unit) {
         return Some(TypedInformationKind::VerifiedDecision);
     }
-    if unit.chars().count() >= MIN_EPISODE_CHARS {
+    if count_chars(unit) >= MIN_EPISODE_CHARS {
         return Some(TypedInformationKind::LowPriorityEpisode);
     }
     None
@@ -769,7 +770,7 @@ fn classify_assistant_unit(unit: &str) -> Option<TypedInformationKind> {
     if HISTORICAL_RE.is_match(unit) {
         return Some(TypedInformationKind::HistoricalFact);
     }
-    if unit.chars().count() >= MIN_EPISODE_CHARS {
+    if count_chars(unit) >= MIN_EPISODE_CHARS {
         return Some(TypedInformationKind::LowPriorityEpisode);
     }
     None
@@ -790,7 +791,7 @@ fn classify_tool_text(text: &str, is_error: bool, tool_name: &str) -> Vec<ToolLi
         return text
             .lines()
             .map(str::trim)
-            .filter(|line| line.chars().count() >= MIN_UNIT_CHARS)
+            .filter(|line| count_chars(line) >= MIN_UNIT_CHARS)
             .take(1)
             .map(|line| ToolLine {
                 kind: TypedInformationKind::SubagentState,
@@ -802,7 +803,7 @@ fn classify_tool_text(text: &str, is_error: bool, tool_name: &str) -> Vec<ToolLi
         return text
             .lines()
             .map(str::trim)
-            .filter(|line| line.chars().count() >= MIN_UNIT_CHARS)
+            .filter(|line| count_chars(line) >= MIN_UNIT_CHARS)
             .take(2)
             .map(|line| ToolLine {
                 kind: TypedInformationKind::VerifiedToolResult,
@@ -816,7 +817,7 @@ fn classify_tool_text(text: &str, is_error: bool, tool_name: &str) -> Vec<ToolLi
     let mut repo = 0;
     for line in text.lines() {
         let trimmed = line.trim();
-        if trimmed.chars().count() < MIN_UNIT_CHARS {
+        if count_chars(trimmed) < MIN_UNIT_CHARS {
             continue;
         }
         if EVIDENCE_LINE_RE.is_match(trimmed) && evidence < TOOL_EVIDENCE_LINES {
@@ -906,17 +907,17 @@ fn anchors(text: &str) -> BTreeSet<String> {
 /// Whitespace-squeezed clip with a single trailing ellipsis character.
 fn clip(text: &str, limit: usize) -> String {
     let squeezed = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    if squeezed.chars().count() <= limit {
+    if count_chars(&squeezed) <= limit {
         return squeezed;
     }
-    let mut out: String = squeezed.chars().take(limit.saturating_sub(1)).collect();
+    let mut out = take_chars(&squeezed, limit.saturating_sub(1)).to_string();
     out.push('\u{2026}');
     out
 }
 
 /// Token estimate for allocation: characters divided by four, rounded up.
 pub fn estimate_tokens(text: &str) -> usize {
-    text.chars().count().div_ceil(4)
+    count_chars(text).div_ceil(4)
 }
 
 /// Lowercased, whitespace-normalized text for containment checks.
@@ -1248,7 +1249,7 @@ fn reconcile(mut records: Vec<TypedStateRecord>) -> TypedStateLedger {
                         || token.contains('/')
                         || token.contains('.')
                         || token.chars().any(|c| c.is_ascii_digit())
-                        || token.chars().count() >= 8
+                        || count_chars(token) >= 8
                 })
                 .count();
             let shared_anchors = correction_anchors
@@ -1956,9 +1957,9 @@ fn artifact_mentions(artifact: &str, record: &TypedStateRecord) -> bool {
     if !record_norm.is_empty() && normalized(artifact).contains(&record_norm) {
         return true;
     }
-    let half: String = record.text.chars().take(record.text.chars().count() / 2).collect();
-    let half = normalized(&half);
-    half.chars().count() >= 16 && normalized(artifact).contains(&half)
+    let half = take_chars(&record.text, count_chars(&record.text) / 2);
+    let half = normalized(half);
+    count_chars(&half) >= 16 && normalized(artifact).contains(&half)
 }
 
 /// Deterministically verify a compact artifact (the model-written summary)

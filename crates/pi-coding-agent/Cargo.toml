@@ -5,6 +5,12 @@ edition.workspace = true
 license.workspace = true
 
 [features]
+default = ["compaction-asm"]
+# Hand-written x86-64 assembly kernels for the compaction character counts
+# and scans (`core::compaction::charcount::asm`). Off: the Rust-intrinsic
+# kernels serve x86-64. Ignored on other architectures and under Miri. At
+# runtime, `PRIME_AGENT_COMPACT_ASM=0` disables the assembly for a process.
+compaction-asm = []
 # Selects the separate benchmark-only wall executable. Production code does not
 # inspect this feature; the default build retains the R1-R3 replay instrument.
 compaction-r4-uninstrumented-wall = []

@@ -1,0 +1,1 @@
+- Compaction counts and scans characters with hand-written x86-64 assembly kernels when the CPU supports them, with bit-identical results. The kernels are 1.3x to 2.8x faster than the previous Rust SIMD kernels on Zen 2. Set `PRIME_AGENT_COMPACT_ASM=0` to use the Rust kernels.
