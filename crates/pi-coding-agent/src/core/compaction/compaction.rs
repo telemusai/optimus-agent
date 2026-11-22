@@ -33,7 +33,7 @@ use pi_ai::types::{
 use pi_ai::utils::event_stream::AssistantMessageEventStream;
 use serde_json::Value;
 
-use crate::core::compaction::charcount::{count_chars, scan_chars_forward};
+use crate::core::compaction::charcount::{count_chars, count_json_chars, last_chars, scan_chars_forward};
 use crate::core::compaction::parallel::{
     approx_agent_message_bytes, approx_agent_messages_bytes, try_parallel_map,
     EXTRACT_BYTES_THRESHOLD, EXTRACT_MESSAGES_THRESHOLD, TOKEN_ESTIMATE_BYTES_THRESHOLD,
@@ -1595,9 +1595,9 @@ pub fn estimate_tokens(message: &AgentMessage) -> f64 {
                     }
                     pi_ai::types::ContentBlock::ToolCall(tool_call) => {
                         chars += count_chars(&tool_call.name);
-                        chars += serde_json::to_string(&tool_call.arguments)
-                            .map(|json| count_chars(&json))
-                            .unwrap_or(0);
+                        // Streamed count of `serde_json::to_string(arguments)`
+                        // without building the string; 0 when it fails.
+                        chars += count_json_chars(&tool_call.arguments).unwrap_or(0);
                     }
                 }
             }
@@ -2115,7 +2115,7 @@ fn retained_state_anchor(entries: &[CompactionSessionEntry]) -> Option<String> {
         let text = strip_file_operations(&text);
         let text = text.trim();
         if text.is_empty() { return None; }
-        Some(text.chars().skip(text.chars().count().saturating_sub(2000)).collect())
+        Some(last_chars(text, 2000).to_string())
     })
 }
 
@@ -2311,7 +2311,7 @@ fn summary_output_budgets(
 /// `SUMMARIZATION_SYSTEM_PROMPT` length in Unicode scalars. The chunk budget
 /// subtracts it on every iteration, so it is computed once.
 static SUMMARIZATION_SYSTEM_PROMPT_CHARS: std::sync::LazyLock<usize> =
-    std::sync::LazyLock::new(|| SUMMARIZATION_SYSTEM_PROMPT.chars().count());
+    std::sync::LazyLock::new(|| count_chars(SUMMARIZATION_SYSTEM_PROMPT));
 
 #[allow(clippy::too_many_arguments)]
 async fn generate_bounded_summary(

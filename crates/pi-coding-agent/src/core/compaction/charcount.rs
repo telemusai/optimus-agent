@@ -1,35 +1,62 @@
-//! Dispatched Unicode-scalar counting for the compaction hot paths.
+//! Dispatched Unicode-scalar counting and scanning for the compaction hot paths.
 //!
-//! `estimate_tokens` re-counts `chars()` of every text block on every
-//! threshold check (per turn end and pre-turn), and the summary chunk loop
-//! walks the serialized conversation by scalar offsets. Both are dominated
-//! by one kernel: counting UTF-8 non-continuation bytes (`(b & 0xC0) != 0x80`),
-//! which equals the Unicode scalar count of any valid UTF-8 string. The same
-//! kernel also backs the raw-byte entry point [`count_noncontinuation`],
-//! used by the Jev compaction fingerprint writer (`core::jev_compaction`),
-//! which counts streamed serialization chunks that are not `&str`.
+//! Every character walk in auto-compaction goes through this module: token
+//! estimates and cut-point costs (`count_chars`, `count_json_chars` for
+//! serialized tool-call arguments and tool schemas), summary truncation and
+//! chunking (`scan_chars_forward`, `scan_chars_backward` and the str helpers
+//! `prefix_end`, `suffix_start`, `take_chars`, `last_chars`), typed and
+//! task-state limits, and the Jev compaction fingerprint
+//! (`count_noncontinuation` over raw streamed bytes). All of them reduce to
+//! one byte classifier: a UTF-8 non-continuation byte (`(b & 0xC0) != 0x80`)
+//! starts exactly one Unicode scalar of any valid UTF-8 string.
 //!
-//! Backends, selected once per process:
-//! - x86-64: AVX2 when `is_x86_feature_detected!("avx2")` (for `len >= 64`),
-//!   SSE2 otherwise (`len >= 16`; SSE2 is part of the x86-64 baseline, so it
-//!   needs no runtime detection). Below those lengths a scalar loop wins.
-//! - aarch64: NEON. NEON is baseline hardware on aarch64 (enabled by default
-//!   for the target), so the kernel needs no runtime feature check.
+//! Layout for kernel work:
+//! - `charcount/x86_64.s` + `charcount/asm.rs`: the hand-written x86-64
+//!   assembly kernels (SSE2 count, AVX2 count, AVX2 forward and backward
+//!   scans) and their safe wrappers. Built when the `compaction-asm` feature
+//!   is on (the default) and not under Miri.
+//! - `charcount/x86.rs`: the Rust-intrinsic x86-64 SIMD kernels (SSE2/AVX2
+//!   counts, AVX2 forward and backward scans) plus the kernel contract table.
+//!   They are the fallback when the assembly is off or rejected.
+//! - `charcount/neon.rs`: the only aarch64 SIMD code (NEON count).
+//! - this file: safe wrappers, the scalar reference walks, dispatch, the
+//!   startup self-check, and the differential tests. A new backend replaces
+//!   kernel functions only; everything here stays unchanged.
+//!
+//! Backends, selected once per process, first candidate that passes the
+//! self-check wins:
+//! - x86-64, in order:
+//!   1. `asm-avx2`: the assembly kernels, when AVX2, BMI1, BMI2, POPCNT and
+//!      LZCNT are all detected (counts and scans at every length).
+//!   2. `avx2`: Rust AVX2 intrinsics when AVX2 is detected (counts for
+//!      `len >= 64`, scans always).
+//!   3. `asm-sse2`: the assembly SSE2 count at every length (SSE2 is part of
+//!      the x86-64 baseline, so it needs no runtime detection); scalar scans.
+//!   4. `sse2`: Rust SSE2 intrinsics (counts for `len >= 16`); scalar scans.
+//!   Below the Rust kernels' lengths a scalar loop runs.
+//!   `PRIME_AGENT_COMPACT_ASM=0` (or `false`) removes the two assembly
+//!   candidates for the process.
+//! - aarch64: NEON counts. NEON is baseline hardware on aarch64 (enabled by
+//!   default for the target), so the kernel needs no runtime feature check.
+//!   Scans use the scalar walk.
 //! - other architectures: the portable `chars().count()` reference, which the
-//!   compiler autovectorizes on most targets.
+//!   compiler autovectorizes on most targets, and the scalar scans.
 //!
 //! Selection happens behind a `OnceLock` that first runs a differential
 //! self-check of each candidate backend against `chars().count()` on fixed
 //! edge-case fixtures (empty input, every byte length 1..=64, load alignments
 //! 0..=31, NUL, every UTF-8 scalar width, and a > 128 KiB mixed buffer so the
-//! aarch64 fold path is exercised). A backend that disagrees on any
-//! fixture is disabled and the next candidate is tried; the compact
-//! diagnostic (no transcript content) is retrievable via [`diagnostic`].
+//! aarch64 fold path is exercised), and of its forward and backward scans
+//! against the scalar walks. A backend that disagrees on any fixture is
+//! disabled and the next candidate is tried; the compact diagnostic (no
+//! transcript content) is retrievable via [`diagnostic`].
 //! `PRIME_AGENT_COMPACT_RUST_COUNT=1` (or `true`) pins the reference
-//! implementation regardless of hardware.
+//! implementation regardless of hardware (it overrides
+//! `PRIME_AGENT_COMPACT_ASM`).
 //!
 //! Every counting result is bit-identical to `chars().count()` for valid
-//! UTF-8; nothing else about the compaction path changes.
+//! UTF-8, and every scan result to the `char_indices()` walk it replaced;
+//! nothing else about the compaction path changes.
 
 use std::sync::OnceLock;
 
@@ -44,6 +71,12 @@ pub enum Backend {
     /// Explicit AVX2 kernel (runtime-detected).
     #[cfg(target_arch = "x86_64")]
     Avx2,
+    /// Assembly SSE2 count (x86-64 baseline); scalar scans.
+    #[cfg(all(target_arch = "x86_64", feature = "compaction-asm", not(miri)))]
+    AsmSse2,
+    /// Assembly AVX2 count and scans (AVX2+BMI1+BMI2+POPCNT+LZCNT detected).
+    #[cfg(all(target_arch = "x86_64", feature = "compaction-asm", not(miri)))]
+    AsmAvx2,
     /// NEON kernel (baseline on aarch64).
     #[cfg(target_arch = "aarch64")]
     Neon,
@@ -57,6 +90,10 @@ impl Backend {
             Backend::Sse2 => "sse2",
             #[cfg(target_arch = "x86_64")]
             Backend::Avx2 => "avx2",
+            #[cfg(all(target_arch = "x86_64", feature = "compaction-asm", not(miri)))]
+            Backend::AsmSse2 => "asm-sse2",
+            #[cfg(all(target_arch = "x86_64", feature = "compaction-asm", not(miri)))]
+            Backend::AsmAvx2 => "asm-avx2",
             #[cfg(target_arch = "aarch64")]
             Backend::Neon => "neon",
         }
@@ -68,6 +105,24 @@ impl Backend {
 fn forced_reference() -> bool {
     std::env::var("PRIME_AGENT_COMPACT_RUST_COUNT")
         .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// `PRIME_AGENT_COMPACT_ASM=0|false` (any case) disables the assembly
+/// backends. Any other value, or no value, leaves them enabled.
+#[cfg_attr(
+    not(all(target_arch = "x86_64", feature = "compaction-asm", not(miri))),
+    allow(dead_code)
+)]
+fn asm_switch_disables(value: &str) -> bool {
+    value == "0" || value.eq_ignore_ascii_case("false")
+}
+
+/// Read once per candidate list (the self-check), never per call.
+#[cfg(all(target_arch = "x86_64", feature = "compaction-asm", not(miri)))]
+fn asm_disabled() -> bool {
+    std::env::var("PRIME_AGENT_COMPACT_ASM")
+        .map(|value| asm_switch_disables(&value))
         .unwrap_or(false)
 }
 
@@ -103,160 +158,47 @@ fn scan_chars_forward_scalar(bytes: &[u8], start: usize, target: usize) -> (usiz
     (pos, seen)
 }
 
+/// Scalar backward scan shared by every non-AVX2 backend: byte offset of the
+/// `target`-th non-continuation byte counted backwards from `end`
+/// (exclusive), plus how many were found. Returns `(end, 0)` for
+/// `target == 0` and `(0, found)` when `bytes[..end]` holds fewer than
+/// `target`. Requires `end <= bytes.len()` (the public wrapper clamps it).
+fn scan_chars_backward_scalar(bytes: &[u8], end: usize, target: usize) -> (usize, usize) {
+    if target == 0 {
+        return (end, 0);
+    }
+    let mut pos = end;
+    let mut seen = 0usize;
+    while pos > 0 {
+        pos -= 1;
+        if bytes[pos] & 0xc0 != 0x80 {
+            seen += 1;
+            if seen == target {
+                return (pos, seen);
+            }
+        }
+    }
+    (0, seen)
+}
+
 // ---------------------------------------------------------------------------
-// x86-64 kernels
+// Architecture kernels
+//
+// Every SIMD instruction of the compaction character work lives in one file
+// per architecture: `charcount/x86.rs` (SSE2/AVX2) and `charcount/neon.rs`.
+// The kernel contract is documented at the top of `charcount/x86.rs`; an
+// assembly backend replaces those functions and keeps the safe wrappers,
+// dispatch, self-check and tests below unchanged.
 // ---------------------------------------------------------------------------
 
 #[cfg(target_arch = "x86_64")]
-mod x86 {
-    use std::arch::x86_64::*;
+mod x86;
 
-    /// Counts non-continuation bytes with explicit SSE2 intrinsics.
-    ///
-    /// # Safety
-    ///
-    /// - Feature requirement: SSE2 is part of the x86-64 baseline, so any
-    ///   x86-64 CPU satisfies `target_feature(enable = "sse2")`; no runtime
-    ///   detection is needed.
-    /// - Input: `bytes` may be any slice (no alignment requirement: loads use
-    ///   `_mm_loadu_si128`). Validity of the UTF-8 is not required — the
-    ///   kernel only classifies individual bytes.
-    /// - Bounds: every load comes from `bytes.chunks_exact(16)`, so each
-    ///   `_mm_loadu_si128` reads exactly 16 in-bounds bytes and never crosses
-    ///   `bytes.len()`. The `< 16`-byte tail is consumed by the checked scalar
-    ///   remainder loop. No out-of-bounds reads are possible.
-    /// - Registers: only xmm registers are touched (no MMX/x87 state); the
-    ///   compiler allocates and preserves them per the Rust ABI.
-    #[target_feature(enable = "sse2")]
-    pub unsafe fn count_noncontinuation_sse2(bytes: &[u8]) -> usize {
-        let ones = _mm_set1_epi8(1);
-        let mask_c0 = _mm_set1_epi8(0xc0u8 as i8);
-        let mask_80 = _mm_set1_epi8(0x80u8 as i8);
-        let zero = _mm_setzero_si128();
-        let mut acc = zero;
-        let mut chunks = bytes.chunks_exact(16);
-        for chunk in &mut chunks {
-            let v = _mm_loadu_si128(chunk.as_ptr().cast());
-            let cont = _mm_cmpeq_epi8(_mm_and_si128(v, mask_c0), mask_80);
-            let non_cont = _mm_andnot_si128(cont, ones);
-            // psadbw sums the 0/1 bytes into two u64 lanes; paddq accumulates.
-            acc = _mm_add_epi64(_mm_sad_epu8(non_cont, zero), acc);
-        }
-        let mut lanes = [0u64; 2];
-        _mm_storeu_si128(lanes.as_mut_ptr().cast(), acc);
-        let mut count = (lanes[0] + lanes[1]) as usize;
-        for &byte in chunks.remainder() {
-            count += usize::from(byte & 0xc0 != 0x80);
-        }
-        count
-    }
+#[cfg(all(target_arch = "x86_64", feature = "compaction-asm", not(miri)))]
+mod asm;
 
-    /// Counts non-continuation bytes with explicit AVX2 intrinsics.
-    ///
-    /// # Safety
-    ///
-    /// - Feature requirement: the caller must have verified AVX2 at runtime
-    ///   (`is_x86_feature_detected!("avx2")`); executing YMM instructions on
-    ///   a non-AVX2 CPU is undefined. The dispatch only reaches this kernel
-    ///   after detection and self-check.
-    /// - Input: `bytes` may be any slice (no alignment requirement: loads use
-    ///   `_mm256_loadu_si256`). UTF-8 validity is not required.
-    /// - Bounds: every load comes from `bytes.chunks_exact(32)`, so each
-    ///   `_mm256_loadu_si256` reads exactly 32 in-bounds bytes; the `< 32`-byte
-    ///   tail goes to the checked scalar remainder loop. No out-of-bounds
-    ///   reads are possible.
-    /// - Registers: only ymm registers are touched; the compiler allocates and
-    ///   preserves them per the Rust ABI.
-    #[target_feature(enable = "avx2")]
-    pub unsafe fn count_noncontinuation_avx2(bytes: &[u8]) -> usize {
-        let ones = _mm256_set1_epi8(1);
-        let mask_c0 = _mm256_set1_epi8(0xc0u8 as i8);
-        let mask_80 = _mm256_set1_epi8(0x80u8 as i8);
-        let zero = _mm256_setzero_si256();
-        let mut acc = zero;
-        let mut chunks = bytes.chunks_exact(32);
-        for chunk in &mut chunks {
-            let v = _mm256_loadu_si256(chunk.as_ptr().cast());
-            let cont = _mm256_cmpeq_epi8(_mm256_and_si256(v, mask_c0), mask_80);
-            let non_cont = _mm256_andnot_si256(cont, ones);
-            acc = _mm256_add_epi64(_mm256_sad_epu8(non_cont, zero), acc);
-        }
-        let mut lanes = [0u64; 4];
-        _mm256_storeu_si256(lanes.as_mut_ptr().cast(), acc);
-        let mut count = (lanes[0] + lanes[1] + lanes[2] + lanes[3]) as usize;
-        for &byte in chunks.remainder() {
-            count += usize::from(byte & 0xc0 != 0x80);
-        }
-        count
-    }
-
-    /// AVX2 forward scan: byte offset just past the `target`-th
-    /// non-continuation byte at/after `start` (completing the trailing
-    /// char's continuation bytes), plus how many were found.
-    ///
-    /// # Safety
-    ///
-    /// - Feature requirement: caller must have verified AVX2 at runtime; the
-    ///   dispatch only reaches this kernel after detection and self-check.
-    /// - Input: `bytes` may be any slice; `start` may be any position `<=
-    ///   bytes.len()` (a char boundary for UTF-8-correct results).
-    /// - Bounds: the vector loop runs while `pos + 32 <= bytes.len()`, so each
-    ///   `_mm256_loadu_si256` reads exactly 32 in-bounds bytes. The final
-    ///   partial block is never loaded as a vector: when the target falls
-    ///   inside a full block, its bytes are walked one by one from the block's
-    ///   movemask (`bit < 32`, so `pos + bit` stays inside the block); the
-    ///   scalar tail only indexes checked positions. No out-of-bounds reads
-    ///   are possible.
-    /// - Registers: only ymm registers are touched.
-    #[target_feature(enable = "avx2")]
-    pub unsafe fn scan_noncontinuation_avx2(
-        bytes: &[u8],
-        start: usize,
-        target: usize,
-    ) -> (usize, usize) {
-        if target == 0 {
-            return (start, 0);
-        }
-        let mask_c0 = _mm256_set1_epi8(0xc0u8 as i8);
-        let mask_80 = _mm256_set1_epi8(0x80u8 as i8);
-        let mut seen = 0usize;
-        let mut pos = start;
-        while pos + 32 <= bytes.len() {
-            let v = _mm256_loadu_si256(bytes[pos..].as_ptr().cast());
-            let cont = _mm256_cmpeq_epi8(_mm256_and_si256(v, mask_c0), mask_80);
-            let non_cont_mask = _mm256_movemask_epi8(_mm256_xor_si256(cont, _mm256_set1_epi8(-1)));
-            let block_count = non_cont_mask.count_ones() as usize;
-            if seen + block_count >= target {
-                let mut mask = non_cont_mask as u32;
-                while mask != 0 {
-                    let bit = mask.trailing_zeros() as usize;
-                    mask &= mask - 1;
-                    seen += 1;
-                    if seen == target {
-                        // Complete the trailing char (its continuation bytes).
-                        let mut end = pos + bit + 1;
-                        while end < bytes.len() && bytes[end] & 0xc0 == 0x80 {
-                            end += 1;
-                        }
-                        return (end, seen);
-                    }
-                }
-            }
-            seen += block_count;
-            pos += 32;
-        }
-        while pos < bytes.len() && seen < target {
-            if bytes[pos] & 0xc0 != 0x80 {
-                seen += 1;
-            }
-            pos += 1;
-        }
-        while pos < bytes.len() && bytes[pos] & 0xc0 == 0x80 {
-            pos += 1;
-        }
-        (pos, seen)
-    }
-}
+#[cfg(target_arch = "aarch64")]
+mod neon;
 
 /// Dispatch thresholds from the kernel-lab measurements: a scalar loop beats
 /// SSE2 setup below 16 bytes and AVX2 setup below 64 bytes. The SSE2 path
@@ -286,63 +228,31 @@ fn scan_noncontinuation_avx2(bytes: &[u8], start: usize, target: usize) -> (usiz
     unsafe { x86::scan_noncontinuation_avx2(bytes, start, target) }
 }
 
-// ---------------------------------------------------------------------------
-// aarch64 kernel
-// ---------------------------------------------------------------------------
+#[cfg(target_arch = "x86_64")]
+fn scan_noncontinuation_backward_avx2(bytes: &[u8], end: usize, target: usize) -> (usize, usize) {
+    // SAFETY: same dispatch-state guarantee as `count_noncontinuation_avx2`;
+    // the public wrapper has already clamped `end <= bytes.len()`.
+    unsafe { x86::scan_noncontinuation_backward_avx2(bytes, end, target) }
+}
 
-#[cfg(target_arch = "aarch64")]
-mod neon {
-    use std::arch::aarch64::*;
+#[cfg(all(target_arch = "x86_64", feature = "compaction-asm", not(miri)))]
+fn count_noncontinuation_asm_avx2(bytes: &[u8]) -> usize {
+    // SAFETY: the dispatch state only selects `AsmAvx2` after
+    // `asm::asm_avx2_supported()` and a passed self-check. No length
+    // threshold: the assembly handles every length itself.
+    unsafe { asm::count_noncontinuation_avx2(bytes) }
+}
 
-    /// Counts non-continuation bytes with NEON.
-    ///
-    /// # Safety
-    ///
-    /// - Feature requirement: NEON is baseline hardware on aarch64 (Rust
-    ///   enables `neon` for the target by default), so no runtime detection
-    ///   is needed.
-    /// - Input: `bytes` may be any slice (no alignment requirement: loads use
-    ///   `vld1q_u8`). UTF-8 validity is not required.
-    /// - Bounds: every load comes from `bytes.chunks_exact(16)`, so each
-    ///   `vld1q_u8` reads exactly 16 in-bounds bytes; the `< 16`-byte tail
-    ///   goes to the checked scalar remainder loop. No out-of-bounds reads
-    ///   are possible.
-    /// - Accumulation: `vpadalq_u8` widens into u16 lanes; the accumulator is
-    ///   folded into a u32 total every 4096 blocks, so a u16 lane can hold at
-    ///   most 4096 * 2 = 8192 and cannot overflow.
-    /// - Registers: only NEON vector registers are touched; the compiler
-    ///   allocates and preserves them per the Rust ABI.
-    #[target_feature(enable = "neon")]
-    pub unsafe fn count_noncontinuation_neon(bytes: &[u8]) -> usize {
-        let ones = vdupq_n_u8(1);
-        let mask_c0 = vdupq_n_u8(0xc0);
-        let mask_80 = vmovq_n_u8(0x80);
-        let mut acc = vdupq_n_u16(0);
-        let mut chunks = bytes.chunks_exact(16);
-        let mut since_fold = 0usize;
-        let mut total = 0usize;
-        for chunk in &mut chunks {
-            let v = vld1q_u8(chunk.as_ptr());
-            let cont = vceqq_u8(vandq_u8(v, mask_c0), mask_80);
-            let non_cont = vandq_u8(vmvnq_u8(cont), ones);
-            acc = vpadalq_u8(acc, non_cont);
-            since_fold += 1;
-            if since_fold == 4096 {
-                let wide = vpaddlq_u16(acc);
-                total = total.wrapping_add(vaddvq_u32(wide) as usize);
-                acc = vdupq_n_u16(0);
-                since_fold = 0;
-            }
-        }
-        if since_fold > 0 {
-            let wide = vpaddlq_u16(acc);
-            total = total.wrapping_add(vaddvq_u32(wide) as usize);
-        }
-        for &byte in chunks.remainder() {
-            total += usize::from(byte & 0xc0 != 0x80);
-        }
-        total
-    }
+#[cfg(all(target_arch = "x86_64", feature = "compaction-asm", not(miri)))]
+fn scan_noncontinuation_asm_avx2(bytes: &[u8], start: usize, target: usize) -> (usize, usize) {
+    // SAFETY: same dispatch-state guarantee as `count_noncontinuation_asm_avx2`.
+    unsafe { asm::scan_noncontinuation_avx2(bytes, start, target) }
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "compaction-asm", not(miri)))]
+fn scan_noncontinuation_backward_asm_avx2(bytes: &[u8], end: usize, target: usize) -> (usize, usize) {
+    // SAFETY: same dispatch-state guarantee as `count_noncontinuation_asm_avx2`.
+    unsafe { asm::scan_noncontinuation_backward_avx2(bytes, end, target) }
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -364,8 +274,20 @@ fn candidate_backends() -> Vec<Backend> {
     let mut candidates = Vec::new();
     #[cfg(target_arch = "x86_64")]
     {
+        #[cfg(all(target_arch = "x86_64", feature = "compaction-asm", not(miri)))]
+        {
+            if !asm_disabled() && asm::asm_avx2_supported() {
+                candidates.push(Backend::AsmAvx2);
+            }
+        }
         if std::arch::is_x86_feature_detected!("avx2") {
             candidates.push(Backend::Avx2);
+        }
+        #[cfg(all(target_arch = "x86_64", feature = "compaction-asm", not(miri)))]
+        {
+            if !asm_disabled() {
+                candidates.push(Backend::AsmSse2);
+            }
         }
         candidates.push(Backend::Sse2);
     }
@@ -383,6 +305,10 @@ fn run_backend(backend: Backend, bytes: &[u8]) -> Option<usize> {
         Backend::Sse2 => Some(count_noncontinuation_sse2(bytes)),
         #[cfg(target_arch = "x86_64")]
         Backend::Avx2 => Some(count_noncontinuation_avx2(bytes)),
+        #[cfg(all(target_arch = "x86_64", feature = "compaction-asm", not(miri)))]
+        Backend::AsmSse2 => Some(asm::count_noncontinuation_sse2(bytes)),
+        #[cfg(all(target_arch = "x86_64", feature = "compaction-asm", not(miri)))]
+        Backend::AsmAvx2 => Some(count_noncontinuation_asm_avx2(bytes)),
         #[cfg(target_arch = "aarch64")]
         Backend::Neon => Some(count_noncontinuation_neon(bytes)),
     }
@@ -492,6 +418,133 @@ fn self_check_byte_fixtures() -> Vec<Vec<u8>> {
     fixtures
 }
 
+/// Forward scan through one backend's kernel (scalar for backends without a
+/// scan kernel). Shared by the self-check and the public dispatch so both
+/// exercise exactly the same code.
+///
+/// The SIMD kernels require `start <= len` and `start` at `len` or at a
+/// non-continuation byte; every production caller passes a char boundary.
+/// Any other `start` takes the scalar walk here, so the result equals the
+/// scalar walk for every input on every backend.
+fn backend_scan_forward(backend: Backend, bytes: &[u8], start: usize, target: usize) -> (usize, usize) {
+    match bytes.get(start) {
+        Some(byte) if byte & 0xc0 != 0x80 => {}
+        None if start == bytes.len() => {}
+        _ => return scan_chars_forward_scalar(bytes, start, target),
+    }
+    match backend {
+        #[cfg(target_arch = "x86_64")]
+        Backend::Avx2 => scan_noncontinuation_avx2(bytes, start, target),
+        #[cfg(all(target_arch = "x86_64", feature = "compaction-asm", not(miri)))]
+        Backend::AsmAvx2 => scan_noncontinuation_asm_avx2(bytes, start, target),
+        _ => scan_chars_forward_scalar(bytes, start, target),
+    }
+}
+
+/// Backward scan through one backend's kernel (scalar for backends without
+/// a scan kernel). `end` must already be clamped to `bytes.len()`.
+fn backend_scan_backward(backend: Backend, bytes: &[u8], end: usize, target: usize) -> (usize, usize) {
+    match backend {
+        #[cfg(target_arch = "x86_64")]
+        Backend::Avx2 => scan_noncontinuation_backward_avx2(bytes, end, target),
+        #[cfg(all(target_arch = "x86_64", feature = "compaction-asm", not(miri)))]
+        Backend::AsmAvx2 => scan_noncontinuation_backward_asm_avx2(bytes, end, target),
+        _ => scan_chars_backward_scalar(bytes, end, target),
+    }
+}
+
+/// Scan fixtures up to this size get the full start/target matrix in the
+/// self-check. Larger fixtures get only four long walks: the scan kernels
+/// carry no long-range state (only the running `seen` count), so the 4 KiB
+/// fixtures already cover many full blocks, and the startup cost stays
+/// small.
+const SCAN_CHECK_MAX_BYTES: usize = 4096;
+
+/// Targets around the AVX2 block size (32 bytes), the fixture midpoint, the
+/// exact total, and one past it (the "fewer than target" path).
+fn scan_check_targets(total: usize) -> [usize; 10] {
+    [0, 1, 2, 31, 32, 33, 64, total / 2, total, total + 1]
+}
+
+/// Differential scan check for one backend against the scalar walks (which
+/// the unit tests pin to `char_indices()` semantics).
+///
+/// - Valid-UTF-8 fixtures up to [`SCAN_CHECK_MAX_BYTES`]: both directions
+///   from char boundaries at the start, the middle and the end.
+/// - Raw-byte fixtures up to that size: the backward scan (defined for any
+///   bytes) from the start, the middle and the end, and the forward scan
+///   from offset 0, the middle, the first non-continuation byte at or after
+///   the middle, and the end. Arbitrary bytes catch kernels that assume
+///   canonical multi-byte sequences; the public forward scan accepts any
+///   `start`.
+/// - Every larger fixture (the > 128 KiB buffers): one forward walk from 0
+///   and one backward walk from the end, to half the total and to one past
+///   it, so the long unrolled loops run at every process start.
+fn scans_match_reference(backend: Backend, fixtures: &[String], byte_fixtures: &[Vec<u8>]) -> bool {
+    for fixture in fixtures.iter().filter(|fixture| fixture.len() <= SCAN_CHECK_MAX_BYTES) {
+        let bytes = fixture.as_bytes();
+        let total = count_noncontinuation_scalar(bytes);
+        let mut middle = bytes.len() / 2;
+        while !fixture.is_char_boundary(middle) {
+            middle -= 1;
+        }
+        for position in [0, middle, bytes.len()] {
+            for target in scan_check_targets(total) {
+                if backend_scan_forward(backend, bytes, position, target)
+                    != scan_chars_forward_scalar(bytes, position, target)
+                    || backend_scan_backward(backend, bytes, position, target)
+                        != scan_chars_backward_scalar(bytes, position, target)
+                {
+                    return false;
+                }
+            }
+        }
+    }
+    for bytes in byte_fixtures.iter().filter(|bytes| bytes.len() <= SCAN_CHECK_MAX_BYTES) {
+        let total = count_noncontinuation_scalar(bytes);
+        let middle = bytes.len() / 2;
+        let lead = bytes[middle..]
+            .iter()
+            .position(|byte| byte & 0xc0 != 0x80)
+            .map_or(bytes.len(), |offset| middle + offset);
+        for end in [0, middle, bytes.len()] {
+            for target in scan_check_targets(total) {
+                if backend_scan_backward(backend, bytes, end, target)
+                    != scan_chars_backward_scalar(bytes, end, target)
+                {
+                    return false;
+                }
+            }
+        }
+        for start in [0, middle, lead, bytes.len()] {
+            for target in scan_check_targets(total) {
+                if backend_scan_forward(backend, bytes, start, target)
+                    != scan_chars_forward_scalar(bytes, start, target)
+                {
+                    return false;
+                }
+            }
+        }
+    }
+    let large = fixtures
+        .iter()
+        .map(|fixture| fixture.as_bytes())
+        .chain(byte_fixtures.iter().map(|bytes| bytes.as_slice()))
+        .filter(|bytes| bytes.len() > SCAN_CHECK_MAX_BYTES);
+    for bytes in large {
+        let total = count_noncontinuation_scalar(bytes);
+        for target in [total / 2, total + 1] {
+            if backend_scan_forward(backend, bytes, 0, target) != scan_chars_forward_scalar(bytes, 0, target)
+                || backend_scan_backward(backend, bytes, bytes.len(), target)
+                    != scan_chars_backward_scalar(bytes, bytes.len(), target)
+            {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 fn init_dispatch() -> DispatchState {
     if forced_reference() {
         return DispatchState {
@@ -532,6 +585,11 @@ fn init_dispatch() -> DispatchState {
                     }
                 }
             }
+        }
+        if ok {
+            // The scan kernels are part of the backend: a backend whose scans
+            // disagree with the scalar walks is rejected as a whole.
+            ok = scans_match_reference(backend, &fixtures, &byte_fixtures);
         }
         if ok {
             return DispatchState {
@@ -584,6 +642,10 @@ pub fn count_noncontinuation(bytes: &[u8]) -> usize {
         Backend::Sse2 => count_noncontinuation_sse2(bytes),
         #[cfg(target_arch = "x86_64")]
         Backend::Avx2 => count_noncontinuation_avx2(bytes),
+        #[cfg(all(target_arch = "x86_64", feature = "compaction-asm", not(miri)))]
+        Backend::AsmSse2 => asm::count_noncontinuation_sse2(bytes),
+        #[cfg(all(target_arch = "x86_64", feature = "compaction-asm", not(miri)))]
+        Backend::AsmAvx2 => count_noncontinuation_asm_avx2(bytes),
         #[cfg(target_arch = "aarch64")]
         Backend::Neon => count_noncontinuation_neon(bytes),
     }
@@ -607,14 +669,81 @@ pub fn count_chars(s: &str) -> usize {
 /// `&s[scan.0..next]` reproduces `chars().skip().take()` slicing. The AVX2
 /// backend scans 32-byte blocks with movemask+popcount; other backends use
 /// the scalar byte walk.
+#[inline]
 pub fn scan_chars_forward(bytes: &[u8], start: usize, target: usize) -> (usize, usize) {
-    #[cfg(target_arch = "x86_64")]
-    {
-        if dispatch_state().backend == Backend::Avx2 {
-            return scan_noncontinuation_avx2(bytes, start, target);
-        }
+    backend_scan_forward(dispatch_state().backend, bytes, start, target)
+}
+
+/// Dispatched backward scan over raw bytes: returns the byte offset of the
+/// `target`-th non-continuation byte counted backwards from `end`
+/// (exclusive; clamped to `bytes.len()`) and how many were found. Returns
+/// `(end, 0)` for `target == 0` and `(0, found)` when fewer exist.
+///
+/// For valid UTF-8 and an `end` on a char boundary this is exactly the byte
+/// offset of `s[..end].char_indices().rev().nth(target - 1)`, so
+/// `&s[scan.0..end]` holds the last `target` chars. Each byte is classified
+/// independently, so the result is also defined for invalid UTF-8.
+#[inline]
+pub fn scan_chars_backward(bytes: &[u8], end: usize, target: usize) -> (usize, usize) {
+    let end = end.min(bytes.len());
+    backend_scan_backward(dispatch_state().backend, bytes, end, target)
+}
+
+/// Byte offset where the first `n` chars of `s` end (`s.len()` when `s` has
+/// fewer, 0 for `n == 0`). Bit-identical to
+/// `s.char_indices().nth(n - 1).map_or(s.len(), |(i, c)| i + c.len_utf8())`.
+#[inline]
+pub fn prefix_end(s: &str, n: usize) -> usize {
+    scan_chars_forward(s.as_bytes(), 0, n).0
+}
+
+/// Byte offset where the last `n` chars of `s` start (0 when `s` has fewer,
+/// `s.len()` for `n == 0`). Bit-identical to
+/// `s.char_indices().rev().nth(n - 1).map_or(0, |(i, _)| i)`.
+#[inline]
+pub fn suffix_start(s: &str, n: usize) -> usize {
+    scan_chars_backward(s.as_bytes(), s.len(), n).0
+}
+
+/// The first `n` chars of `s` as a borrowed slice: the same text as
+/// `s.chars().take(n).collect::<String>()`, without per-char pushes.
+#[inline]
+pub fn take_chars(s: &str, n: usize) -> &str {
+    &s[..prefix_end(s, n)]
+}
+
+/// The last `n` chars of `s` as a borrowed slice: the same text as
+/// `s.chars().skip(s.chars().count().saturating_sub(n)).collect::<String>()`.
+#[inline]
+pub fn last_chars(s: &str, n: usize) -> &str {
+    &s[suffix_start(s, n)..]
+}
+
+/// `io::Write` sink that counts the non-continuation bytes streamed into it
+/// with the dispatched kernel. Chunk boundaries do not matter: each byte is
+/// classified independently.
+#[derive(Default)]
+struct CharCountWriter {
+    chars: usize,
+}
+
+impl std::io::Write for CharCountWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.chars += count_noncontinuation(bytes);
+        Ok(bytes.len())
     }
-    scan_chars_forward_scalar(bytes, start, target)
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Unicode-scalar count of `serde_json::to_string(value)` without building
+/// the string: `serde_json` writes the same bytes through `to_writer`, and the
+/// streamed count is chunk-additive. `None` exactly when `to_string` fails.
+pub fn count_json_chars<T: serde::Serialize + ?Sized>(value: &T) -> Option<usize> {
+    let mut writer = CharCountWriter::default();
+    serde_json::to_writer(&mut writer, value).ok()?;
+    Some(writer.chars)
 }
 
 // ---------------------------------------------------------------------------
@@ -845,6 +974,14 @@ mod tests {
                     );
                 }
             }
+            for backend in candidate_backends() {
+                assert_eq!(
+                    run_backend(backend, text.as_bytes()),
+                    Some(expected),
+                    "{} backend failed on {name}",
+                    backend.name()
+                );
+            }
             #[cfg(target_arch = "aarch64")]
             {
                 // SAFETY: NEON is baseline on aarch64.
@@ -995,12 +1132,371 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Backward scan vs `char_indices().rev()`, plus the str helpers built on
+    // the two scans and the streamed JSON counter
+    // -----------------------------------------------------------------------
+
+    /// Reference: byte start of the `target`-th char counted backwards from
+    /// `end`, computed with the std char iterator (the shape of the
+    /// `char_boundary_before` walk it replaces).
+    fn scan_backward_reference(text: &str, end: usize, target: usize) -> (usize, usize) {
+        if target == 0 {
+            return (end, 0);
+        }
+        let head = &text[..end];
+        let seen = head.chars().count().min(target);
+        let start = match head.char_indices().rev().nth(target - 1) {
+            Some((offset, _)) => offset,
+            None => 0,
+        };
+        (start, seen)
+    }
+
+    /// Each backend's backward kernel, called directly (not via dispatch).
+    fn backward_kernels() -> Vec<(&'static str, fn(&[u8], usize, usize) -> (usize, usize))> {
+        let mut kernels: Vec<(&'static str, fn(&[u8], usize, usize) -> (usize, usize))> =
+            vec![("scalar", scan_chars_backward_scalar), ("dispatch", scan_chars_backward)];
+        #[cfg(target_arch = "x86_64")]
+        if std::arch::is_x86_feature_detected!("avx2") {
+            kernels.push(("avx2", scan_noncontinuation_backward_avx2));
+        }
+        #[cfg(all(target_arch = "x86_64", feature = "compaction-asm", not(miri)))]
+        {
+            if asm::asm_avx2_supported() {
+                kernels.push(("asm-avx2", scan_noncontinuation_backward_asm_avx2));
+            }
+        }
+        kernels
+    }
+
+    #[test]
+    fn scan_chars_backward_matches_char_indices_on_a_boundary_matrix() {
+        let text = "abc\u{4e2d}\u{1f600}def\u{e9}\u{0301}gh\u{0}ijk\u{10ffff}lmn";
+        let mut ends: Vec<usize> = text.char_indices().map(|(i, _)| i).collect();
+        ends.push(text.len());
+        for (name, kernel) in backward_kernels() {
+            for &end in &ends {
+                for target in 0..=(text[..end].chars().count() + 2) {
+                    let expected = scan_backward_reference(text, end, target);
+                    let got = kernel(text.as_bytes(), end, target);
+                    assert_eq!(got, expected, "{name} end {end} target {target}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn scan_chars_backward_scan_ends_on_every_alignment() {
+        // The AVX2 kernel loads `bytes[pos - 32..pos]` from unaligned ends;
+        // sweep char-boundary ends behind 0..=40 bytes of padding.
+        let payload = "\u{4e2d}\u{1f600}abc\u{e9}\u{0301}def\u{10ffff}\u{0}";
+        for (name, kernel) in backward_kernels() {
+            for pad in 0..=40usize {
+                let text = format!("{}{}", "x".repeat(pad), payload.repeat(8));
+                let mut ends: Vec<usize> = text.char_indices().map(|(i, _)| i).collect();
+                ends.push(text.len());
+                for &end in &ends {
+                    for target in [0usize, 1, 7, 31, 32, 33, 64, 65, 10_000] {
+                        let expected = scan_backward_reference(&text, end, target);
+                        let got = kernel(text.as_bytes(), end, target);
+                        assert_eq!(got, expected, "{name} pad {pad} end {end} target {target}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn scan_chars_backward_matches_the_reference_on_the_full_matrix() {
+        for (case, text) in count_cases() {
+            let total = text.chars().count();
+            for (name, kernel) in backward_kernels() {
+                for target in [1usize, 2, 31, 32, 33, 500, 2000, total / 2, total, total + 1] {
+                    let expected = scan_backward_reference(&text, text.len(), target);
+                    assert_eq!(
+                        kernel(text.as_bytes(), text.len(), target),
+                        expected,
+                        "{name} {case} target {target}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn scan_chars_backward_is_exact_on_arbitrary_bytes() {
+        // The backward contract classifies each byte independently, so the
+        // accelerated kernels must equal the scalar walk on any bytes and any
+        // `end`, not only on char boundaries.
+        let mut rng = Lcg::new(0x0BAC_CAFE);
+        for size in [0usize, 1, 31, 32, 33, 63, 64, 65, 97, 200] {
+            let mut bytes = Vec::with_capacity(size);
+            for _ in 0..size {
+                bytes.push((rng.next_u64() >> 32) as u8);
+            }
+            let total = count_noncontinuation_scalar(&bytes);
+            for (name, kernel) in backward_kernels() {
+                for end in 0..=size {
+                    for target in [0usize, 1, 2, 15, 31, 32, 33, 64, total / 2, total, total + 1] {
+                        assert_eq!(
+                            kernel(&bytes, end, target),
+                            scan_chars_backward_scalar(&bytes, end, target),
+                            "{name} size {size} end {end} target {target}"
+                        );
+                    }
+                }
+            }
+        }
+        // The public wrapper clamps an out-of-range `end`.
+        let bytes = b"abc";
+        assert_eq!(scan_chars_backward(bytes, 99, 2), (1, 2));
+        assert_eq!(scan_chars_backward(bytes, 99, 0), (3, 0));
+    }
+
+    /// Every backend whose scans the host can run, called through
+    /// `backend_scan_forward` / `backend_scan_backward` (not the dispatch
+    /// state). The assembly backend is included whenever the CPU supports
+    /// it, even when `PRIME_AGENT_COMPACT_ASM=0` hides it from dispatch.
+    fn scan_backends() -> Vec<Backend> {
+        let mut backends = vec![Backend::Reference];
+        backends.extend(candidate_backends());
+        #[cfg(all(target_arch = "x86_64", feature = "compaction-asm", not(miri)))]
+        {
+            if asm::asm_avx2_supported() && !backends.contains(&Backend::AsmAvx2) {
+                backends.push(Backend::AsmAvx2);
+            }
+        }
+        backends
+    }
+
+    /// Random bytes in one of four shapes: uniform, ASCII-heavy,
+    /// continuation-heavy (long invalid runs), and lead-heavy.
+    fn random_bytes(rng: &mut Lcg, size: usize, mode: u64) -> Vec<u8> {
+        (0..size)
+            .map(|_| {
+                let value = rng.next_u64();
+                let byte = (value >> 32) as u8;
+                match mode {
+                    0 => byte,
+                    1 if value % 8 != 0 => byte & 0x7f,
+                    2 if value % 4 != 0 => 0x80 | (byte & 0x3f),
+                    3 if value % 3 != 0 => 0xc0 | byte,
+                    _ => byte,
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn scan_chars_forward_is_exact_on_arbitrary_bytes() {
+        // The forward contract classifies each byte independently. Every
+        // backend must equal the scalar walk on any bytes and on every
+        // `start`, including continuation-byte starts (the assembly wrapper
+        // routes those to the scalar walk) and starts past the end.
+        let mut rng = Lcg::new(0xF0D_5CA9);
+        let sizes = [
+            0usize, 1, 2, 3, 4, 7, 8, 15, 16, 17, 31, 32, 33, 63, 64, 65, 96, 97, 127, 128, 129, 160,
+            161, 200, 255, 256, 257, 300,
+        ];
+        for mode in 0..4u64 {
+            for size in sizes {
+                let bytes = random_bytes(&mut rng, size, mode);
+                let total = count_noncontinuation_scalar(&bytes);
+                for backend in scan_backends() {
+                    for start in 0..=size + 1 {
+                        for target in [
+                            0usize,
+                            1,
+                            2,
+                            3,
+                            7,
+                            8,
+                            15,
+                            16,
+                            31,
+                            32,
+                            33,
+                            63,
+                            64,
+                            65,
+                            79,
+                            160,
+                            total / 2,
+                            total,
+                            total + 1,
+                            usize::MAX,
+                        ] {
+                            assert_eq!(
+                                backend_scan_forward(backend, &bytes, start, target),
+                                scan_chars_forward_scalar(&bytes, start, target),
+                                "{} mode {mode} size {size} start {start} target {target}",
+                                backend.name()
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn scans_are_exact_above_128_kib() {
+        // The long unrolled loops (128..512-byte blocks) and every block
+        // boundary of a > 128 KiB buffer, for valid UTF-8 of each corpus
+        // class and for arbitrary bytes.
+        let mut buffers: Vec<(String, Vec<u8>)> = all_classes()
+            .into_iter()
+            .map(|class| {
+                (
+                    format!("{class:?}"),
+                    generate_text(class, 300 * 1024 + 17, 0x5CA1_AB1E).into_bytes(),
+                )
+            })
+            .collect();
+        let mut rng = Lcg::new(0xB16_B0FF);
+        for mode in 0..4u64 {
+            buffers.push((format!("random-{mode}"), random_bytes(&mut rng, 300 * 1024 + 29, mode)));
+        }
+        for (name, bytes) in buffers {
+            let total = count_noncontinuation_scalar(&bytes);
+            for backend in scan_backends() {
+                assert_eq!(run_backend(backend, &bytes), Some(total), "{} count {name}", backend.name());
+                let middle = bytes.len() / 2;
+                let lead = bytes[middle..]
+                    .iter()
+                    .position(|byte| byte & 0xc0 != 0x80)
+                    .map_or(bytes.len(), |offset| middle + offset);
+                for target in [1usize, 1000, 65_537, total / 3, total / 2, total - 1, total, total + 1, usize::MAX] {
+                    for start in [0, lead] {
+                        assert_eq!(
+                            backend_scan_forward(backend, &bytes, start, target),
+                            scan_chars_forward_scalar(&bytes, start, target),
+                            "{} forward {name} start {start} target {target}",
+                            backend.name()
+                        );
+                    }
+                    for end in [bytes.len(), middle, bytes.len() - 1] {
+                        assert_eq!(
+                            backend_scan_backward(backend, &bytes, end, target),
+                            scan_chars_backward_scalar(&bytes, end, target),
+                            "{} backward {name} end {end} target {target}",
+                            backend.name()
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn asm_switch_accepts_only_0_and_false() {
+        assert!(asm_switch_disables("0"));
+        assert!(asm_switch_disables("false"));
+        assert!(asm_switch_disables("FALSE"));
+        assert!(asm_switch_disables("False"));
+        assert!(!asm_switch_disables("1"));
+        assert!(!asm_switch_disables("true"));
+        assert!(!asm_switch_disables("no"));
+        assert!(!asm_switch_disables(""));
+        assert!(!asm_switch_disables(" 0"));
+    }
+
+    #[test]
+    fn self_check_prefers_the_assembly_backend_when_supported() {
+        #[cfg(all(target_arch = "x86_64", feature = "compaction-asm", not(miri)))]
+        {
+            if forced_reference() || asm_disabled() {
+                return;
+            }
+            let candidates = candidate_backends();
+            assert!(candidates.contains(&Backend::AsmSse2));
+            if asm::asm_avx2_supported() {
+                assert_eq!(candidates[0], Backend::AsmAvx2);
+                assert_eq!(self_check(), Backend::AsmAvx2);
+                assert_eq!(diagnostic(), "");
+            }
+        }
+    }
+
+    #[test]
+    fn str_helpers_match_the_char_iterator_forms_they_replace() {
+        let mut cases = count_cases();
+        cases.push(("empty".to_string(), String::new()));
+        for (case, text) in cases {
+            let total = text.chars().count();
+            for n in [0usize, 1, 2, 7, 8, 16, 31, 32, 33, 160, 2000, total / 2, total, total + 1] {
+                let take: String = text.chars().take(n).collect();
+                assert_eq!(take_chars(&text, n), take, "{case} take {n}");
+                let last: String = text.chars().skip(total.saturating_sub(n)).collect();
+                assert_eq!(last_chars(&text, n), last, "{case} last {n}");
+                let after = if n == 0 {
+                    0
+                } else {
+                    text.char_indices()
+                        .nth(n - 1)
+                        .map_or(text.len(), |(byte, ch)| byte + ch.len_utf8())
+                };
+                assert_eq!(prefix_end(&text, n), after, "{case} prefix_end {n}");
+                let before = if n == 0 {
+                    text.len()
+                } else {
+                    text.char_indices().rev().nth(n - 1).map_or(0, |(byte, _)| byte)
+                };
+                assert_eq!(suffix_start(&text, n), before, "{case} suffix_start {n}");
+            }
+        }
+    }
+
+    #[test]
+    fn count_json_chars_matches_to_string_then_count() {
+        let values = vec![
+            serde_json::json!(null),
+            serde_json::json!({}),
+            serde_json::json!({"path": "src/\u{4e2d}\u{6587}.rs", "n": 3, "ok": true}),
+            serde_json::json!({"text": "quote \" backslash \\ nl \n tab \t nul \u{0} del \u{7f}"}),
+            serde_json::json!({"emoji": "\u{1f600}\u{1f44d}\u{200d}", "list": [1.5, -2, "\u{e9}\u{0301}"]}),
+            serde_json::json!({"big": generate_text(FixtureClass::MixedCrlf, 64 * 1024, 0x15_0A)}),
+        ];
+        for value in &values {
+            let expected = serde_json::to_string(value).ok().map(|json| json.chars().count());
+            assert_eq!(count_json_chars(value), expected, "{value}");
+        }
+        // A map with non-string keys fails `to_string`; the counter reports
+        // `None` exactly then, never a partial count.
+        let mut bad = std::collections::BTreeMap::new();
+        bad.insert((1u8, 2u8), "x");
+        assert!(serde_json::to_string(&bad).is_err());
+        assert_eq!(count_json_chars(&bad), None);
+    }
+
+    #[test]
+    fn every_candidate_backend_passes_the_scan_self_check() {
+        let fixtures = self_check_fixtures();
+        let byte_fixtures = self_check_byte_fixtures();
+        assert!(scans_match_reference(Backend::Reference, &fixtures, &byte_fixtures));
+        for backend in candidate_backends() {
+            assert!(
+                scans_match_reference(backend, &fixtures, &byte_fixtures),
+                "{} scan kernels disagree with the scalar walks",
+                backend.name()
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // Dispatch, self-check, force switch
     // -----------------------------------------------------------------------
 
     #[test]
     fn self_check_activates_an_accelerated_backend_with_no_diagnostic() {
         let backend = self_check();
+        // With PRIME_AGENT_COMPACT_RUST_COUNT=1|true the forced reference is
+        // the expected state, and its diagnostic says so.
+        if forced_reference() {
+            assert_eq!(backend, Backend::Reference);
+            assert!(diagnostic().contains("forced reference"));
+            return;
+        }
         #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
         assert_ne!(
             backend,
@@ -1009,12 +1505,8 @@ mod tests {
         );
         #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
         assert_eq!(backend, Backend::Reference);
-        // A healthy backend selection carries no diagnostic. (If the test
-        // process runs with PRIME_AGENT_COMPACT_RUST_COUNT set, the forced
-        // reference is the expected state instead.)
-        if std::env::var("PRIME_AGENT_COMPACT_RUST_COUNT").is_err() {
-            assert_eq!(diagnostic(), "");
-        }
+        // A healthy backend selection carries no diagnostic.
+        assert_eq!(diagnostic(), "");
     }
 
     #[test]
@@ -1122,6 +1614,14 @@ mod tests {
                         "avx2 failed on {name}"
                     );
                 }
+            }
+            for backend in candidate_backends() {
+                assert_eq!(
+                    run_backend(backend, &bytes),
+                    Some(expected),
+                    "{} backend failed on {name}",
+                    backend.name()
+                );
             }
             #[cfg(target_arch = "aarch64")]
             {
