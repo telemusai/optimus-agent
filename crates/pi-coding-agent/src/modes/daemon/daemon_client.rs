@@ -359,6 +359,7 @@ pub struct DaemonClientReconnectOptions {
 }
 
 pub type DaemonClientMessageListener = Arc<dyn Fn(&Value) + Send + Sync>;
+pub type DaemonWireListener = Arc<dyn Fn(&Value, &str) + Send + Sync>;
 pub type DaemonClientCloseListener = Arc<dyn Fn(&DaemonClientError) + Send + Sync>;
 pub type DaemonClientProgressListener = Arc<dyn Fn(&Value) + Send + Sync>;
 
@@ -714,7 +715,7 @@ pub trait DaemonTransportClient: Send + Sync {
 pub struct DaemonClient {
     socket_path: String,
     state: Mutex<ClientState>,
-    listeners: Arc<StdMutex<HashMap<u64, DaemonClientMessageListener>>>,
+    listeners: Arc<StdMutex<HashMap<u64, DaemonWireListener>>>,
     close_listeners: Arc<StdMutex<HashMap<u64, DaemonClientCloseListener>>>,
     next_listener_id: AtomicU64,
     protocol_client_id: String,
@@ -913,6 +914,10 @@ impl DaemonClient {
     }
 
     pub fn on_message(&self, listener: DaemonClientMessageListener) -> Box<dyn Fn() + Send + Sync> {
+        self.on_wire_message(Arc::new(move |value, _| listener(value)))
+    }
+
+    pub(crate) fn on_wire_message(&self, listener: DaemonWireListener) -> Box<dyn Fn() + Send + Sync> {
         let id = self.next_listener_id.fetch_add(1, Ordering::SeqCst);
         self.listeners.lock().expect("listeners poisoned").insert(id, listener);
         let registry = Arc::clone(&self.listeners);
@@ -1152,6 +1157,11 @@ impl DaemonClient {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) async fn receive_test_line(self: &Arc<Self>, line: &str) {
+        self.handle_line(line).await;
+    }
+
     async fn handle_line(self: &Arc<Self>, line: &str) {
         let Ok(message) = serde_json::from_str::<Value>(line) else {
             return;
@@ -1232,13 +1242,13 @@ impl DaemonClient {
             }
         }
 
-        let listeners: Vec<DaemonClientMessageListener> = {
+        let listeners: Vec<DaemonWireListener> = {
             let registry = self.listeners.lock().expect("listeners poisoned");
             registry.values().cloned().collect()
         };
         for listener in listeners {
             // A consumer failure must not interrupt protocol parsing for other clients.
-            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| listener(&message)));
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| listener(&message, line)));
         }
     }
 

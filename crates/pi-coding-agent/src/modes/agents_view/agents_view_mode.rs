@@ -26,7 +26,7 @@ use super::roster_store::{
     AgentsViewRosterStore, DaemonClientRequestOptions, DaemonResponse, DaemonTransportClient,
     STALE_ROSTER_DAEMON_MESSAGE,
 };
-use super::session_view_search::matches_search_text;
+use super::session_view_search::{match_search_text, parse_search_query};
 
 pub const HEARTBEAT_POLL_INTERVAL_MS: u64 = 15000;
 pub const RECONNECT_TIMEOUT_MS: u64 = 120000;
@@ -2780,7 +2780,14 @@ impl<'a> AgentsViewMode<'a> {
     /// `getFilteredRecords()`.
     pub fn get_filtered_records(&self) -> Vec<UnifiedSessionRecord> {
         let query = self.action_search_text();
-        filter_unified_sessions(&self.scoped_records, &|text| matches_search_text(text, &query))
+        if query.trim().is_empty() {
+            return self.scoped_records.clone();
+        }
+        let search = parse_search_query(&query);
+        if search.error.is_some() {
+            return Vec::new();
+        }
+        filter_unified_sessions(&self.scoped_records, &|text| match_search_text(text, &search).matches)
     }
 
     // Cancel through the transport so a dropped view cannot leave a parked

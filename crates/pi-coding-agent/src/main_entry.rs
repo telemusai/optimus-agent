@@ -1717,15 +1717,18 @@ fn main_entry_session_snapshot(snapshot: &ProtocolSessionSnapshot) -> Connection
 /// `session_list_progress`) read as `None`, exactly as the TypeScript connection
 /// ignores them.
 fn main_entry_outbound_from_wire(value: &Value) -> Option<ConnectionOutbound> {
-    let meta = main_entry_meta_from_wire(value.get("meta"));
+    main_entry_outbound_from_owned_wire(value.clone())
+}
+
+pub(crate) fn main_entry_outbound_from_owned_wire(mut frame: Value) -> Option<ConnectionOutbound> {
+    let meta = main_entry_meta_from_wire(frame.get("meta"));
     // `meta` is reconstructed above; dropping it here keeps parsing independent of
     // the daemon-side meta shape (which carries required fields this adapter and
     // the connection do not read).
-    let mut frame = value.clone();
     if let Some(object) = frame.as_object_mut() {
         object.remove("meta");
     }
-    let outbound = ProtocolOutbound::from_value(&frame)?;
+    let outbound: ProtocolOutbound = serde_json::from_value(frame).ok()?;
     let outbound = match outbound {
         ProtocolOutbound::DaemonClosing { reason } => ConnectionOutbound::DaemonClosing { reason },
         ProtocolOutbound::HeartbeatsChanged { active_session_id, .. } => ConnectionOutbound::HeartbeatsChanged {
@@ -1941,6 +1944,13 @@ impl ConnectionTransport for MainEntryDaemonTransport {
                 error_code: response.error_info.map(|info| info.code().to_string()),
             })
         })
+    }
+
+    fn on_viewer_frame(
+        &self,
+        listener: crate::modes::daemon::daemon_client::DaemonWireListener,
+    ) -> Option<Box<dyn Fn() + Send + Sync>> {
+        Some(self.client.on_wire_message(listener))
     }
 
     fn on_message(&self, listener: Arc<dyn Fn(ConnectionOutbound) + Send + Sync>) -> Box<dyn Fn() + Send + Sync> {

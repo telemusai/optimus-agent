@@ -1,0 +1,1 @@
+- Fixed excessive memory use in an open terminal chat by filtering unrelated traffic early, combining adjacent streaming updates, and delivering ordered events through a bounded viewer inbox.
