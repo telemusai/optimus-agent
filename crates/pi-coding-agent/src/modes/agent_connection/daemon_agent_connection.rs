@@ -13,6 +13,8 @@
 
 #[path = "roster_subscription.rs"]
 mod roster_subscription;
+#[path = "viewer_delivery.rs"]
+mod viewer_delivery;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, Weak};
@@ -326,6 +328,9 @@ pub trait DaemonTransportClient: Send + Sync {
         self.request(command, timeout_ms)
     }
     fn on_message(&self, listener: Arc<dyn Fn(DaemonOutbound) + Send + Sync>) -> Box<dyn Fn() + Send + Sync>;
+    fn on_viewer_frame(&self, _: crate::modes::daemon::daemon_client::DaemonWireListener) -> Option<Box<dyn Fn() + Send + Sync>> {
+        None
+    }
     fn on_close(&self, listener: Arc<dyn Fn(String) + Send + Sync>) -> Box<dyn Fn() + Send + Sync>;
     fn supports_server_capability(&self, capability: &str) -> bool;
     fn hello_socket_path(&self) -> Option<String>;
@@ -991,6 +996,21 @@ impl DaemonAgentConnection {
     /// Transport message/close handlers are registered by `attach`, matching the
     /// TypeScript constructor, and detached by `dispose`.
     fn bind_transport(&self, this: &Arc<Self>) {
+        let interactive = self.options.lock().unwrap().defer_session_events;
+        let message_handle = interactive.then(|| viewer_delivery::bind(this)).flatten()
+            .unwrap_or_else(|| self.bind_callback_delivery(this));
+        *self.unsubscribe_daemon_messages.lock().unwrap() = Some(message_handle);
+        let weak = Arc::downgrade(this);
+        let close_handle = self.client.on_close(Arc::new(move |error| {
+            if let Some(connection) = weak.upgrade() {
+                tokio::spawn(async move { connection.handle_transport_close(error).await });
+            }
+        }));
+        *self.unsubscribe_daemon_close.lock().unwrap() = Some(close_handle);
+        self.capture_daemon_log_path();
+    }
+
+    fn bind_callback_delivery(&self, this: &Arc<Self>) -> Box<dyn Fn() + Send + Sync> {
         let weak: Weak<DaemonAgentConnection> = Arc::downgrade(this);
         // Advance the event cursor in transport order. Per-message tasks can
         // otherwise advance past agent_end and discard it as stale.
@@ -1027,18 +1047,7 @@ impl DaemonAgentConnection {
             }
             let _ = send.send(message);
         }));
-        *self.unsubscribe_daemon_messages.lock().unwrap() = Some(message_handle);
-        let weak: Weak<DaemonAgentConnection> = Arc::downgrade(this);
-        let close_handle = self.client.on_close(Arc::new(move |error| {
-            if let Some(connection) = weak.upgrade() {
-                let connection_clone = connection.clone();
-                tokio::spawn(async move {
-                    connection_clone.handle_transport_close(error).await;
-                });
-            }
-        }));
-        *self.unsubscribe_daemon_close.lock().unwrap() = Some(close_handle);
-        self.capture_daemon_log_path();
+        message_handle
     }
 
     fn capture_daemon_log_path(&self) {
@@ -1101,7 +1110,7 @@ impl DaemonAgentConnection {
 
     fn is_message_for_active_session(&self, message: &DaemonOutbound) -> bool {
         match message.active_session_id() {
-            Some(active_session_id) => active_session_id == self.active_session_id(),
+            Some(active_session_id) => active_session_id == self.active_session_id.lock().unwrap().as_str(),
             None => false,
         }
     }
@@ -1288,7 +1297,15 @@ impl DaemonAgentConnection {
             _ => {}
         }
         self.observe_replacement_snapshot(&event);
-        let listeners = self.listeners.lock().unwrap().clone();
+        let listeners = {
+            let subscribed = self.listeners.lock().unwrap();
+            if let [listener] = subscribed.as_slice() {
+                let listener = listener.clone();
+                drop(subscribed);
+                return listener(event);
+            }
+            subscribed.clone()
+        };
         Box::pin(async move {
             let mut deliveries = Vec::with_capacity(listeners.len());
             for listener in listeners {
@@ -1515,6 +1532,15 @@ impl DaemonAgentConnection {
 
     async fn handle_transport_close(&self, error: String) {
         let direct_session_survives = self.client.has_direct_transport();
+        if self.options.lock().unwrap().defer_session_events && !*self.disposing.lock().unwrap()
+            && !*self.disposed.lock().unwrap() {
+            let reason = get_daemon_socket_close_reason(&error)
+                .map(DaemonClosingReason::as_str).unwrap_or("unannounced");
+            let sequence = *self.last_event_sequence.lock().unwrap();
+            append_rotating_log(&get_agent_log_path(), &format!(
+                "[{}] viewer transport closed: reason={reason} direct_session_survives={direct_session_survives} last_sequence={sequence:?}", now_iso()
+            ));
+        }
         let invalidated_input_pause =
             !direct_session_survives && !self.session_input_pauses.lock().unwrap().is_empty();
         if !direct_session_survives {
@@ -2420,13 +2446,12 @@ impl DaemonAgentConnection {
                 last_event_cursor,
                 ..
             } => {
-                self.complete_snapshot_assembly(
+                Box::pin(self.complete_snapshot_assembly(
                     snapshot_id,
                     *chunk_count,
                     *last_event_sequence,
                     last_event_cursor.clone(),
-                )
-                .await;
+                )).await;
                 return Ok(());
             }
             DaemonOutbound::SessionSnapshotFailed {
@@ -2450,7 +2475,7 @@ impl DaemonAgentConnection {
                 self.reject_snapshot_assembly(snapshot_id, &assembly, snapshot_error);
                 self.ignore_snapshot_id(snapshot_id);
                 if let Some((purpose, error)) = recovery {
-                    self.recover_failed_snapshot(&purpose, error).await;
+                    Box::pin(self.recover_failed_snapshot(&purpose, error)).await;
                 }
                 return Ok(());
             }
@@ -2619,7 +2644,7 @@ impl DaemonAgentConnection {
                 if matches!(reason.as_str(), "shutdown" | "killed")
                     && *self.shutdown_restart_pending.lock().unwrap()
                 {
-                    return self.reconnect("The daemon is restarting; waiting for this session to return.".into()).await;
+                    return Box::pin(self.reconnect("The daemon is restarting; waiting for this session to return.".into())).await;
                 }
                 *self.terminal_close_emitted.lock().unwrap() = true;
                 let message = self.format_daemon_session_closed_error(&reason);
