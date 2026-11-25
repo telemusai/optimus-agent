@@ -1,0 +1,1 @@
+- Changed Optimus Agent release version to 0.1.49.
