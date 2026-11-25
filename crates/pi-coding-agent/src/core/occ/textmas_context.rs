@@ -100,7 +100,8 @@ fn preflight_roles(original: &Context, mode: TextMasMode, model: &Model) -> Resu
 /// The ordinary parent never receives this replacement base.
 fn preparation_base(original: &Context, mode: TextMasMode, model: &Model) -> (Context, bool) {
     let base = Context::new(original.system_prompt.clone(), Vec::new(), None);
-    if preflight_roles(&base, mode, model).is_ok() {
+    let reduced_probe = role_original(&base, None, false, &bounded_draft());
+    if preflight_roles(&reduced_probe, mode, model).is_ok() {
         return (base, false);
     }
     if original
@@ -109,7 +110,8 @@ fn preparation_base(original: &Context, mode: TextMasMode, model: &Model) -> (Co
         .is_some_and(|prompt| !prompt.is_empty())
     {
         let bounded = Context::new(None, Vec::new(), None);
-        if preflight_roles(&bounded, mode, model).is_ok() {
+        let reduced_probe = role_original(&bounded, None, false, &bounded_draft());
+        if preflight_roles(&reduced_probe, mode, model).is_ok() {
             return (bounded, true);
         }
     }
@@ -980,6 +982,36 @@ mod tests {
             image.data.len(),
             "image budgeting must use the same bounded auxiliary base"
         );
+    }
+
+    #[test]
+    fn hierarchical_reduction_accounts_for_the_brief_before_keeping_system_instructions() {
+        let instructions = "s".repeat(MAX_CONTEXT_BYTES - 4_096);
+        let original = Context::new(
+            Some(instructions),
+            vec![user("history".repeat(MAX_CONTEXT_BYTES)), user("latest request".into())],
+            None,
+        );
+        let bare = Context::new(original.system_prompt.clone(), Vec::new(), None);
+        assert!(preflight_roles(&bare, TextMasMode::Hierarchical, &model()).is_ok());
+        let reduced_probe = role_original(&bare, None, false, &bounded_draft());
+        assert!(preflight_roles(&reduced_probe, TextMasMode::Hierarchical, &model()).is_err());
+
+        let plan = TextMasPreparationPlan::new(&original, TextMasMode::Hierarchical, &model())
+            .expect("the brief overflow must select the generic base before mapper spend");
+        assert!(plan.system_instructions_in_source());
+        assert!(plan.base.system_prompt.is_none());
+        for role in TextMasRole::ALL {
+            let context = role_context(
+                &plan.reduced_original(&bounded_draft()),
+                TextMasMode::Hierarchical,
+                role,
+                &[],
+            )
+            .unwrap();
+            assert!(serde_json::to_vec(&context).unwrap().len() <= MAX_CONTEXT_BYTES);
+            assert!(output_budget(&model(), &context).is_ok());
+        }
     }
 
     #[test]

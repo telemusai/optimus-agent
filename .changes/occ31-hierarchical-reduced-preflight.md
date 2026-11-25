@@ -1,0 +1,1 @@
+- Fixed hierarchical OCC3.1 preparation for near-limit system prompts by validating the complete reduced-role envelope before mapper calls; full parent context remains unchanged.

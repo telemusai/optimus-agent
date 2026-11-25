@@ -786,6 +786,57 @@ async fn large_history_reduction_and_parent_retry_keep_exact_latest_and_do_not_r
 
 
 #[tokio::test]
+async fn hierarchical_large_root_reduction_includes_brief_in_base_selection() {
+    let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let f = Fixture::new();
+    let instructions =
+        "NEAR_LIMIT_SYSTEM".to_string() + &"s".repeat(MAX_CONTEXT_BYTES - 16_384);
+    std::fs::write(f.root.path().join("workspace/AGENTS.md"), &instructions).unwrap();
+    let session = f.session(0, false).await;
+    let history = format!(
+        "ROOT_HISTORY_BEGIN{}ROOT_HISTORY_END",
+        "h".repeat(MAX_CONTEXT_BYTES * 2)
+    );
+    f.reply(text_reply("HISTORY_ANSWER"), None, None);
+    turn(&session, &history, None).await.unwrap();
+    let file = session.session_file().unwrap();
+    textmas_settings::set_mode(&file, TextMasMode::Hierarchical).unwrap();
+    f.dynamic_preparation_replies(64);
+    turn(&session, "CURRENT_REQUEST", None).await.unwrap();
+
+    let contexts = f.captured.lock().unwrap().clone();
+    let role_name = |context: &Context| {
+        let prompt = context.system_prompt.as_deref().unwrap_or_default();
+        ["mapper", "reducer", "planner", "critic", "refiner"]
+            .into_iter()
+            .find(|role| prompt.contains(&format!("advisory role: {role}")))
+    };
+    for role in ["planner", "critic", "refiner"] {
+        let context = contexts
+            .iter()
+            .find(|context| role_name(context) == Some(role))
+            .unwrap();
+        assert!(serde_json::to_vec(context).unwrap().len() <= MAX_CONTEXT_BYTES);
+        let encoded = serde_json::to_string(context).unwrap();
+        assert!(encoded.contains("CURRENT_REQUEST") && encoded.contains("REDUCED_BRIEF"));
+        assert!(!encoded.contains("ROOT_HISTORY_BEGIN"));
+        assert!(!encoded.contains("NEAR_LIMIT_SYSTEM"));
+        assert!(!encoded.contains("PLANNER_DRAFT") && !encoded.contains("CRITIC_DRAFT"));
+    }
+    let parent = contexts
+        .iter()
+        .rev()
+        .find(|context| context.tools.is_some())
+        .unwrap();
+    let parent_text = serde_json::to_string(parent).unwrap();
+    assert!(parent_text.contains("ROOT_HISTORY_BEGIN") && parent_text.contains("ROOT_HISTORY_END"));
+    assert!(parent_text.contains("NEAR_LIMIT_SYSTEM"));
+    assert!(parent_text.contains("REFINER_DRAFT"));
+    assert!(serde_json::to_vec(parent).unwrap().len() > MAX_CONTEXT_BYTES);
+    session.dispose_async(Some(false)).await;
+}
+
+#[tokio::test]
 async fn large_project_instructions_trigger_bounded_source_preparation() {
     let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
     let f = Fixture::new();
