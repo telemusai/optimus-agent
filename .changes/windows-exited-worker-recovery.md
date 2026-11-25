@@ -1,0 +1,1 @@
+- Fixed Windows chat recovery getting stuck when an exited session worker still has an open process handle. Opening the saved chat can now use the existing recovery path without restarting the daemon.

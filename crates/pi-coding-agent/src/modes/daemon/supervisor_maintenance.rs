@@ -133,7 +133,7 @@ impl Supervisor {
             || !self.workers.lock().unwrap().get(&expected.worker_id).is_some_and(|registered| Arc::ptr_eq(registered, worker)) {
             return Err("Worker registration changed during recovery cleanup".into());
         }
-        if is_stopping_process_alive(&ProcessIdentity { pid: expected.pid as i64, process_start_id: expected.process_start_id.clone() }) {
+        if is_process_identity_alive(&ProcessIdentity { pid: expected.pid as i64, process_start_id: expected.process_start_id.clone() }) {
             return Err("Cannot recover uncertain operations of a live or unverified worker".into());
         }
         Ok(())
@@ -190,7 +190,7 @@ impl Supervisor {
                 // A foreign record whose journaled process is provably gone is
                 // inert: a dead pid is nothing to reap, not a failed stop.
                 let identity = ProcessIdentity { pid: record.pid, process_start_id: record.process_start_id.clone() };
-                if !is_stopping_process_alive(&identity) { continue; }
+                if !is_process_identity_alive(&identity) { continue; }
                 // A foreign record that may still be live is not this stop's to
                 // kill: a bare pid is never kill authority. Supersede the
                 // uncertainty into the bounded side record, exactly like an owned
@@ -206,7 +206,7 @@ impl Supervisor {
                 if should_reap_orphan_process(&orphan) {
                     // Only a provably live record needs a kill; a gone pid is
                     // nothing to reap, not a failed cleanup.
-                    if is_stopping_process_alive(&identity) {
+                    if is_process_identity_alive(&identity) {
                         let killed = tokio::time::timeout(Duration::from_secs(6), tokio::task::spawn_blocking(move || {
                             kill_orphan_process(orphan.pid)
                         })).await;
@@ -226,7 +226,7 @@ impl Supervisor {
                     // The pid is gone entirely: the journaled process is provably
                     // dead, so there is nothing to defer (same gate as the
                     // pid-only branch below).
-                    if !is_stopping_process_alive(&ProcessIdentity { pid: orphan.pid, process_start_id: None }) {
+                    if !is_process_identity_alive(&ProcessIdentity { pid: orphan.pid, process_start_id: None }) {
                         continue;
                     }
                     deferred.push(orphan.clone());
@@ -235,7 +235,7 @@ impl Supervisor {
                 // A pid-only record can never prove identity: win32 relies on the
                 // kernel's kill-on-close job for those, and a bare pid is never
                 // kill authority. A provably dead pid needs no reap.
-                if !is_stopping_process_alive(&ProcessIdentity { pid: orphan.pid, process_start_id: None }) {
+                if !is_process_identity_alive(&ProcessIdentity { pid: orphan.pid, process_start_id: None }) {
                     continue;
                 }
                 // A live pid the cleanup cannot prove is ours: never kill by bare
@@ -330,7 +330,7 @@ impl Supervisor {
                 Some(_) => {}
             }
         }
-        if is_stopping_process_alive(&ProcessIdentity { pid: descriptor.pid as i64, process_start_id: descriptor.process_start_id.clone() }) { return Ok(false); }
+        if is_process_identity_alive(&ProcessIdentity { pid: descriptor.pid as i64, process_start_id: descriptor.process_start_id.clone() }) { return Ok(false); }
         if descriptor.stop_requested_at.is_some() {
             self.stop_worker(worker, descriptor.archive_on_stop == Some(true), false).await?;
             return Ok(true);
@@ -431,7 +431,7 @@ impl Supervisor {
             let Some(file) = descriptor.session_file.as_ref().or(descriptor.create_command.session_path.as_ref()) else { continue; };
             blocked.insert(canonical_session_path(file));
             if self.workers.lock().unwrap().contains_key(&descriptor.worker_id) { continue; }
-            if is_stopping_process_alive(&ProcessIdentity { pid: descriptor.pid as i64, process_start_id: descriptor.process_start_id.clone() }) { continue; }
+            if is_process_identity_alive(&ProcessIdentity { pid: descriptor.pid as i64, process_start_id: descriptor.process_start_id.clone() }) { continue; }
             if let Err(error) = self.cancel_session_tree(&descriptor, None).await {
                 eprintln!("Retaining cancelled-owner schedule cleanup {}: {error}", descriptor.worker_id);
                 continue;

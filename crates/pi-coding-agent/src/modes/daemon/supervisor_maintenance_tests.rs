@@ -449,7 +449,7 @@ async fn nine_supervisor_foreign_owner_live_orphans_are_deferred_not_failed() {
     let side_text = std::fs::read_to_string(&side).expect("deferred orphan side record");
     assert!(side_text.contains(&test_pid.to_string()), "{side_text}");
     assert!(side_text.contains("could not prove the live pid is the journaled process"), "{side_text}");
-    assert!(is_stopping_process_alive(&ProcessIdentity { pid: test_pid, process_start_id: None }), "the unproven pid must never be killed");
+    assert!(is_process_identity_alive(&ProcessIdentity { pid: test_pid, process_start_id: None }), "the unproven pid must never be killed");
 }
 
 #[cfg(windows)]
@@ -468,7 +468,7 @@ async fn nine_supervisor_foreign_owner_recycled_pid_is_nothing_to_reap() {
     assert!(!journal.exists(), "a provably gone journaled process is cleared with the journal");
     let side = fixture.supervisor.descriptor_dir.join("dead.orphans.unreapable.jsonl");
     assert!(!side.exists(), "the recycled pid was never this stop's to judge as unproven");
-    assert!(is_stopping_process_alive(&ProcessIdentity { pid: test_pid, process_start_id: None }), "the live pid must never be killed");
+    assert!(is_process_identity_alive(&ProcessIdentity { pid: test_pid, process_start_id: None }), "the live pid must never be killed");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -533,7 +533,7 @@ async fn nine_supervisor_pid_only_live_orphans_are_deferred_not_failed() {
     // The uncertainty is recorded, never cleared to green: the side record says why.
     assert!(side_text.contains("could not prove the live pid is the journaled process"), "{side_text}");
     assert!(
-        is_stopping_process_alive(&ProcessIdentity { pid: test_pid, process_start_id: None }),
+        is_process_identity_alive(&ProcessIdentity { pid: test_pid, process_start_id: None }),
         "the unproven pid must never be killed"
     );
 }
@@ -554,7 +554,7 @@ async fn deferred_orphan_write_failure_retains_source_and_parks_cleanup() {
     assert!(super::supervisor_maintenance::permanent_stop_cleanup_error(&error), "{error}");
     assert_eq!(std::fs::read_to_string(&journal).unwrap(), original);
     assert!(side.is_dir());
-    assert!(is_stopping_process_alive(&ProcessIdentity { pid: test_pid, process_start_id: None }));
+    assert!(is_process_identity_alive(&ProcessIdentity { pid: test_pid, process_start_id: None }));
     worker.descriptor.lock().unwrap().stop_requested_at = Some("now".into());
     fixture.supervisor.park_worker_stop_cleanup_failure(&worker, &error);
     assert!(stop_cleanup_is_parked(&worker.descriptor.lock().unwrap()));
@@ -579,7 +579,7 @@ async fn deferred_orphan_capacity_and_malformed_evidence_never_discard_records()
         assert!(super::supervisor_maintenance::permanent_stop_cleanup_error(&error), "{error}");
         assert_eq!(std::fs::read_to_string(&side).unwrap(), evidence);
         assert_eq!(std::fs::read_to_string(&journal).unwrap(), original);
-        assert!(is_stopping_process_alive(&ProcessIdentity { pid: test_pid, process_start_id: None }));
+        assert!(is_process_identity_alive(&ProcessIdentity { pid: test_pid, process_start_id: None }));
     }
 }
 
@@ -603,7 +603,7 @@ async fn deferred_orphan_retry_is_idempotent_at_capacity() {
         assert_eq!(rows.len(), 64);
         assert_eq!(rows.iter().filter(|record| record["pid"] == test_pid).count(), 1);
         assert!(rows.iter().any(|record| record["pid"] == 900_000_000i64));
-        assert!(is_stopping_process_alive(&ProcessIdentity { pid: test_pid, process_start_id: None }));
+        assert!(is_process_identity_alive(&ProcessIdentity { pid: test_pid, process_start_id: None }));
         assert!(!std::fs::read_dir(&fixture.supervisor.descriptor_dir).unwrap().filter_map(Result::ok).any(|entry| entry.file_name().to_string_lossy().ends_with(".tmp")));
     }
 }
