@@ -505,7 +505,27 @@ pub fn is_zombie_process(pid: i32) -> bool {
 
 /// True only for a process that is actually running: zombies do not count.
 pub fn is_process_alive(pid: i32) -> bool {
-    process_id_exists(pid) && !is_zombie_process(pid)
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
+        use windows_sys::Win32::System::Threading::{OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE};
+
+        // An exited process can still be opened by PID while a handle is held.
+        // Its process object is signaled even if its exit code is STILL_ACTIVE.
+        unsafe {
+            let handle = OpenProcess(PROCESS_SYNCHRONIZE, 0, pid as u32);
+            if handle.is_null() {
+                return process_id_exists(pid);
+            }
+            let exited = WaitForSingleObject(handle, 0) == WAIT_OBJECT_0;
+            CloseHandle(handle);
+            !exited
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        process_id_exists(pid) && !is_zombie_process(pid)
+    }
 }
 
 /// True while the group has any member left, zombies included; a group can outlive its leader.

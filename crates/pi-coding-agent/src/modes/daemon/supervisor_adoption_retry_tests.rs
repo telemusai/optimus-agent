@@ -1,4 +1,4 @@
-//! Isolated startup recovery probes; no worker processes or provider calls.
+//! Isolated startup recovery probes.
 use super::*;
 use super::daemon_supervisor_parity_tests::{SupervisorFixture, add_descriptor_only_worker};
 use crate::modes::daemon::daemon_worker_client::{encode_private_frame, PrivateFrameDecoder};
@@ -177,6 +177,47 @@ fn adoption_identity_observation_distinguishes_unknown_from_replaced_and_dead() 
     assert!(process_identity_observation(true, Some("old"), Some("new")) == ProcessIdentityVerdict::Gone);
     assert!(process_identity_observation(false, Some("start"), None) == ProcessIdentityVerdict::Gone);
     assert!(process_identity_observation(true, Some("start"), Some("start")) == ProcessIdentityVerdict::Current);
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn exited_worker_with_retained_handle_is_recoverable_without_a_daemon_restart() {
+    use std::io::Write;
+    use std::os::windows::process::CommandExt;
+    use std::process::{Command, Stdio};
+    use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
+
+    let fixture = SupervisorFixture::new("retained-worker-handle").await;
+    let worker = add_descriptor_only_worker(&fixture, "held", "root", "test-token", DAEMON_WORKER_LIFECYCLE_RECOVERING);
+    let mut child = Command::new("cmd.exe")
+        .args(["/d", "/q"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn().unwrap();
+    let pid = i64::from(child.id());
+    let identity = ProcessIdentity { pid, process_start_id: Some(get_process_start_id(pid).unwrap()) };
+    {
+        let mut descriptor = worker.descriptor.lock().unwrap();
+        descriptor.pid = pid as i32;
+        descriptor.process_start_id = identity.process_start_id.clone();
+    }
+    assert!(process_identity_verdict(&identity) == ProcessIdentityVerdict::Current);
+    child.stdin.take().unwrap().write_all(b"exit 259\r\n").unwrap();
+    assert_eq!(child.wait().unwrap().code(), Some(259));
+    // Holding Child keeps the same PID and creation time observable after exit.
+    assert_eq!(get_process_start_id(pid), identity.process_start_id);
+    assert!(process_identity_verdict(&identity) == ProcessIdentityVerdict::Gone);
+    assert!(!matches_exact_process_identity(&identity));
+    let attach = tokio::time::timeout(Duration::from_secs(2), fixture.supervisor.connected_client(&worker))
+        .await.expect("attempted to connect to an exited worker");
+    assert_eq!(attach.err().as_deref(), Some("Session worker held exited; retry_worker is required"));
+    tokio::time::timeout(Duration::from_secs(15), fixture.supervisor.recover_worker(&worker))
+        .await.expect("recovery kept polling the exited worker").unwrap();
+    assert_eq!(worker.descriptor.lock().unwrap().lifecycle, DAEMON_WORKER_LIFECYCLE_FAILED);
+    drop(child);
+    fixture.supervisor.ownership.release().await.unwrap();
 }
 
 #[tokio::test]

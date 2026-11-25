@@ -1621,7 +1621,7 @@ impl Supervisor {
             let descriptor: DaemonWorkerDescriptor = match std::fs::read(&path).ok().and_then(|bytes| serde_json::from_slice(&bytes).ok()) { Some(value) => value, None => continue };
             if normalize_socket_path_for_daemon(&descriptor.supervisor_socket_path, None) != self.socket_path { continue; }
             let identity = ProcessIdentity { pid: descriptor.pid as i64, process_start_id: descriptor.process_start_id.clone() };
-            if !is_stopping_process_alive(&identity) {
+            if !is_process_identity_alive(&identity) {
                 let worker = self.install_worker(descriptor.clone(), Arc::new(DaemonWorkerClient::new(&descriptor.socket_path)));
                 worker.client.lock().unwrap().take();
                 if stop_cleanup_is_parked(&descriptor) {
@@ -2779,7 +2779,7 @@ impl Supervisor {
         // `const gracefulDeadline = Date.now() + (force ? 500 : process.platform === "win32" ? 10_000 : 2000)`
         // (daemon-supervisor.ts:6824); this port only serves Windows workers.
         let deadline = tokio::time::Instant::now() + Duration::from_millis(if force { 500 } else { 10_000 });
-        let mut alive = is_stopping_process_alive(&identity);
+        let mut alive = is_process_identity_alive(&identity);
         let mut sigkill_sent = false;
         while alive {
             assert_stop_current()?;
@@ -2791,13 +2791,13 @@ impl Supervisor {
                 if force && identity.process_start_id.is_some() && matches_exact_process_identity(&identity) {
                     sigkill_sent = signal_process_group_or_process(descriptor.pid, Signal::Kill);
                     let force_deadline = tokio::time::Instant::now() + Duration::from_millis(1000);
-                    while is_stopping_process_alive(&identity) && tokio::time::Instant::now() < force_deadline {
+                    while is_process_identity_alive(&identity) && tokio::time::Instant::now() < force_deadline {
                         assert_stop_current()?;
                         tokio::time::sleep(Duration::from_millis(25)).await;
                     }
                 }
                 assert_stop_current()?;
-                if is_stopping_process_alive(&identity) {
+                if is_process_identity_alive(&identity) {
                     // `if (removeDescriptor) { this.scheduleWorkerStopFinalization(worker); }` then
                     // `throw new WorkerStopTimeoutError(...)` (daemon-supervisor.ts:6845-6852): a
                     // stop that timed out keeps escalating in the background and finishes the
@@ -2819,7 +2819,7 @@ impl Supervisor {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
-            alive = is_stopping_process_alive(&identity);
+            alive = is_process_identity_alive(&identity);
         }
         self.ownership.assert_current().await.map_err(|error| error.to_string())?;
         assert_stop_current()?;
@@ -3990,25 +3990,6 @@ fn stop_cleanup_should_retry(error: &str, attempts: usize) -> bool {
     !supervisor_maintenance::permanent_stop_cleanup_error(error) && attempts < STOP_CLEANUP_MAX_ATTEMPTS
 }
 
-fn is_stopping_process_alive(identity: &ProcessIdentity) -> bool {
-    #[cfg(windows)]
-    {
-        use windows_sys::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
-        use windows_sys::Win32::System::Threading::{OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE};
-        // Windows keeps an exited process object addressable while another handle
-        // is open. OpenProcess alone therefore does not establish liveness.
-        unsafe {
-            let handle = OpenProcess(PROCESS_SYNCHRONIZE, 0, identity.pid as u32);
-            if !handle.is_null() {
-                let exited = WaitForSingleObject(handle, 0) == WAIT_OBJECT_0;
-                CloseHandle(handle);
-                if exited { return false; }
-            }
-        }
-    }
-    is_process_identity_alive(identity)
-}
-
 async fn finalize_timed_out_worker_stop(supervisor: Arc<Supervisor>, worker: Arc<Worker>, descriptor: DaemonWorkerDescriptor) {
     let (pid, process_start_id, worker_id, worker_instance_id, stop_requested_at, archive_on_stop) =
         (descriptor.pid as i64, descriptor.process_start_id, descriptor.worker_id, descriptor.worker_instance_id, descriptor.stop_requested_at, descriptor.archive_on_stop == Some(true));
@@ -4027,7 +4008,7 @@ async fn finalize_timed_out_worker_stop(supervisor: Arc<Supervisor>, worker: Arc
     let mut killed = false;
     while !supervisor.stopped.is_cancelled() {
         if !is_stop_generation_current() { return; }
-        if !is_stopping_process_alive(&identity) { break; }
+        if !is_process_identity_alive(&identity) { break; }
         if !killed && tokio::time::Instant::now() >= sigkill_deadline {
             if supervisor.ownership.assert_current().await.is_err() || !is_stop_generation_current() { return; }
             if identity.process_start_id.is_some() && matches_exact_process_identity(&identity) {
